@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""helm chat node — supervision of the chat room node (a dregg tmpfs node).
+"""helm chat node — supervision of the chat room node (a dregg node).
 
 INTERIM SCAFFOLDING by design (one-node-per-team law, PRD 2026-07-19): the
 target topology is one team node; interim, chat gets its OWN tmpfs node so a signed
@@ -9,8 +9,10 @@ this module keeps working unchanged.
 
 The daemon is the SUBSTRATE's (`dregg-cave-node`), helm only supervises it
 via a user systemd unit `helm-chat-node.service` (precedent: the team node's
-dregg-cave.service) — the no-daemons law stays intact. Data-dir lives on
-tmpfs (/dev/shm/helm-chat-node): messages exist only in RAM.
+dregg-cave.service) — the no-daemons law stays intact. The data dir is
+node_data_dir(): tmpfs (/dev/shm/helm-chat-node) by default, or the placement
+`helm chat node move` recorded (disk: <helm-home>/_global/.state/
+chat-node-data, served from the page cache, and it survives a reboot).
 
 Provisioning contract (probed live against the binary, 2026-07-19):
   - a fresh node boots LOCKED. The fee-loop build also boots UNHEALTHY (no
@@ -49,7 +51,13 @@ import time
 from . import cell, home, pk
 
 UNIT = "helm-chat-node.service"
+# THE RAM PLACEMENT, and the default when nothing is recorded. The data dir the
+# unit actually runs is node_data_dir(): `helm chat node move` records another
+# placement in the state file, and every reader resolves it at call time.
 DATA_DIR = "/dev/shm/helm-chat-node"
+DISK_DIR_NAME = "chat-node-data"      # disk_data_dir(), beside the snapshot
+MOVE_INFIX = ".move-"                 # a data dir being copied, beside it
+MOVED_INFIX = ".moved-"               # the source a verified move left aside
 PORT = 8898
 GOSSIP_PORT = 18898
 # HOW LONG `up` WAITS FOR THE API, and why it is ten minutes. A rebased node
@@ -65,6 +73,26 @@ GOSSIP_PORT = 18898
 # before provision(). wait_boot does not count time in the prepare step;
 # systemd's TimeoutStartSec (START_TIMEOUT_S) is that step's bound.
 HEALTH_WAIT_S = 600
+# BOOTING IS MEASURED, NOT AGED (task/3891). A node replays its blocklace
+# before it binds its API, and that replay grows with the lace: measured
+# over an hour at 100% of one core, its main thread in load_blocklace ->
+# from_checkpoint -> detect_equivocation (emberian/dregg#101). A fixed
+# HEALTH_WAIT_S called that hung and prescribed a restart, and each restart
+# threw the replay away. So the main thread's CPU decides: a process with no
+# listener whose main thread advances is BOOTING; HUNG needs two readings at
+# least PROGRESS_WINDOW_S apart in which it used at most PROGRESS_FLAT of a
+# core, and still only past hung_after_s. The readings persist across reads
+# (progress_path), so a status read never sleeps to measure.
+PROGRESS_WINDOW_S = 30
+PROGRESS_SPACING_S = 10    # a reading closer than this to the newest is not kept
+PROGRESS_KEEP_S = 600      # a reading older than this is history, not a window
+PROGRESS_FLAT = 0.01       # CPU seconds per second at or below which it is flat
+LISTENER_SCAN_LIMIT = 4096  # excess descriptors leave ownership unknown
+BOOTING_TASK = "task/3859"
+BOOTING_REMEDY = ("wait for the chat node to finish booting; do not restart "
+                  "it: a restart throws its blocklace replay away and starts "
+                  "it over. CPU activity alone cannot prove replay progress; "
+                  "if it is spinning, use --force --reason (%s)" % BOOTING_TASK)
 BOOT_WAIT_ENV = "CHAT_NODE_BOOT_WAIT_S"   # HELM_ (or MELD_) prefixed
 BOOT_TICK_S = 30                          # one progress line per tick
 START_GRACE_S = 10                        # a --no-block start still queued
@@ -87,6 +115,13 @@ GENESIS_FILE = "genesis.json"
 MINT_TIMEOUT_S = 900
 PROBE_TIMEOUT_S = 30
 START_TIMEOUT_S = MINT_TIMEOUT_S + PROBE_TIMEOUT_S + 60
+# The measured daemon-reload (task/4204) over ~7k user units tops ~36 s: a
+# cutover that loaded them all took 29-36 s, past _systemctl's 30 s default,
+# which is what made `up`'s probe fail mid-reload (the probe itself reads the
+# peer through timerhealth's runner — its own 10 s — not _systemctl, but the
+# reload that timed out was _systemctl's). So `up`'s daemon-reload gets its
+# own larger bound, not the 30 s.
+RELOAD_TIMEOUT_S = 120
 MINT_DIR_PREFIX = "chat-node-mint-"   # scratch beside the snapshot, on disk
 STAGE_INFIX = ".mint-"                # a data dir being assembled, beside it
 PARTIAL_INFIX = ".partial-"           # a keyless data dir moved aside
@@ -325,13 +360,15 @@ def identity_dir():
 
     THE CAVE STAYS RAM-HOT: one-cave-per-team keeps the ledger on tmpfs and
     a2a-ram-only-disk-log-after keeps the send/read path off disk. But a node
-    has two halves and only one of them is data. `dregg.redb` IS the RAM-hot
-    room and it is SUPPOSED to evaporate on reboot. `node.key` is the node's
+    has two halves and only one of them is data. `dregg.redb` is the ledger,
+    and on the tmpfs default it does not survive a reboot (the a2a-ram-only-disk-log-after
+    premise says it must; a disk placement, `helm chat node move
+    --to disk`, is the one that keeps it). `node.key` is the node's
     IDENTITY, and an identity that changes every boot is not a room that
     forgets — it is a different node wearing the room's name.
 
     So what is snapshotted here is 32 bytes of key material and a seed, NEVER
-    the ledger. Messages still exist only in RAM. What survives is WHO the
+    the ledger. What this snapshot guarantees is WHO the
     node is, which is the same category as the node passphrase already stored
     beside it at 0600, and as the unit file itself.
 
@@ -344,6 +381,116 @@ def identity_dir():
     return os.path.join(home.global_dir(), ".state", "chat-node-identity")
 
 
+def disk_data_dir():
+    """<helm-home>/_global/.state/chat-node-data — the DISK placement, beside
+    the identity snapshot and the state file (git-ignored with them)."""
+    return os.path.join(home.global_dir(), ".state", DISK_DIR_NAME)
+
+
+def node_data_dir():
+    """The data dir the unit runs: the placement `move` recorded, else the
+    tmpfs default. Only an absolute path is taken from the record."""
+    rec = state().get("data_dir")
+    return rec if isinstance(rec, str) and os.path.isabs(rec) else DATA_DIR
+
+
+def fs_type(path):
+    """The filesystem type /proc/mounts names for `path`'s longest mount
+    prefix, or None when it cannot be read."""
+    p = os.path.realpath(path)
+    while not os.path.exists(p) and p != os.path.dirname(p):
+        p = os.path.dirname(p)
+    best, kind = "", None
+    try:
+        with open("/proc/mounts", encoding="utf-8", errors="replace") as f:
+            rows = [ln.split() for ln in f]
+    except OSError:
+        return None
+    for row in rows:
+        if len(row) < 3:
+            continue
+        mnt = row[1].replace("\\040", " ")
+        if (p == mnt or p.startswith(mnt.rstrip("/") + "/")) \
+                and len(mnt) >= len(best):
+            best, kind = mnt, row[2]
+    return kind
+
+
+def store_bytes(data_dir):
+    """(apparent, allocated) bytes of the data dir's store files, or None
+    when there is no store. Allocated is what the filesystem holds for them;
+    on tmpfs that is RAM (or swap) the kernel can never drop."""
+    try:
+        names = [n for n in os.listdir(data_dir) if n.startswith(STORE_PREFIX)]
+    except OSError:
+        return None
+    sizes = []
+    for n in names:
+        try:
+            st = os.stat(os.path.join(data_dir, n))
+        except OSError:
+            continue
+        sizes.append((st.st_size, st.st_blocks * 512))
+    if not sizes:
+        return None
+    return sum(a for a, _ in sizes), sum(b for _, b in sizes)
+
+
+def placement_line(data_dir=None):
+    """One status line: where the store lives, on what, and what that costs.
+    A tmpfs store is RAM the kernel can swap but never drop; a disk store is
+    served from the page cache, which the kernel reclaims under pressure."""
+    d = data_dir or node_data_dir()
+    kind = fs_type(d) or "unknown fs"
+    size = store_bytes(d)
+    held = ("no store yet" if size is None else "store %.2f GB (%.2f GB "
+            "allocated)" % (size[0] / 1e9, size[1] / 1e9))
+    cost = ("RAM-resident: the kernel can swap it but never drop it"
+            if kind == "tmpfs" else "on disk: the page cache holds the hot "
+            "set and gives it back under pressure")
+    return "data-dir %s (%s) — %s, %s" % (d, kind, held, cost)
+
+
+def _beside(infix, data_dir=None):
+    """Dirs named <placement><infix>* beside the default, the disk or the
+    current data dir: [(path, allocated bytes)]."""
+    out = []
+    for d in sorted({DATA_DIR, data_dir or node_data_dir(), disk_data_dir()}):
+        parent, base = os.path.split(os.path.abspath(d))
+        try:
+            names = os.listdir(parent)
+        except OSError:
+            continue
+        for n in sorted(names):
+            p = os.path.join(parent, n)
+            if n.startswith(base + infix) and os.path.isdir(p):
+                out.append((p, _tree_allocated(p)))
+    return out
+
+
+def moved_aside(data_dir=None):
+    """Sources a verified move left aside: [(path, allocated bytes)]."""
+    return _beside(MOVED_INFIX, data_dir)
+
+
+def move_stages(data_dir=None):
+    """Copies a move was assembling: [(path, allocated bytes)]. A move
+    removes its stage on any error it sees, so one that outlives the move was
+    killed mid-copy (or the move is running now)."""
+    return _beside(MOVE_INFIX, data_dir)
+
+
+def _tree_allocated(root):
+    total = 0
+    for dirpath, _dirs, files in os.walk(root):
+        for n in files:
+            try:
+                total += os.lstat(os.path.join(dirpath, n)).st_blocks * 512
+            except OSError:
+                pass
+    return total
+
+
 def _same_bytes(path, blob):
     try:
         with open(path, "rb") as f:
@@ -352,7 +499,7 @@ def _same_bytes(path, blob):
         return False
 
 
-def snapshot_identity(data_dir=DATA_DIR):
+def snapshot_identity(data_dir=None):
     """Copy the cave's chain descriptor to disk (0600). Returns (saved, err).
 
     Content-addressed and idempotent: an unchanged file is not rewritten, so
@@ -365,6 +512,7 @@ def snapshot_identity(data_dir=DATA_DIR):
     written over it, the whole snapshot is archived beside itself
     (identity_dir() + ".replaced-<ts>"), exactly as the successor ceremony
     archives the identity it replaces."""
+    data_dir = data_dir or node_data_dir()
     d = identity_dir()
     saved = []
     try:
@@ -453,7 +601,7 @@ def _install(data_dir, src_dir, key):
     return ["node.key" if n == key else n for n in names]
 
 
-def restore_identity(data_dir=DATA_DIR):
+def restore_identity(data_dir=None):
     """Copy a snapshotted identity INTO a cave. Returns (restored, err).
 
     Into an absent or empty cave the whole snapshot is installed atomically
@@ -471,6 +619,7 @@ def restore_identity(data_dir=DATA_DIR):
     (node/src/state.rs, first run), and the next `up` snapshotted that
     stranger: with no saved node.key to compare, neither the DISAGREES gate
     nor the archive-before-overwrite could fire."""
+    data_dir = data_dir or node_data_dir()
     d = identity_dir()
     names = descriptor_files(d)
     if not names:
@@ -500,11 +649,12 @@ def restore_identity(data_dir=DATA_DIR):
     return restored, None
 
 
-def identity_state(data_dir=DATA_DIR):
+def identity_state(data_dir=None):
     """{saved, live, matched} — the owner-facing answer to 'will this node come
     back as itself?'. `matched` is False when a snapshot exists but the running
     cave holds a DIFFERENT key, which is the one state that looks fine and is
     not: the next reboot would restore a stranger."""
+    data_dir = data_dir or node_data_dir()
     d = identity_dir()
     saved = descriptor_files(d)
     live = descriptor_files(data_dir)
@@ -863,7 +1013,7 @@ def prepare_lock_path():
     return os.path.join(os.path.dirname(identity_dir()), PREPARE_LOCK)
 
 
-def prepare(data_dir=DATA_DIR, binary=None):
+def prepare(data_dir=None, binary=None):
     """ExecStartPre: guarantee a STARTABLE data dir. Returns (msg, err).
 
     ONE PREPARE AT A TIME, AND A SECOND ONE REFUSES. Two at once (the unit's
@@ -874,6 +1024,7 @@ def prepare(data_dir=DATA_DIR, binary=None):
     the lock, and never waits: a waiting ExecStartPre would stall the unit's
     start behind a mint it cannot see. The kernel drops the lock when its
     holder exits, however it exits, so no stale lock can outlive a prepare."""
+    data_dir = data_dir or node_data_dir()
     import fcntl
     lock = prepare_lock_path()
     try:
@@ -992,6 +1143,382 @@ def _prepare_locked(data_dir, binary):
                 "boot starts fresh, the next one will not"
                 % ", ".join(descriptor_files(identity_dir()))), None
 
+
+# MOVING THE DATA DIR (task/4064). Measured on the owner's laptop (87 GB,
+# 29 GB swapped): the tmpfs store was 4.8 GB, all of it shmem the
+# kernel can swap but never drop, and it grows with the chain. A data dir on
+# disk is served from the page cache, which the kernel reclaims under
+# pressure. Measured on the same NVMe with redb 2.6.3 (dregg's version): a
+# one-row commit costs p50 0.2-0.4 ms, p99 0.7 ms on ext4 against 0.02 ms on
+# tmpfs, and the 230 MB blocklace checkpoint the node writes every 100 blocks
+# costs 0.2-0.7 s against 0.06 s.
+#
+# THE NODE MUST BE STOPPED. redb rewrites pages in place between commits, so
+# a copy of a live store is torn: four of five copies of the live 4.8 GB
+# store spanned a commit, and redb refused the one opened ("All roots are
+# corrupted"). move refuses a running unit, and holds redb's own lock (an
+# exclusive flock on the store file, which a running node holds) for the
+# whole copy, so neither a node outside the unit nor a start during the copy
+# can tear it.
+COPY_CHUNK = 8 << 20
+MOVE_HEADROOM = 1 << 30   # free space a move leaves on the target filesystem
+
+
+def placement_target(word):
+    """`ram`, `disk` or an absolute path -> the data dir it names, else None."""
+    if word == "ram":
+        return DATA_DIR
+    if word == "disk":
+        return disk_data_dir()
+    return os.path.normpath(word) if word and os.path.isabs(word) else None
+
+
+def _copy_file(src, dst):
+    """Copy one regular file to a new path, sparse (an all-zero chunk stays a
+    hole), and fsync it. Returns the sha256 of the bytes read."""
+    h = hashlib.sha256()
+    mode = stat.S_IMODE(os.stat(src).st_mode)
+    fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
+    with open(src, "rb") as f, os.fdopen(fd, "wb") as out:
+        for buf in iter(lambda: f.read(COPY_CHUNK), b""):
+            h.update(buf)
+            if buf.count(0) == len(buf):
+                out.seek(len(buf), os.SEEK_CUR)
+            else:
+                out.write(buf)
+        out.truncate()
+        out.flush()
+        os.fsync(out.fileno())
+    os.chmod(dst, mode)
+    return h.hexdigest()
+
+
+def _tree(root):
+    """(dirs, files) under `root`, relative, or an error naming the first
+    entry that is neither a directory nor a regular file."""
+    dirs, files = [], []
+    for dirpath, dnames, fnames in os.walk(root):
+        rel = os.path.relpath(dirpath, root)
+        for n in dnames + fnames:
+            p = os.path.join(dirpath, n)
+            st = os.lstat(p)
+            r = os.path.normpath(os.path.join(rel, n))
+            if stat.S_ISDIR(st.st_mode):
+                dirs.append(r)
+            elif stat.S_ISREG(st.st_mode):
+                files.append(r)
+            else:
+                return None, None, ("%s is neither a directory nor a regular "
+                                    "file — refusing to guess how to move it"
+                                    % p)
+    return dirs, files, None
+
+
+def _fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _hold_store(src, files):
+    """Take redb's own lock on every store file: [fds], or an error when one
+    is held (a node has the store open)."""
+    import fcntl
+    fds = []
+    for r in files:
+        if not os.path.basename(r).startswith(STORE_PREFIX):
+            continue
+        fd = os.open(os.path.join(src, r), os.O_RDONLY)
+        fds.append(fd)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            for f in fds:
+                os.close(f)
+            return None, ("%s is open in a running node (it holds redb's "
+                          "lock on the store) — stop it first: `helm chat "
+                          "node down`" % os.path.join(src, r))
+    return fds, None
+
+
+def _copy_tree(src, dst, dirs, files, did):
+    """Copy the data dir into a stage beside `dst`, verify every file by
+    sha256, and rename the stage onto `dst` (absent or empty). Returns the
+    bytes copied. A failure before the rename removes the stage and leaves
+    `dst` untouched; once the rename succeeds `dst` holds the verified store
+    and did["copied"] says so, even when the parent fsync after it fails."""
+    parent = os.path.dirname(dst)
+    stage = tempfile.mkdtemp(prefix=os.path.basename(dst) + MOVE_INFIX,
+                             dir=parent)
+    copied = 0
+    try:
+        for r in sorted(dirs):
+            os.makedirs(os.path.join(stage, r), exist_ok=True)
+        for r in files:
+            a, b = os.path.join(src, r), os.path.join(stage, r)
+            got = _copy_file(a, b)
+            if file_sha256(b) != got:
+                raise OSError("the copy of %s does not match its source" % r)
+            copied += os.path.getsize(b)
+        for r in sorted(dirs, reverse=True) + ["."]:
+            os.chmod(os.path.join(stage, r),
+                     stat.S_IMODE(os.stat(os.path.join(src, r)).st_mode))
+            _fsync_dir(os.path.join(stage, r))
+        _swap_in(stage, dst)
+        did["copied"] = True
+        _fsync_dir(parent)
+    except BaseException:
+        shutil.rmtree(stage, ignore_errors=True)
+        raise
+    return copied
+
+
+def write_unit(text):
+    """Write the unit file when it differs: "written" (it was absent),
+    "refreshed" (it had drifted) or None (unchanged). 0600, atomically and
+    durably (file, then directory): move sets the source aside after a
+    rewrite, and a reboot must find the unit that names the new dir."""
+    path = unit_path()
+    have = None
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as f:
+                have = f.read()
+        except OSError:
+            have = None
+    if have == text:
+        return None
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    _fsync_dir(os.path.dirname(path))
+    return "written" if have is None else "refreshed"
+
+
+# THE UNIT WRITES THE DATA DIR UNQUOTED into ExecStartPre and ExecStart:
+# whitespace splits it into two arguments, `%` is a systemd specifier, and a
+# control character ends the line. move refuses such a path rather than
+# installing a unit that runs another dir, or none.
+_UNIT_UNSAFE = re.compile(r"[\s%\x00-\x1f\x7f]")
+
+
+def _stopped_for_move(st):
+    """Is the unit stopped for good? Inactive or failed, with no restart
+    queued. Stricter than _gone: a unit waiting out RestartSec, or one whose
+    stop is still in flight, is about to run (or still runs) on the store."""
+    return (st["active"] in ("inactive", "failed")
+            and not st["sub"].startswith("auto-restart"))
+
+
+def _repoint_unit(binary, dst):
+    """Rewrite the installed unit to run `dst` and reload systemd. Returns
+    (how, err); on err the unit file holds its old text again."""
+    path = unit_path()
+    try:
+        with open(path, encoding="utf-8") as f:
+            old = f.read()
+    except OSError as e:
+        return None, "cannot read the unit %s: %s" % (path, e)
+    try:
+        how = write_unit(unit_text(binary, dst))
+    except OSError as e:
+        return None, "cannot rewrite the unit %s: %s" % (path, e)
+    rc, out = _systemctl("daemon-reload")
+    if rc == 0:
+        return how, None
+    why = ("daemon-reload failed (%s): systemd would still start the old "
+           "dir" % out)
+    try:
+        write_unit(old)
+    except OSError as e:
+        why += "; the unit file could NOT be restored (%s), so it names %s " \
+               "while systemd runs the old text" % (e, dst)
+    return None, why
+
+
+def move(target, source=None, unit_st=None):
+    """Move the node's data dir to `target`: copy it with the node stopped,
+    verify every file, record the new placement, repoint an installed unit
+    at it, and set the source aside. Returns (msg, err).
+
+    THE ORDER IS THE SAFETY, and all of it runs under the prepare lock. The
+    copy lands in a stage and is renamed onto the target only once verified;
+    the placement is recorded and the unit rewritten and reloaded before the
+    source moves. A record or a unit naming a dir that does not hold the
+    store starts the same node on an empty ledger: prepare restores the
+    identity into an empty dir. So systemd's loaded unit names the new dir
+    before the old one leaves, and a start in between finds the prepare lock
+    held and refuses. The unit is rewritten here, not at the next `up`,
+    because it is enabled: a reboot in between would run the old path. A
+    unit that cannot be rewritten or reloaded rolls the move back: the
+    record names the source again, the source stays, the copy is removed.
+    The source is set aside, never deleted, and the message names it and the
+    command that frees it. The record and the unit are durable (file, then
+    directory) before the rename, and the rename after it. An OSError part
+    way returns words built from how far the move got (_move_left)."""
+    src = os.path.normpath(source or node_data_dir())
+    dst = os.path.normpath(target)
+    did = {}
+    try:
+        return _move_steps(src, dst, unit_st, did)
+    except OSError as e:
+        return None, "%s: %s — %s" % (e.__class__.__name__, e,
+                                      _move_left(src, dst, did))
+
+
+def _move_left(src, dst, did):
+    """What a move that raised left, from the steps it finished and the
+    record as it reads now. Never a blanket "untouched": move only reads the
+    source until it sets it aside, and past that rename it is not."""
+    said = ["the source is set aside at %s" % did["aside"] if "aside" in did
+            else "the source %s is untouched" % src]
+    rec = node_data_dir()
+    if not did.get("copied"):
+        said.append("nothing was copied to %s" % dst)
+    elif os.path.isdir(dst):
+        said.append("the verified copy is at %s" % dst)
+        if "aside" not in did and os.path.normpath(rec) != dst:
+            said.append("a retry refuses while it is there and nothing "
+                        "names it, so remove it first: rm -rf %s" % dst)
+    said.append("the record names %s" % rec)
+    if "unit" in did:
+        said.append("the unit runs %s" % dst)
+    return "; ".join(said)
+
+
+def _move_steps(src, dst, unit_st, did):
+    """move's body; `did` collects the steps it finished, for _move_left."""
+    import fcntl
+    if dst == src:
+        return "the data dir is already %s — nothing to move" % dst, None
+    if dst.startswith(src + os.sep) or src.startswith(dst + os.sep):
+        return None, "%s and %s nest — refusing to move one into the other" % (
+            src, dst)
+    if _UNIT_UNSAFE.search(dst):
+        return None, ("%r cannot be the data dir: the unit writes it unquoted "
+                      "into ExecStartPre and ExecStart, where whitespace "
+                      "splits it, %% is a systemd specifier and a control "
+                      "character ends the line — choose a path without them"
+                      % dst)
+    st = unit_state() if unit_st is None else unit_st
+    if st is None and os.path.lexists(unit_path()):
+        return None, ("systemctl cannot report %s, so move cannot tell a "
+                      "stopped node from a running one or a restart queued, "
+                      "and the daemon-reload the unit rewrite needs would "
+                      "fail after the copy — run it where `systemctl --user` "
+                      "answers" % UNIT)
+    if st and not _stopped_for_move(st):
+        return None, ("the node is not stopped (%s %s/%s) — stop it first: "
+                      "`helm chat node down`. A copy of a live store is torn: "
+                      "redb rewrites pages in place between commits, and a "
+                      "restart pending or a stop in flight runs on it"
+                      % (UNIT, st["active"], st["sub"]))
+    b = unit_binary()
+    if b is None and os.path.lexists(unit_path()):
+        return None, ("the installed unit %s names no ExecStart binary, so "
+                      "move cannot repoint it at %s and a start would run "
+                      "the old dir — reinstall it (`helm chat node up`, then "
+                      "`helm chat node down`) or remove it, then move"
+                      % (unit_path(), dst))
+    if os.path.lexists(dst) and not (os.path.isdir(dst)
+                                     and not os.path.islink(dst)
+                                     and not os.listdir(dst)):
+        return None, ("%s already exists and is not an empty directory — "
+                      "refusing to merge a store into it; move it aside first"
+                      % dst)
+    if os.path.ismount(dst):
+        return None, ("%s is a mount point: the copy is assembled beside it "
+                      "and renamed into place, which rename(2) cannot do onto "
+                      "a mount point — use a subdirectory of it" % dst)
+    parent = os.path.dirname(dst)
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+    has_src = os.path.isdir(src) and bool(os.listdir(src))
+    dirs, files, err = _tree(src) if has_src else ([], [], None)
+    if err:
+        return None, err
+    need = _tree_allocated(src) if has_src else 0
+    free = shutil.disk_usage(parent).free
+    if need + MOVE_HEADROOM > free:
+        return None, ("%s has %.2f GB free; the store needs %.2f GB plus %.2f "
+                      "GB headroom — refusing to fill it" % (
+                          parent, free / 1e9, need / 1e9, MOVE_HEADROOM / 1e9))
+    lock = prepare_lock_path()
+    os.makedirs(os.path.dirname(lock), mode=0o700, exist_ok=True)
+    lfd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    held = []
+    try:
+        try:
+            fcntl.flock(lfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return None, ("a prepare holds %s — the node is starting; stop it "
+                          "first: `helm chat node down`" % lock)
+        fds, err = _hold_store(src, files) if has_src else ([], None)
+        if err:
+            return None, err
+        held = fds
+        copied = _copy_tree(src, dst, dirs, files, did) if has_src else 0
+        before = state()
+        d = dict(before)
+        if dst == DATA_DIR:
+            d.pop("data_dir", None)
+        else:
+            d["data_dir"] = dst
+        write_state(d)
+        how, err = _repoint_unit(b, dst) if b else (None, None)
+        if err:
+            write_state(before)
+            if has_src:
+                shutil.rmtree(dst, ignore_errors=True)
+            return None, ("%s. Rolled back: the record names %s again, the "
+                          "source is untouched%s" % (
+                              err, src, ", and the copy at %s is removed"
+                              % dst if has_src else ""))
+        if b:
+            did["unit"] = True
+        aside, stuck = None, None
+        if has_src:
+            aside = "%s%s%d" % (src, MOVED_INFIX, int(time.time()))
+            try:
+                os.rename(src, aside)
+            except OSError as e:
+                aside, stuck = None, e
+            if aside:
+                did["aside"] = aside
+                # src and aside share one parent: one fsync makes the
+                # rename durable.
+                _fsync_dir(os.path.dirname(src))
+    finally:
+        for f in held:
+            os.close(f)
+        os.close(lfd)
+    notes = ["recorded the data dir %s (%s)" % (dst, fs_type(dst) or "?")]
+    if st is None:
+        notes.append("systemctl did not answer and no unit is installed: the "
+                     "store's redb lock, taken for the copy, is what refuses "
+                     "a running node")
+    if has_src:
+        notes.insert(0, "copied %d files, %.2f GB, from %s; every file "
+                        "verified by sha256" % (len(files), copied / 1e9, src))
+    if b:
+        notes.append("unit %s to run %s" % (how or "already set", dst))
+    if has_src:
+        notes.append("the source is set aside at %s — once the node is live "
+                     "on the new dir, free it: rm -rf %s" % (aside, aside)
+                     if aside else "the source could NOT be set aside (%s): "
+                     "%s still holds the old copy, which is now stale — a "
+                     "move back refuses until it is removed" % (stuck, src))
+    else:
+        notes.append("%s held nothing to copy: prepare restores the identity "
+                     "into the new dir at the next start" % src)
+    notes.append("start it: `helm chat node up`")
+    return "; ".join(notes), None
 
 def unit_path():
     from . import timerhealth
@@ -1289,8 +1816,9 @@ def write_posture_dropin(posture, unit=UNIT):
     return p
 
 
-# THE NODE YIELDS THE CPU TO THE OWNER'S PANES. Measured on the owner's 8-core
-# laptop while his typing lagged in his terminal panes: load 38.7, CPU pressure
+# THE NODE YIELDS THE CPU TO THE OWNER'S PANES. Measured on the owner's laptop
+# (24 logical CPUs; `nproc` printed 8, the fleet slice's CPU quota) while his
+# typing lagged in his terminal panes: load 38.7, CPU pressure
 # some=55-63%, and this node at 303% CPU proving signed chat turns. A runtime
 # CPUWeight=20 plus renice +10 brought pressure to 32% within a minute, and the
 # next restart would have dropped both. Proofs attach AFTER a turn commits,
@@ -1306,18 +1834,158 @@ def write_posture_dropin(posture, unit=UNIT):
 # thread the node spawns — which a later `renice` of the PID is not, since
 # Linux nice is per thread.
 #
-# NO IOWeight, deliberately. The data dir is tmpfs (DATA_DIR), so the node's
-# store writes never reach a block device and a block-IO weight has nothing of
-# the node's to weigh; and stock systemd's user@.service delegates pids, memory
-# and cpu to the user manager, not io, so a user unit's IOWeight is inert.
+# NO IOWeight, deliberately. Stock systemd's user@.service delegates pids,
+# memory and cpu to the user manager, not io, so a user unit's IOWeight is
+# inert wherever the data dir lives; on the tmpfs default the node's store
+# writes never reach a block device at all.
+#
+# THE SAME FILE BOUNDS THE PROVING (task/3851). Measured on the owner's
+# laptop, 24 logical CPUs: a signed chat send costs the node about 25
+# CPU-seconds, in bursts of 7-12 cores for about 3.6 s, and 80% of its CPU
+# ran in one pool of 24 threads. The prover uses rayon's global pool, which
+# sizes itself to every CPU unless RAYON_NUM_THREADS says otherwise (dregg's
+# node builds no pool of its own), and dregg's async prove pool runs
+# DREGG_PROVE_WORKERS proofs at once, 2 by default (node/src/prove_pool.rs).
+# The weight above did not bound a burst: the unit ran in app.slice, weighted
+# 100, and the fleet's agents.slice is weighted 25, so a burst outranked every
+# seat 4:1, and the node's own API took 1.5-1.8 s, past the 1.5 s a chat send
+# waits for it (task/3287). So this file also sets the prover's threads, one
+# proof at a time, and background.slice: the stock user slice, weighted 30,
+# the only one near the fleet's 25. agents.slice itself is no home for it: it
+# carries the fleet's CPU quota and memory ceiling, which a node must not share.
+# systemd applies Slice= and Environment= when the process starts, so a node
+# that is already running keeps its old slice and pool until its next start.
 PRIORITY_DROPIN = "20-helm-priority.conf"
 CPU_WEIGHT = 20     # systemd weighs each sibling 100: the panes come first
 NICE = 10           # the order where no weight applies; helm's background units
                     # (log-flush, proxy-fork-watch) run at the same nice
-PRIORITY = (("CPUWeight", CPU_WEIGHT), ("Nice", NICE))
+PROVE_SLICE = "background.slice"
+PROVE_WORKERS = 1   # proofs at once; dregg's default is 2
+PRIORITY = (("CPUWeight", str(CPU_WEIGHT)), ("Nice", str(NICE)),
+            ("Slice", PROVE_SLICE))
+# The drop-ins `up` writes. Any other file in the unit's drop-in directory is
+# someone else's: `up` never writes it, and names it when it sets a directive
+# 20-helm-priority.conf sets.
+HELM_DROPINS = ("10-helm-posture.conf", PRIORITY_DROPIN)
 
 
-def write_priority_dropin(unit=UNIT):
+def prove_threads(online=None):
+    """RAYON_NUM_THREADS for the node: one prover thread for each six online
+    CPUs, and never fewer than two (4 on the owner's 24). `online` defaults
+    to what the kernel counts online, which a cgroup CPU quota does not
+    shrink: `nproc` printed 8 on that laptop, the fleet slice's quota."""
+    if online is None:
+        online = os.sysconf("SC_NPROCESSORS_ONLN")
+    return max(2, online // 6)
+
+
+def prove_env(online=None):
+    """(name, value) for each variable 20-helm-priority.conf sets in the
+    node's environment."""
+    return (("RAYON_NUM_THREADS", str(prove_threads(online))),
+            ("DREGG_PROVE_WORKERS", str(PROVE_WORKERS)))
+
+
+def priority_words(online=None):
+    """What 20-helm-priority.conf sets, as `up` prints it."""
+    return " ".join("%s=%s" % kv for kv in PRIORITY + prove_env(online))
+
+
+def priority_text(online=None):
+    """The bytes of 20-helm-priority.conf for a machine with `online` CPUs."""
+    from . import timerhealth
+    return "\n".join([
+        "# Written by `helm chat node up`, every run: edits here are replaced.",
+        "# A drop-in of your own that sorts after this one is applied over it;",
+        "# `up` names such a file and never writes it.",
+        "# The owner's interactive panes outrank this node's background",
+        "# proving, and a burst no longer outranks the fleet: a low weight and",
+        "# nice, a slice weighted next to the fleet's, and a prover held to %s"
+        % prove_env(online)[0][1],
+        "# threads, one proof at a time.",
+        "# Proofs attach asynchronously after a turn commits, so this delays",
+        "# proofs, never delivery. Slice and Environment reach the node when it",
+        "# next starts. No IOWeight: a user unit's io weight is inert.",
+        "[Service]"] + ["%s=%s" % kv for kv in PRIORITY]
+        + ["Environment=" + timerhealth.env_assignment(n, v)
+           for n, v in prove_env(online)]) + "\n"
+
+
+def foreign_dropins(paths):
+    """[(file name, the directives it sets that 20-helm-priority.conf sets,
+    whether it sorts after that file)] for each drop-in among `paths` that
+    helm did not write, and sets at least one; the directives are None when
+    the file cannot be read. systemd applies a unit's drop-ins in file name
+    order, so a later one's CPUWeight, Nice, Slice and any variable its
+    Environment names again win over ours. Only the directive names are
+    read: what an Environment line sets is systemd's to say, and `status`
+    reads it from systemd."""
+    keys = [k for k, _v in PRIORITY] + ["Environment"]
+    out = []
+    for p in sorted(set(paths), key=os.path.basename):
+        name = os.path.basename(p)
+        if name in HELM_DROPINS or not name.endswith(".conf"):
+            continue
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            out.append((name, None, name > PRIORITY_DROPIN))
+            continue
+        section, sets = None, set()
+        for line in lines:
+            line = line.strip()
+            if line.startswith("["):
+                section = line
+            elif section == "[Service]" and "=" in line:
+                sets.add(line.split("=", 1)[0].strip())
+        found = [k for k in keys if k in sets]
+        if found:
+            out.append((name, found, name > PRIORITY_DROPIN))
+    return out
+
+
+def unit_dropins(unit=UNIT):
+    """Every drop-in path `up` weighs against 20-helm-priority.conf: the files
+    in helm's own directory, and each one systemd applies to the unit from
+    any other directory, as `systemctl show` lists them. systemd merges
+    drop-ins from every directory by file name, and `systemctl set-property`
+    writes a 50-<Property>.conf into user.control, where a listing of helm's
+    directory alone never looks. `up` asks after its first daemon-reload, so
+    systemd has loaded every file on disk by then."""
+    from . import timerhealth
+    d = _dropin_dir(unit)
+    own = [os.path.join(d, n) for n in (os.listdir(d) if os.path.isdir(d)
+                                        else ())]
+    rc, out = _systemctl("show", unit, "--property=DropInPaths")
+    shown = (out or "").partition("DropInPaths=")[2].strip() \
+        if rc == 0 and (out or "").startswith("DropInPaths=") else ""
+    here = os.path.realpath(d)
+    return own + [p for p in timerhealth.show_strings(shown) or ()
+                  if os.path.realpath(os.path.dirname(p)) != here]
+
+
+def _mismatched_directives(held, want):
+    """The drop-in directives behind each value systemd holds that is not
+    20-helm-priority.conf's: the key itself, or Environment for a variable."""
+    keys = {k for k, _v in PRIORITY}
+    return {k if k in keys else "Environment"
+            for k, v in want if held[k] != v}
+
+
+def foreign_line(name, found, later):
+    """One sentence naming a drop-in `foreign_dropins` found."""
+    if found is None:
+        return ("%s is not helm's and cannot be read, so whether it overrides "
+                "%s is unknown; helm leaves it as it is" % (name, PRIORITY_DROPIN))
+    return ("%s is not helm's and also sets %s; it sorts %s %s, so %s. helm "
+            "never writes it" % (
+                name, ", ".join(found), "after" if later else "before",
+                PRIORITY_DROPIN, "systemd applies its values over helm's"
+                if later else "helm's values win"))
+
+
+def write_priority_dropin(unit=UNIT, online=None):
     """Write <unit>.d/20-helm-priority.conf (0600). The path when its bytes
     or mode changed, None when it was already exactly this.
 
@@ -1326,12 +1994,7 @@ def write_priority_dropin(unit=UNIT):
     drop-in that sorts later, which systemd applies over this one."""
     d = _dropin_dir(unit)
     p = os.path.join(d, PRIORITY_DROPIN)
-    want = "\n".join([
-        "# Written by `helm chat node up`, every run: edits here are replaced.",
-        "# The owner's interactive panes outrank this node's background proving.",
-        "# Proofs attach asynchronously after a turn commits, so this delays",
-        "# proofs, never delivery. No IOWeight: the data dir is tmpfs.",
-        "[Service]"] + ["%s=%d" % kv for kv in PRIORITY]) + "\n"
+    want = priority_text(online)
     try:
         with open(p, encoding="utf-8") as f:
             same = (f.read() == want
@@ -1350,21 +2013,32 @@ def write_priority_dropin(unit=UNIT):
     return p
 
 
-def priority_line(unit=UNIT):
-    """(yields, line) — the CPUWeight and Nice systemd holds for `unit` and
-    the nice its main process runs at, against PRIORITY. None when systemd
-    does not describe the unit.
+# What `status` asks systemd about the unit: the values 20-helm-priority.conf
+# sets, the control group the running process is in, and every drop-in that
+# applies, from whichever directory.
+PRIORITY_PROPS = [k for k, _v in PRIORITY] + [
+    "Environment", "ControlGroup", "DropInPaths", "MainPID"]
+_SHOWN_VALUE = re.compile(r"-?[0-9]+|[A-Za-z0-9_.@:-]+\.slice")
+
+
+def priority_line(unit=UNIT, online=None):
+    """(yields, line) — the CPUWeight, Nice, Slice and prover environment
+    systemd holds for `unit`, and the nice and slice its main process runs
+    at, against 20-helm-priority.conf. None when systemd does not describe
+    the unit. Only RAYON_NUM_THREADS and DREGG_PROVE_WORKERS are read from
+    the unit's environment, which can hold anything.
 
     TWO GAPS, TWO CURES. A unit without the values needs `up`, which writes
     the drop-in and reloads systemd, and a reload re-applies a running
-    unit's cgroup settings, so the weight reaches the live node. Nice is set
-    at exec: a process started before the drop-in keeps its old nice until
-    its next start, and `up` adds no restart to say otherwise."""
-    keys = [k for k, _v in PRIORITY]
-    rc, out = _systemctl("show", unit,
-                         "--property=" + ",".join(keys + ["MainPID"]))
+    unit's weight, so that reaches the live node. Nice, Slice and the
+    environment are applied at exec: a process started before the drop-in
+    keeps its old ones until its next start, and `up` adds no restart to
+    say otherwise. When the values are wrong because a drop-in that is not
+    helm's sorts after helm's, the line names that file instead of `up`."""
+    from . import timerhealth
+    rc, out = _systemctl("show", unit, "--property=" + ",".join(PRIORITY_PROPS))
     kv = dict(ln.split("=", 1) for ln in (out or "").splitlines() if "=" in ln)
-    if rc != 0 or any(k not in kv for k in keys):
+    if rc != 0 or any(k not in kv for k, _v in PRIORITY):
         return None
     pid = int(kv["MainPID"]) if kv.get("MainPID", "").isdigit() else 0
     running = None
@@ -1373,18 +2047,45 @@ def priority_line(unit=UNIT):
             running = os.getpriority(os.PRIO_PROCESS, pid)
         except OSError:     # it exited between the two reads
             pass
-    have = ", ".join("%s %s" % (k, kv[k] if kv[k].lstrip("-").isdigit()
-                                else "unset") for k in keys)
-    have += ", main process nice %s" % ("-" if running is None else running)
-    if any(kv[k] != str(v) for k, v in PRIORITY):
+    env = dict(w.partition("=")[::2] for w in
+               timerhealth.show_strings(kv.get("Environment", "")) or ())
+    want = PRIORITY + prove_env(online)
+    held = {k: kv[k] for k, _v in PRIORITY}
+    held.update((n, env.get(n, "")) for n, _v in prove_env(online))
+    have = ", ".join("%s %s" % (
+        k, held[k] if _SHOWN_VALUE.fullmatch(held[k]) else "unset"
+        if held[k] in ("", "[not set]") else "(a value not shown)")
+        for k, _v in want)
+    group = kv.get("ControlGroup", "")
+    moved = bool(pid and group) and not group.endswith(
+        "/%s/%s" % (PROVE_SLICE, unit))
+    have += ", main process nice %s%s" % (
+        "-" if running is None else running,
+        " in %s" % group.split("/")[-2] if moved and "/" in group else "")
+    if any(held[k] != v for k, v in want):
+        # A LATER FILE IS NAMED ONLY FOR A VALUE IT CAN EXPLAIN. One that sets
+        # a directive whose value already matches (a set-property
+        # 50-CPUWeight.conf holding the same 20) is not the cause, and naming
+        # it instead of `up` sent the operator after the wrong file. A value
+        # no later file sets still needs `up`.
+        wrong = _mismatched_directives(held, want)
+        later = [d for d in foreign_dropins(timerhealth.show_strings(
+            kv.get("DropInPaths", "")) or ()) if d[2]
+            and (d[1] is None or wrong & set(d[1]))]
+        cures = [foreign_line(*f) for f in later]
+        if any(f[1] is None for f in later) or not later \
+                or wrong - {k for f in later for k in f[1]}:
+            cures.append("Fix: helm chat node up")
         return False, ("does NOT yield the CPU to interactive work — %s; %s "
-                       "sets %s. Fix: helm chat node up" % (
-                           have, PRIORITY_DROPIN,
-                           " ".join("%s=%d" % pair for pair in PRIORITY)))
-    if running not in (None, NICE):
-        return False, ("yields the CPU by weight, not yet by nice — %s: the "
-                       "process predates %s and takes Nice=%d at its next "
-                       "start" % (have, PRIORITY_DROPIN, NICE))
+                       "sets %s. %s" % (
+                           have, PRIORITY_DROPIN, priority_words(online),
+                           "; ".join(cures)))
+    if running not in (None, NICE) or moved:
+        return False, ("yields the CPU by weight, not yet by %s — %s: the "
+                       "process predates %s and takes %s at its next start"
+                       % ("slice" if moved else "nice", have, PRIORITY_DROPIN,
+                          "its slice, prover bound and Nice=%d" % NICE
+                          if moved else "Nice=%d" % NICE))
     return True, "yields the CPU to interactive work — " + have
 
 
@@ -1463,8 +2164,8 @@ CAVE_RESTORE_DIR = os.path.join("~", ".local", "share", "dregg-cave", "data")
 CAVE_TMPFS_DIR = "/dev/shm/dregg-cave"   # the migration's TMPFS_DIR
 
 
-def _regenesis_remedy(data_dir=DATA_DIR):
-    d = data_dir
+def _regenesis_remedy(data_dir=None):
+    d = data_dir = data_dir or node_data_dir()
     ident = identity_state(data_dir)
     out = ("re-genesis: archive the data dir and keep the identity. `helm "
            "chat node down`, move %s aside (`mv %s %s.pre-regenesis-$(date "
@@ -1491,7 +2192,8 @@ def _regenesis_remedy(data_dir=DATA_DIR):
     return out
 
 
-def _genesis_remedy(data_dir=DATA_DIR):
+def _genesis_remedy(data_dir=None):
+    data_dir = data_dir or node_data_dir()
     out = ("the data dir %s has no genesis.json, and a rebased node refuses "
            "to invent a consensus clock; a node key alone cannot start it. "
            "prepare mints the chain descriptor around the SAME key (the "
@@ -1532,7 +2234,7 @@ REFUSALS = (
 )
 
 
-def classify_refusal(text, data_dir=DATA_DIR):
+def classify_refusal(text, data_dir=None):
     """{kind, remedy} for a refusal line with a known cure, else None."""
     for kind, pattern, remedy in REFUSALS:
         if text and pattern.search(text):
@@ -1540,7 +2242,7 @@ def classify_refusal(text, data_dir=DATA_DIR):
     return None
 
 
-def refusal_remedy(text, data_dir=DATA_DIR):
+def refusal_remedy(text, data_dir=None):
     """The cure for a known refusal line, or None."""
     hit = classify_refusal(text, data_dir)
     return hit["remedy"] if hit else None
@@ -1556,6 +2258,29 @@ def unreachable_line(url, d=None):
     from . import chat
     d = d or boot_diagnosis(url)
     line = chat._safe_reason(d["line"]) if d["line"] else None
+    if d["state"] == "booting":
+        return ("BOOTING at %s — pid %d is alive with %s; phase %s ("
+                "blocklace replay and root "
+                "re-verification may run before the API binds); booting %s, %s. "
+                "Wait; do not restart: a restart throws the boot away and "
+                "starts it over. CPU use cannot prove replay progress; if "
+                "the node is spinning, use --force --reason (%s). Chat posts "
+                "fall back to [unsigned] until "
+                "it answers" % (url, d["pid"], LISTENER_WORDS[d["listener"]],
+                                d["phase"], _span(d["running_s"]),
+                                _cpu_words(d), BOOTING_TASK))
+    if d["state"] == "unmeasured":
+        return ("CANNOT TELL at %s — the node is %s, so helm cannot tell a "
+                "boot from a hang: read `journalctl --user -u %s` and the "
+                "process's CPU before any restart; a restart of a boot throws "
+                "it away. Chat posts fall back to [unsigned]" % (url, line,
+                                                                 UNIT))
+    if d["state"] == "unanswered":
+        return ("API UNREACHABLE at %s — pid %d is listening on :%d but its API "
+                "did not answer; it has bound its API, so it is past boot: "
+                "read `journalctl --user -u %s` before any restart; chat "
+                "posts fall back to [unsigned]"
+                % (url, d["pid"], PORT, UNIT))
     if d["state"] == "initializing":
         return ("INITIALIZING VERIFIED RUNTIME at %s — the node is running and "
                 "has not bound its API yet (a rebased node's Lean init takes "
@@ -1590,31 +2315,227 @@ def serves_unit(url, port=PORT):
         return False
 
 
-def hung_diagnosis(st):
-    """The `hung` diagnosis for a unit_state, or None when it is not hung: a
-    process running (not gone, not in ExecStartPre) for longer than
-    hung_after_s without its API answering. The ONE place the hung verdict and
-    its words are made, so `up` (wait_boot) and `status`/`doctor`
-    (boot_diagnosis) can never disagree about the same unit. The words hold
-    for a node that never bound its API and for one that bound it and then
-    wedged: either way it runs and does not answer."""
-    if not st or _gone(st) or st["sub"] == "start-pre" \
-            or st["running_s"] is None or st["running_s"] <= hung_after_s():
+def _span(s):
+    """Seconds as an operator reads a boot: 1h29m, 4m05s, 45s."""
+    if s is None:
+        return "an unknown time"
+    s = int(max(0, s))
+    if s >= 3600:
+        return "%dh%02dm" % (s // 3600, s % 3600 // 60)
+    return "%dm%02ds" % (s // 60, s % 60) if s >= 60 else "%ds" % s
+
+
+def _cpu_words(d):
+    """The main thread's CPU as the BOOTING line carries it."""
+    out = "main-thread CPU %.0fs" % d["cpu_s"]
+    if d["progress"] == "unmeasured":
+        return out + (" (progress not measured yet: a second reading %ds "
+                      "later tells booting from hung)" % PROGRESS_WINDOW_S)
+    return out + " (+%.1fs over the last %ds)" % (d["delta_s"], d["window_s"])
+
+
+def _stat_fields(path):
+    """The fields of a /proc stat file after its LAST ')' (a comm may hold
+    spaces and parens), or None when it cannot be read."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read(4096)
+    except OSError:
         return None
-    return {"state": "hung", "remedy": None,
-            "line": "running %ds and its API does not answer, past the %ds "
-                    "boot wait" % (st["running_s"], hung_after_s())}
+    _head, sep, tail = raw.rpartition(b")")
+    return tail.split() if sep else None
 
 
-def boot_diagnosis(url):
-    """Why a chat node URL is not answering, as far as systemd and the
-    journal can say. {state, line, remedy} with state one of:
+def main_thread_cpu(pid):
+    """(start, cpu_s) for `pid`: its start time, /proc/<pid>/stat field 22 (a
+    recycled pid has another, so no reading carries over to it), and its MAIN
+    THREAD's utime+stime in seconds, from /proc/<pid>/task/<pid>/stat. The
+    main thread, not the process: the replay runs there, while the gossip and
+    runtime threads tick on regardless. None when either file cannot be
+    read."""
+    proc = _stat_fields(os.path.join(PROC, str(pid), "stat"))
+    task = _stat_fields(os.path.join(PROC, str(pid), "task", str(pid), "stat"))
+    try:
+        return int(proc[19]), (int(task[11]) + int(task[12])) / float(
+            os.sysconf("SC_CLK_TCK") or 100)
+    except (TypeError, IndexError, ValueError):
+        return None
 
-      initializing  the unit's process is running and has not bound its API —
-                    a rebased node's verified-runtime init, not a failure;
-      hung          the process has run longer than hung_after_s (the boot
-                    wait, floored at its default) without binding its API —
-                    not booting;
+
+def api_listener(pid, port=PORT):
+    """Who holds a listening socket on the API port, as THIS process sees it:
+
+      own      this process holds one: it has bound its API;
+      other    the port has a listener and this process holds none of it —
+               another process owns the port;
+      none     nothing listens on the port;
+      unknown  the tables or this process's descriptors cannot be read
+               within LISTENER_SCAN_LIMIT.
+
+    A host-wide port row alone may belong to another process while this node
+    is still replaying, so only `own` is past boot. The other three keep
+    their difference so the words can say which one held."""
+    seen = False
+    inodes = set()
+    want = "%04X" % port
+    for name in ("tcp", "tcp6"):
+        try:
+            with open(os.path.join(PROC, "net", name), encoding="ascii",
+                      errors="replace") as f:
+                next(f, None)
+                for i, row in enumerate(f):
+                    if i >= LISTENER_SCAN_LIMIT:
+                        return "unknown"
+                    cols = row.split()
+                    if len(cols) > 9 and cols[3] == "0A" \
+                            and cols[1].rpartition(":")[2].upper() == want:
+                        inodes.add("socket:[%s]" % cols[9])
+        except OSError:
+            continue
+        seen = True
+    if not inodes:
+        return "none" if seen else "unknown"
+    try:
+        with os.scandir(os.path.join(PROC, str(pid), "fd")) as entries:
+            for i, entry in enumerate(entries):
+                if i >= LISTENER_SCAN_LIMIT:
+                    return "unknown"
+                try:
+                    if os.readlink(entry.path) in inodes:
+                        return "own"
+                except OSError:
+                    return "unknown"
+    except OSError:
+        return "unknown"
+    return "other"
+
+
+# WHAT THE LISTENER READING PROVED, in the words every BOOTING and HUNG line
+# carries. A refusal that said "no listener" while another process held the
+# port stated a fact helm had measured false.
+LISTENER_WORDS = {
+    "none": "no listener on :%d" % PORT,
+    "other": "no listener of its own on :%d (another process holds that "
+             "port)" % PORT,
+    "unknown": "no listener proven on :%d (its sockets could not be read)"
+               % PORT,
+}
+
+
+def progress_path():
+    return os.path.join(home.global_dir(), ".state", "chat-node-progress.json")
+
+
+def cpu_progress(pid):
+    """The main thread's CPU progress for `pid`, measured against an earlier
+    reading of the same process that any read (status, doctor, the signing
+    line, `up`) left in progress_path. {cpu_s, delta_s, window_s, progress}
+    with progress one of:
+
+      advancing   it used more than PROGRESS_FLAT of a core since the reading;
+      flat        it did not, over at least PROGRESS_WINDOW_S;
+      unmeasured  no reading old enough to tell (delta/window may be set).
+
+    The newest reading at least PROGRESS_WINDOW_S old is the base, else the
+    oldest kept. This reading is kept when the newest is PROGRESS_SPACING_S
+    old. None when /proc cannot be read. A store that cannot be written only
+    costs the next read its window."""
+    got = main_thread_cpu(pid)
+    if got is None:
+        return None
+    start, cpu = got
+    now, key, path = time.monotonic(), "%d@%d" % (pid, start), progress_path()
+    rec = pk.read_json(path, {})
+    kept = []
+    if isinstance(rec, dict) and rec.get("key") == key:
+        for s in rec.get("samples") or ():
+            try:
+                t, c = float(s[0]), float(s[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if 0 <= now - t <= PROGRESS_KEEP_S:
+                kept.append((t, c))
+    kept.sort()
+    ripe = [s for s in kept if now - s[0] >= PROGRESS_WINDOW_S]
+    base = ripe[-1] if ripe else kept[0] if kept else None
+    if not kept or now - kept[-1][0] >= PROGRESS_SPACING_S:
+        try:
+            pk.write_json(path, {"key": key,
+                                 "samples": (kept + [(now, cpu)])[-16:]})
+        except OSError:
+            pass
+    out = {"cpu_s": cpu, "delta_s": None, "window_s": None,
+           "progress": "unmeasured"}
+    if base is None or now <= base[0]:
+        return out
+    out.update(delta_s=max(0.0, cpu - base[1]), window_s=now - base[0])
+    if out["delta_s"] > PROGRESS_FLAT * out["window_s"]:
+        out["progress"] = "advancing"
+    elif out["window_s"] >= PROGRESS_WINDOW_S:
+        out["progress"] = "flat"
+    return out
+
+
+def _running_diagnosis(st):
+    """The verdict on a unit whose process runs (not gone, not in prepare).
+
+    MEASURED, when its main process's /proc reads: a listener of its own on
+    the API port is past boot (`unanswered`); a main thread flat over the
+    window, past hung_after_s, is `hung`; anything else is `booting`, with
+    the phase, the elapsed time, the main thread's CPU and what the listener
+    reading proved (`listener`). UNMEASURABLE (no MainPID, its /proc gone or
+    unreadable): `initializing` up to hung_after_s and `unmeasured` past it,
+    NEVER `hung` — HUNG is a measured flat window, and an age alone is the
+    verdict that steered two seats into restarting a replay (task/3891).
+    `up` and `down` refuse only a measured `booting`."""
+    run, pid = st["running_s"], st.get("pid")
+    prog = cpu_progress(pid) if pid else None
+    if prog is None:
+        if run is None or run <= hung_after_s():
+            return {"state": "initializing", "line": None, "remedy": None}
+        return {"state": "unmeasured", "remedy": None, "pid": pid,
+                "running_s": run,
+                "line": "running %ds with no API answering, past the %ds "
+                        "boot wait, and %s" % (
+                            run, hung_after_s(),
+                            "the CPU of its main thread (pid %d) could not "
+                            "be read" % pid if pid else
+                            "systemd names no main process to read")}
+    d = dict(prog, pid=pid, running_s=run, phase="pre-bind", line=None,
+             remedy=None, listener=api_listener(pid))
+    if d["listener"] == "own":
+        return dict(d, state="unanswered")
+    if d["progress"] == "flat" and run is not None and run > hung_after_s():
+        return dict(d, state="hung", line=(
+            "running %ds, past the %ds boot wait, with %s, and its main "
+            "thread used %.1fs CPU over the last %ds"
+            % (run, hung_after_s(), LISTENER_WORDS[d["listener"]],
+               d["delta_s"], d["window_s"])))
+    return dict(d, state="booting", remedy=BOOTING_REMEDY)
+
+
+def boot_diagnosis(url, st=None):
+    """Why a chat node URL is not answering, as far as systemd, /proc and
+    the journal can say: THE ONE CLASSIFIER. `helm chat node status`, `helm
+    doctor`, the chat-signing DEGRADED line, `up`'s wait and the `up`/`down`
+    door all read it, so no two of them can disagree about one unit. `st` is
+    a unit_state the caller already read. {state, line, remedy, ...} with
+    state one of:
+
+      booting       the process is alive with no listener of its own on the
+                    API port and its main thread is working (or the boot is
+                    inside hung_after_s, or one reading cannot tell yet):
+                    wait. Also pid, running_s, phase, cpu_s, delta_s,
+                    window_s, progress, listener;
+      hung          the process has no listener of its own and its main
+                    thread made no progress over PROGRESS_WINDOW_S, past
+                    hung_after_s — measured, never aged;
+      unanswered    the process listens on the API port and did not answer:
+                    past boot, not booting;
+      initializing  the process runs and its CPU cannot be read, inside
+                    hung_after_s;
+      unmeasured    the process runs past hung_after_s and its CPU cannot be
+                    read: neither booting nor hung, and the line says so;
       preparing     ExecStartPre (prepare) is still running;
       refused       this run exited and its last words name a known refusal:
                     `remedy` is the cure;
@@ -1625,14 +2546,13 @@ def boot_diagnosis(url):
       unknown       helm cannot tell (not this unit's URL, or no systemd)."""
     if not serves_unit(url):
         return {"state": "unknown", "line": None, "remedy": None}
-    st = unit_state(UNIT)
+    st = unit_state(UNIT) if st is None else st
     if st is None:
         return {"state": "unknown", "line": None, "remedy": None}
     if not _gone(st):
         if st["sub"] == "start-pre":
             return {"state": "preparing", "line": None, "remedy": None}
-        return (hung_diagnosis(st)
-                or {"state": "initializing", "line": None, "remedy": None})
+        return _running_diagnosis(st)
     if st["result"] == "success":
         return {"state": "down", "line": None, "remedy": None}
     line = last_failure(invocation=st["invocation"])
@@ -1641,7 +2561,86 @@ def boot_diagnosis(url):
             "remedy": cure}
 
 
-def unit_text(binary, data_dir=DATA_DIR, port=PORT, gossip=GOSSIP_PORT):
+def booting(url=None):
+    """boot_diagnosis(url) when it says `booting`, else None — without the
+    journal read a gone unit costs, for the readers that ask only this (the
+    chat-signing line)."""
+    url = url or default_url()
+    if not serves_unit(url):
+        return None
+    st = unit_state(UNIT)
+    if not st or _gone(st) or st["sub"] == "start-pre":
+        return None
+    d = boot_diagnosis(url, st)
+    return d if d["state"] == "booting" else None
+
+
+def _restart_door(verb, args):
+    """None when `verb` (`up` or `down`) may go on, else its exit code, with
+    the refusal printed. A BOOTING node is refused: stopping it throws its
+    replay away, and `up` rewrites the unit and its drop-ins under it. Given
+    --force and a --reason, it goes on and says so. A down, hung or live node
+    passes as before.
+
+    AN UNMEASURED BOOT PAST THE FLOOR IS MEASURED HERE: with no earlier
+    reading the door takes its own second one a window later, because a
+    guess either way is wrong for somebody (a refused restart of a hung node,
+    or a restart of a replay)."""
+    from . import chat
+    force = "--force" in args
+    reason = None
+    if "--reason" in args:
+        i = args.index("--reason")
+        reason = args[i + 1].strip() if i + 1 < len(args) else ""
+    if force and not reason:
+        print("helm chat node %s: --force needs --reason \"<why>\": a forced "
+              "restart of a booting node is a decision someone owns" % verb,
+              file=sys.stderr)
+        return 2
+    url = default_url()
+    st = unit_state(UNIT)
+    if not st or _gone(st) or st["sub"] == "start-pre":
+        return None
+    d = boot_diagnosis(url, st)
+    if not force and d["state"] == "booting" \
+            and d["progress"] == "unmeasured" \
+            and (d["running_s"] or 0) > hung_after_s():
+        print("helm chat node: pid %d has run %s with %s and no earlier "
+              "reading of its CPU; measuring its main thread for %ds to tell "
+              "booting from hung" % (d["pid"], _span(d["running_s"]),
+                                     LISTENER_WORDS[d["listener"]],
+                                     PROGRESS_WINDOW_S),
+              file=sys.stderr)
+        time.sleep(PROGRESS_WINDOW_S)
+        st = unit_state(UNIT)
+        if not st or _gone(st):
+            return None
+        d = boot_diagnosis(url, st)
+    if d["state"] != "booting":
+        return None
+    said = "pid %d alive for %s, %s, %s" % (
+        d["pid"], _span(d["running_s"]), LISTENER_WORDS[d["listener"]],
+        _cpu_words(d))
+    if force:
+        print("helm chat node: %s FORCED while the node is BOOTING (%s) — "
+              "reason: %s" % (verb, said, chat._safe_reason(reason)),
+              file=sys.stderr)
+        return None
+    why = ("stopping it now throws that boot away, and the next start "
+           "replays from the beginning" if verb == "down" else
+           "`up` would rewrite its unit and drop-ins under a boot that has "
+           "not read them; it provisions once the API answers, so re-run it "
+           "then")
+    print("helm chat node: REFUSED `%s` — the node is BOOTING: %s. Wait: %s "
+          "(%s). CPU activity alone cannot prove replay progress; a spin "
+          "needs an operator decision. `helm chat node status` reads API "
+          "LIVE when it is done; to go anyway: "
+          "`helm chat node %s --force --reason \"<why>\"`"
+          % (verb, said, why, BOOTING_TASK, verb), file=sys.stderr)
+    return 1
+
+
+def unit_text(binary, data_dir=None, port=PORT, gossip=GOSSIP_PORT):
     """The unit body — mirrors the team node's dregg-cave.service, tmpfs
     data-dir + its own ports. Faucet ON: chat turns must never die on
     computrons (the provisioning exhaustion lesson).
@@ -1660,7 +2659,9 @@ def unit_text(binary, data_dir=DATA_DIR, port=PORT, gossip=GOSSIP_PORT):
     a2a-ram-only-disk-log-after says the send/read path never touches disk.
     Moving to a durable data dir would trade a two-line unit bug for a
     violation of the topology law. What tmpfs demands is that recreation be
-    automatic, which is precisely what was missing.
+    automatic, which is precisely what was missing. (task/4064: the data dir
+    is the recorded placement, node_data_dir(); tmpfs stays the default, and
+    `move` is the measured, reversible way off it.)
 
     THE PREPARE STEP IS A HELM VERB, NOT A SHELL CONDITIONAL. The first fix
     here was `test -d || init`, which restarted the node but re-keyed it on
@@ -1687,8 +2688,9 @@ def unit_text(binary, data_dir=DATA_DIR, port=PORT, gossip=GOSSIP_PORT):
     override chosen at `up` never reached the mint, which then used whatever
     the default resolution found. systemd's default start timeout (90 s)
     would kill that mint half way, so TimeoutStartSec covers it."""
+    data_dir = data_dir or node_data_dir()
     return """[Unit]
-Description=helm chat node (dregg tmpfs node :%d)
+Description=helm chat node (dregg node :%d)
 After=network.target
 StartLimitIntervalSec=60
 StartLimitBurst=5
@@ -1719,7 +2721,13 @@ def state():
 def write_state(d):
     """0600 FROM BIRTH: the tmp is created (and fchmod'd, covering a stale
     leftover) before the credential bytes land — pk.write_json's umask-mode
-    tmp would expose the passphrase/token for a window on a shared host."""
+    tmp would expose the passphrase/token for a window on a shared host.
+
+    DURABLE BEFORE IT RETURNS: the tmp is fsynced before the rename and the
+    directory after it. move sets the source aside once this returns; power
+    lost with the rename on disk and the record's bytes not leaves no
+    data_dir, so node_data_dir() names the tmpfs default and prepare
+    re-geneses the node there."""
     import json
     path = state_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1728,7 +2736,10 @@ def write_state(d):
     os.fchmod(fd, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(json.dumps(d, indent=2, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
     os.replace(tmp, path)
+    _fsync_dir(os.path.dirname(path))
     os.chmod(path, 0o600)
 
 
@@ -1736,12 +2747,19 @@ def default_url():
     return "http://127.0.0.1:%d" % PORT
 
 
-def _systemctl(*args):
-    """(rc, out+err) — systemd absent degrades to a loud reason, no traceback."""
+def _systemctl(*args, timeout=30):
+    """(rc, out+err) — systemd absent degrades to a loud reason, no traceback.
+
+    `timeout` is per call: 30 s by default; the posture probe does not go
+    through here (it reads the peer through timerhealth's runner, whose own
+    bound is 10 s), so this default is the general caller bound. Callers that
+    run a long command (up's daemon-reload, task/4204, 29-36 s over ~7k units)
+    pass their own. A timeout is an explicit "unknown" (rc None), never a
+    success and never an empty value another layer can mistake for a reading."""
     try:
         p = subprocess.run(["systemctl", "--user"] + list(args),
                            capture_output=True, encoding="utf-8",
-                           errors="replace", timeout=30)
+                           errors="replace", timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return None, "systemctl unavailable: %s" % exc
     return p.returncode, (p.stdout + p.stderr).strip()
@@ -1987,8 +3005,8 @@ MEMBERSHIP_PATH = "/api/membership"
 def _local_genesis(data_dir=None):
     """(bytes, parsed) of the local unit's genesis.json, or (None, None) when
     there is none, it is too large to be a descriptor, or it does not parse
-    to an object. DATA_DIR is read at call time."""
-    path = os.path.join(data_dir or DATA_DIR, GENESIS_FILE)
+    to an object. The placement is read at call time (node_data_dir)."""
+    path = os.path.join(data_dir or node_data_dir(), GENESIS_FILE)
     try:
         if os.path.getsize(path) > DESCRIPTOR_MAX_BYTES:
             return None, None
@@ -3044,10 +4062,12 @@ def unit_state(unit=UNIT):
                     the key that scopes the journal to THIS run
       running_s     seconds since the main process started, None when it has
                     not (read against the same CLOCK_MONOTONIC systemd uses)
+      pid           MainPID, None when there is none (whose main thread's
+                    CPU boot_diagnosis reads)
     """
     rc, out = _systemctl(
         "show", unit, "--property=ActiveState,SubState,NRestarts,Result,"
-        "InvocationID,ExecMainStartTimestampMonotonic")
+        "InvocationID,ExecMainStartTimestampMonotonic,MainPID")
     if rc != 0:
         return None
     kv = dict(ln.split("=", 1) for ln in out.splitlines() if "=" in ln)
@@ -3063,7 +4083,7 @@ def unit_state(unit=UNIT):
             "restarts": num("NRestarts"), "result": kv.get("Result", ""),
             "invocation": inv if _INVOCATION.fullmatch(inv) else "",
             "running_s": (time.monotonic() - started / 1e6) if started
-            else None}
+            else None, "pid": num("MainPID") or None}
 
 
 _INVOCATION = re.compile(r"[0-9a-f]{32}")
@@ -3095,12 +4115,16 @@ def wait_boot(url, unit=None, seconds=None, say=None):
       ("initializing", seconds) the wait ran out with the process still
                                 running — NOT a failure: a rebased node's
                                 verified-runtime init can outlast any wait;
-      ("hung", unit_state)      the process has run past hung_after_s without
-                                its API answering — reported at the first
-                                look that shows it, never after the wait.
-                                `up` against a node that is already running
-                                reaches this at once: `enable --now` does not
-                                restart it, so its clock is the old run's.
+      ("hung", diagnosis)       boot_diagnosis says `hung` (no progress
+                                over its window, past hung_after_s) —
+                                reported at the first look that shows it,
+                                never after the wait. `up` against a node
+                                that is already running and hung reaches
+                                this at once: `enable --now` does not
+                                restart it, so its clock is the old run's;
+      ("unmeasured", diagnosis) past hung_after_s with a CPU helm cannot
+                                read — reported at once in status's words,
+                                neither booting nor hung.
 
     With no `unit`, only the API is watched. `say(text)` gets one progress
     line per BOOT_TICK_S.
@@ -3149,8 +4173,10 @@ def wait_boot(url, unit=None, seconds=None, say=None):
                       and now - start < START_GRACE_S)
             if not queued and _exited(st, restarts0):
                 return "exited", st
-            if hung_diagnosis(st):
-                return "hung", st
+            if st and not _gone(st) and st["sub"] != "start-pre":
+                d = boot_diagnosis(url, st)
+                if d["state"] in ("hung", "unmeasured"):
+                    return d["state"], d
             ticking = _clock_runs(st, started)
             next_look = now + 2
         if spent >= seconds:
@@ -3197,29 +4223,24 @@ def _up(args):
             "the node binary %s cannot be read (%s) — nothing installed"
             % (b, e.__class__.__name__)), file=sys.stderr)
         return 1
-    up_path = unit_path()
-    want = unit_text(b)
+    # NOTHING IS WRITTEN UNDER A BOOT (task/3891): the door stands before the
+    # unit, the drop-ins and the start, and after the reads above.
+    refused = _restart_door("up", args)
+    if refused is not None:
+        return refused
     # REWRITE A DRIFTED UNIT, don't just create a missing one. `up` used to
     # write the unit only when absent, so every generator fix — the restart
     # limiter, the prepare step, the identity restore — landed in the source
     # and never reached the hosts that already had a unit file. A fix that
-    # cannot deploy itself is not a fix.
-    have = None
-    if os.path.exists(up_path):
-        try:
-            with open(up_path, encoding="utf-8") as f:
-                have = f.read()
-        except OSError:
-            have = None
-    if have != want:
-        os.makedirs(os.path.dirname(up_path), exist_ok=True)
-        tmp = up_path + ".tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w") as f:
-            f.write(want)
-        os.replace(tmp, up_path)
+    # cannot deploy itself is not a fix. The data dir is the recorded
+    # placement (node_data_dir), which only `move` changes: pointing a unit
+    # at a new dir without the store would start the same node on an empty
+    # ledger.
+    how = write_unit(unit_text(b))
+    if how:
         print("helm chat node: unit %s (0600): %s" % (
-            "written" if have is None else "REFRESHED (it had drifted)", up_path))
+            "written" if how == "written" else "REFRESHED (it had drifted)",
+            unit_path()))
     err = record_binary(b)
     if err:
         print("helm chat node: " + chat._safe_reason(
@@ -3235,7 +4256,10 @@ def _up(args):
     # peer environment and the first `up` sees NeedDaemonReload=yes on its
     # own unit.  A second reload AFTER writing drop-ins so the mirror takes
     # effect in the start that follows.  The unit never restarts itself.
-    rc, out = _systemctl("daemon-reload")
+    # This reload sits before the posture probe, so it must survive the ~36 s
+    # reload task/4204 measured — past the probe's 30 s bound, which is the
+    # reload that was failing the probe mid-flight.
+    rc, out = _systemctl("daemon-reload", timeout=RELOAD_TIMEOUT_S)
     if rc:
         print("helm chat node: systemctl daemon-reload failed: %s" % out,
               file=sys.stderr)
@@ -3245,22 +4269,41 @@ def _up(args):
     # drop-in is written every run (write_posture_dropin), and `up` names
     # each loosening flag it set empty.
     posture, unproven = running_posture()
-    dropin = os.path.basename(write_posture_dropin(posture))
+    # A probe that fails or times out proves nothing: writing its empty result
+    # would overwrite the good mirror dregg was reading with both loosening
+    # flags EMPTY — the exact refusal the running peer had cleared. So a
+    # failed/timed-out probe keeps the existing drop-in unchanged (task/4204):
+    # only a probe that read the running node's values writes it. `up` never
+    # deletes it here (write_posture_dropin never does either); the previous
+    # run's mirror stands until a real read replaces it.
+    if not unproven:
+        dropin = os.path.basename(write_posture_dropin(posture))
+    else:
+        dropin = None
     mirrored = {a.partition("=")[0] for _src, a in posture}
     blank = [n for n in LOOSENING if n not in mirrored]
-    print("helm chat node: %s; %s %s" % (
-        "no posture proven for %s: %s" % (PEER_UNIT, unproven) if unproven
-        else "mirrored %d posture flag%s from the running %s" % (
-            len(posture), "s"[:len(posture) != 1], PEER_UNIT) if posture
-        else "the running %s runs with no posture flag" % PEER_UNIT,
-        dropin, "sets %s empty, which dregg reads as refusal"
-        % " and ".join(blank) if blank else "written"))
+    if unproven:
+        print("helm chat node: %s — %s; keeping the existing %s unchanged"
+              % (PEER_UNIT, unproven, "10-helm-posture.conf"))
+    else:
+        print("helm chat node: %s; %s %s" % (
+            "mirrored %d posture flag%s from the running %s" % (
+                len(posture), "s"[:len(posture) != 1], PEER_UNIT) if posture
+            else "the running %s runs with no posture flag" % PEER_UNIT,
+            dropin, "sets %s empty, which dregg reads as refusal"
+            % " and ".join(blank) if blank else "written"))
     # THE PRIORITY RIDES THE SECOND RELOAD. Written before the reload below,
-    # which is what loads it; `up` restarts nothing it did not before.
+    # which is what loads it; `up` restarts nothing it did not before. A
+    # drop-in that helm did not write is named, never written, from any
+    # directory systemd reads (unit_dropins), not only helm's own.
     if write_priority_dropin():
         print("helm chat node: %s (0600) written: %s — the owner's panes "
-              "outrank background proving" % (PRIORITY_DROPIN, " ".join(
-                  "%s=%d" % pair for pair in PRIORITY)))
+              "outrank background proving, and a burst no longer outranks the "
+              "fleet; a running node takes the slice and the prover's bound "
+              "at its next start" % (PRIORITY_DROPIN, priority_words()))
+    for name, found, later in foreign_dropins(unit_dropins()):
+        print("helm chat node: " + foreign_line(name, found, later),
+              file=sys.stderr if later else sys.stdout)
     # NO makedirs HERE. Pre-creating the data dir is exactly what defeats the
     # prepare step: `dregg-cave-node init` no-ops on an existing-but-empty dir
     # and still exits 0, so the unit would start a KEYLESS cave with every exit
@@ -3274,7 +4317,7 @@ def _up(args):
     # gate (a unit that is not failed has nothing to reset).
     _systemctl("reset-failed", UNIT)
     for verb in (("daemon-reload",), ("enable", "--now", "--no-block", UNIT)):
-        rc, out = _systemctl(*verb)
+        rc, out = _systemctl(*verb, timeout=RELOAD_TIMEOUT_S)
         if rc not in (0,):
             print("helm chat node: systemctl %s failed: %s" % (" ".join(verb), out),
                   file=sys.stderr)
@@ -3288,11 +4331,11 @@ def _up(args):
           % (wait, url))
     outcome, what = wait_boot(url, unit=UNIT, seconds=wait,
                               say=lambda t: print("helm chat node: " + t))
-    if outcome == "hung":
+    if outcome in ("hung", "unmeasured"):
         # THE SAME WORDS STATUS PRINTS. Waiting the whole boot wait on a node
         # that is already past it, then calling it "still initializing",
         # told the operator to wait while status told them to restart.
-        print("helm chat node: " + unreachable_line(url, hung_diagnosis(what)),
+        print("helm chat node: " + unreachable_line(url, what),
               file=sys.stderr)
         return 1
     if outcome == "initializing":
@@ -3350,7 +4393,7 @@ def _up(args):
               "restore a different node, and the snapshot may hold the only "
               "copy of the real key). Compare the two node.key files; if the "
               "running one is right, archive the snapshot by hand and re-run"
-              % (DATA_DIR, identity_dir()), file=sys.stderr)
+              % (node_data_dir(), identity_dir()), file=sys.stderr)
         return 1
     saved, serr = snapshot_identity()
     if serr:
@@ -3366,20 +4409,23 @@ def _up(args):
               file=sys.stderr)
         return 1
     head = cell.get_json(url + "/api/receipts", timeout=3) or []
-    print("helm chat node: LIVE at %s — data-dir %s (tmpfs), chain head %s, "
-          "faucet on, credential stored (0600)" % (
-              url, DATA_DIR,
-              head[0].get("chain_index") if head else "(genesis)"))
+    print("helm chat node: LIVE at %s — chain head %s, faucet on, credential "
+          "stored (0600); %s" % (
+              url, head[0].get("chain_index") if head else "(genesis)",
+              placement_line()))
     return 0
 
 
 def _down(args):
+    refused = _restart_door("down", args)
+    if refused is not None:
+        return refused
     rc, out = _systemctl("stop", UNIT)
     if rc not in (0,):
         print("helm chat node: systemctl stop failed: %s" % out, file=sys.stderr)
         return 1
-    print("helm chat node: stopped — the RAM room is gone; the journal keeps "
-          "whatever `helm chat log-flush` recorded")
+    print("helm chat node: stopped — its store stays in %s until it starts "
+          "again (a tmpfs store does not survive a reboot)" % node_data_dir())
     return 0
 
 
@@ -3387,6 +4433,16 @@ def _status(args):
     from . import chat
     rc, out = _systemctl("is-active", UNIT)
     print("helm chat node: unit %s (%s)" % (UNIT, out or "unknown"))
+    print("helm chat node: " + placement_line())
+    for path, held in moved_aside():
+        print("helm chat node: a moved-aside store holds %.2f GB at %s — free "
+              "it once the node is live on its new dir: rm -rf %s"
+              % (held / 1e9, path, path))
+    for path, held in move_stages():
+        print("helm chat node: a move stage holds %.2f GB at %s — a move "
+              "killed mid-copy left it, and nothing reads it; unless `helm "
+              "chat node move` is running now, free it: rm -rf %s"
+              % (held / 1e9, path, path))
     pri = priority_line()
     if pri:
         print("helm chat node: " + pri[1],
@@ -3497,10 +4553,30 @@ def _status(args):
                  or lock["state"] == "locked") else 0
 
 
+def _move(args):
+    """`helm chat node move --to ram|disk|PATH`."""
+    if "--to" not in args or args.index("--to") + 1 >= len(args):
+        print("helm chat node move: --to ram|disk|PATH is required",
+              file=sys.stderr)
+        return 2
+    word = args[args.index("--to") + 1]
+    target = placement_target(word)
+    if target is None:
+        print("helm chat node move: --to takes ram, disk or an absolute path, "
+              "not %r" % word, file=sys.stderr)
+        return 2
+    msg, err = move(target)
+    if err:
+        print("helm chat node move: REFUSED — " + err, file=sys.stderr)
+        return 1
+    print("helm chat node move: " + msg)
+    return 0
+
+
 def _prepare(args):
     """ExecStartPre body. Loud on both paths: systemd swallows nothing here,
     and a silent prepare is what let a keyless cave look like a healthy one."""
-    opts = {"--data-dir": DATA_DIR, "--bin": None}
+    opts = {"--data-dir": node_data_dir(), "--bin": None}
     for flag in opts:
         if flag in args:
             i = args.index(flag)
@@ -3544,22 +4620,29 @@ PREPARE_FAILED = "helm chat node prepare: FAILED — "
 # written down here, and a description with no handler will not run.
 _VERBS = (
     ("up", lambda a: _up(a),
-     "write the unit and its drop-ins (0600; the priority that yields the\n"
-     "           CPU to interactive work), record its binary, start, wait for\n"
+     "write the unit and its drop-ins (0600; the CPU priority and the\n"
+     "           prover bound), record its binary, start, wait for\n"
      "           health, unlock + bootstrap the chain, store the node "
-     "credential (0600), snapshot identity"),
+     "credential (0600), snapshot identity.\n"
+     "           Refuses a BOOTING node unless --force --reason \"<why>\""),
     ("down", lambda a: _down(a),
-     "stop the unit (the RAM room evaporates — flush first: "
-     "helm chat log-flush)"),
+     "stop the unit (its store stays in the data dir; a tmpfs one\n"
+     "           does not survive a reboot).\n"
+     "           Refuses a BOOTING node unless --force --reason \"<why>\""),
     ("status", lambda a: _status(a),
-     "unit + CPU priority + node health + chain head + joined-cell "
-     "balances + identity"),
+     "unit + data-dir placement and store size + CPU priority + node\n"
+     "           health + chain head + joined-cell balances + identity"),
     ("prepare", lambda a: _prepare(a),
      "ExecStartPre [--data-dir D] [--bin B]: restore the chain descriptor\n"
-     "           into the tmpfs cave, or mint one (keeping a snapshotted key)\n"
+     "           into the data dir, or mint one (keeping a snapshotted key)\n"
      "           and snapshot it — never re-key a live cave (run by the unit;\n"
      "           one at a time: a second refuses). D must NOT be a mount point:\n"
      "           the data dir is assembled beside it and renamed into place"),
+    ("move", lambda a: _move(a),
+     "--to ram|disk|PATH: with the node stopped, copy its data dir there,\n"
+     "           verify every file, record it as the placement, repoint the\n"
+     "           unit, and set the source aside (ram = /dev/shm/helm-chat-node,\n"
+     "           disk = <helm-home>/_global/.state/chat-node-data)"),
     ("refuel", lambda a: _refuel(a),
      "state (and with --apply, sign) the move that puts computrons back\n"
      "           into the faucet cell the node pays every grant out of"),
@@ -3578,7 +4661,7 @@ def _usage():
 
 
 def cmd_node(args):
-    """Supervise the chat tmpfs node.
+    """Supervise the chat node.
 
     THE VERBS ARE NOT LISTED HERE ON PURPOSE. This docstring is a third place
     the list could rot, and it already had — it named four verbs while the

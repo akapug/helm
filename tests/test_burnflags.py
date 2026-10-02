@@ -681,6 +681,52 @@ class ReachAxisTest(unittest.TestCase):
         self.assertEqual(axis["expires_at"], now + 900)
         self.assertIn("owner", axis["expires_source"])
 
+    def test_based_off_quota_refusal_is_reach_not_money(self):
+        from helm import proxywatch, seat
+        rec, now = self._record(proxywatch._QUOTA_WALL)
+        rec.update({"resets_at_ms": int((now + 600) * 1000),
+                    "reset_source": "canary"})
+        row = _row(99.0)
+        based = bf.fold({"money": {"cursor": [row]},
+                         "upstream": {"cursor": rec}, "ceiling": 90},
+                        now=now)["families"]["cursor"]
+        self.assertEqual(based["axes"]["reach"], bf.RED)
+        self.assertEqual(based["axes"]["money"], bf.ORANGE)
+        self.assertEqual((based["axis"], based["cause_id"],
+                          based["expires_at"]),
+                         ("reach", "reach:vendor-quota-wall", now + 600))
+        self.assertIsNone(bf.derive_quota_wall("cursor", dict(rec, dark=False)))
+        # Unbased and absent claims must retain the old MONEY classification.
+        for claim in ({"state": "off", "basis": "   "},
+                      {"state": "on", "basis": "test"}, None):
+            fam = dict(seat.FAMILIES["cursor"])
+            if claim is None:
+                fam.pop("on_demand", None)
+            else:
+                fam["on_demand"] = claim
+            with self.subTest(claim=claim), mock.patch.dict(
+                    seat.FAMILIES, {"cursor": fam}):
+                flag = bf.fold({"money": {"cursor": [row]},
+                                "upstream": {"cursor": rec}, "ceiling": 90},
+                               now=now)["families"]["cursor"]
+                self.assertEqual(flag["axes"]["reach"], None)
+                self.assertEqual(flag["axes"]["money"], bf.RED)
+                self.assertEqual(flag["cause_id"], "money:capped")
+                self.assertEqual(bf.derive_quota_wall("cursor", rec)["cause_id"],
+                                 "money:vendor-quota-wall")
+
+    def test_based_off_turn_billing_refusal_is_reach(self):
+        wall = {"money": {"seat": "cursor", "label": "vendor refused",
+                          "at": 1789000000.0}}
+        money, reach = bf.derive_turn_wall("cursor", wall)
+        self.assertIsNone(money)
+        self.assertEqual((reach["colour"], reach["cause_id"]),
+                         (bf.RED, "reach:turn-quota-wall"))
+        money, reach = bf.derive_turn_wall("grok", wall)
+        self.assertEqual((money["colour"], money["cause_id"]),
+                         (bf.RED, "money:turn-wall"))
+        self.assertIsNone(reach)
+
     def test_a_healthy_or_disputed_family_contributes_nothing(self):  # noqa: VACUOUS_ASSERTION — a dark record through the same call is asserted to answer, unconditionally, at the end of this method
         block = _upstream()["upstream"]
         self.assertEqual(block["gemini"]["state"], "HEALTHY")
@@ -1035,6 +1081,111 @@ class ComposeTest(unittest.TestCase):
         self.assertEqual(bf.credit_count([{"account": "pool-b",
                                            "available": 3,
                                            "spendable": 0}]), 0)
+
+
+class PendingDeclarationTest(unittest.TestCase):
+    """task/4027: a declaration the snapshot has not folded yet is PENDING.
+
+    The owner declared kimi ORANGE for 7 days, and the sheet still read NOT
+    MEASURED after a refresh: the declaration was saved, but the snapshot
+    folds it only at the next watchdog pass. `pending_declarations` names
+    each live declaration that the snapshot has not folded, so a reader can
+    show it as declared and pending. It never changes a colour."""
+
+    NOW = 1789000000.0
+
+    def _declare(self, colour, declared_at, until=None, why="spend down"):
+        return {"families": {"kimi": {
+            "colour": colour, "declared_at": declared_at, "why": why,
+            "until": until or self.NOW + 7 * 86400}}}
+
+    def _fold(self, declarations, now):
+        """The snapshot's families, folded by the REAL fold at `now`."""
+        return bf.fold({"declarations": declarations}, now=now)["families"]
+
+    def test_a_declaration_after_the_fold_is_pending_until_the_next(self):
+        from helm import proxywatch
+        decl = self._declare(bf.ORANGE, self.NOW)
+        flags = self._fold({"families": {}}, self.NOW - 60)
+        got = bf.pending_declarations(decl, flags, self.NOW - 60,
+                                      now=self.NOW)
+        self.assertEqual(sorted(got), ["kimi"])
+        pend = got["kimi"]
+        self.assertEqual((pend["colour"], pend["until"], pend["declared_at"]),
+                         (bf.ORANGE, self.NOW + 7 * 86400, self.NOW))
+        self.assertEqual(pend["why"], "spend down")
+        self.assertEqual(pend["folds_by"],
+                         self.NOW - 60 + proxywatch.INTERVAL_S)
+        # NEVER AS MEASURED: the snapshot's own reading is not touched
+        self.assertEqual(flags["kimi"]["colour"], bf.GREY)
+        # CONTROL: the next fold reads the same record, and it is no longer
+        # pending
+        folded = self._fold(decl, self.NOW + 900)
+        self.assertEqual(folded["kimi"]["colour"], bf.ORANGE)
+        self.assertEqual(folded["kimi"]["declared_at"], self.NOW)
+        self.assertEqual(bf.pending_declarations(decl, folded, self.NOW + 900,
+                                                 now=self.NOW + 901), {})
+
+    def test_a_declaration_folded_inside_a_pass_is_not_pending(self):
+        """The watchdog stamps the snapshot at the START of its pass and reads
+        the declarations near the end. A record written in between is folded
+        although it is younger than the snapshot's own `ts`: the fold says
+        WHICH record it read, so the instant does not decide."""
+        decl = self._declare(bf.ORANGE, self.NOW + 30)
+        flags = self._fold(decl, self.NOW)
+        self.assertEqual(bf.pending_declarations(decl, flags, self.NOW,
+                                                 now=self.NOW + 60), {})
+
+    def test_a_redeclaration_in_the_same_colour_is_pending(self):
+        """A second declaration in the same colour (a new expiry or reason)
+        is a new record. The fold read the first one."""
+        first = self._declare(bf.ORANGE, self.NOW - 600)
+        flags = self._fold(first, self.NOW - 300)
+        again = self._declare(bf.ORANGE, self.NOW, until=self.NOW + 86400)
+        got = bf.pending_declarations(again, flags, self.NOW - 300,
+                                      now=self.NOW + 1)
+        self.assertEqual(got["kimi"]["until"], self.NOW + 86400)
+
+    def test_an_older_snapshot_without_the_record_instant_reads_pending(self):
+        """A snapshot written before the fold carried `declared_at` cannot
+        say which record it read. It reads PENDING, for one pass at most,
+        rather than FOLDED on a guess."""
+        decl = self._declare(bf.ORANGE, self.NOW - 600)
+        flags = self._fold(decl, self.NOW - 300)
+        old = {f: {k: v for k, v in fl.items() if k != "declared_at"}
+               for f, fl in flags.items()}
+        self.assertIn("kimi", bf.pending_declarations(
+            decl, old, self.NOW - 300, now=self.NOW))
+
+    def test_an_expired_or_unreadable_declaration_is_not_pending(self):
+        flags = self._fold({"families": {}}, self.NOW - 60)
+        expired = self._declare(bf.ORANGE, self.NOW - 7200,
+                                until=self.NOW - 1)
+        self.assertEqual(bf.pending_declarations(expired, flags,
+                                                 self.NOW - 60,
+                                                 now=self.NOW), {})
+        self.assertEqual(bf.pending_declarations(
+            self._declare("PURPLE", self.NOW), flags, self.NOW - 60,
+            now=self.NOW), {})
+        self.assertEqual(bf.pending_declarations({"families": {}}, flags,
+                                                 self.NOW - 60,
+                                                 now=self.NOW), {})
+        # CONTROL: the same record one second before its expiry is pending
+        self.assertIn("kimi", bf.pending_declarations(
+            expired, flags, self.NOW - 60, now=self.NOW - 2))
+
+    def test_with_no_fresh_snapshot_every_live_declaration_is_pending(self):
+        decl = self._declare(bf.RED, self.NOW)
+        got = bf.pending_declarations(decl, None, None, now=self.NOW)
+        self.assertEqual(got["kimi"]["colour"], bf.RED)
+        self.assertIsNone(got["kimi"]["folds_by"])
+
+    def test_the_reason_is_redacted_as_the_folded_cause_is(self):
+        decl = self._declare(bf.ORANGE, self.NOW,
+                             why="owner@example.com said stop")
+        got = bf.pending_declarations(decl, None, None, now=self.NOW)
+        self.assertNotIn("owner@example.com", got["kimi"]["why"])
+        self.assertIn(bf.ADDRESS_TOKEN, got["kimi"]["why"])
 
 
 class ReferenceWorldTest(unittest.TestCase):
@@ -1843,6 +1994,13 @@ class VerbTest(unittest.TestCase):
         self.assertEqual(bf.cmd_burn(["declare", "kimi", "chartreuse",
                                       "--until", until]), 2)
         self.assertEqual(bf.cmd_burn(["declare", "kimi", "orange"]), 2)
+
+    def test_a_declaration_missing_its_colour_prints_the_usage(self):
+        # The usage branch writes to stderr: it must reach its own imports.
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(bf.cmd_burn(["declare"]), 2)
+        self.assertIn("helm burn declare", err.getvalue())
 
     def test_an_improving_declaration_exits_two_and_names_the_measured_colour(self):
         """A declaration that would lighten a measured colour is refused at
@@ -2834,6 +2992,136 @@ class UnreadStreakTest(unittest.TestCase):
                     self._row("a@example.com", 60, "no-credentials"))
         self.assertEqual(len(bf.unread_streaks(path=self.path,
                                                now=self.now)), 1)
+
+
+class PoolPaceFoldTest(unittest.TestCase):
+    """The pool's WEEKLY pace joins the native family's colour at the ONE
+    place every consumer reads (task/3880): the family's colour is the WORSE
+    of its 5h axis and the pool's pace colour. An EASE (ORANGE) pool holds a
+    GREEN 5h at ORANGE; a GREEN pool never lifts a RED 5h; an unreadable
+    (GREY) pool pace is a no-op, never an invented colour.
+
+    The pace arrives as the fold's own input, exactly as the codex runway
+    does: this drives `fold` with a synthetic `pool_pace` record in the shape
+    `claudepace.pool_reading` emits, and each arm asserts the 5h base colour
+    through `derive_money` (the control) before asserting the folded family."""
+
+    def _pace(self, colour, state="unknown", runout=None):
+        """One synthetic claudepace pool record, the keys `pool_reading` sets."""
+        return {"state": state, "colour": colour, "advice": None, "why": None,
+                "accounts": 4, "read": 4, "left_pct": 25.0, "pct_per_hour": 1.0,
+                "span_s": 7200, "runout_at": runout, "horizon_at": None,
+                "horizon_from": None, "ratio": 1.0}
+
+    def _native_green(self):
+        """The owner's own pool, mutated to a strict majority that still
+        carries: four Max accounts under half their week -> the 5h axis is
+        GREEN. The unmutated capture is ORANGE through the same call, so a
+        fold that saw no input cannot pass (NativePoolTest's own law)."""
+        cap = _owner_pool()
+        rows = json.loads(json.dumps(cap["rows"]))
+        for row, pct in zip(rows, (39.0, 34.0, 20.0, 37.0)):
+            row["longest_pct"] = pct
+            row["windows"][0]["used_percent"] = pct
+        return cap, rows
+
+    def _native_red(self):
+        """One native account at 100% of a measured window: a window wall,
+        RED, the family's hardest 5h reading."""
+        cap = _owner_pool()
+        now = cap["measured_at"]
+        rows = [{"state": "ok", "longest_pct": 100.0,
+                 "windows": [{"label": "5h", "seconds": 18000,
+                              "used_percent": 100.0, "reset_at": now + 3600,
+                              "source": "measured"}]}]
+        return cap, rows
+
+    def _fold(self, cap, rows, pace):
+        inputs = {"ceiling": cap["ceiling"],
+                  "money": {bf.NATIVE_FAMILY: rows},
+                  "money_measured_at": {bf.NATIVE_FAMILY: cap["measured_at"]}}
+        if pace is not None:
+            inputs["pool_pace"] = {bf.NATIVE_FAMILY: pace}
+        return bf.fold(inputs, now=cap["measured_at"] + 60)
+
+    def test_orange_pool_holds_a_green_5h_at_orange(self):
+        cap, rows = self._native_green()
+        # CONTROL: the 5h axis alone is GREEN, and the unmutated pool is ORANGE
+        self.assertEqual(bf.derive_money(bf.NATIVE_FAMILY, rows,
+                                         ceiling=cap["ceiling"],
+                                         measured_at=cap["measured_at"],
+                                         rotated=False)["colour"], bf.GREEN)
+        # THE POLE the owner named: the pool eases (ORANGE), so the family
+        # carries it even though the 5h window still carries.
+        flag = self._fold(cap, rows, self._pace(bf.ORANGE, "ease",
+                                                cap["measured_at"] + 43200))
+        fam = flag["families"][bf.NATIVE_FAMILY]
+        self.assertEqual(fam["colour"], bf.ORANGE)
+        self.assertEqual(fam["axes"]["money"], bf.ORANGE)
+        self.assertEqual(fam["axis"], "money")
+
+    def test_a_green_pool_never_lifts_a_red_5h(self):  # noqa: VACUOUS_ASSERTION — RED tops _RANK, so no pool pace is worse than it; the worse-only law leaves the wall alone and no positive control exists
+        cap, rows = self._native_red()
+        self.assertEqual(bf.derive_money(bf.NATIVE_FAMILY, rows,
+                                         ceiling=cap["ceiling"],
+                                         measured_at=cap["measured_at"],
+                                         rotated=False)["colour"], bf.RED)
+        # The pool can go faster (GREEN); that is a fact about the pool, not
+        # a reason to lower a measured wall.
+        flag = self._fold(cap, rows, self._pace(bf.GREEN, "faster"))
+        self.assertEqual(flag["families"][bf.NATIVE_FAMILY]["colour"], bf.RED)
+
+    def test_a_green_pool_on_a_green_5h_stays_green(self):  # noqa: VACUOUS_ASSERTION — GREEN is the floor of the ordering, so a GREEN pool is never worse than a GREEN 5h; the sibling arm's ORANGE pole is what proves the fold reads the pace
+        cap, rows = self._native_green()
+        self.assertEqual(bf.derive_money(bf.NATIVE_FAMILY, rows,
+                                         ceiling=cap["ceiling"],
+                                         measured_at=cap["measured_at"],
+                                         rotated=False)["colour"], bf.GREEN)
+        flag = self._fold(cap, rows, self._pace(bf.GREEN, "faster"))
+        self.assertEqual(flag["families"][bf.NATIVE_FAMILY]["colour"], bf.GREEN)
+
+    def test_an_unreadable_pool_pace_leaves_the_5h_colour_alone(self):  # noqa: VACUOUS_ASSERTION — GREY is off the ordering (_RANK holds no key for it), so an unreadable pace cannot worsen, improve or invent a colour; the 5h reading stands by the module's first law
+        cap = _owner_pool()
+        rows = json.loads(json.dumps(cap["rows"]))
+        # The unmutated capture: the 5h axis reads ORANGE on its own.
+        self.assertEqual(bf.derive_money(bf.NATIVE_FAMILY, rows,
+                                         ceiling=cap["ceiling"],
+                                         measured_at=cap["measured_at"],
+                                         rotated=False)["colour"], bf.ORANGE)
+        # A pool that could not be read (GREY) invents nothing: the 5h
+        # colour stands as it was measured.
+        flag = self._fold(cap, rows, self._pace(bf.GREY, "unknown"))
+        self.assertEqual(flag["families"][bf.NATIVE_FAMILY]["colour"], bf.ORANGE)
+        self.assertEqual(flag["families"][bf.NATIVE_FAMILY]["axes"]["money"],
+                         bf.ORANGE)
+
+    def test_read_inputs_carries_the_pool_pace_the_fold_folds(self):  # noqa: VACUOUS_ASSERTION — the fresh-snapshot half asserts the pace IS carried and folded (ORANGE); the absent half's assertNotIn is that same control's no-snapshot counterpart, not the only observable
+        """The data actually flows: a fresh claudepace snapshot the watchdog
+        pass wrote is read back by `read_inputs` as the `pool_pace` input and
+        folded into the family colour the arm above proves. An absent
+        snapshot (`claudepace.cached` -> None, the missing watchdog pass) is
+        no input at all, so nothing is invented. Mocks the reader, so this is
+        the fold's own purity idiom and never touches a live path."""
+        cap, rows = self._native_green()
+        pace = self._pace(bf.ORANGE, "ease", cap["measured_at"] + 4000)
+        snap = {"v": 1, "ts": cap["measured_at"] + 30, "accounts": {},
+                "pool": pace}
+        with mock.patch("helm.claudepace.cached", return_value=snap), \
+                mock.patch.object(bf, "anthropic_money_rows",
+                                  return_value=(rows, cap["measured_at"])):
+            inputs = bf.read_inputs(now=cap["measured_at"] + 60)
+        self.assertEqual(inputs["pool_pace"][bf.NATIVE_FAMILY], pace)
+        self.assertEqual(bf.fold(inputs, now=cap["measured_at"] + 60)[
+            "families"][bf.NATIVE_FAMILY]["colour"], bf.ORANGE)
+        # The unmeasured world: no snapshot, so no `pool_pace` key, and the
+        # 5h colour stands as the fold's own reading.
+        with mock.patch("helm.claudepace.cached", return_value=None), \
+                mock.patch.object(bf, "anthropic_money_rows",
+                                  return_value=(rows, cap["measured_at"])):
+            inputs = bf.read_inputs(now=cap["measured_at"] + 60)
+        self.assertNotIn("pool_pace", inputs)
+        self.assertEqual(bf.fold(inputs, now=cap["measured_at"] + 60)[
+            "families"][bf.NATIVE_FAMILY]["colour"], bf.GREEN)
 
 
 if __name__ == "__main__":

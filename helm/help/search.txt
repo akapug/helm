@@ -1,0 +1,1 @@
+search <text> [--scope P] [--refs] — content search inside transcripts

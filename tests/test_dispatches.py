@@ -23,7 +23,7 @@ import unittest
 from unittest import mock
 
 from helm import (chat, dispatches, eventledger, fsops, gate, home, landreq,
-                  seat, seats, store, vcs, verdicts)
+                  seat, seats, store, tasks, vcs, verdicts)
 from tests import subsumption_property
 from tests._gate_receipt import serial_process
 
@@ -401,6 +401,10 @@ class DispatchBase(unittest.TestCase):
         self._real_home_repo_id = pin_dispatch_home(self, self.repo)
         # NO ROW WRITTEN HERE WALKS THE HOST'S PROCESS TABLE (task/3039).
         pin_live_seats(self)
+        self.review_task, why = tasks.add(
+            "fixture reviewed work", "integrator", project="helm",
+            force_new=True)
+        self.assertIsNone(why, why)
 
         # THE ROSTER STAYS EMPTY HERE, DELIBERATELY. Do not add
         # `seats.write_roster(...)` to this setUp: an empty roster is UNKNOWN,
@@ -469,6 +473,12 @@ class DispatchBase(unittest.TestCase):
         # the helper roots its own chain and steps aside the moment a test names
         # a parent. It never fills in both — that is refused at the writer.
         defaults.setdefault("new_work", "supersedes" not in defaults)
+        # Positive new review chains serve real open work. Explicit task=False
+        # keeps a taskless/refusal control taskless without passing a fake id.
+        if defaults.get("task") is False:
+            defaults.pop("task")
+        elif defaults.get("new_work") and defaults.get("kind", "review") in (None, "review"):
+            defaults.setdefault("task", self.review_task["id"])
         # NO NOTIFICATION LEG BY DEFAULT. This helper exists to mint a LEDGER
         # ROW; almost every caller is testing replay, terminality or chain
         # mechanics and does not care that a mention was posted. Since add()
@@ -518,6 +528,20 @@ class DispatchBase(unittest.TestCase):
                 if event.get("id") == rid and event.get("event") == "dispatch":
                     event.update(fields)
                 f.write(json.dumps(event, separators=(",", ":")) + "\n")
+
+    def legacy_taskless_review(self, **kwargs):
+        """A historical review opener, not a new taskless write through today's door."""
+        row = self.add(**kwargs)
+        path = dispatches.ledger_path()
+        events = eventledger.events(path)
+        with open(path, "w", encoding="utf-8") as f:
+            for event in events:
+                if event.get("id") == row["id"] and event.get("event") == "dispatch":
+                    event.pop("task", None)
+                f.write(json.dumps(event, separators=(",", ":")) + "\n")
+        row.pop("task", None)
+        self.assertNotIn("task", dispatches.snapshot()[0][row["id"]])
+        return row
 
 
 class RepoIdentityWithoutTheCarriageProjectionTest(DispatchBase):
@@ -1090,7 +1114,7 @@ class LifecycleTest(DispatchBase):
                 dispatches, "mark_verdict", side_effect=capture):
             rc, out, err = run(dispatches.cmd_dispatch, [
                 "verdict", row["id"], self.a, "--fix", "--measured",
-                "--finding-count", "1", "--prior-relation", "new",
+                "--finding", "the review found a regression", "--prior-relation", "new",
                 "--worse-than-main", "helm/dispatches.py",
                 "--no-patch-because", "a design finding for a meld", "safe"])
         self.assertEqual((rc, err), (0, ""))
@@ -1114,7 +1138,7 @@ class LifecycleTest(DispatchBase):
                 dispatches, "mark_verdict", side_effect=capture):
             rc, out, err = run(dispatches.cmd_dispatch, [
                 "verdict", row["id"], self.a, "--fix", "--measured",
-                "--finding-count", "1", "--prior-relation", "new",
+                "--finding", "the review found a regression", "--prior-relation", "new",
                 "--worse-than-main", "helm/dispatches.py",
                 "--no-patch-because", "a design finding for a meld", "safe"])
         self.assertEqual((rc, err), (0, ""))
@@ -1126,7 +1150,7 @@ class LifecycleTest(DispatchBase):
 
         rc, _out, err = run(dispatches.cmd_dispatch, [
             "verdict", row["id"], self.a, "--fix", "--unverified",
-            "--finding-count", "1", "--prior-relation", "new",
+            "--finding", "the review found a regression", "--prior-relation", "new",
             "--worse-than-main", "helm/dispatches.py",
             "--no-patch-because", "a design finding for a meld", "safe"])
         self.assertEqual(rc, 1)
@@ -3309,6 +3333,32 @@ class RebindTest(DispatchBase):
 
 
 class AtomicSendTest(DispatchBase):
+    def test_legacy_taskless_review_retry_does_not_mint_or_redeliver(self):
+        # An old review already exists without a task. The new-chain task door
+        # must not turn an identical-key retry into a fresh write or a DM.
+        args = ("seat-a", "legacy-review", "Review this tip", self.a)
+        kw = {"repo": self.repo, "kind": "review", "key": "legacy-key",
+              "sign": False, "new_work": True}
+        with mock.patch.object(seats, "dm", return_value=({"id": "dm-1"}, None)) as dm:
+            row, why, sent = dispatches.send(*args, task=self.review_task["id"],
+                                              **kw)
+            self.assertIsNone(why, why)
+            self.assertTrue(sent)
+            self.forge_open(row["id"], task=None)
+            old = dispatches.rows()[row["id"]]
+            self.assertIsNone(old.get("task"))
+            again, why, sent = dispatches.send(*args, **kw)
+            changed, changed_why, changed_sent = dispatches.send(
+                *args, task=self.review_task["id"], **kw)
+        self.assertEqual(again["id"] if again else None, row["id"], why)
+        self.assertFalse(sent)
+        self.assertIn("do not resend", why)
+        self.assertIsNone(changed)
+        self.assertIn("different work", changed_why)
+        self.assertFalse(changed_sent)
+        dm.assert_called_once()
+        self.assertEqual(len(dispatches.rows()), 1)
+
     def test_send_is_one_first_class_handoff_and_retry_never_resends(self):
         row, why, posted = dispatches.send(
             "codex-3", "review", "Review this tip", self.a, repo=self.repo,
@@ -3440,6 +3490,63 @@ class AtomicSendTest(DispatchBase):
         self.assertEqual(again["id"], first["id"])
         self.assertEqual(len(dispatches.rows()), 1)
 
+    def test_a_retry_that_lost_its_task_is_not_different_work(self):
+        """task/4050 residual A1.
+
+        task/3936 put `task` in the exact-retry semantic tuple, which is right
+        for a retry that NAMES a task and wrong for one whose task the writer
+        can no longer RESOLVE. A retry passes task=False when its task came
+        from a literal lane or a note; once that task closes the retry
+        resolves none, and every other field is byte-identical. In main the
+        standing row came back; with `task` in the tuple it is refused as
+        "operation key already names different work" — a true sentence about
+        a case that is not different work."""
+        first, why, _ = dispatches.send(
+            "seat-a", "review", "same work", self.a, repo=self.repo,
+            key="taskdrift", sign=False, new_work=True, task=self.review_task["id"])
+        self.assertIsNone(why)
+        self.assertEqual(first.get("task"), self.review_task["id"])
+        again, why, posted = dispatches.send(
+            "seat-a", "review", "same work", self.a, repo=self.repo,
+            key="taskdrift", sign=False, new_work=True, task=False)
+        # the standing row comes back with the idempotent-retry advisory, which
+        # is what main returns; the refusal is what must NOT come back.
+        self.assertIn("do not resend", why)
+        self.assertNotIn("different work", why)
+        self.assertEqual(again["id"], first["id"])
+        self.assertEqual(len(dispatches.rows()), 1)
+
+    def test_a_retry_naming_another_task_is_refused_and_names_the_drift(self):  # noqa: VACUOUS_ASSERTION — the absence of the other task id rides an assertIn on the same refusal text
+        """The control on the relaxation above: a retry that NAMES a task the
+        standing row does not carry is other work, and the refusal says
+        which field drifted instead of only that something did."""
+        other, why = tasks.add("other reviewed work", "integrator",
+                               project="helm", force_new=True)
+        self.assertIsNone(why, why)
+        first, why, _ = dispatches.send(
+            "seat-a", "review", "same work", self.a, repo=self.repo,
+            key="taskswap", sign=False, new_work=True,
+            task=self.review_task["id"])
+        self.assertIsNone(why)
+        again, why, posted = dispatches.send(
+            "seat-a", "review", "same work", self.a, repo=self.repo,
+            key="taskswap", sign=False, new_work=True, task=other["id"])
+        self.assertIsNone(again)
+        self.assertFalse(posted)
+        self.assertIn("operation key already names different work", why)
+        self.assertIn("task", why)
+        self.assertIn(other["id"], why)
+        self.assertIn(self.review_task["id"], why)
+        # A drift in a field that is not the task names that field.
+        again, why, posted = dispatches.send(
+            "seat-a", "review", "other words", self.a, repo=self.repo,
+            key="taskswap", sign=False, new_work=True,
+            task=self.review_task["id"])
+        self.assertIsNone(again)
+        self.assertIn("message_hash differs", why)
+        self.assertNotIn(other["id"], why)
+        self.assertEqual(len(dispatches.rows()), 1)
+
     def test_same_key_cannot_alias_different_payload(self):
         dispatches.send("codex-3", "review", "one", self.a, repo=self.repo,
                         key="same", sign=False, new_work=True)
@@ -3485,7 +3592,7 @@ class AtomicSendTest(DispatchBase):
     def test_exact_successor_retry_reconciles_before_mutable_gates(self):
         parent = dispatches.add(
             "seat-c", "parent", ref=self.a, repo=self.repo, kind="review",
-            new_work=True, notify=False)
+            new_work=True, task=self.review_task["id"], notify=False)
         key = "stale-cure:%s:%s" % (parent["id"], self.b)
         args = ("seat-c", "atomic-cure", "Review cure", self.b)
         kw = {"repo": self.repo, "kind": "review", "supersedes": parent["id"],
@@ -3496,7 +3603,7 @@ class AtomicSendTest(DispatchBase):
         self.assertTrue(sent)
         for gate_name in ("_acting_author", "_recipient_operand",
                           "_validate_recipient_rostered",
-                          "_validate_recipient_usable", "_base"):
+                          "_validate_recipient_usable", "_base3"):
             with self.subTest(gate=gate_name), mock.patch.object(
                     dispatches, gate_name,
                     side_effect=AssertionError("retry consulted " + gate_name)):
@@ -3521,7 +3628,7 @@ class AtomicSendTest(DispatchBase):
         would measure nothing but its own refusal."""
         parent = dispatches.add(
             "seat-c", "parent", ref=self.a, repo=self.repo, kind="review",
-            new_work=True, notify=False)
+            new_work=True, task=self.review_task["id"], notify=False)
         key = "stale-cure:%s:%s" % (parent["id"], self.b)
         args = ("seat-c", "atomic-cure", "Review cure", self.b)
         kw = {"repo": self.repo, "kind": "review", "supersedes": parent["id"],
@@ -3552,7 +3659,7 @@ class AtomicSendTest(DispatchBase):
     def test_same_key_wrong_route_refuses_instead_of_reconciling(self):
         parent = dispatches.add(
             "seat-c", "parent", ref=self.a, repo=self.repo, kind="review",
-            new_work=True, notify=False)
+            new_work=True, task=self.review_task["id"], notify=False)
         key = "stale-cure:%s:%s" % (parent["id"], self.b)
         first, why, sent = dispatches.send(
             "seat-c", "atomic-cure", "Review cure", self.b, repo=self.repo,
@@ -3576,7 +3683,7 @@ class AtomicSendTest(DispatchBase):
     def test_two_concurrent_exact_successors_append_once(self):  # noqa: VACUOUS_ASSERTION — two completed calls and one shared durable id are unconditional positive controls before the one-row assertion
         parent = dispatches.add(
             "seat-c", "parent", ref=self.a, repo=self.repo, kind="review",
-            new_work=True, notify=False)
+            new_work=True, task=self.review_task["id"], notify=False)
         key = "stale-cure:%s:%s" % (parent["id"], self.b)
         barrier = threading.Barrier(2)
         results = []
@@ -3630,7 +3737,7 @@ class AtomicSendTest(DispatchBase):
     def test_cured_new_admission_rechecks_identity_and_refuses_self_delivery(self):
         parent = dispatches.add(
             "seat-c", "parent", ref=self.a, repo=self.repo, kind="review",
-            new_work=True, notify=False)
+            new_work=True, task=self.review_task["id"], notify=False)
         key = "stale-cure:%s:%s" % (parent["id"], self.b)
         with mock.patch.object(dispatches, "_acting_author",
                                return_value=("seat-c", None)), \
@@ -3650,10 +3757,10 @@ class AtomicSendTest(DispatchBase):
     def test_cured_validation_is_the_last_fallible_step_before_append(self):
         parent = dispatches.add(
             "seat-c", "parent", ref=self.a, repo=self.repo, kind="review",
-            new_work=True, notify=False)
+            new_work=True, task=self.review_task["id"], notify=False)
         key = "stale-cure:%s:%s" % (parent["id"], self.b)
         order = []
-        original_base = dispatches._base
+        original_base = dispatches._base3
         original_append = eventledger.append_unlocked
 
         def base(*args, **kwargs):
@@ -3669,7 +3776,7 @@ class AtomicSendTest(DispatchBase):
                 order.append("append")
             return original_append(path, event)
 
-        with mock.patch.object(dispatches, "_base", side_effect=base), \
+        with mock.patch.object(dispatches, "_base3", side_effect=base), \
                 mock.patch.object(eventledger, "append_unlocked", side_effect=append):
             row, why, sent = dispatches.send(
                 "seat-c", "atomic-cure", "Review cure", self.b,
@@ -3679,6 +3786,7 @@ class AtomicSendTest(DispatchBase):
         self.assertIsNone(why, why)
         self.assertTrue(sent)
         self.assertIsNotNone(row)
+        self.assertIn("base", order)
         self.assertEqual(order[-2:], ["validate", "append"])
 
     def test_unique_key_refuses_the_same_operation_under_another_sender(self):
@@ -3832,7 +3940,7 @@ class HistoricalCompatTest(DispatchBase):
         short = "deadbeef"
         longer = short + "1" * 24
         for rid in (short, longer):
-            row, why = dispatches._base(
+            row, why, _advisory = dispatches._base3(
                 "codex-3", "collision-" + rid, self.a, None,
                 dispatches.DEFAULT_DEADLINE_S, self.repo, rid=rid, new_work=True)
             self.assertIsNone(why)
@@ -4614,7 +4722,7 @@ class StorageSafetyTest(DispatchBase):
                             else fresh,))
 
         row = dispatches.add("seat-under-test", "lane/real-write", ref=self.a,
-                             repo=self.repo, new_work=True, kind="review",
+                             repo=self.repo, new_work=True, kind="build",
                              notify=False)
         self.assertIsNotNone(row, "the control write was refused, so the "
                                   "assertion below measures nothing")
@@ -4631,7 +4739,7 @@ class StorageSafetyTest(DispatchBase):
         STRICT read, which RE-RAISES instead of failing open — so the version
         this arm guards consulted the registry on the PROVEN-HOME path too, for
         a project label every caller discards, and a malformed registry threw
-        the exception straight out of `_base`/`add` past the (row, why) contract:
+        the exception straight out of `_base3`/`add` past the (row, why) contract:
         a valid own-repository dispatch died where trunk admitted it, and
         `stalebot`'s per-row consultation of the same door died on row one.
 
@@ -4673,7 +4781,8 @@ class StorageSafetyTest(DispatchBase):
                          "the registry")
         row, why = dispatches.add("seat-under-test", "lane/home-under-garbage",
                                   ref=self.a, repo=self.repo, new_work=True,
-                                  kind="review", notify=False, _reason=True)
+                                  kind="review", notify=False,
+                                   task=self.review_task["id"], _reason=True)
         self.assertIsNotNone(row, "a ref in this helm's OWN repository was "
                                   "refused because the registry is garbled: %s"
                              % (why,))
@@ -4799,7 +4908,7 @@ class CmdTest(DispatchBase):
         rc, out, err = run(dispatches.cmd_dispatch, [
             "send", "codex-3", "review", "review", "this", "--ref", self.a,
             "--repo", self.repo, "--key", "cli-review", "--deadline", "900",
-            "--kind", "review", "--new-work"])
+            "--kind", "review", "--new-work", "--task", self.review_task["id"], "--part"])
         # self.a IS on the fixture trunk, so the ref-sanity check correctly
         # emits an advisory NOTE. It must WARN and never refuse: rc stays 0 and
         # the dispatch is still recorded.
@@ -4860,7 +4969,7 @@ class CmdTest(DispatchBase):
         with self.verdict_author():
             rc, out, err = run(dispatches.cmd_dispatch, [
                 "verdict", row["id"], row["tip"], "--fix", "--measured",
-                "--finding-count", "1", "--prior-relation", "new",
+                "--finding", "the review found a regression", "--prior-relation", "new",
                 "--worse-than-main", paths[0], "--worse-than-main", paths[1],
                 "--no-patch-because", "a design finding for a meld",
                 "these paths regress relative to main"])
@@ -4943,7 +5052,7 @@ class CmdTest(DispatchBase):
         rc, out, err = run(dispatches.cmd_dispatch,
                            ["add", "someseat", "somelane", "--ref", self.a,
                             "--kind", "review", "--repo", self.repo,
-                            "--new-work"])
+                            "--new-work", "--task", self.review_task["id"], "--part"])
         self.assertEqual(rc, 0)
         # add() NOW NOTIFIES (a sibling lane, landed in the same merge), so the
         # honest report is that the mention posted and DELIVERY is what remains
@@ -4966,7 +5075,8 @@ class CmdTest(DispatchBase):
         send() always recorded the sender. add() was the quiet path nobody
         re-derived — the same asymmetry as the notification gap."""
         row = dispatches.add("someseat", "somelane", ref=self.a,
-                             repo=self.repo, kind="review", notify=False, new_work=True)
+                             repo=self.repo, kind="review", notify=False,
+                             new_work=True, task=self.review_task["id"])
         self.assertIsNotNone(row)
         self.assertTrue(row.get("sender"),
                         "add() must record WHO owes this row, not None")
@@ -4977,13 +5087,15 @@ class CmdTest(DispatchBase):
         unseen in the recipient's task list. Read from the DURABLE notify-failed
         event, not a return value: _notify_public's post_ok is discarded by
         add(), so the ledger is the only non-transient answer."""
-        with mock.patch.object(dispatches, "_notify_public", return_value=False), \
+        with mock.patch.object(dispatches, "_notify_public", return_value=False) as public, \
                 mock.patch.object(dispatches, "_notify_failed_for",
-                                  return_value={"reason": "room unwritable"}):
+                                  return_value={"reason": "room unwritable"}) as failed:
             rc, out, err = run(dispatches.cmd_dispatch,
                                ["add", "someseat", "somelane", "--ref", self.a,
                                 "--kind", "review", "--repo", self.repo,
-                                "--new-work"])
+                                "--new-work", "--task", self.review_task["id"], "--part"])
+        public.assert_called_once()
+        failed.assert_called_once()
         self.assertEqual(rc, 0)
         self.assertIn("mention FAILED", err)
         self.assertIn("room unwritable", err)      # the CAUSE, not just the fact
@@ -5856,7 +5968,7 @@ class TriageAnswersEveryNamedIdTest(DispatchBase):
         exact-short-collision test elsewhere in this file mints its pair."""
         twins = [short + "a" * 24, short + "b" * 24]
         for rid in twins:
-            row, why = dispatches._base(
+            row, why, _advisory = dispatches._base3(
                 "seat-a", "twin-" + rid[-1], self.a, None,
                 dispatches.DEFAULT_DEADLINE_S, self.repo, rid=rid,
                 new_work=True)
@@ -6260,6 +6372,133 @@ class DischargeEventTest(DispatchBase):
         self.assertIsNone(out)
         self.assertIn("stale verdict", why)
         self.assertIn("first difference at character 1", why)
+
+
+class ChainTaskEventTest(DispatchBase):
+    """task/4000: one `chain-task` event on a chain's FIRST row records that
+    the taskless chain now serves a task, and replay projects it as
+    `attached_task` — never as the row's own `task`, which stays the
+    immutable fact of what the opener recorded. The fold refuses what the
+    writer refuses: a malformed task, a row that already names a task, and a
+    second attach are all inert on read."""
+
+    def attach_event(self, row, seq, task="task/4000", **extra):
+        return {"v": 3, "event": "chain-task", "seq": seq, "id": row["id"],
+                "ts": "2026-10-01T00:00:00Z", "task": task,
+                "attached_by": "integrator", "attach_role": "integrator",
+                **extra}
+
+    def test_a_well_formed_attach_folds_on_an_open_and_a_verdicted_root(self):
+        open_row = self.legacy_taskless_review(lane="open-chain")
+        eventledger.append_unlocked(
+            dispatches.ledger_path(), self.attach_event(open_row, 1))
+        replayed = dispatches.snapshot()[0][open_row["id"]]
+        self.assertEqual(replayed["attached_task"], "task/4000")
+        self.assertEqual(replayed["attached_task_by"], "integrator")
+        self.assertNotIn("task", replayed)
+        verdicted = self.legacy_taskless_review(lane="verdicted-chain")
+        dispatches.mark_verdict(verdicted["id"], self.a, "review",
+                                polarity="fix")
+        standing = dispatches.snapshot()[0][verdicted["id"]]
+        eventledger.append_unlocked(
+            dispatches.ledger_path(),
+            self.attach_event(verdicted, standing["seq"] + 1))
+        replayed = dispatches.snapshot()[0][verdicted["id"]]
+        self.assertEqual(replayed["attached_task"], "task/4000")
+        self.assertEqual(replayed["status"], "verdict")
+        self.assertEqual(replayed["polarity"], "fix")
+
+    def test_forged_attachment_on_the_opener_cannot_become_effective(self):
+        from helm import taskkey
+        row = self.legacy_taskless_review(lane="forged-opener")
+        # Only a separately validated chain-task event may project an attach.
+        # A hand-edited opener must not give the chain a filing identity.
+        self.forge_open(row["id"], attached_task=self.review_task["id"],
+                        attached_task_by="integrator",
+                        attached_task_ts="2026-10-01T00:00:00Z",
+                        attach_role="integrator")
+        root = dispatches.snapshot()[0][row["id"]]
+        self.assertNotIn("attached_task", root)
+        self.assertIsNone(taskkey.join(row=root, current={}, lanes=False).task)
+        eventledger.append_unlocked(
+            dispatches.ledger_path(),
+            self.attach_event(row, 1, task=self.review_task["id"]))
+        attached = dispatches.snapshot()[0][row["id"]]
+        self.assertEqual(attached["attached_task"], self.review_task["id"])
+        self.assertEqual(taskkey.join(row=attached, current={}, lanes=False).task,
+                         self.review_task["id"])
+
+    def test_forged_attaches_are_inert(self):
+        row = self.legacy_taskless_review(lane="forged")
+        bad = [self.attach_event(row, True),
+               self.attach_event(row, 1, task=None),
+               self.attach_event(row, 1, task=""),
+               self.attach_event(row, 1, task="task/not-a-number"),
+               self.attach_event(row, 1, task=4000),
+               self.attach_event(row, 1, task=["task/4000"]),
+               self.attach_event(row, 1, attached_by=""),
+               self.attach_event(row, 1, attach_role="passenger"),
+               self.attach_event(row, 3)]
+        for event in bad:
+            eventledger.append_unlocked(dispatches.ledger_path(), event)
+        replayed = dispatches.snapshot()[0][row["id"]]
+        self.assertNotIn("attached_task", replayed)
+        self.assertEqual(replayed["seq"], 0)
+        # POSITIVE CONTROL on the same observable: the one well-formed
+        # event at the right seq folds.
+        eventledger.append_unlocked(
+            dispatches.ledger_path(), self.attach_event(row, 1))
+        self.assertEqual(dispatches.snapshot()[0][row["id"]]
+                         ["attached_task"], "task/4000")
+
+    def test_a_row_that_names_a_task_never_gains_a_second_one(self):
+        row = self.add(lane="tasked")
+        # The opener records its task at MINT; the fixture forges the
+        # historical shape below today's write door rather than filing a real
+        # task ledger row for the write door to join against.
+        self.forge_open(row["id"], task="task/3748")
+        self.assertEqual(dispatches.snapshot()[0][row["id"]]["task"],
+                         "task/3748")
+        eventledger.append_unlocked(
+            dispatches.ledger_path(), self.attach_event(row, 1))
+        replayed = dispatches.snapshot()[0][row["id"]]
+        self.assertNotIn("attached_task", replayed)
+        self.assertEqual(replayed["task"], "task/3748")
+        self.assertEqual(replayed["seq"], 0)
+        # AND A SECOND ATTACH, even the identical one, folds to nothing.
+        plain = self.legacy_taskless_review(lane="taskless")
+        eventledger.append_unlocked(
+            dispatches.ledger_path(), self.attach_event(plain, 1))
+        first = dispatches.snapshot()[0][plain["id"]]
+        self.assertEqual(first["attached_task"], "task/4000")
+        eventledger.append_unlocked(
+            dispatches.ledger_path(),
+            self.attach_event(plain, 2, attached_by="seat-else"))
+        replayed = dispatches.snapshot()[0][plain["id"]]
+        self.assertEqual(replayed, first)
+
+    def test_the_event_replays_on_the_root_and_no_other_row(self):
+        root = self.legacy_taskless_review(lane="rootless")
+        kid = self.add(lane="kid", supersedes=root["id"])
+        # An attach event on a NON-root row of a tasked chain is inert: the
+        # chain's task is the FIRST row's fact, and a hand-appended event on
+        # a later round must not mint one.
+        eventledger.append_unlocked(
+            dispatches.ledger_path(), self.attach_event(kid, 1))
+        replayed = dispatches.snapshot()[0]
+        self.assertNotIn("attached_task", replayed[kid["id"]])
+        self.assertNotIn("attached_task", replayed[root["id"]])
+        # POSITIVE CONTROL: the same event on the ROOT folds, and the chain
+        # reads its task from the first row alone. The kid's mint annotated
+        # the parent (a `superseded` event), so the root's seq is read, not
+        # assumed.
+        root_seq = dispatches.snapshot()[0][root["id"]]["seq"]
+        eventledger.append_unlocked(
+            dispatches.ledger_path(),
+            self.attach_event(root, root_seq + 1))
+        replayed = dispatches.snapshot()[0]
+        self.assertEqual(replayed[root["id"]]["attached_task"], "task/4000")
+        self.assertNotIn("attached_task", replayed[kid["id"]])
 
 
 class AbandonEventTest(DispatchBase):
@@ -6721,7 +6960,7 @@ class CancelTest(DispatchBase):
             rc, out, _err = run(dispatches.cmd_dispatch,
                                 ["send", "codex-3", "raced-lane", "hello",
                                  "--ref", self.a, "--repo", self.repo,
-                                 "--kind", "review", "--new-work"])
+                                 "--kind", "review", "--new-work", "--task", self.review_task["id"], "--part"])
         self.assertEqual(rc, 0)
         self.assertIn("CANCELLED", out)
         self.assertNotIn("PENDING VERDICT", out)
@@ -6844,7 +7083,8 @@ class CancelTest(DispatchBase):
             with mock.patch.object(seats, "dm", return_value=({"id": "p1"}, None)):
                 r, why, sent = dispatches.send(
                     "codex-3", "lane-" + closer, "hi", self.a,
-                    key="op-" + closer, repo=self.repo, kind="review", new_work=True)
+                    key="op-" + closer, repo=self.repo, kind="review", new_work=True,
+                                 task=self.review_task["id"])
             self.assertTrue(sent, why)
             if closer == "verdict":
                 self._legacy_undeclared(r)
@@ -6853,7 +7093,8 @@ class CancelTest(DispatchBase):
             # resend the SAME operation — the existed branch fires
             r2, why2, sent2 = dispatches.send(
                 "codex-3", "lane-" + closer, "hi", self.a,
-                key="op-" + closer, repo=self.repo, kind="review", new_work=True)
+                key="op-" + closer, repo=self.repo, kind="review", new_work=True,
+                                 task=self.review_task["id"])
             self.assertEqual(r2["id"], r["id"])            # same operation
             self.assertIsNone(why2)                        # NOT confirmation debt
             self.assertFalse(sent2)
@@ -6862,7 +7103,7 @@ class CancelTest(DispatchBase):
             rc, out, _ = run(dispatches.cmd_dispatch,
                              ["send", "codex-3", "lane-" + closer, "hi", "--ref",
                               self.a, "--key", "op-" + closer, "--repo", self.repo,
-                              "--kind", "review", "--new-work"])
+                              "--kind", "review", "--new-work", "--task", self.review_task["id"], "--part"])
             self.assertEqual(rc, 0)
             self.assertIn(label, out)
             self.assertNotIn("confirm at the", out)
@@ -7000,7 +7241,8 @@ class ASnapshotOfADirtyTreeIsNotAReviewedTipTest(DispatchBase):
         # ordinary commit goes through, so the refusal below is about the tip.
         ok, err, _d = dispatches.send(
             "reviewer", "lane-ok", "review this", self.c,
-            kind="review", new_work=True, repo=self.repo)
+            kind="review", new_work=True, repo=self.repo,
+            task=self.review_task["id"])
         self.assertIsNone(err)
         self.assertTrue(ok)
 
@@ -7019,7 +7261,7 @@ class ASnapshotOfADirtyTreeIsNotAReviewedTipTest(DispatchBase):
         of this door lived in `send` against `raw_tip`, which is
         `str(ref).strip().lower()` — and the same snapshot named as `HEAD`
         arrived there as `head`, which resolves to nothing, so the door stayed
-        silent while `_base` went on to resolve the ORIGINAL `HEAD` and append
+        silent while `_base3` went on to resolve the ORIGINAL `HEAD` and append
         the snapshot. A helper-only arm passes through all of that.
 
         THE LOWERCASING WITNESS IS IN THIS ARM, so the regression is provable
@@ -7050,7 +7292,8 @@ class ASnapshotOfADirtyTreeIsNotAReviewedTipTest(DispatchBase):
             with self.subTest(admit=label):
                 row, err, _d = dispatches.send(
                     "reviewer", "lane-ok-" + label, "review " + label, ref,
-                    kind="review", new_work=True, repo=self.repo)
+                    kind="review", new_work=True, repo=self.repo,
+                    task=self.review_task["id"])
                 self.assertIsNone(err, err)
                 self.assertEqual(row["tip"], self.c,
                                  "the row bound something other than the "
@@ -7423,6 +7666,127 @@ class HoldReleaseTest(DispatchBase):
         snap = dispatches.snapshot()[0][row["id"]]
         self.assertEqual(snap["status"], "open")
 
+    def test_release_records_the_calling_seat(self):
+        # WHO RELEASED IS THE SAME IDENTITY A HOLD RECORDS (task/4149): the
+        # acting seat, resolved through the hold's own door, stamped on the
+        # release event and carried on the row.
+        row = self.add()
+        dispatches.mark_hold(row["id"], "waiting on the fab")
+        out, why = dispatches.mark_release(row["id"])
+        self.assertIsNone(why)
+        self.assertEqual(out.get("release_actor"), "integrator", out)
+        replayed = dispatches.snapshot()[0][row["id"]]
+        self.assertEqual(replayed.get("release_actor"), "integrator")
+
+    def test_cli_release_records_the_calling_seat(self):
+        row = self.add(lane="cli-release-actor")
+        dispatches.mark_hold(row["id"], "waiting on the fab")
+        rc, out, err = run(dispatches.cmd_dispatch, ["release", row["id"]])
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(dispatches.snapshot()[0][row["id"]].get(
+                             "release_actor"), "integrator")
+
+    def test_release_records_an_explicit_actor(self):
+        # A PROGRAMMATIC CALLER (THE DARK-SEAT MOVER) NAMES ITS OWN HAND
+        # rather than the seat the process happens to run under.
+        row = self.add()
+        dispatches.mark_hold(row["id"], "waiting on the fab")
+        out, why = dispatches.mark_release(row["id"], actor="darkmove")
+        self.assertIsNone(why)
+        self.assertEqual(out.get("release_actor"), "darkmove", out)
+        replayed = dispatches.snapshot()[0][row["id"]]
+        self.assertEqual(replayed.get("release_actor"), "darkmove")
+
+    def test_release_replay_omits_a_malformed_actor(self):
+        # THE REPLAY ENFORCES WHAT THE DOOR ENFORCES: an actor that is not a
+        # seat token reads as UNRECORDED, never as a forged one.
+        row = self.add()
+        held, why = dispatches.mark_hold(row["id"], "waiting on the fab")
+        self.assertIsNone(why)
+        self.assertTrue(eventledger.append(dispatches.ledger_path(), {
+            "v": 3, "event": "release", "seq": held["seq"] + 1,
+            "id": row["id"], "ts": dispatches.pk.now_ts(),
+            "reason": "waiting on the fab",
+            "release_actor": "not a seat token"}))
+        replayed = dispatches.snapshot()[0][row["id"]]
+        self.assertEqual(replayed["status"], "open")
+        self.assertNotIn("release_actor", replayed)
+
+    def test_an_actorless_release_replays_without_an_actor(self):
+        # A release written before the actor was recorded stays foldable and
+        # reads as UNRECORDED -- never as somebody.
+        row = self.add()
+        held, why = dispatches.mark_hold(row["id"], "waiting on the fab")
+        self.assertIsNone(why)
+        self.assertTrue(eventledger.append(dispatches.ledger_path(), {
+            "v": 3, "event": "release", "seq": held["seq"] + 1,
+            "id": row["id"], "ts": dispatches.pk.now_ts(),
+            "reason": "waiting on the fab"}))
+        replayed = dispatches.snapshot()[0][row["id"]]
+        self.assertEqual(replayed["status"], "open")
+        self.assertNotIn("release_actor", replayed)
+
+    def test_the_event_actor_table_reads_release(self):
+        # A release records its hand the way a hold records its holder: the
+        # registry names the field the census reads.
+        self.assertIn("release_actor",
+                      dispatches.LEDGER_EVENT_ACTORS["release"])
+
+    def test_lr_show_prints_released_by_the_seat(self):
+        from helm import landreq_cli
+        row = self.add(kind="build")
+        dispatches.mark_hold(row["id"], "waiting on the fab")
+        dispatches.mark_release(row["id"])
+        dispatches.mark_cancel(row["id"], "rebound to @kimi: dark seat")
+        succ = self.add(recipient="kimi", kind="build",
+                        supersedes=row["id"], new_work=False)
+        rc, out, err = run(landreq_cli.cmd_lr, ["show", succ["id"]])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("RELEASED by @integrator", out, out)
+
+    def test_lr_show_prints_released_by_the_mover(self):
+        from helm import landreq_cli
+        row = self.add(kind="build")
+        dispatches.mark_hold(row["id"], "waiting on the fab")
+        dispatches.mark_release(row["id"], actor="darkmove")
+        dispatches.mark_cancel(row["id"], "rebound to @kimi: dark seat")
+        succ = self.add(recipient="kimi", kind="build",
+                        supersedes=row["id"], new_work=False)
+        rc, out, err = run(landreq_cli.cmd_lr, ["show", succ["id"]])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("RELEASED by @darkmove", out, out)
+
+    def test_lr_show_prints_unrecorded_for_an_actorless_release(self):
+        from helm import landreq_cli
+        row = self.add(kind="build")
+        held, why = dispatches.mark_hold(row["id"], "waiting on the fab")
+        self.assertIsNone(why)
+        self.assertTrue(eventledger.append(dispatches.ledger_path(), {
+            "v": 3, "event": "release", "seq": held["seq"] + 1,
+            "id": row["id"], "ts": dispatches.pk.now_ts(),
+            "reason": "waiting on the fab"}))
+        dispatches.mark_cancel(row["id"], "rebound to @kimi: dark seat")
+        succ = self.add(recipient="kimi", kind="build",
+                        supersedes=row["id"], new_work=False)
+        rc, out, err = run(landreq_cli.cmd_lr, ["show", succ["id"]])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("RELEASED by (unrecorded)", out, out)
+
+    def test_a_cancelled_row_with_a_hold_prints_no_release_line(self):
+        # THE CONTROL: the superseded walk RUNS (the held row's hold line
+        # prints), and no release fact was recorded, so no release line does.
+        from helm import landreq_cli
+        row = self.add(kind="build")
+        dispatches.mark_hold(row["id"], "waiting on the fab")
+        dispatches.mark_cancel(row["id"], "rebound to @kimi: dark seat")
+        succ = self.add(recipient="kimi", kind="build",
+                        supersedes=row["id"], new_work=False)
+        rc, out, err = run(landreq_cli.cmd_lr, ["show", succ["id"]])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("FROM ", out)
+        self.assertIn("HOLD", out)
+        self.assertNotIn("RELEASED by", out)
+
     def test_cli_hold_usage_on_no_args(self):
         rc, _out, err = run(dispatches.cmd_dispatch, ["hold"])
         self.assertEqual(rc, 2)
@@ -7554,7 +7918,7 @@ class StdinBodyDoorTest(DispatchBase):
             rc, out, _err = run(dispatches.cmd_dispatch, [
                 "send", "reviewer", "with-body-lane",
                 "--ref", self.a, "--repo", self.repo, "--kind", "review",
-                "--key", "stdin-body-control", "--new-work"])
+                "--key", "stdin-body-control", "--new-work", "--task", self.review_task["id"], "--part"])
         self.assertTrue(live_reads,
                         "a body-carrying stdin was never read, so the guard "
                         "closed the door it was meant to keep open")
@@ -7583,6 +7947,7 @@ class ApprovalTierAdvisoryTest(DispatchBase):
             "Review this tip",
             "--ref", self.a, "--repo", self.repo, "--kind", kind,
             "--key", "check-" + recipient + "-" + kind, "--new-work",
+            "--task", self.review_task["id"], "--part",
         ])
 
     def runtime(self, name, family):
@@ -7697,8 +8062,9 @@ class ApprovalTierAdvisoryTest(DispatchBase):
     def test_invalid_review_recipient_warns_with_policy_but_send_succeeds(self):
         self.policy(["seat:lead", "family:codex"])
         self.runtime("reviewer", "gemini")
-        with mock.patch.object(dispatches, "_ref_sanity", return_value=[]):
+        with mock.patch.object(dispatches, "_ref_sanity", return_value=[]) as sanity:
             rc, out, err = self.send_cli()
+        sanity.assert_called_once()
         self.assertEqual(rc, 0)
         self.assertIn("outside the current approval tier", err)
         self.assertIn("only the independent tier may final-approve", err)
@@ -7795,8 +8161,9 @@ class ApprovalTierAdvisoryTest(DispatchBase):
         surviving restriction is the advisory's own: it speaks for the review
         kind and is silent for a build, which produces no verdict to bind.
         """
-        with mock.patch.object(dispatches, "_ref_sanity", return_value=[]):
+        with mock.patch.object(dispatches, "_ref_sanity", return_value=[]) as sanity:
             rc, _out, err = self.send_cli()
+        sanity.assert_called_once()
         self.assertEqual(rc, 0)
         self.assertIn("check unavailable", err)
         self.assertNotIn("outside the current approval tier", err)
@@ -7804,9 +8171,10 @@ class ApprovalTierAdvisoryTest(DispatchBase):
         # half, and it is the half that keeps the widening honest.
         with mock.patch.object(dispatches, "_approval_tier_advisory",
                                side_effect=AssertionError("wrong scope")), \
-                mock.patch.object(dispatches, "_ref_sanity", return_value=[]):
+                mock.patch.object(dispatches, "_ref_sanity", return_value=[]) as sanity:
             rc, _out, _err = self.send_cli(recipient="builder", kind="build")
             self.assertEqual(rc, 0)
+        sanity.assert_called_once()
         # AND A REVIEW WRITTEN THROUGH add() MUST REACH IT. This is the half
         # that closes the hole: a review obligation can be written by a door
         # that is not the send verb, and its recipient is no less in need of a
@@ -7814,11 +8182,13 @@ class ApprovalTierAdvisoryTest(DispatchBase):
         seen = []
         with mock.patch.object(dispatches, "_approval_tier_advisory",
                                side_effect=lambda r: seen.append(r)), \
-                mock.patch.object(dispatches, "_ref_sanity", return_value=[]):
+                mock.patch.object(dispatches, "_ref_sanity", return_value=[]) as sanity:
             rc, _out, _err = run(dispatches.cmd_dispatch, [
                 "add", "reviewer", "approval-check", "--ref", self.a,
-                "--repo", self.repo, "--kind", "review", "--new-work"])
+                "--repo", self.repo, "--kind", "review", "--new-work",
+                "--task", self.review_task["id"], "--part"])
             self.assertEqual(rc, 0)
+        sanity.assert_called_once()
         self.assertEqual(seen, ["reviewer"],
                          "a review written through add() never consulted the "
                          "tier, which is the population this cure exists for")
@@ -8128,7 +8498,7 @@ class RefSanityTest(DispatchBase):
         rc, _out, err = run(dispatches.cmd_dispatch, [
             "send", "reviewer", "review-base", "inspect", "this",
             "--ref", tip, "--repo", self.repo, "--kind", "review",
-            "--new-work"])
+            "--new-work", "--task", self.review_task["id"], "--part"])
         self.assertEqual(rc, 0, err)
         self.assertIn("cannot stay true", err)
         self.assertIn("integrator", err)
@@ -8913,7 +9283,7 @@ class VerdictAuthorNudgeTest(DispatchBase):
         with self.verdict_author():
             rc, _out, err = run(dispatches.cmd_dispatch, [
                 "verdict", erow["id"], erow["tip"], "--fix", "--measured",
-                "--finding-count", "1", "--prior-relation", "new",
+                "--finding", "the review found a regression", "--prior-relation", "new",
                 "--worse-than-main", "helm/dispatches.py",
                 "--no-patch-because", "a design finding for a meld",
                 "cli-door evidence"])
@@ -9054,6 +9424,34 @@ class ApplySignalsWhatItTookTest(DispatchBase):
                          ["dispatch", "delivered"])
 
 
+class OneWriterNameTest(unittest.TestCase):
+
+    def test_the_row_writer_has_no_pass_through_alias(self):  # noqa: VACUOUS_ASSERTION — the scan's callers set is asserted to hold add and send before the empty alias list, so a scan that sees nothing fails
+        """task/4026 (e): a two-value wrapper forwarded `*args, **kwargs` to
+        `_base3`, and two names for one writer let a mock go dead — `send`
+        called `_base3`, so arms that patched the wrapper patched nothing
+        (task/4020, cured by hand). No top-level function of the module may
+        forward its whole call to the writer; the control is that the scan
+        sees the writer's real callers."""
+        import ast
+        with open(dispatches.__file__, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        callers, aliases = set(), []
+        for node in tree.body:
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            calls = [c for c in ast.walk(node) if isinstance(c, ast.Call)
+                     and isinstance(c.func, ast.Name)
+                     and c.func.id == "_base3"]
+            if calls:
+                callers.add(node.name)
+            if any(any(isinstance(a, ast.Starred) for a in c.args)
+                   and any(k.arg is None for k in c.keywords) for c in calls):
+                aliases.append(node.name)
+        self.assertTrue({"add", "send"} <= callers, callers)
+        self.assertEqual(aliases, [])
+
+
 class MovedLaneTest(DispatchBase):
     """An APPROVE on a branch that moved under the review is orphaned at
     birth: the write authorizes landing a commit no branch carries. The guard
@@ -9168,6 +9566,187 @@ class MovedLaneTest(DispatchBase):
         row = self.add(lane="remote-control", ref=self.b)
         self.assertEqual(row["tip"], self.b)
         self.assertIsNone(row.get("ref_branch"))
+
+    def test_two_branches_at_the_sha_bind_the_rows_own_lane(self):
+        """task/4020 arm 1: 2+ branches at the reviewed sha, exactly one
+        refs/heads/lane/<the row's lane> among them -> the row binds THAT
+        branch. Measured on task/4002: a reviewer-patch branch sat at the
+        same sha as the lane branch after a ff, the unique-tip probe refused
+        to choose, and the hold rode no train."""
+        tip = self.topic("lane/sha-mine", self.a, "sha-mine")
+        self.git("branch", "lane/reviewer-patch-4002-hc2p", tip)
+        self.assertEqual(set(self.local_tips(tip)),
+                         {"refs/heads/lane/sha-mine",
+                          "refs/heads/lane/reviewer-patch-4002-hc2p"})
+        row = self.add(lane="sha-mine", ref=tip)
+        self.assertEqual(row["tip"], tip)
+        self.assertEqual(row.get("ref_branch"), "refs/heads/lane/sha-mine")
+
+    def test_ambiguity_without_the_rows_lane_binds_nothing(self):
+        """task/4020 arm 2: 2+ branches at the sha, none of them
+        refs/heads/lane/<the row's lane> -> no binding, and the write-time
+        warning says so with the remedy (--ref lane/<lane>). A lane-free probe
+        cannot discriminate."""
+        tip = self.topic("worktree-agent-9f3c2a", self.a, "sha-x")
+        # NO lane/* branch may CONTAIN the tip: task/3511's
+        # _review_lane_refusal (--contains) would refuse the row before the
+        # warning arm is reached. The measured 3937 shape is exactly this: the
+        # reviewed sha sat on a subagent's worktree-agent-* scratch branch and
+        # an integrator-side rescue branch, lane/<lane> not among them.
+        self.git("branch", "rescue-side-ref-3937", tip)
+        self.assertEqual(set(self.local_tips(tip)),
+                         {"refs/heads/worktree-agent-9f3c2a",
+                          "refs/heads/rescue-side-ref-3937"})
+        with mock.patch("helm.dispatches._this_helm_tree",
+                        return_value=self.repo):
+            row, why = dispatches.add(
+                "codex-3",  # noqa: SEAT_NAME — DispatchBase's rostered fixture recipient; a house name is unrostered in this fixture and refuses
+                "ambiguous-elsewhere", ref=tip, repo=self.repo,
+                kind="review", new_work=True, notify=False, _reason=True,
+                task=self.review_task["id"])
+        self.assertIsNotNone(row, why)
+        self.assertEqual(row["task"], self.review_task["id"])
+        self.assertEqual(row["tip"], tip)
+        self.assertIsNone(row.get("ref_branch"))
+        warnings = row.get(dispatches._WRITE_WARNINGS) or []
+        joined = "\n".join(warnings)
+        self.assertIn("binds no local branch", joined)
+        self.assertIn("--ref lane/ambiguous-elsewhere", joined)
+
+    def test_a_sha_with_no_local_branch_but_a_remote_lane_warns_the_remedy(self):  # noqa: VACUOUS_ASSERTION — ref_branch None and the empty local_tips census are asserted as preconditions; the asserted warning text IS the positive control on the same row
+        """task/4020 arm 3a: 0 local branches at the sha; the trunk remote's
+        lane/<lane> IS at the sha -> no binding, warning names the remote
+        branch and the local-branch remedy. The 3896 failure shape: the gc
+        rescue sweep moved the local branch, only origin/lane/<lane> still
+        pointed at the held sha."""
+        tip = self.topic("lane/remote-only", self.a, "remote-only")
+        self.git("update-ref", "-d", "refs/heads/lane/remote-only")
+        self.git("update-ref", "refs/remotes/origin/lane/remote-only", tip)
+        self.assertEqual(self.local_tips(tip), [])
+        with mock.patch("helm.dispatches._this_helm_tree",
+                        return_value=self.repo):
+            row = self.add(lane="remote-only", ref=tip, kind="review")
+        self.assertEqual(row["tip"], tip)
+        self.assertIsNone(row.get("ref_branch"))
+        joined = "\n".join(row.get(dispatches._WRITE_WARNINGS) or [])
+        self.assertIn("binds no local branch", joined)
+        self.assertIn("origin/lane/remote-only", joined)
+        self.assertIn("git branch lane/remote-only", joined)
+
+    def test_a_sha_no_branch_anywhere_warns_without_a_remedy_ref(self):  # noqa: VACUOUS_ASSERTION — the warning's presence is asserted before its text; a missing warning fails the assertIn, never passes vacuously
+        """task/4020 arm 3b: 0 local branches at the sha and no lane/<lane>
+        remote branch either -> the warning says so and still names --ref
+        lane/<lane> as the fix once the branch exists."""
+        with mock.patch("helm.dispatches._this_helm_tree",
+                        return_value=self.repo):
+            row = self.add(lane="nowhere", ref=self.b, kind="review")
+        self.assertEqual(row["tip"], self.b)
+        self.assertIsNone(row.get("ref_branch"))
+        joined = "\n".join(row.get(dispatches._WRITE_WARNINGS) or [])
+        self.assertIn("binds no local branch", joined)
+        self.assertIn("lane/nowhere", joined)
+
+    def test_a_bound_review_row_carries_no_unbound_warning(self):  # noqa: VACUOUS_ASSERTION — the positive control is the bound ref_branch asserted on the same row; the warning absence is the deliberate arm
+        """The positive control: an ordinary review row on a unique branch
+        tip binds as before and warns about nothing."""
+        tip = self.topic("lane/warn-free", self.a, "warn-free")
+        row = self.add(lane="warn-free", ref=tip, kind="review")
+        self.assertEqual(row.get("ref_branch"), "refs/heads/lane/warn-free")
+        joined = "\n".join(row.get(dispatches._WRITE_WARNINGS) or [])
+        self.assertNotIn("binds no local branch", joined)
+
+    def test_a_build_row_binds_no_branch_without_the_review_warning(self):  # noqa: VACUOUS_ASSERTION — the warning's PRESENCE on the review arms beside this one is the control; this arm pins the kind scope
+        """The advisory is scoped to review rows: a build naming a bare sha
+        binds no branch and stays silent — its car does not ride the
+        one-car-per-lane guard off a hold."""
+        row = self.add(lane="build-unbound", ref=self.b, kind="build")
+        self.assertIsNone(row.get("ref_branch"))
+        joined = "\n".join(row.get(dispatches._WRITE_WARNINGS) or [])
+        self.assertNotIn("binds no local branch", joined)
+
+    def unbound_warning(self, lane, tip):
+        """The joined write warnings of a review row on `lane` at `tip`,
+        written with this fixture standing in for the helm tree; the row
+        binds no branch."""
+        with mock.patch("helm.dispatches._this_helm_tree",
+                        return_value=self.repo):
+            row = self.add(lane=lane, ref=tip, kind="review")
+        self.assertEqual(row["tip"], tip)
+        self.assertIsNone(row.get("ref_branch"))
+        joined = "\n".join(row.get(dispatches._WRITE_WARNINGS) or [])
+        self.assertIn("binds no local branch", joined)
+        return joined
+
+    def test_a_retry_that_finds_its_bound_row_carries_no_unbound_warning(self):  # noqa: VACUOUS_ASSERTION — the retry's bound ref_branch and the control's advisory at the same topology are asserted positively
+        """task/4026 (a): the warning describes the row RETURNED. A retry of
+        a review send reconciles onto the row its first write bound, but its
+        probe re-reads today's topology — here the gc rescue shape, the lane
+        branch moved past the tip — and printed "binds no local branch"
+        beside a row that binds one. The control: the writer asked of that
+        same topology DOES warn."""
+        tip = self.topic("lane/retry-bound", self.a, "retry-bound")
+        args = ("seat-c", "retry-bound", "Review the retry", tip)
+        kw = {"repo": self.repo, "kind": "review", "new_work": True,
+              "sign": False, "task": self.review_task["id"]}
+        with mock.patch("helm.dispatches._this_helm_tree",
+                        return_value=self.repo):
+            first, why, _sent = dispatches.send(*args, **kw)
+            self.assertIsNotNone(first, why)
+            self.assertEqual(first.get("ref_branch"),
+                             "refs/heads/lane/retry-bound")
+            self.advance("lane/retry-bound", "retry-rescue")
+            again, _why, sent = dispatches.send(*args, **kw)
+            _row, err, advisory = dispatches._base3(
+                "seat-c", "retry-bound", tip, None, None, self.repo,
+                kind="review", new_work=True, task=self.review_task["id"])
+        self.assertIsNone(err, err)
+        self.assertIn("binds no local branch", advisory or "")
+        self.assertFalse(sent)
+        self.assertEqual(again["id"], first["id"])
+        self.assertEqual(again.get("ref_branch"), "refs/heads/lane/retry-bound")
+        self.assertNotIn("binds no local branch", "\n".join(
+            again.get(dispatches._WRITE_WARNINGS) or []))
+
+    def test_a_branch_moved_past_the_tip_names_a_reset_not_a_create(self):
+        """task/4026 (b), the 3896 shape: a gc rescue commit moved the local
+        lane branch past the reviewed sha and only origin/lane/<lane> still
+        points at it. `git branch lane/<lane> <remote>` fails "already
+        exists", so the remedy names the branch's new tip and the reset."""
+        tip = self.topic("lane/moved-past", self.a, "moved-past")
+        head = self.advance("lane/moved-past", "moved-past-rescue")
+        self.git("update-ref", "refs/remotes/origin/lane/moved-past", tip)
+        joined = self.unbound_warning("moved-past", tip)
+        self.assertIn("only the REMOTE branch origin/lane/moved-past", joined)
+        self.assertIn("moved past it to %s" % head[:12], joined)
+        self.assertIn("git reset --hard %s" % tip[:12], joined)
+        self.assertIn("--ref lane/moved-past", joined)
+        self.assertNotIn("git branch lane/moved-past", joined)
+
+    def test_a_branch_that_does_not_hold_the_tip_names_a_fast_forward(self):
+        """task/4026 (b): the local lane branch exists but does not hold the
+        tip (it is behind), and the remote lane branch is at it. A create
+        fails "already exists"; the remedy is a fast-forward, which git
+        refuses when the two diverged."""
+        tip = self.topic("scratch-behind", self.a, "behind")
+        self.git("branch", "-D", "scratch-behind")
+        self.git("branch", "lane/behind", self.a)
+        self.git("update-ref", "refs/remotes/origin/lane/behind", tip)
+        joined = self.unbound_warning("behind", tip)
+        self.assertIn("is at %s, which does not hold it" % self.a[:12], joined)
+        self.assertIn("git merge --ff-only origin/lane/behind", joined)
+        self.assertNotIn("git branch lane/behind", joined)
+
+    def test_a_remote_branch_that_only_ends_in_the_lane_is_not_the_lane(self):
+        """task/4026 (c): refs/remotes/r/foo/lane/<lane> ends in
+        '/lane/<lane>' but is remote r's branch foo/lane/<lane>; the
+        suffix match named it as the lane's remote."""
+        tip = self.topic("scratch-suffix", self.a, "suffix")
+        self.git("branch", "-D", "scratch-suffix")
+        self.git("update-ref", "refs/remotes/r/foo/lane/suffix", tip)
+        joined = self.unbound_warning("suffix", tip)
+        self.assertIn("no lane/suffix branch, local or remote, is at the tip",
+                      joined)
+        self.assertNotIn("foo/lane/suffix", joined)
 
     def test_tags_and_remotes_do_not_make_one_local_tip_ambiguous(self):
         tip = self.topic("lane/sha-local", self.a, "sha-local")
@@ -9471,14 +10050,16 @@ class MovedLaneTest(DispatchBase):
         with mock.patch.dict(os.environ, {"GIT_DIR": os.path.join(clone, ".git"),
                                           "GIT_WORK_TREE": clone}):
             row = dispatches.add("codex-3", "UI cleanup review", ref=self.main,
-                                 repo=self.repo, kind="review", new_work=True)
+                                 repo=self.repo, kind="review", new_work=True,
+                                 task=self.review_task["id"])
         self.assertIsNotNone(row)
         self.assertEqual(row["repo_id"],
                          os.path.realpath(os.path.join(self.repo, ".git")))
         self.assertEqual(row["tip"], a_head)
         self.assertEqual(row["ref_branch"], "refs/heads/" + self.main)
         control = dispatches.add("codex-3", "UI cleanup review 2", ref=self.main,
-                                 repo=self.repo, kind="review", new_work=True)
+                                 repo=self.repo, kind="review", new_work=True,
+                                 task=self.review_task["id"])
         for key in ("repo_id", "tip", "ref_branch"):
             self.assertEqual(row[key], control[key])   # byte-identical identity
 
@@ -9495,7 +10076,8 @@ class MovedLaneTest(DispatchBase):
         with mock.patch.dict(os.environ, {"GIT_DIR": os.path.join(clone, ".git"),
                                           "GIT_WORK_TREE": clone}):
             row = dispatches.add("codex-3", "a-only work", ref="lane/a-only",
-                                 repo=self.repo, kind="review", new_work=True)
+                                 repo=self.repo, kind="review", new_work=True,
+                                 task=self.review_task["id"])
         self.assertIsNotNone(row)
         self.assertEqual(row["tip"], tip)
         self.assertEqual(row["ref_branch"], "refs/heads/lane/a-only")
@@ -9623,7 +10205,7 @@ class AuthorIdentityTest(DispatchBase):
         seats.write_roster("someseat")                  # recipient must be rostered
         row = dispatches.add("someseat", "somelane", ref=self.a,
                              repo=self.repo, kind="review", notify=False,
-                             new_work=True)
+                             new_work=True, task=self.review_task["id"])
         self.assertIsNotNone(row)
         self.assertEqual(row["sender"], "integrator")
 
@@ -9668,7 +10250,7 @@ class UnroutableRecipientTest(DispatchBase):
     def argv(self, verb, recipient, lane, *extra):
         return [verb, recipient, lane, "hi", "--ref", self.a,
                 "--repo", self.repo, "--kind", "review",
-                "--new-work"] + list(extra)
+                "--new-work", "--task", self.review_task["id"], "--part"] + list(extra)
 
     def test_an_unroutable_recipient_is_REFUSED_naming_the_REAL_seats(self):
         for name in ("helm-claude", "helm-claude-2", "codex"):
@@ -9971,7 +10553,7 @@ class RecipientCapabilityGridTest(DispatchBase):
     def argv(self, verb, recipient, lane, *extra):
         return [verb, recipient, lane, "hi", "--ref", self.a,
                 "--repo", self.repo, "--kind", "review",
-                "--new-work"] + list(extra)
+                "--new-work", "--task", self.review_task["id"], "--part"] + list(extra)
 
     def roster_state(self, state):
         """Plant one of the five roster states and return it."""
@@ -10853,7 +11435,7 @@ class StaleWriterDetectorTest(unittest.TestCase):
     the one already in use.
 
     THE NAIVE VERSION WAS SHIPPED FIRST AND WAS WRONG: comparing against the
-    key set _base writes today flagged 714 of 1375 live creations, because
+    key set _base3 writes today flagged 714 of 1375 live creations, because
     chain_root and supersedes appear on 977, ref_branch on 852 and
     recipient_display on 185 — added at different times. The ledger's own
     history is the only honest floor, which is why the rule is monotonic and
@@ -11314,7 +11896,7 @@ class CuredFixAwaitsAReviewerTest(DispatchBase):
             row, add_err = dispatches.add(
                 "seat-under-test", "coordinate-carrier", ref=self.reviewed,
                 repo=self.repo, kind="review", new_work=True, notify=False,
-                _reason=True)
+                task=self.review_task["id"], _reason=True)
         self.assertIsNone(add_err, add_err)
         # CONTROL ON THE INPUT: the row really carries BOTH coordinates and they
         # are different strings, which is the whole premise — a reader that
@@ -11342,7 +11924,7 @@ class CuredFixAwaitsAReviewerTest(DispatchBase):
     def test_production_writer_and_replay_supply_the_carried_checkout(self):  # noqa: VACUOUS_ASSERTION — materialized repo_root and the exact rendered row are unconditional positive controls on writer, replay, and consumer
         """The composed contract, not a hand-written `repo_root` fixture.
 
-        add() traverses the production `_base` writer, snapshot() traverses
+        add() traverses the production `_base3` writer, snapshot() traverses
         `_new_state`, and the web consumer reads that materialized row while its
         process cwd is outside every checkout. Removing either producer field
         assignment or the consumer read makes the exact row disappear.
@@ -11363,7 +11945,7 @@ class CuredFixAwaitsAReviewerTest(DispatchBase):
             row, add_err = dispatches.add(
                 "seat-under-test", "composed-carrier", ref=self.reviewed,
                 repo=separate, kind="review", new_work=True, notify=False,
-                _reason=True)
+                task=self.review_task["id"], _reason=True)
         self.assertIsNone(add_err, add_err)
         verdict, err = dispatches.mark_verdict(
             row["id"], self.reviewed, "measured cure", "fix")
@@ -11472,7 +12054,8 @@ class CuredFixAwaitsAReviewerTest(DispatchBase):
         from helm import landreq
         parent, err = dispatches.add(
             "peer-seat", "chain-cure", ref=self.reviewed, repo=self.repo,
-            kind="review", new_work=True, notify=False, _reason=True)
+            kind="review", new_work=True, notify=False, _reason=True,
+            task=self.review_task["id"])
         self.assertIsNone(err, err)
         _v, err = dispatches.mark_verdict(parent["id"], self.reviewed,
                                           "measured findings", "fix")
@@ -11631,6 +12214,40 @@ class CuredFixAwaitsAReviewerTest(DispatchBase):
         self.assertEqual(got, [])
         self.assertIn("ambiguous live cure carriers", err)
         self.assertIn(sibling[:12], err)
+
+    def test_a_backup_preserved_copy_is_not_a_cure_carrier(self):
+        # A reaped lane leaves its tip on a `backup/...` ref —
+        # `work/_gc.py::_delete_lane_branch` writes `refs/helm-retired/`-style
+        # preserved copies under `refs/heads/backup/` before removing the branch.
+        # That preserved copy carries the SAME commits as the live branch that
+        # is the real cure, so before the fix the index saw both tips as
+        # incomparable carriers and returned CURE_AMBIGUOUS for a row that IS
+        # placeable. A preserved copy must never name the author's debt: it
+        # must be absent from the carrier index entirely.
+        self.git("checkout", "-q", "-b", "backup/reap-cure-line", self.reviewed)
+        self.commit("preserved-copy-diverge")
+        self.git("checkout", "-q", self.main)
+        # MUST-HIT: with the preserved copy present, the live branch still
+        # names the cure. On the broken code this row is reported as
+        # "ambiguous live cure carriers" and the census drops it.
+        got, err = self.rows(self.snap_of(self.row("r1", self.reviewed)))
+        self.assertIsNone(err)
+        self.assertEqual([r["id"] for r, _w in got], ["r1"])
+        self.assertEqual(got[0][1], ("side", self.cure, 1),
+                         "the live branch, not the preserved copy, names the cure")
+        state, _w = dispatches.cure_state(
+            self.row("r1", self.reviewed),
+            dispatches._cure_index(root=self.repo, trunk=self.main)[0])
+        self.assertEqual(state, dispatches.CURE_AWAITING)
+        # CONTROL: a genuinely incomparable pair of LIVE branches (no backup
+        # ref involved) still refuses. Dropping backup refs must not swallow a
+        # real ambiguity, which would hide a cure the author actually owes.
+        self.git("checkout", "-q", "-b", "sibling", self.reviewed)
+        self.commit("independent-cure")
+        self.git("checkout", "-q", self.main)
+        got2, err2 = self.rows(self.snap_of(self.row("r2", self.reviewed)))
+        self.assertEqual(got2, [])
+        self.assertIn("ambiguous live cure carriers", err2)
 
     def test_one_ambiguous_row_does_not_suppress_an_unrelated_unique_cure(self):
         self.git("checkout", "-q", "-b", "sibling", self.reviewed)
@@ -12145,7 +12762,8 @@ class NewWorkOverALiveContraryIsAContinuationTest(DispatchBase):
         DISAGREE about it — which is the entire defect, asserted here so a
         later change to either relation lands on this arm first."""
         row = dispatches.add("seat-b", lane, ref=tip, repo=self.repo,
-                             kind="review", notify=False, new_work=True)
+                             kind="review", notify=False, new_work=True,
+                             task=self.review_task["id"])
         _out, err = dispatches.mark_verdict(row["id"], tip, "findings",
                                             polarity=polarity)
         self.assertIsNone(err)
@@ -12325,7 +12943,7 @@ class NewWorkOverALiveContraryIsAContinuationTest(DispatchBase):
 class ForeignRepoWriteDoorTest(DispatchBase):
     """A row whose repository is not this project's is refused at the door.
 
-    `_base` is the SOLE MINT of `repo_id`: rebind and retip refuse unless
+    `_base3` is the SOLE MINT of `repo_id`: rebind and retip refuse unless
     --repo matches the value the row already carries, and the abandon, landing
     and verdict paths read `row["repo_id"]` rather than measuring a fresh one.
     So this one door is the whole of the prevention, which is why it is tested
@@ -12436,8 +13054,9 @@ class ForeignRepoWriteDoorTest(DispatchBase):
         home = self._elsewhere()
         self._home(home)
         mine = dispatches._repo_info(self.repo)["repo_id"]
-        row, err = dispatches._base("seat-under-test", "zz-lane", self.a, "note", 60,
-                                    self.repo, new_work=True)
+        row, err, _advisory = dispatches._base3(
+            "seat-under-test", "zz-lane", self.a, "note", 60, self.repo,
+            new_work=True)
         self.assertIsNone(row)
         self.assertIn(mine, err)
         self.assertIn(home, err)
@@ -12579,7 +13198,8 @@ class RegisteredProjectWriteDoorTest(DispatchBase):
         self._register(otherproj=self.repo)
         row, why = dispatches.add("seat-under-test", "lane/other-project-work",
                                   ref=self.a, repo=self.repo, new_work=True,
-                                  kind="review", notify=False, _reason=True)
+                                  kind="review", notify=False,
+                                  task=self.review_task["id"], _reason=True)
         self.assertIsNotNone(row, "a registered project's row was refused: %s"
                              % (why,))
         mine = dispatches._repo_info(self.repo)["repo_id"]
@@ -12597,7 +13217,7 @@ class RegisteredProjectWriteDoorTest(DispatchBase):
         rc, out, err = run(dispatches.cmd_dispatch,
                            ["add", "seat-under-test", "lane/shipped-verb",
                             "--ref", self.a, "--kind", "review", "--new-work",
-                            "--repo", self.repo])
+                            "--repo", self.repo, "--task", self.review_task["id"], "--part"])
         self.assertEqual(rc, 0, "the shipped verb refused: %s%s" % (out, err))
         rows = list(dispatches.rows().values())
         self.assertEqual(len(rows), 1, "%r" % (rows,))
@@ -12643,7 +13263,9 @@ class RegisteredProjectWriteDoorTest(DispatchBase):
                          "`home_repo_id` names, so the ref below would be "
                          "about another repository")
         here = info["repo"]
-        tip = subprocess.run(["git", "-C", here, "rev-parse", "HEAD"],
+        # Fab may run this test at a dirty-tree snapshot commit; use a real
+        # ancestor so the assertion stays about registry admission.
+        tip = subprocess.run(["git", "-C", here, "rev-parse", "HEAD^"],
                              check=True, capture_output=True,
                              text=True).stdout.strip()
         from helm import registry
@@ -12699,14 +13321,14 @@ class RegisteredProjectWriteDoorTest(DispatchBase):
 
         row, why = dispatches.add("seat-under-test", "lane/from-the-room",
                                   ref=tip, repo=room, new_work=True,
-                                  kind="review", notify=False, _reason=True)
+                                  kind="build", notify=False, _reason=True)
         self.assertIsNotNone(row, "an empty registry locked helm out of its "
                                   "own ledger from a lane room: %s" % (why,))
         self.assertEqual(dispatches.rows()[row["id"]]["repo_id"], mirror_id)
 
         refused, why = dispatches.add("seat-under-test", "lane/from-the-gitdir",
                                       ref=tip, repo=mirror, new_work=True,
-                                      kind="review", notify=False,
+                                      kind="build", notify=False,
                                       _reason=True)
         self.assertIsNone(refused, "a path with no working tree filed a row")
         self.assertIn("needs a Git working tree", why)
@@ -12725,12 +13347,13 @@ class RegisteredProjectWriteDoorTest(DispatchBase):
         kept, why = dispatches.add("seat-under-test", "lane/registered",
                                    ref=reg_tip, repo=registered,
                                    new_work=True, kind="review", notify=False,
-                                   _reason=True)
+                                   task=self.review_task["id"], _reason=True)
         self.assertIsNotNone(kept, "the control row never landed: %s" % (why,))
 
         row, why = dispatches.add("seat-under-test", "lane/stranger",
                                   ref=self.a, repo=self.repo, new_work=True,
-                                  kind="review", notify=False, _reason=True)
+                                  kind="review", notify=False,
+                                  task=self.review_task["id"], _reason=True)
         self.assertIsNone(row, "an unregistered repository's row was filed")
         self.assertIn("not a registered helm project", why)
         self.assertIn("helm sync", why)
@@ -12754,7 +13377,8 @@ class RegisteredProjectWriteDoorTest(DispatchBase):
         self._register(projone=one, projtwo=two)
         parent, why = dispatches.add("seat-under-test", "lane/p", ref=one_tip,
                                      repo=one, new_work=True, kind="review",
-                                     notify=False, _reason=True)
+                                     task=self.review_task["id"], notify=False,
+                                     _reason=True)
         self.assertIsNotNone(parent, "%s" % (why,))
         child, why = dispatches.add("seat-under-test", "lane/p", ref=one_tip,
                                     repo=one, supersedes=parent["id"],
@@ -12869,7 +13493,8 @@ class RegisteredProjectWriteDoorTest(DispatchBase):
         self._register(otherproj=self.repo)
         row, why = dispatches.add("seat-under-test", "lane/placed-by-registry",
                                   ref=self.a, repo=self.repo, new_work=True,
-                                  kind="review", notify=False, _reason=True)
+                                  kind="review", notify=False,
+                                  task=self.review_task["id"], _reason=True)
         self.assertIsNotNone(row, "a registered project's row was refused "
                              "because THIS helm has no repository: %s" % (why,))
         self.assertEqual(dispatches.rows()[row["id"]]["repo_id"],
@@ -12944,7 +13569,8 @@ class LaneClaimEvidenceBindsToTheRowsRepositoryTest(DispatchBase):
 
         own, why = dispatches.add("seat-a", "lane/own-room", ref=mine_tip,
                                   repo=mine, new_work=True, kind="review",
-                                  deadline_s=60, notify=False, _reason=True)
+                                  deadline_s=60, task=self.review_task["id"],
+                                  notify=False, _reason=True)
         self.assertIsNotNone(own, "the registered project's row was refused, so "
                              "there is no row to measure progress on: %s" % (why,))
         rc, line = _claims.claim(mine, "own-room", "seat-a", ttl=600)
@@ -12959,7 +13585,8 @@ class LaneClaimEvidenceBindsToTheRowsRepositoryTest(DispatchBase):
 
         theirs, why = dispatches.add("seat-a", "lane/fork-room", ref=mine_tip,
                                      repo=mine, new_work=True, kind="review",
-                                     deadline_s=60, notify=False, _reason=True)
+                                     deadline_s=60, task=self.review_task["id"],
+                                     notify=False, _reason=True)
         self.assertIsNotNone(theirs, "%s" % (why,))
         rc, line = _claims.claim(fork, "fork-room", "seat-a", ttl=600)
         self.assertEqual(rc, 0, line)
@@ -12997,7 +13624,8 @@ class LaneClaimEvidenceBindsToTheRowsRepositoryTest(DispatchBase):
         """A real dispatch row through the real write door, bound to `root`."""
         row, why = dispatches.add("seat-a", "lane/" + lane, ref=tip, repo=root,
                                   new_work=True, kind="review", deadline_s=60,
-                                  notify=False, _reason=True)
+                                  task=self.review_task["id"], notify=False,
+                                  _reason=True)
         self.assertIsNotNone(row, "the row was refused, so there is nothing to "
                                   "measure progress on: %s" % (why,))
         return row
@@ -13427,9 +14055,9 @@ class ProjectLocalRuntimeBindsIdentityE2E(DispatchBase):
         self.assertEqual(list(dispatches.rows()), [kept["id"]],
                          "the refused sibling row reached the ledger anyway")
 
-        row, err = dispatches._base("seat-under-test", "zz-sibling",
-                                    sibling_head, "note", 60, sibling,
-                                    new_work=True)
+        row, err, _advisory = dispatches._base3(
+            "seat-under-test", "zz-sibling", sibling_head, "note", 60,
+            sibling, new_work=True)
         self.assertIsNone(row)
         self.assertIn(dispatches._repo_info(sibling)["repo_id"], err)
         self.assertIn(resolved["repo_id"], err)
@@ -13546,7 +14174,8 @@ class TheTierAdvisoryRidesTheWriteDoorNotAVerb(DispatchBase):
         self._outside_tier()
         row, why = dispatches.add("target-seat", "tier-lane", ref=self.a,
                                   repo=self.repo, kind="review",
-                                  new_work=True, _reason=True, notify=False)
+                                  new_work=True, task=self.review_task["id"],
+                                  _reason=True, notify=False)
         self.assertIsNone(why, why)
         self.assertTrue(row, "the advisory must not have blocked the write")
         self.assertTrue(
@@ -13571,7 +14200,7 @@ class TheTierAdvisoryRidesTheWriteDoorNotAVerb(DispatchBase):
         """A SPELLING THE ROW ACCEPTS MUST NOT LOSE THE ADVISORY.
 
         `clean_kind` lowercases and strips, and BOTH doors normalise AFTER
-        asking for the note — `add` one line before `_base`, `send` while
+        asking for the note — `add` one line before `_base3`, `send` while
         holding its own `kind_value`. So `--kind Review` minted a row recorded
         as "review" and carrying NO tier note: a review by every later reader,
         with the one write-time warning about an unbindable approve silently
@@ -13586,7 +14215,8 @@ class TheTierAdvisoryRidesTheWriteDoorNotAVerb(DispatchBase):
         # at all, which is the way this arm would rot silently.
         row, why = dispatches.add("target-seat", "tier-lane", ref=self.a,
                                   repo=self.repo, kind="review",
-                                  new_work=True, _reason=True, notify=False)
+                                  new_work=True, task=self.review_task["id"],
+                                  _reason=True, notify=False)
         self.assertIsNone(why, why)
         self.assertTrue(self._notes(row), "the control must carry a note")
         # THE LANE MUST DIFFER PER ITERATION AND THE SPELLING CANNOT SUPPLY
@@ -13599,7 +14229,8 @@ class TheTierAdvisoryRidesTheWriteDoorNotAVerb(DispatchBase):
                 row, why = dispatches.add(
                     "target-seat", "tier-lane-cased-%d" % index,
                     ref=self.a, repo=self.repo, kind=spelling,
-                    new_work=True, _reason=True, notify=False)
+                    new_work=True, task=self.review_task["id"],
+                    _reason=True, notify=False)
                 self.assertIsNone(why, why)
                 # THE ROW RECORDS IT AS A REVIEW — the half that makes the
                 # missing note a contradiction rather than a policy.
@@ -13637,7 +14268,8 @@ class TheTierAdvisoryRidesTheWriteDoorNotAVerb(DispatchBase):
         self._outside_tier()
         row, why, _sent = dispatches.send(
             "source-seat", "tier-rebind-lane", "review this", self.a,
-            repo=self.repo, sign=False, new_work=True, kind="review")
+            repo=self.repo, sign=False, new_work=True, kind="review",
+            task=self.review_task["id"])
         self.assertIsNone(why, why)
         # force=True with a reason IS the evidence arm's documented override,
         # so this arm does not need to stage a starved source: it is about the
@@ -15690,7 +16322,7 @@ class ASourceCleanHoldNamesTheIntegrator(DispatchBase):
     def held(self, tip=None, **kw):
         row = self.add()
         return row, dispatches.mark_hold(
-            row["id"], "awaiting the land gate",
+            row["id"], "awaiting the land gate; fab Ran 5 tests OK",
             source_clean_tip=tip, **kw)
 
     def folded(self, row):
@@ -15796,14 +16428,14 @@ class ASourceCleanHoldNamesTheIntegrator(DispatchBase):
         reviewer believed the newer one was recorded."""
         row, (_out, why) = self.held(tip=self.a)
         self.assertIsNone(why)
-        again, err = dispatches.mark_hold(row["id"], "awaiting the land gate",
+        again, err = dispatches.mark_hold(row["id"], "awaiting the land gate; fab Ran 5 tests OK",
                                           source_clean_tip=self.c)
         self.assertIsNone(again)
         self.assertIn(self.a, err)
         self.assertIn(self.c, err)
         # The SAME tip with the same reason is still idempotent, so the
         # refusal above is about the change and not about repetition.
-        same, serr = dispatches.mark_hold(row["id"], "awaiting the land gate",
+        same, serr = dispatches.mark_hold(row["id"], "awaiting the land gate; fab Ran 5 tests OK",
                                           source_clean_tip=self.a)
         self.assertIsNone(serr)
         self.assertEqual(same["source_clean_tip"], self.a)
@@ -15912,7 +16544,7 @@ class ASourceCleanHoldNamesTheIntegrator(DispatchBase):
                              (41, False), (63, False), (39, False)):
             tip = "b" * length
             rid = self.found_with()
-            self.plant_hold(rid, "awaiting the land gate",
+            self.plant_hold(rid, "awaiting the land gate; fab Ran 5 tests OK",
                             source_clean_tip=tip)
             folded = dispatches.snapshot()[0][rid]
             self.assertEqual(folded["status"], "held",
@@ -15980,7 +16612,7 @@ class ASourceCleanHoldNamesTheIntegrator(DispatchBase):
         with mock.patch.object(dispatches, "_nudge",
                                lambda to, body, ctx: calls.append((to, body, ctx))):
             rc, _out, err = run(dispatches.cmd_dispatch,
-                                ["hold", row["id"], "awaiting the land gate",
+                                ["hold", row["id"], "awaiting the land gate; fab Ran 5 tests OK",
                                  "--source-clean", self.c])
         self.assertEqual(rc, 0, err)
         self.assertEqual(len(calls), 1, calls)
@@ -16006,7 +16638,7 @@ class ASourceCleanHoldNamesTheIntegrator(DispatchBase):
             # empty one above is the claim and not a dead double.
             clean = self.add()
             run(dispatches.cmd_dispatch,
-                ["hold", clean["id"], "awaiting the land gate",
+                ["hold", clean["id"], "awaiting the land gate; fab Ran 5 tests OK",
                  "--source-clean", self.c])
         self.assertEqual(rc, 0, err)         # the hold itself still happened
         self.assertEqual(self.folded(row)["status"], "held")
@@ -16025,7 +16657,7 @@ class ASourceCleanHoldNamesTheIntegrator(DispatchBase):
                                  "--owner-gated"])
             clean = self.add()               # same-observable control
             run(dispatches.cmd_dispatch,
-                ["hold", clean["id"], "awaiting the land gate",
+                ["hold", clean["id"], "awaiting the land gate; fab Ran 5 tests OK",
                  "--source-clean", self.c])
         self.assertEqual(rc, 0, err)
         self.assertTrue(self.folded(row)["owner_gated"])
@@ -16048,14 +16680,14 @@ class ASourceCleanHoldNamesTheIntegrator(DispatchBase):
         with mock.patch.object(dispatches, "_nudge",
                                lambda to, body, ctx: calls.append(to)):
             out, why = dispatches.mark_hold(
-                row["id"], "awaiting the land gate", source_clean_tip=self.c)
+                row["id"], "awaiting the land gate; fab Ran 5 tests OK", source_clean_tip=self.c)
             writer_calls = list(calls)
             # THE SAME OBSERVABLE, PROVEN LIVE: the identical hold through the
             # VERB fills this list. So an empty writer_calls is about WHERE
             # the delivery lives and not about a patch that never fired.
             via_verb = self.add()
             run(dispatches.cmd_dispatch,
-                ["hold", via_verb["id"], "awaiting the land gate",
+                ["hold", via_verb["id"], "awaiting the land gate; fab Ran 5 tests OK",
                  "--source-clean", self.c])
         self.assertIsNone(why)
         self.assertEqual(out["status"], "held")
@@ -16088,7 +16720,7 @@ class ReviewerPatchTipIsCoAuthorWorkTest(DispatchBase):
         with self.verdict_author():
             return run(dispatches.cmd_dispatch, [
                 "verdict", row["id"], row["tip"], "--fix", "--measured",
-                "--finding-count", "1", "--prior-relation", "new",
+                "--finding", "the review found a regression", "--prior-relation", "new",
                 "--worse-than-main", "helm/dispatches.py", *flags,
                 *(() if any(f == "--patch-tip" for f in flags)
                   else ("--no-patch-because", "a design finding for a meld")),
@@ -16368,8 +17000,8 @@ class ReadVerbsRunInsideOneMemoScopeTest(DispatchBase):
         self.assertEqual(sorted(dispatches.DISPATCH_READ_VERBS),
                          ["brief", "briefs", "collisions", "get", "list", "mix",
                           "read", "show", "status", "triage"])
-        writers = ["add", "cancel", "hold", "mark-delivered", "rebind",
-                   "release", "retip", "send", "verdict"]
+        writers = ["add", "attach-task", "cancel", "hold", "mark-delivered",
+                   "rebind", "release", "retip", "send", "verdict"]
         self.assertEqual(
             [v for v in writers if v in dispatches.DISPATCH_READ_VERBS], [],
             "a verb that APPENDS is inside the memo scope")
@@ -16406,7 +17038,7 @@ class RowHeaderSiteTest(DispatchBase):
         row, why, posted = dispatches.send(
             "seat-a", "dm-brief-site", "Do this exact thing", self.a,
             repo=self.repo, key="dm-brief-1", kind="review", sign=False,
-            new_work=True)
+            new_work=True, task=self.review_task["id"])
         self.assertIsNone(why)
         self.assertTrue(posted)
         self.assertEqual(len(row["id"]), 32,
@@ -16516,7 +17148,7 @@ class ReviewLaneRefusalTest(DispatchBase):
     def _add_review(self, lane, ref, repo):
         """Call dispatches.add with kind="review" and return (row, why)."""
         return dispatches.add(
-            "seat-a", lane, ref=ref, repo=repo,
+            "seat-a", lane, ref=ref, repo=repo, task=self.review_task["id"],
             kind="review", new_work=True, notify=False, _reason=True)
 
     def _with_helm_mock(self, test_fn):

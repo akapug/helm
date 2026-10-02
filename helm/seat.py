@@ -377,11 +377,21 @@ def _gated_proxy_before_pane(family, seat_name):
 
 def _resume(seat_name, rest, _locked=False, target_sid=None,
             expected_session=None, adapter=None, reboot_dead=False,
-            reboot_sid=None):
+            reboot_sid=None, unattended=None):
     """seat resume <seat> — relaunch the seat's pane at its drain point via
     the detected metaharness: the pane runs the seat's freshly re-minted
-    launch.sh (latest env/identity/hooks) with claude's own continuity flag
-    appended, so the SESSION survives while the environment refreshes: the
+    launch.sh (latest identity/hooks) with claude's own continuity flag
+    appended, so the SESSION survives while the environment refreshes.
+
+    EXACTLY AS IT RAN (task/3695). The re-mint carries the seat's LAUNCH
+    RECIPE — the model, window, subagent pin, denied tools and system prompt
+    it ran with, and its effort on the pane command — read from its own
+    transcript, its live process or the sweep's capture of it, and its last
+    launch (helm/seat_recipe.py), never today's catalog defaults: a catalog
+    change reaches a parked seat only when the operator asks for it with
+    `--defaults`, which prints each field that moves first. A recipe with a
+    field no source knows, or one the launch line cannot carry, REFUSES
+    before anything is stopped or re-minted. The session it resumes is: the
     session the seat's LIVE process holds, from its presence record
     (`--resume <id>`, or `--session-id <id>` for one with no transcript yet —
     task/3208, a /clear moves the live session before any transcript does);
@@ -433,9 +443,15 @@ def _resume(seat_name, rest, _locked=False, target_sid=None,
     transcript vanishes is a DIFFERENT conversation (found on the cut
     that pinned only the zero-transcript case). It pins the session alone:
     the worktree and pane-proof pins of target_sid belong to the
-    autocompact seam and are not the sweep's."""
+    autocompact seam and are not the sweep's. `unattended` names an
+    UNATTENDED caller — the reboot sweep, the context-wall recovery — which
+    has no operator to choose --defaults, so a recipe missing only fields a
+    defaults resume never took from the seat's past run resumes on today's
+    defaults in one loud line naming them (helm/seat_recipe.py
+    `_takes_defaults`); the operator's resume passes none and refuses."""
     rest = list(rest)
     into_pane = None
+    defaults = "--defaults" in rest
     role_err = _seat_lifecycle_impl._resume_role(rest, {})[1]
     if role_err:
         print("helm seat: " + role_err, file=sys.stderr)
@@ -482,15 +498,31 @@ def _resume(seat_name, rest, _locked=False, target_sid=None,
                   "row (sessions.spawn_resume)", file=sys.stderr)
             return 2
         if "--role" in rest:
-            print("helm seat: --role is not supported for an orca-adopted seat "
-                  "— only Helm-managed spawn records can preserve and reassert "
-                  "a launch role", file=sys.stderr)
-            return 2
+            # AN ADOPTED SEAT HAS NO SPAWN REGISTER, so its role is its native
+            # DECLARATION (seat_role.declare_role), recorded before the relaunch
+            # so a refused declaration relaunches nothing. The relaunch reads
+            # it back: a claude session declared lead resumes with the lead
+            # window, marker and lean profile (seat_recipe.adopted_plan), as a
+            # `helm launch --seat S --role lead` would carry them; every role
+            # reader sees the declaration at once.
+            from .seat_role import declare_role
+            role = _seat_lifecycle_impl._resume_role(rest, {})[0]
+            why = declare_role(seat_name, role)
+            if why:
+                print("helm seat: " + why, file=sys.stderr)
+                return 2
+            print("helm seat: %s declared role %s" % (seat_name, role))
         # the hand verb's call is pinned by test_orcaadopt; the sweep's pin
         # rides only when there is one
+        # only an unattended caller's call carries `unattended`: it resumes
+        # a recipe missing fields the defaults never carried on the defaults
         rc, lines = orcaadopt.resume(seat_name, force="--force" in rest,
-                                     **({"session": reboot_sid}
-                                        if reboot_sid else {}))
+                                     **dict({"session": reboot_sid}
+                                            if reboot_sid else {},
+                                            **({"defaults": True}
+                                               if defaults else {}),
+                                            **({"unattended": unattended}
+                                               if unattended else {})))
         for line in lines:
             print(line, file=sys.stderr if rc else sys.stdout)
         return rc
@@ -522,7 +554,7 @@ def _resume(seat_name, rest, _locked=False, target_sid=None,
                            target_sid=target_sid,
                            expected_session=expected_session,
                            adapter=adapter, reboot_dead=reboot_dead,
-                           reboot_sid=reboot_sid)
+                           reboot_sid=reboot_sid, unattended=unattended)
     launch_sh = os.path.join(d, "launch.sh")
     if not os.path.exists(launch_sh):
         print("helm seat: no %s seat minted (%s missing) — `helm seat add %s` "
@@ -588,6 +620,11 @@ def _resume(seat_name, rest, _locked=False, target_sid=None,
     # transcript, the old session again; so that pane starts FRESH under the
     # same id, which claude accepts for an id with no transcript (MEASURED).
     fresh = False
+    # the session a resumed PRUNED COPY was pruned from, when this resume
+    # asked for one: the recovery's registered session, or the live one a
+    # rescue copy replaces. Its capture binds the copy only through the
+    # copy's own lineage stamp naming exactly it (task/3695)
+    lineage_source = expected_session if target_sid else None
     if target_sid:
         sid, sess_cwd = _seat_session_by_id(d, target_sid)
     elif reboot_sid:
@@ -617,7 +654,7 @@ def _resume(seat_name, rest, _locked=False, target_sid=None,
             if path and _prune_source(path) == sid:
                 print("  session %s… is a pruned copy of it, the rescue, so "
                       "the pane resumes the copy" % rescue[:8])
-                sid = rescue
+                lineage_source, sid = sid, rescue
             sess_cwd = _seat_session_by_id(d, sid, real_turn=False)[1] \
                 or live_cwd
             fresh = not glob.glob(os.path.join(
@@ -631,6 +668,11 @@ def _resume(seat_name, rest, _locked=False, target_sid=None,
             if live == LIVE_FOREIGN:
                 print("  %s; the transcripts decide" % live_why)
             sid, sess_cwd = _newest_seat_session(d, prefer_source=prior_sid)
+            # the ranking's rescue copy of the registered session (rank 3)
+            # asks for that session as its source, as `seat recipe` reads
+            # it; the copy's own lineage stamp must still name exactly it
+            if sid and prior_sid and sid != prior_sid:
+                lineage_source = prior_sid
 
     def continuity():
         """The relaunch's continuity flag, asked again after the reap: a
@@ -669,9 +711,13 @@ def _resume(seat_name, rest, _locked=False, target_sid=None,
                   "worktree is missing or unavailable: %r" %
                   (seat_name, prior_worktree), file=sys.stderr)
             return 1
-        resume_cwd = prior_worktree
+        resume_cwd, cwd_source = prior_worktree, "spawn register worktree"
     else:
         resume_cwd = cwd_override or _resume_cwd(seat_name, sess_cwd)
+        cwd_source = ("--cwd" if cwd_override else "transcript"
+                      if resume_cwd == sess_cwd else
+                      "moved from the transcript's cwd" if sess_cwd else
+                      "helm's safe cwd; the transcript names none")
     stale_why = _stale_resume_cwd(resume_cwd)
     if stale_why:
         # REFUSE BEFORE REAPING: the gate must fire while the seat still has
@@ -770,9 +816,26 @@ def _resume(seat_name, rest, _locked=False, target_sid=None,
         print("helm seat: %s cannot be resumed — %s"
               % (seat_name, endpoint_err), file=sys.stderr)
         return 1
+    # THE RECIPE (task/3695), read and judged while the seat's process, if
+    # any, still runs, and before anything is stopped or written: a refusal
+    # here leaves the pane and launch.sh exactly as they were. It sits after
+    # the endpoint only because the exact line it checks renders the port; a
+    # seat with a launch.sh already holds its endpoint, so that is no spend.
+    from . import seat_recipe
+    plan = seat_recipe.proxy_plan(
+        family, seat_name, d, sid, resume_cwd,
+        prior if prior.get("seat") == seat_name else {}, role, room,
+        room_source, multi, identity, prior_model, defaults=defaults,
+        cwd_source=cwd_source, unattended=unattended, source=lineage_source)
+    for line in plan.lines:
+        print("  " + line)
+    if plan.refusal:
+        print("helm seat: refusing to resume %s — %s"
+              % (seat_name, plan.refusal), file=sys.stderr)
+        return 1
     # The flag the relaunch line carries is kept, so the closing line names
     # the one used rather than asking again after the new claude has run.
-    tail = continuity()
+    tail = plan.extra + continuity()
     command = _seat_lifecycle_impl._launch_command(launch_sh, role, tail=tail)
     from . import harness
     ad = adapter or harness.detect()
@@ -790,7 +853,8 @@ def _resume(seat_name, rest, _locked=False, target_sid=None,
             refused = _write_launch_assets(
                 family, d, room, seat_name,
                 room_source=room_source, multi=multi,
-                model=prior_model, identity=identity) is _SEAT_SURFACE_REFUSED
+                model=prior_model, identity=identity,
+                recipe=plan.overrides) is _SEAT_SURFACE_REFUSED
         except OSError as e:
             _restore_launch(launch_sh, launch_was)
             print("helm seat: launch asset re-mint failed: %s" % e,
@@ -825,7 +889,7 @@ def _resume(seat_name, rest, _locked=False, target_sid=None,
         # id with a transcript is refused ("already in use", MEASURED).
         print("  session %s… wrote its first transcript before the reap; "
               "resuming it instead" % sid[:8])
-        tail = continuity()
+        tail = plan.extra + continuity()
         command = _seat_lifecycle_impl._launch_command(launch_sh, role,
                                                        tail=tail)
     prove = reboot_dead or bool(errors)
@@ -895,7 +959,8 @@ def _resume(seat_name, rest, _locked=False, target_sid=None,
         if _write_launch_assets(
                 family, d, room, seat_name, workdir=resume_cwd,
                 room_source=room_source, multi=multi,
-                model=prior_model, identity=identity) \
+                model=prior_model, identity=identity,
+                recipe=plan.overrides) \
                 is _SEAT_SURFACE_REFUSED:
             return _unwound()
         from . import seats
@@ -1512,8 +1577,12 @@ def _spawn_native_plan(seat_name, project, room, cwd, role, model=None):
     allocate a scratch TMPDIR. The name is still READ BACK FROM ITS PRODUCER
     rather than restated from this function's own string."""
     from . import launch as launch_mod
+    # THE PLAN SHOWS THE WINDOW THE LAUNCH WILL REALLY STAMP, so it takes the
+    # SAME role the live leg takes from the same register (`role`, this
+    # function's own argument). A preview built without it showed a lead an
+    # env with no window and then launched one with 240k (task/4049).
     env = launch_mod.build_env(os.environ, seat_name, room=room,
-                               allocate_scratch=False)
+                               allocate_scratch=False, role=role)
     print("helm seat spawn %s — plan (--print: nothing spawned, reaped, or "
           "re-minted):" % seat_name)
     print("  family: %s (NATIVE — no proxy, no port, no seat config, no "
@@ -2751,8 +2820,8 @@ def _boot_brief(rest):
 
 
 def cmd_seat(args):
-    """seat add|up|down|launch|spawn|where|rebind|resume|retitle|smoke|list|
-    status|doctor|lifecycle — multimodel seats."""
+    """seat add|up|down|launch|spawn|where|rebind|resume|retitle|cubicles|
+    smoke|list|status|doctor|lifecycle — multimodel seats."""
     args = list(args)
     if not args:
         print(_USAGE, file=sys.stderr)
@@ -2789,6 +2858,9 @@ def cmd_seat(args):
     if verb == "lifecycle":
         from . import seat_ledger
         return seat_ledger.cmd_lifecycle(rest)
+    if verb == "mood":                     # task/3899: guards its own tail
+        from . import seatmood
+        return seatmood.cmd(rest)
     if verb == "autocompact":
         from . import autocompact
         return autocompact.cmd_autocompact(rest)
@@ -2861,6 +2933,11 @@ def cmd_seat(args):
         # guards its own tail; helm/seat_rest.py says who may write it.
         from . import seat_rest
         return seat_rest.cmd_rest(rest)
+    if verb == "shout":
+        # A SEAT'S VOICE WITH A BUDGET (task/3901): speak up in #seats, or
+        # shout to the owner's phone. It guards its own tail.
+        from . import seatshout
+        return seatshout.cmd_shout(rest)
     if verb == "where":
         if not rest:
             print("usage: helm seat where <seat> [--json]", file=sys.stderr)
@@ -2900,6 +2977,12 @@ def cmd_seat(args):
         # RETIRED_SPAWN_DENIES). Dry-run default; it guards its own tail.
         from . import seat_launch_assets as _assets
         return _assets.cmd_retire_deny(rest)
+    if verb == "recipe":
+        # READ-ONLY (task/3695): the launch recipe a seat runs or ran with,
+        # each field's source, and whether a resume restores it exactly.
+        # It guards its own tail.
+        from . import seat_recipe
+        return seat_recipe.cmd_recipe(rest)
     if verb == "remint":
         # RE-MINT WITHOUT LAUNCHING: a seat's launch.sh brought back to what
         # the catalog (or the seat's explicit choice) says, through the same
@@ -2913,6 +2996,13 @@ def cmd_seat(args):
         # checksum table. It guards its own tail.
         from . import orcatitle
         return orcatitle.cmd_retitle(rest)
+    if verb == "cubicles":
+        # THE OWNER'S FLOOR (task/3900): each fleet seat's tab moved to the
+        # Orca pane its state names. The seat resume sweep makes the same
+        # moves on its timer; this is the plan on demand. Dry-run default; it
+        # guards its own tail.
+        from . import cubicles
+        return cubicles.cmd_cubicles(rest)
     if verb == "composers":
         rc = guard_tail("helm seat composers", rest, flags=("--json",),
                         valued=("--submit",),
@@ -2941,8 +3031,8 @@ def cmd_seat(args):
             return seat_resume_all.cmd_resume_all(rest)
         if not rest:
             print("usage: helm seat resume <seat>|--all [--cwd DIR] "
-                  "[--session ID] [--role worker|lead] [--force] [--apply]",
-                  file=sys.stderr)
+                  "[--session ID] [--role worker|lead] [--force] "
+                  "[--defaults] [--apply]", file=sys.stderr)
             return 2
         # resume RELAUNCHES the pane — trailing junk refuses before it fires.
         # --force is admitted because an orca-adopted resume is REFUSED by the
@@ -2953,10 +3043,13 @@ def cmd_seat(args):
         # --session pins the exact transcript (the rescue path: cv prune
         # prints the new id, resume must attach THAT copy — the walled
         # original otherwise wins the content race 3 times out of 5).
-        rc = guard_tail("helm seat resume", rest[1:], flags=("--force",),
+        # --defaults (task/3695) is the operator CHOOSING today's defaults
+        # over the recipe the seat ran with; resume is exact without it.
+        rc = guard_tail("helm seat resume", rest[1:],
+                        flags=("--force", "--defaults"),
                         valued=("--cwd", "--session", "--role"),
                         usage="seat resume <seat> [--cwd DIR] [--session ID] "
-                              "[--role worker|lead] [--force]")
+                              "[--role worker|lead] [--force] [--defaults]")
         if rc is not None:
             return rc
         # The operator's resume clears a desired-down record; `_resume` itself

@@ -87,8 +87,13 @@ PARKS_WORDS = ("PARKS until a tier reader can take it",
 #: NEVER_OVER_OPUS (the owner, room row 2217).
 FABLE_RUNG = "Fable is for max QC only"
 NEVER_OVER_OPUS = "never prefer Fable over Opus automatically"
-MAX_QC_CASES = ("an owner P0, a release, a public push, or a money or creds "
-                "door with no other reader")
+#: ONLY ON THE OWNER'S ASK (task/3855, the owner: "Fable? we
+#: haven't used Fable in days. why did we just start again now?"). The old
+#: case list ended "or a money or creds door with no other reader", and that
+#: clause is how a door read with every author Opus or codex went to Fable.
+MAX_QC_CASES = "it reads only when the owner asks for it"
+#: The retired case list, which no ladder surface may teach again.
+RETIRED_MAX_QC_CASES = "a money or creds door with no other reader"
 MAX_QC_WORDS = ("max QC", MAX_QC_CASES, "3 Opus tokens per Fable token",
                 "helm burn", "anthropic ORANGE or worse")
 #: (c) MUST-MISS: Fable named as a last rung, a default, or a fallback the
@@ -491,31 +496,37 @@ class AModelRunsReadIsRecordedOnTheLedgerTest(_landreq.LandReqBase):
         self.assertEqual((read["reviewer_family"], read["independence"]),
                          ("codex", "cross-family"))
 
-    def test_the_SAME_FAMILY_is_refused_even_as_another_model(self):  # noqa: VACUOUS_ASSERTION — the refusal is asserted POSITIVELY (out is None AND the error names the rule and the remedy), and the absence of a read is read off the same ledger a sibling arm proves a read lands on
+    def test_an_OPUS_reader_of_a_CLAUDE_author_is_judged_by_its_run(self):  # noqa: VACUOUS_ASSERTION — the refusal is asserted POSITIVELY (out is None AND the error names the run's bound and the remedy), and the absence of a read is read off the same ledger a sibling arm proves a read lands on
         """Opus 5.4 for an Opus 5.5 author, in the two spellings helm knows
-        for a Claude Opus model. Both are Claude and neither is Fable. THE
-        RULE IS UNCHANGED; the remedy it names is the owner's order."""
+        for a Claude Opus model. Both are Claude and neither is Fable, so the
+        read counts only as a fresh-context run (task/3855): with no run on
+        disk the refusal names that bound, never "the same family", and the
+        remedy it names is the owner's order."""
         row = self.row()
         for model in ("opus", "claude-opus-5"):
             with self.subTest(model=model):
                 out, err = self.record(row["id"], reviewer_model=model)
                 self.assertIsNone(out)
-                self.assertIn("same family", err)
+                self.assertIn("helm judges it as a fresh-context run", err)
+                self.assertNotIn("same family", err)
                 assert_cheap_first_fable_max_qc(self, err)
         self.assertEqual(self.reads(row["id"]), [])
         self.assertEqual(self.open_row(row["id"])["status"], "open")
 
-    def test_the_AUTHORS_EXACT_MODEL_is_refused_and_names_the_owners_order(self):  # noqa: VACUOUS_ASSERTION — the refusal is asserted POSITIVELY (out is None AND the error names the rule and the remedy), and the absence of a read is read off the same ledger a sibling arm proves a read lands on
+    def test_the_AUTHORS_EXACT_MODEL_is_refused_and_names_the_owners_order(self):  # noqa: VACUOUS_ASSERTION — the refusal is asserted POSITIVELY (out is None AND the error names the run's bound and the remedy), and the absence of a read is read off the same ledger a sibling arm proves a read lands on
         """THE LIVE REFUSAL: "the reviewing model opus IS the author's model
         opus ... Get another family's read (the qwen27 seat is always one)
-        or Fable's". The rule stands; its remedy now names a cheap different
-        family first, codex for an irreversible door, the park when none can
-        take it, and Fable only for max QC."""
+        or Fable's". An Opus read of Opus work is judged by its run
+        (task/3855), so with no run on disk the refusal names that bound and
+        never says the read is not independent; its remedy names the
+        approval tier, the park when none can take it, and Fable only on the
+        owner's ask."""
         row = self.row()
         out, err = self.record(row["id"], reviewer_model="opus",
                                author_model="opus")
         self.assertIsNone(out)
-        self.assertIn("IS the author's model", err)
+        self.assertIn("helm judges it as a fresh-context run", err)
+        self.assertNotIn("not an independent review", err)
         assert_cheap_first_fable_max_qc(self, err)
         self.assertEqual(self.reads(row["id"]), [])
 
@@ -935,7 +946,7 @@ class AReadOnACancelledRowRidesItsSuccessorTest(_landreq.LandReqBase):
     `--supersedes`; the rebind arm moves a read row through the real verb."""
 
     AUTHOR = "claude-opus-5-5"
-    HOLD = "read clean, awaiting the land gate"
+    HOLD = "read clean, awaiting the land gate; fab Ran 5 tests OK"
 
     def setUp(self):
         super().setUp()
@@ -1271,6 +1282,22 @@ class FableIsForMaxQCOnlyTest(unittest.TestCase):
         self.assertLess(qc, words.index(MAX_QC_CASES))
         self.assertLess(words.index(MAX_QC_CASES),
                         words.index("You have reached your Fable limit"))
+
+    def test_Fable_reads_only_on_the_owners_ask_after_a_fresh_Opus_read(self):  # noqa: VACUOUS_ASSERTION — the surface count is asserted 10 unconditionally, and each surface is asserted to carry the new case and name Fable before the retired case's absence is read
+        """task/3855: every ladder surface names a fresh-context Opus read
+        before Fable, says Fable reads only on the owner's ask, and no
+        longer teaches the "money or creds door with no other reader" case
+        that sent a door read to Fable."""
+        remedy = flat(dispatches.review_remedy("abcdef0123456789"))
+        self.assertLess(remedy.index("fresh-context"), remedy.index("Fable"))
+        surfaces = ladder_surfaces()
+        self.assertEqual(len(surfaces), 10)
+        for name, text in surfaces.items():
+            with self.subTest(surface=name):
+                words = flat(text)
+                self.assertIn("Fable", words)
+                self.assertIn(MAX_QC_CASES, words)
+                self.assertNotIn(RETIRED_MAX_QC_CASES, words)
 
     #: The sentences the ruling retired, as the surfaces carried them (a
     #: placeholder filled), and the shapes a later edit could reach for.

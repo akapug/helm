@@ -105,6 +105,9 @@ def _empty_profile():
         "schema_version": SCHEMA_VERSION,
         "technical_level": "",
         "guidance": [],
+        # what a seat the owner rarely talks to is told instead (inject's
+        # WHO_LONGTAIL audience): answer him if he speaks, else agent-to-agent
+        "longtail_guidance": [],
         "interview_status": "",  # "" (never offered) | "offered" | "done"
         "updated_at": "",
         "source": "fresh",  # "fresh" | "merged-from-scaffold"
@@ -135,6 +138,7 @@ def load_profile():
     base["schema_version"] = max(SCHEMA_VERSION, ver)
     base["technical_level"] = str(d.get("technical_level") or "").strip()
     base["guidance"] = _norm_guidance(d.get("guidance"))
+    base["longtail_guidance"] = _norm_guidance(d.get("longtail_guidance"))
     base["interview_status"] = str(d.get("interview_status") or "").strip()
     base["updated_at"] = str(d.get("updated_at") or "").strip()
     base["source"] = str(d.get("source") or "fresh").strip()
@@ -150,7 +154,7 @@ def save_profile(p):
 
 def _content_key(p):
     return (p["schema_version"], p["technical_level"], tuple(p["guidance"]),
-            p["interview_status"], p["source"])
+            tuple(p["longtail_guidance"]), p["interview_status"], p["source"])
 
 
 def merge_scaffold(scaffold_path=None):
@@ -167,9 +171,10 @@ def merge_scaffold(scaffold_path=None):
         lvl = str(ext.get("technical_level") or "").strip()
         if lvl and not p["technical_level"]:
             p["technical_level"] = lvl
-        for g in _norm_guidance(ext.get("guidance")):
-            if g not in p["guidance"]:
-                p["guidance"].append(g)
+        for key in ("guidance", "longtail_guidance"):
+            for g in _norm_guidance(ext.get(key)):
+                if g not in p[key]:
+                    p[key].append(g)
         status = str(ext.get("interview_status") or "").strip()
         if _STATUS_RANK.get(status, 0) > _STATUS_RANK.get(p["interview_status"], 0):
             p["interview_status"] = status
@@ -313,10 +318,12 @@ def cmd_whoami(args):
         print("  technical level: %s" % p["technical_level"])
     print("  interview: %s   source: %s   updated: %s" % (
         p["interview_status"] or "not offered", p["source"], p["updated_at"] or "-"))
-    if p["guidance"]:
-        print("\n  standing guidance:")
-        for g in p["guidance"]:
-            print("    - %s" % g)
+    for key, head in (("guidance", "standing guidance"),
+                      ("longtail_guidance", "for seats you rarely talk to")):
+        if p[key]:
+            print("\n  %s:" % head)
+            for g in p[key]:
+                print("    - %s" % g)
     if notes:
         print("\n  active notes (newest first):")
         for e in notes:

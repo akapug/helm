@@ -174,7 +174,9 @@ class EveryTaughtSurfaceCarriesTheCoAuthorProcedureTest(unittest.TestCase):
                       verbs)
         self.assertIn("A review whose original full brief is recoverable",
                       verbs)
-        help_text = read("helm/cli_help.py")
+        # The verb help moved to one file per verb (task/3918); dispatch's
+        # help is helm/help/dispatch.txt, the text `helm dispatch --help` prints.
+        help_text = read("helm/help/dispatch.txt")
         self.assertIn("a recoverable full brief travels with the move",
                       help_text)
         self.assertIn("in MELD-DIFF the reviewer posts the exact diff",

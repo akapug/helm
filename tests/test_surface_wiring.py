@@ -99,8 +99,9 @@ def _assigned_dicts(filename):
 
 
 def _cli_tables():
-    """The dispatch table from cli.py and the verb help table from
-    cli_help.py, where each is written."""
+    """The dispatch table from cli.py (still a literal there) and the verb
+    help table, read from the dict cli_help builds at import — one file
+    per verb in helm/help/, not a dict literal in the module (3918)."""
     verb_mod, verb_help = {}, {}
     for name, table in _assigned_dicts("cli.py"):
         if name == "VERBS":
@@ -110,11 +111,10 @@ def _cli_tables():
                     verb_mod[k.value] = (v.args[0].value, v.args[1].value)
                 elif isinstance(v, ast.Name):
                     verb_mod[k.value] = ("cli", v.id)
-    for name, table in _assigned_dicts("cli_help.py"):
-        if name == "_VERB_HELP":
-            for k, v in zip(table.keys, table.values):
-                if isinstance(v, ast.Constant):
-                    verb_help[k.value] = v.value
+    from helm import cli_help
+    for k, v in cli_help._VERB_HELP.items():
+        if isinstance(v, str):
+            verb_help[k] = v
     return verb_mod, verb_help
 
 

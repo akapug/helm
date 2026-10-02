@@ -203,8 +203,10 @@ def owed_line(got, hint=True):
                           if hint else "")
 
 
-def brief(root, now=None):
-    """The walk's method, filled for this walk, to hand a fresh reader."""
+def brief(root, now=None, checks=()):
+    """The walk's method, filled for this walk, to hand a fresh reader.
+    `checks`, a sequence of one-line checks, prints as a "CHECK THESE
+    (release gate)" block before the method (task/3938)."""
     got = owed(root, now=now)
     if got["owed"] is None:
         status = "Whether a walk is owed is %s." % got["reason"]
@@ -217,7 +219,15 @@ def brief(root, now=None):
             % got["reason"]
     from .web_common import DEFAULT_PORT    # DEFERRED — the owner's port
     widths = " and ".join("%d px" % w for w in WIDTHS)
-    return "\n".join((
+    lines = []
+    checks = tuple(c for c in (checks or ()) if isinstance(c, str)
+                    and c.strip())
+    if checks:
+        lines.append("CHECK THESE (release gate)")
+        for i, c in enumerate(checks, 1):
+            lines.append("  %d. %s" % (i, c))
+        lines.append("")
+    lines.append("\n".join((
         "CONSOLE WALK %d — walk the owner's web console whole, as a fresh "
         "reader." % got["next_n"],
         "",
@@ -268,7 +278,8 @@ def brief(root, now=None):
         "  P2: the same kind of break in a hover, a footer or a secondary "
         "fold, or on a surface that often fails to read.",
         "  P3: weak or cosmetic.",
-    )) + "\n"
+    )) + "\n")
+    return "\n".join(lines)
 
 
 def _read_said(root):
@@ -319,9 +330,70 @@ def surface(root, post, now=None, say=None):
     return line
 
 
+def _release_design_doc(reviews_dir_path, release):
+    """The design doc for `release` in the project's reviews dir: the file
+    whose name ends in -design.md and carries the release (a date-stamped
+    <date>-<release>-design.md), or None when there is no such doc."""
+    try:
+        names = os.listdir(reviews_dir_path)
+    except OSError:
+        return None
+    for name in sorted(names):
+        if name.endswith("-%s-design.md" % release):
+            return os.path.join(reviews_dir_path, name)
+    return None
+
+
+def _acceptance_console_checks(doc_path):
+    """The release-gate checks on the design doc's Acceptance section: the
+    single item that names "the owner's console", its clauses split on the
+    commas and the final "and" into the checks to run, in order. -> a list
+    of check strings, or None when the doc, its Acceptance section or its
+    console line cannot be read."""
+    try:
+        with open(doc_path) as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    m = re.search(r"^##\s*Acceptance\s*\(.*?\)[^\n]*\n(.*?)(?=\n##\s|$)",
+                  text, re.M | re.S)
+    if not m:
+        return None
+    for line in m.group(1).splitlines():
+        if "owner's console" not in line:
+            continue
+        clause = re.sub(r"^\s*\d+\.\s*", "", line).strip()
+        m2 = re.search(r"console:\s*([^.]*)", clause)
+        if not m2:
+            return None
+        rest = m2.group(1).strip().rstrip(".")
+        items = [p.strip() for p in re.split(r",\s+", rest)]
+        if items and items[-1].lower().startswith("and "):
+            items[-1] = items[-1][4:].strip()
+        return [c for c in items if c.strip()]
+    return None
+
+
+def release_checks(root, release):
+    """The checks a release's confirm walk verifies, read from the design
+    doc's Acceptance section console line (task/3938). Graceful degrade: an
+    unreadable doc, missing Acceptance section or missing console line gives
+    an empty list, never an error — the walk prints no check block in that
+    case."""
+    doc = _release_design_doc(reviews_dir(root), release)
+    if doc is None:
+        return []
+    return _acceptance_console_checks(doc) or []
+
+
 def cmd_walk(args):
-    """web walk [--repo DIR] — print the console walk brief."""
+    """web walk [--repo DIR] [--check "TEXT"]... [--release VERSION] — print
+    the console walk brief. Repeated --check (or --release, which reads the
+    checks from the design doc's Acceptance section console line) prints a
+    "CHECK THESE (release gate)" block in the brief."""
     repo = None
+    checks = []
+    release = None
     args = list(args or [])
     while args:
         a = args.pop(0)
@@ -329,17 +401,29 @@ def cmd_walk(args):
             repo = args.pop(0)
         elif a.startswith("--repo="):
             repo = a.split("=", 1)[1]
+        elif a == "--check" and args:
+            checks.append(args.pop(0))
+        elif a.startswith("--check="):
+            checks.append(a.split("=", 1)[1])
+        elif a == "--release" and args:
+            release = args.pop(0)
+        elif a.startswith("--release="):
+            release = a.split("=", 1)[1]
         elif a in ("-h", "--help"):
-            print("usage: helm web walk [--repo DIR] — print the brief a "
-                  "fresh reader walks the console by")
+            print("usage: helm web walk [--repo DIR] [--check CHECK]... "
+                  "[--release VERSION] — print the brief a fresh reader "
+                  "walks the console by")
             return 0
         else:
-            print("usage: helm web walk [--repo DIR]", file=sys.stderr)
+            print("usage: helm web walk [--repo DIR] [--check CHECK]... "
+                  "[--release VERSION]", file=sys.stderr)
             return 2
     root = _lanes.find_root(repo or os.getcwd())
     if not root:
         print("helm web walk: %s is not inside a git repository"
               % (repo or os.getcwd()), file=sys.stderr)
         return 1
-    print(brief(root), end="")
+    if release:
+        checks = release_checks(root, release) + list(checks or [])
+    print(brief(root, checks=checks), end="")
     return 0

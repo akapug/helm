@@ -1,0 +1,1 @@
+weather [--json] [--push] — alias for `helm office weather` (the whole floor, read-only by default)

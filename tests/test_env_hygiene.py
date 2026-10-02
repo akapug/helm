@@ -30,6 +30,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 _TESTS = os.path.dirname(os.path.abspath(__file__))
 
@@ -41,6 +42,12 @@ INTENTIONAL_GLOBAL = {
     "tests/__init__.py": {"HELM_METAHARNESS", "HELM_STOP_TIMING_AFTER",
                           # no suite filing may start a real model read
                           "HELM_QWEN27_FINDINGS",
+                          # no arm may ring the owner's phone through the
+                          # office weather, nor read the fleet for it
+                          "HELM_OFFICE_WEATHER",
+                          # no arm's failing tick leg may count toward
+                          # another arm's tick alarm
+                          "HELM_TICK_ALARM",
                           # no arm may read this box's seat memory unasked
                           "HELM_SEAT_PRESSURE",
                           # no arm may change this host's scheduler
@@ -458,6 +465,45 @@ def suite_census():
 
 
 class EnvHygieneTest(unittest.TestCase):
+    def test_sweep_fixtures_restore_absent_and_present_env(self):
+        from tests import test_resumeturn
+        keys = ("HELM_HOME", "HELM_CHAT_DIR", "HELM_CHAT_NAME",
+                "HELM_RESUME_TURN_SETTLE_S", "HELM_SUBMIT_SETTLE_S",
+                "HELM_RESUME_TURN_RECOVERY_PERSIST_S",
+                "HELM_RESUME_TURN_RECOVERY_BACKOFF_S")
+        cases = ((test_resumeturn.SweepClosesStaleRecoveryRowsTest,
+                  "test_older_recovery_row_is_not_closed_when_a_newer_nudge_overwrites"),
+                 (test_resumeturn.SweepProcessesAmbiguousRecordsTest,
+                  "test_a_record_on_each_of_two_keys_is_cleared"))
+        with mock.patch.dict(os.environ, {}, clear=True):
+            fixture = cases[0][0](cases[0][1])
+            fixture.setUp()
+            self.assertIn("HELM_HOME", tuple(os.environ))
+            try:
+                self.assertTrue(os.environ["HELM_HOME"] ==
+                                os.path.join(fixture.tmp, "helm-home"),
+                                "HELM_HOME fixture setup")
+            finally:
+                fixture.tearDown()
+            for case, method in cases:
+                for prior in (None, "original"):
+                    with self.subTest(case=case.__name__, prior=prior):
+                        os.environ.clear()
+                        if prior is not None:
+                            os.environ.update({k: prior for k in keys})
+                        fixture = case(method)
+                        fixture.setUp()
+                        try:
+                            self.assertTrue(os.environ["HELM_HOME"] ==
+                                            os.path.join(fixture.tmp, "helm-home"),
+                                            "HELM_HOME fixture setup")
+                        finally:
+                            fixture.tearDown()
+                        for k in keys:
+                            self.assertEqual(k in os.environ, prior is not None, k)
+                            if prior is not None:
+                                self.assertTrue(os.environ[k] == prior, k)
+
     def _scan(self):
         """[(rel, {key: line})] for every test module that leaks."""
         census = suite_census()

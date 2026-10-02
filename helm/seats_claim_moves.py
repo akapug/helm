@@ -7,8 +7,12 @@ claims patch or a seats-facade patch must still reach the transfer transaction.
 from . import seats_claims as claims
 
 
-def rebind_claim_holder(source, target, snap=None, restore=None):
+def rebind_claim_holder(source, target, snap=None, restore=None, only=None):
     """Move every live lease from one seat NAME to another: (ok, msg, manifest).
+
+    `only`, when given, is the STORED resource keys to move and no others:
+    the dark-seat mover hands one started task's leases to the seat that
+    takes that task, and the seat's other leases stay (task/3881).
 
     `_binding_ok` compares `holder` RAW, so a rename ORPHANS the old name's
     leases, and release_stale cannot rescue them — it needs exactly "stale"
@@ -44,6 +48,7 @@ def rebind_claim_holder(source, target, snap=None, restore=None):
             dst, "unaddressable as a seat token" if listed == "unmeasurable"
             else "on no roster row (`helm chat seats --all`)")), []
     back = {e.get("resource"): e for e in restore or () if isinstance(e, dict)}
+    only = None if only is None else set(only)
     moved, now = [], claims._now_mono()
     with claims._claim_flocked() as lock:
         if lock.f is None:
@@ -54,7 +59,8 @@ def rebind_claim_holder(source, target, snap=None, restore=None):
             return False, "%s — the ledger was NOT rewritten" % exc, []
         for resource, row in list(c.items()):
             if resource == "_fence" or not isinstance(row, dict) \
-                    or row.get("holder") != src:
+                    or row.get("holder") != src \
+                    or (only is not None and resource not in only):
                 continue
             undo = back.get(resource)
             if restore is not None and (undo is None or

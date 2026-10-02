@@ -335,7 +335,7 @@ class ClaimTaskTest(WorkBase):
     def test_claim_task_records_the_lane_key(self):  # noqa: VACUOUS_ASSERTION — the record and the join are asserted equal to the filed task id
         tid = self.file()
         rc, out, err = self.work("claim", "demo", "--seat", "s1",
-                                 "--task", tid)
+                                 "--task", tid, "--part")
         self.assertEqual(rc, 0, err)
         self.assertEqual(taskkey.lane_records(self.root)[0]["demo"],
                          frozenset({tid}))
@@ -344,7 +344,7 @@ class ClaimTaskTest(WorkBase):
 
     def test_claim_task_refuses_an_unknown_task_by_name(self):  # noqa: VACUOUS_ASSERTION — the refusal text is the positive control; the absent room and record are the point
         rc, _out, err = self.work("claim", "demo", "--seat", "s1",
-                                  "--task", "task/999999")
+                                  "--task", "task/999999", "--part")
         self.assertNotEqual(rc, 0)
         self.assertIn("task/999999", err)
         self.assertIn("not in the task ledger", err)
@@ -356,7 +356,7 @@ class ClaimTaskTest(WorkBase):
         tid = self.file()
         tasks.close(tid, "done by hand")
         rc, _out, err = self.work("claim", "demo", "--seat", "s1",
-                                  "--task", tid)
+                                  "--task", tid, "--part")
         self.assertNotEqual(rc, 0)
         self.assertIn(tid, err)
         self.assertIn("closed", err)
@@ -372,7 +372,7 @@ class ClaimTaskTest(WorkBase):
                             capture_output=True).returncode
         self.assertEqual(rc, 0)
         rc, _out, err = self.work("claim", "demo", "--seat", "s1",
-                                  "--task", tid)
+                                  "--task", tid, "--part")
         self.assertEqual(rc, 0, err)
         self.assertEqual(taskkey.lane_records(self.root)[0]["demo"],
                          frozenset({tid}))
@@ -395,7 +395,7 @@ class ClaimTaskTest(WorkBase):
             return real(where, *args, **kw)
         with mock.patch.object(_lanes, "_git", git):
             rc, _out, err = self.work("claim", "demo", "--seat", "s1",
-                                      "--task", tid)
+                                      "--task", tid, "--part")
         self.assertNotEqual(rc, 0)
         self.assertIn("could not be read", err)
         self.assertEqual(subprocess.run(
@@ -497,7 +497,7 @@ class ClaimTaskTest(WorkBase):
             return real(where, *args, **kw)
         with mock.patch.object(_lanes, "_git", git):
             rc, _out, err = self.work("claim", "demo", "--seat", "s1",
-                                      "--task", tid)
+                                      "--task", tid, "--part")
         self.assertNotEqual(rc, 0)
         self.assertIn("could not be read", err)
         self.assertEqual(subprocess.run(
@@ -508,16 +508,65 @@ class ClaimTaskTest(WorkBase):
     def test_claim_task_refuses_a_lane_that_records_another_task(self):  # noqa: VACUOUS_ASSERTION — the first claim's record is asserted present and unchanged
         one, two = self.file("one"), self.file("two")
         rc, out, err = self.work("claim", "demo", "--seat", "s1",
-                                 "--task", one)
+                                 "--task", one, "--part")
         self.assertEqual(rc, 0, err)
         lease = out.strip().split("\t")[2]
         rc, _out, err = self.work("claim", "demo", "--seat", "s1",
-                                  "--lease", lease, "--task", two)
+                                  "--lease", lease, "--task", two, "--part")
         self.assertNotEqual(rc, 0)
         self.assertIn(one, err)
         self.assertIn(two, err)
         self.assertEqual(taskkey.lane_records(self.root)[0]["demo"],
                          frozenset({one}))
+
+
+class ClaimWholeTest(WorkBase):
+    """task/3746 D2: `helm work claim <lane> --task task/N --whole` records,
+    on the lane branch beside its task, that the lane carries the WHOLE ask,
+    so its land leaves the task owing a seen-working check
+    (helm/landtask.py, helm/observed.py)."""
+
+    def file(self, title="the thing"):
+        row, err = tasks.add(title, "s1", force_new=True)
+        self.assertIsNone(err, err)
+        return row["id"]
+
+    def test_claim_whole_records_the_whole_ask_on_the_lane_branch(self):  # noqa: VACUOUS_ASSERTION — the whole record is asserted equal to the filed id
+        tid = self.file()
+        rc, out, err = self.work("claim", "demo", "--seat", "s1",
+                                 "--task", tid, "--whole")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(taskkey.lane_wholes(self.root)[0]["demo"],
+                         frozenset({tid}))
+        self.assertEqual(_git(self.root, "config", "--get",
+                              "branch.lane/demo.helmWhole"), tid)
+        self.assertIn("whole", out + err)
+
+    def test_a_claim_without_whole_records_no_whole_ask(self):  # noqa: VACUOUS_ASSERTION — the task record beside it is asserted written
+        tid = self.file()
+        rc, _out, err = self.work("claim", "demo", "--seat", "s1",
+                                  "--task", tid, "--part")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(taskkey.lane_records(self.root)[0]["demo"],
+                         frozenset({tid}))
+        self.assertEqual(taskkey.lane_wholes(self.root)[0], {})
+
+    def test_whole_without_task_refuses_before_anything_is_claimed(self):  # noqa: VACUOUS_ASSERTION — the refusal text is the positive control; the absent room is the point
+        rc, _out, err = self.work("claim", "demo", "--seat", "s1", "--whole")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("--whole", err)
+        self.assertIn("--task", err)
+        self.assertFalse(os.path.isdir(os.path.join(self.tmp, "proj-wt",
+                                                    "demo")))
+
+    def test_a_deleted_branch_takes_its_whole_record_with_it(self):
+        _git(self.root, "branch", "lane/gone")
+        self.assertEqual(taskkey.record_whole(self.root, "gone", "task/5"),
+                         (True, None))
+        self.assertEqual(taskkey.lane_wholes(self.root)[0],
+                         {"gone": frozenset({"task/5"})})
+        _git(self.root, "branch", "-D", "lane/gone")
+        self.assertEqual(taskkey.lane_wholes(self.root)[0], {})
 
 
 class _RaceKit:
@@ -1674,25 +1723,94 @@ class DispatchTaskTest(ChainBase):
         self.assertIsNone(kid)
         self.assertIn("--new-work", why)
 
+    def test_a_continuation_refuses_a_different_proven_lane_task(self):
+        first, other = self.file("first ask"), self.file("other ask")
+        parent = self.root(task=first)
+        self.git("branch", "lane/lane-b")
+        self.assertEqual(taskkey.record_lane(self.repo, "lane-b", other),
+                         (True, None))
+        kid, why = self.child(parent["id"])
+        self.assertIsNone(kid)
+        self.assertIn(first, why)
+        self.assertIn(other, why)
+        literal, why = self.child(parent["id"],
+                                  lane="task-%s-other" % other.split("/")[1])
+        self.assertIsNone(literal)
+        self.assertIn(first, why)
+        self.assertIn(other, why)
+        self.assertEqual(set(dispatches.rows()), {parent["id"]})
+
+    def test_a_continuation_refuses_contradictory_or_unreadable_lane_proof(self):
+        first, other = self.file("first ask"), self.file("other ask")
+        parent = self.root(task=first)
+        self.git("branch", "lane/lane-b")
+        self.assertEqual(taskkey.record_lane(self.repo, "lane-b", first),
+                         (True, None))
+        self.git("config", "--add", "branch.lane/lane-b.helmTask", other)
+        kid, why = self.child(parent["id"])
+        self.assertIsNone(kid)
+        self.assertIn("contradictory", why)
+        self.assertIn(other, why)
+        original = taskkey.lane_records
+
+        def unread(repo, key=taskkey.LANE_KEY):
+            records, error = original(repo, key)
+            return (records, "injected unreadable record") if key == taskkey.LANE_KEY \
+                else (records, error)
+
+        with mock.patch.object(taskkey, "lane_records", unread):
+            kid, why = self.child(parent["id"], lane="unread-lane")
+        self.assertIsNone(kid)
+        self.assertIn("injected unreadable record", why)
+        self.assertEqual(set(dispatches.rows()), {parent["id"]})
+
+    def test_a_same_task_rename_and_an_unproved_suffix_can_continue(self):
+        first, other = self.file("first ask"), self.file("other ask")
+        parent = self.root(task=first)
+        self.git("branch", "lane/lane-b")
+        self.assertEqual(taskkey.record_lane(self.repo, "lane-b", first),
+                         (True, None))
+        renamed, why = self.child(parent["id"])
+        self.assertIsNone(why, why)
+        self.assertEqual(renamed["chain_root"], parent["id"])
+        suffix, why = self.child(renamed["id"],
+                                 lane="unproven-%s" % other.split("/")[1])
+        self.assertIsNone(why, why)
+        self.assertEqual(suffix["chain_root"], parent["id"])
+
+    def test_train_blame_uses_the_ejected_cars_own_late_proof(self):
+        first, other = self.file("first ask"), self.file("other ask")
+        parent = self.root(task=first)
+        child, why = self.child(parent["id"])
+        self.assertIsNone(why, why)
+        self.git("branch", "lane/lane-b")
+        self.assertEqual(taskkey.record_lane(self.repo, "lane-b", other),
+                         (True, None))
+        task, unknown, refusal = trainblame.lane_task(child["id"])
+        self.assertIsNone(refusal)
+        self.assertIsNone(task)
+        self.assertIn(first, unknown)
+        self.assertIn(other, unknown)
+
     def test_a_literal_in_the_lane_is_recorded_and_a_suffix_is_not(self):  # noqa: VACUOUS_ASSERTION — the literal lane's row carries the task, the positive control on the same field
         tid = self.file()
         num = tid.split("/")[1]
-        named = self.root(lane="task-%s-x" % num)
+        named = self.root(lane="task-%s-x" % num, task=None)
         self.assertEqual(named.get("task"), tid)
-        suffix = self.root(lane="fix-%s" % num)
+        suffix = self.root(lane="fix-%s" % num, task=None, kind="build")
         self.assertNotIn("task", suffix)
         self.assertEqual(trainblame.lane_task(suffix["id"]),
                          (None, None, None))
 
     def test_the_brief_names_one_task(self):  # noqa: VACUOUS_ASSERTION — the one-task brief's row carries the task, the positive control on the same field
         tid, other = self.file("one"), self.file("two")
-        one, err = dispatches._base(
+        one, err, _advisory = dispatches._base3(
             "seat-b", "lane-b", self.a, None, 600, self.repo, kind="review",
             new_work=True, message_body="build %s now" % tid)
         self.assertIsNone(err, err)
         self.assertEqual(one.get("task"), tid)
-        two, err = dispatches._base(
-            "seat-b", "lane-b", self.a, None, 600, self.repo, kind="review",
+        two, err, _advisory = dispatches._base3(
+            "seat-b", "lane-b", self.a, None, 600, self.repo, kind="build",
             new_work=True, message_body="build %s after %s" % (tid, other))
         self.assertIsNone(err, err)
         self.assertNotIn("task", two)
@@ -1702,7 +1820,7 @@ class DispatchTaskTest(ChainBase):
         self.git("branch", "lane/lane-a")
         self.assertEqual(taskkey.record_lane(self.repo, "lane-a", tid),
                          (True, None))
-        row = self.root()
+        row = self.root(task=None)
         self.assertEqual(row.get("task"), tid)
         bad, why = dispatches.add("seat-b", "lane-a", repo=self.repo,
                                   kind="review", notify=False, new_work=True,
@@ -1719,7 +1837,7 @@ class DispatchTaskTest(ChainBase):
         tasks.close(tid, "closed between the claim and the first dispatch")
         row, why = dispatches.add("seat-b", "lane-a", repo=self.repo,
                                   kind="review", notify=False, new_work=True,
-                                  _reason=True, ref=self.a)
+                                  _reason=True, ref=self.a, task=None)
         self.assertIsNone(row)
         self.assertIn(tid, why)
         self.assertIn("closed", why)
@@ -1730,7 +1848,7 @@ class DispatchTaskTest(ChainBase):
         rc, _out, err = run(dispatches.cmd_dispatch,
                             ["add", "seat-b", "lane-a", "--ref", self.a,
                              "--kind", "review", "--repo", self.repo,
-                             "--new-work", "--task", tid])
+                             "--new-work", "--task", tid, "--part"])
         self.assertEqual(rc, 0, err)
         (row,) = dispatches.rows().values()
         self.assertEqual(row["task"], tid)
@@ -1828,7 +1946,7 @@ class TrainBlameUnknownTest(ChainBase):
         self.assertIsNone(task)
         self.assertIsNone(refusal)
         self.assertIn("contradictory", unknown)
-        plain = self.root(lane="plain-lane")
+        plain = self.root(lane="plain-lane", task=None, kind="build")
         self.assertEqual(trainblame.lane_task(plain["id"]),
                          (None, None, None))
         from helm import autoland

@@ -68,6 +68,10 @@ HELD_PANE = "\n".join(("─" * 40,
                        "  ⏵⏵ bypass permissions on"))
 
 
+KILL_LINE = "\x15"       # the readline kill-to-line-start key a TUI reads
+END_OF_LINE = "\x05"     # the readline end-of-line key a TUI reads
+
+
 class FakeAdapter(harness._CLIAdapter):
     """Inherits the REAL `submit` (split send + read-back) from the base, so a
     second implementation cannot agree with a broken one."""
@@ -91,6 +95,10 @@ class FakeAdapter(harness._CLIAdapter):
     def send(self, handle, text, enter=True):
         if enter:
             self.enter_attempted = True
+        elif text == KILL_LINE:
+            self.typed = ""       # what a TUI does with Ctrl+U: empties the line
+        elif text == END_OF_LINE:
+            pass                  # a cursor move; it changes neither line nor text
         else:
             self.typed = text
         self.sent.append((handle, text, enter))
@@ -671,10 +679,7 @@ class DetachedInjectionTest(ResumeTurnBase):
                 return self.tails.pop(0)
 
         ad = StuckThenMoves()
-        with mock.patch.object(resumeturn, "_route_recovery",
-                               return_value=False):
-            mode, detail = resumeturn.child(
-                "codex", SID, text, 0, adapter=ad)
+        mode, detail = resumeturn.child("codex", SID, text, 0, adapter=ad)
         self.assertEqual(mode, "resumed", detail)
         self.assertEqual(ad.sent,
                          [("h1", text, False), ("h1", "", True),
@@ -755,7 +760,11 @@ class DetachedInjectionTest(ResumeTurnBase):
         self.assertEqual(ad.sent, [],
                          "one recorded snapshot must spend zero Enters")
 
-    def test_typed_but_unreadable_injection_routes_without_recovery_enter(self):  # noqa: VACUOUS_ASSERTION — unverified mode and the exact initial two sends positively control zero retry Enter
+    def test_typed_but_unreadable_injection_is_kept_for_the_sweep_without_recovery_enter(self):  # noqa: VACUOUS_ASSERTION — unverified mode, the exact initial two sends, the kept record and the one alert positively control zero retry Enter and zero rows
+        """A pane that goes unreadable after the Enter: helm cannot prove the
+        line is still there, so it presses nothing more and sends no clear
+        key; the record stays for the sweep, and the parked seat is alerted.
+        No recovery row is filed (task/1818)."""
         class UnreadableAfterEnter(FakeAdapter):
             def read(self, handle, limit=3000, timeout=60):
                 if self.enter_attempted:
@@ -763,21 +772,17 @@ class DetachedInjectionTest(ResumeTurnBase):
                 return super().read(handle, limit=limit, timeout=timeout)
 
         ad = UnreadableAfterEnter()
-        with mock.patch.object(resumeturn, "_route_recovery",
-                               return_value=(None, "task ledger refused")) as route, \
-                mock.patch.object(resumeturn, "_alert") as alert:
+        with mock.patch.object(resumeturn, "_alert") as alert:
             mode, detail = resumeturn.child(
                 "codex", SID, "GO NOW", 0, adapter=ad)
         self.assertEqual(mode, "unverified", detail)
         self.assertEqual(ad.sent,
                          [("h1", "GO NOW", False), ("h1", "", True)],
                          "UNKNOWN must not guess with another bare Enter")
-        route.assert_called_once()
-        self.assertEqual(route.call_args.args[0], "codex")
-        self.assertEqual(route.call_args.args[1]["handle"], "h1")
-        self.assertTrue(route.call_args.args[1]["generation"])
-        self.assertIn("recovery routing UNKNOWN: task ledger refused", detail)
-        alert.assert_not_called()
+        self.assertIn("Helm's own line unknown", detail)
+        self.assertIn("h1", resumeturn.recorded_injections())
+        self.assertEqual(tasks.rows(), {})
+        alert.assert_called_once()
 
     def test_direct_delivery_clear_failure_mints_terminal_task(self):  # noqa: VACUOUS_ASSERTION — resumed mode and the closed terminal row positively control the blocked second Enter
         ad = FakeAdapter()
@@ -819,15 +824,16 @@ class DetachedInjectionTest(ResumeTurnBase):
                                side_effect=fail_clear), \
                 mock.patch.object(tasks, "add",
                                   return_value=(None, "task store unwritable")), \
-                mock.patch.object(resumeturn, "_recovery_owner",
-                                  return_value=(None, None)), \
                 mock.patch.object(resumeturn, "_alert") as alert:
             mode, detail = resumeturn.child(
                 "codex", SID, "GO NOW", 0, adapter=ad)
         self.assertEqual(mode, "unverified", detail)
         self.assertIn("no terminal authority persisted", detail)
-        self.assertIn("recovery routing UNKNOWN", detail)
-        self.assertIn("injection", resumeturn._peek("codex"))
+        # The pane advanced, so the take-back finds the line already gone:
+        # no key, and the record that could have re-armed an Enter goes too.
+        self.assertIn("Helm's own line gone", detail)
+        self.assertEqual([s for s in ad.sent if s[1] == KILL_LINE], [])
+        self.assertNotIn("injection", resumeturn._peek("codex"))
         alert.assert_not_called()
 
     def test_scan_requires_identity_then_a_later_persistent_read(self):  # noqa: VACUOUS_ASSERTION — both scans return populated rows before the error-absence checks
@@ -1014,6 +1020,92 @@ class DetachedInjectionTest(ResumeTurnBase):
         self.assertEqual(len(wakes), 1, self.spawned)
         self.assertEqual(wakes[0]["seat"], "codex")
         self.assertTrue(wakes[0]["reason"], wakes)
+
+
+class ResumeOverSuggestionTest(ResumeTurnBase):
+    """task/4001 — a Claude Code SUGGESTION is not a human draft.
+
+    resume-turn refused to resume a compacted seat because its composer
+    held CC's own per-turn suggestion (measured: 33 and 17 characters), so
+    the seat stayed down for hours. The stripped composer read (the locator
+    strips every SGR) cannot see that the text is drawn faint or greyed, so
+    it reads a suggestion as a possible draft and refuses. The cure keeps
+    that read and, only when it says dirty, takes one styled read of the
+    same row: a body drawn entirely faint (SGR 2) or grey-foregrounded is a
+    suggestion and reads clean; anything else keeps the draft refusal.
+    """
+
+    def _child(self, ad):
+        def reproved(_row, _adapter, action, **_kw):
+            return action(ad, "h1", "re-proved h1"), None
+
+        with mock.patch("helm.autocompact._pane_action",
+                        side_effect=reproved), \
+                mock.patch.object(resumeturn, "_alert") as alert:
+            mode, detail = resumeturn.child("codex", SID, "GO NOW", 0,
+                                            adapter=ad)
+        return mode, detail, alert
+
+    def _holding(self, row, resume=False):
+        # Before typing the composer holds `row`. A resume must then see the
+        # TYPED text — a real pane overwrites a suggestion once you type — so a
+        # resume arm delegates to the base after the first keystroke; a
+        # refusal never types, so its composer stays as `row`.
+        class Holding(FakeAdapter):
+            def read(self, handle, limit=3000, timeout=60):
+                if resume and self.typed:
+                    return super().read(handle, limit=limit, timeout=timeout)
+                return "\n".join(("─" * 40, row, "─" * 40,
+                                  "  opus-5 | ~/dev/example/repo"))
+        return Holding()
+
+    def _resume(self, ad):
+        # The CLEAN idiom (the registered-pane test above): no _pane_action
+        # mock, so once the pre-read passes the real deliver flow runs —
+        # type, then a bare Enter — and the two sends are the positive
+        # control that the resume actually happened.
+        mode, detail = resumeturn.child("codex", SID, "GO NOW", 0,
+                                        adapter=ad)
+        return mode, detail
+
+    def test_a_faint_suggestion_reads_clean_and_resumes(self):  # noqa: VACUOUS_ASSERTION — resumed mode and the exact two sends positively control the resume-over
+        ad = self._holding("❯\xa0\x1b[2mRerun the failing test suite\x1b[22m   ",
+                           resume=True)
+        mode, detail = self._resume(ad)
+        self.assertEqual(mode, "resumed", detail)
+        self.assertEqual(ad.sent, [("h1", "GO NOW", False), ("h1", "", True)])
+
+    def test_a_grey_foreground_suggestion_reads_clean_too(self):
+        ad = self._holding("❯\xa0\x1b[38;2;127;127;127mPick up the 4001 lane"
+                           "\x1b[39m   ", resume=True)
+        mode, detail = self._resume(ad)
+        self.assertEqual(mode, "resumed", detail)
+        self.assertEqual(ad.sent, [("h1", "GO NOW", False), ("h1", "", True)])
+
+    def test_a_real_typed_draft_still_refuses(self):  # noqa: VACUOUS_ASSERTION — "resumed" is the positive control; the redacted detail proves the refusal carried no draft text, and ad.sent == [] proves nothing was typed
+        secret = "Run the failing test suite"
+        ad = self._holding("❯\xa0" + secret)
+        mode, detail, alert = self._child(ad)
+        self.assertEqual(mode, "unverified", detail)
+        self.assertEqual(ad.sent, [], "nothing is typed over a real draft")
+        self.assertNotIn(secret, detail)
+        self.assertIn("redacted", detail)
+        self.assertNotIn(secret, str(alert.call_args))
+
+    def test_a_mixed_styled_row_still_refuses(self):  # noqa: VACUOUS_ASSERTION — a dim run beside a plain run is not a proven suggestion
+        ad = self._holding("❯\xa0\x1b[2mRerun\x1b[0m the suite")
+        mode, detail, _alert = self._child(ad)
+        self.assertEqual(mode, "unverified", detail)
+        self.assertEqual(ad.sent, [])
+
+    def test_an_unreadable_composer_still_refuses(self):  # noqa: VACUOUS_ASSERTION — "resumed" is the positive control; an unreadable composer fails closed (no send, no resume)
+        class Dark(FakeAdapter):
+            def read(self, handle, limit=3000, timeout=60):
+                return "pane repainting; no prompt located"
+        ad = Dark()
+        mode, detail, _alert = self._child(ad)
+        self.assertEqual(mode, "unverified", detail)
+        self.assertEqual(ad.sent, [])
 
 
 class InjectionIdentityOutlivesAuthorizationTest(ResumeTurnBase):
@@ -2127,8 +2219,6 @@ class InjectionIdentityOutlivesAuthorizationTest(ResumeTurnBase):
                         mock.patch.object(harness, "SUBMIT_VERIFY_INTERVAL_S", 0), \
                         mock.patch("helm.autocompact._pane_action", side_effect=current), \
                         mock.patch.object(pk, "event", side_effect=journal), \
-                        mock.patch.object(resumeturn, "_route_recovery",
-                                          return_value=(None, "synthetic route")) as route, \
                         mock.patch.object(resumeturn, "_alert") as alert:
                     mode, detail = resumeturn.child(
                         "codex", SID, "the actual child's long directive " * 8,
@@ -2138,29 +2228,28 @@ class InjectionIdentityOutlivesAuthorizationTest(ResumeTurnBase):
                 self.assertIn("STILL holds", action_results[0][1])
                 slept.assert_called_once_with(30)
                 self.assertEqual(len(prepared), 1)
-                self.assertTrue(ad.typed.startswith("Run `helm seat resume-turn --show "))
-                self.assertEqual(ad.sent[:2], [("h1", ad.typed, False), ("h1", "", True)])
-                alert.assert_not_called()
+                wire = prepared[0]["text"]
+                self.assertTrue(wire.startswith("Run `helm seat resume-turn --show "))
+                self.assertEqual(ad.sent[:2], [("h1", wire, False), ("h1", "", True)])
                 if change is None:
                     self.assertEqual(mode, "resumed", detail)
                     self.assertEqual(ad.sent[2:], [("h1", "", True)])
                     self.assertEqual(ad.reads, 5)
                     self.assertNotIn("injection", resumeturn._peek("codex"))
-                    route.assert_not_called()
+                    alert.assert_not_called()
                 else:
+                    # THE POINTER'S DIRECTIVE IS GONE, so the line can never be
+                    # submitted: no recovery Enter, and helm takes the line
+                    # back out (task/1818) and alerts the parked seat.
                     self.assertEqual(mode, "unverified", detail)
                     self.assertIn("RETRIEVAL PROMPT", detail)
-                    self.assertEqual(ad.sent[2:], [])
-                    self.assertEqual(ad.reads, 4)
-                    remaining = resumeturn._peek("codex")["injection"]
-                    self.assertEqual(remaining["generation"], prepared[0]["generation"])
-                    self.assertEqual(remaining["text"], ad.typed)
-                    self.assertEqual(remaining["held_at"], 1020)
-                    self.assertNotIn("recovery", remaining)
-                    route.assert_called_once()
-                    self.assertEqual(route.call_args[0][0], "codex")
-                    self.assertEqual(route.call_args[0][1], {
-                        "handle": "h1", "generation": remaining["generation"]})
+                    self.assertEqual(ad.sent[2:],
+                                     [("h1", END_OF_LINE, False),
+                                      ("h1", KILL_LINE, False)])
+                    self.assertIn("Helm's own line cleared", detail)
+                    self.assertNotIn("injection", resumeturn._peek("codex"))
+                    self.assertEqual(tasks.rows(), {})
+                    alert.assert_called_once()
                     self.assertEqual(resumeturn._peek("codex")["mode"], "unverified")
 
     def test_payload_expiry_before_retry_retains_the_already_used_claim(self):
@@ -2457,149 +2546,131 @@ class ComposerVisibilityTest(unittest.TestCase):
         self.assertIn("newer output sits below the last prompt", why)
 
 
-class RecoveryRoutingTest(ResumeTurnBase):
-    INJECTION = {"handle": "h1", "generation": "generation-1"}
+class LegacyRecoveryRowTest(ResumeTurnBase):
+    """A `task/resume-turn-*` row an OLDER helm filed for a stranded line.
+    helm files none now (task/1818: a line it cannot submit is taken back out
+    of the composer), and the rows already in a ledger still close when their
+    injection is delivered, so the Enter authority they describe is spent
+    once."""
 
-    def test_live_armed_non_owner_gets_the_persisted_task(self):
-        with mock.patch("helm.seats_work_offer._live_seats",
-                        return_value={"codex", "captain", "peer-a"}), \
-                mock.patch.object(seats, "owner_names",
-                                  return_value={"captain"}), \
-                mock.patch.object(seats, "roster_checked",
-                                  return_value=({"codex": {}, "captain": {},
-                                                "Peer-A": {}}, False)), \
-                mock.patch.object(seats, "beacon_procs",
-                                  return_value=([22], None)) as beacon, \
-                mock.patch.object(seats, "dm", return_value=({"id": "m"}, None)) \
-                as dm:
-            row, err = resumeturn._route_recovery(
-                "codex", self.INJECTION, "stuck")
-        self.assertIsNone(err)
-        self.assertEqual(row["owner"], "Peer-A")
-        self.assertEqual(row["status"], "in_progress")
-        beacon.assert_called_once_with("Peer-A", strict=True)
-        self.assertEqual(dm.call_args.args[0], "Peer-A")
+    def legacy_row(self, injection):
+        ident = resumeturn._recovery_task_identity(
+            injection["handle"], injection["generation"])
+        row, err = tasks.add(
+            ident["title"], None, note="filed by an older helm",
+            refs=[ident["ref"]], source=ident["source"], tid=ident["id"],
+            status="open", origin="agent", project=tasks.current_project(),
+            force_new=True)
+        self.assertIsNone(err, err)
+        return row
 
-    def test_quiet_checked_roster_peer_is_the_fallback(self):  # noqa: VACUOUS_ASSERTION — the persisted owned row is the positive fallback control
-        with mock.patch("helm.seats_work_offer._live_seats", return_value=set()), \
-                mock.patch.object(seats, "owner_names", return_value={"captain"}), \
-                mock.patch.object(seats, "roster_checked",
-                                  return_value=({"quiet": {}}, False)), \
-                mock.patch("helm.dispatches._default_lander",
-                           return_value="missing-lander"), \
-                mock.patch("helm.beacons.roll",
-                           return_value=["graveyard", "quiet"]), \
-                mock.patch.object(seats, "dm", return_value=({"id": "m"}, None)):
-            row, err = resumeturn._route_recovery(
-                "codex", self.INJECTION, "stuck")
-        self.assertIsNone(err)
-        self.assertEqual((row["owner"], row["status"]),
-                         ("quiet", "in_progress"))
+    def test_a_terminal_recovery_row_names_a_project(self):
+        """A recovery row is never homeless (task/3745). The one recovery row
+        helm still writes, the terminal row minted when a provenance clear
+        failed, names the project of the cwd the hook runs in, and helm's own
+        project when that cwd is inside no registered project, since the
+        injection is helm's. MUTATION: drop `or tasks.OWN_PROJECT` from
+        `_close_recovery_task` — the first row files with no project."""
+        self.assertEqual(tasks.current_project(), None)
+        terminal, why = resumeturn._close_recovery_task(
+            "h2", "generation-2", ensure_terminal=True)
+        self.assertTrue(terminal, why)
+        closed = [r for r in tasks.rows().values()
+                  if r.get("status") == "closed"]
+        self.assertEqual([r["project"] for r in closed], ["helm"])
+        # a hook running inside a registered checkout files there
+        repo = os.path.realpath(os.path.join(self.tmp, "recproj-repo"))
+        os.makedirs(repo)
+        pk.write_json(os.path.join(os.path.dirname(tasks.ledger_path()),
+                                   "registry.json"),
+                      {"version": 1, "projects": {"recproj": {
+                          "name": "recproj", "path": repo}}})
+        prior = os.getcwd()
+        self.addCleanup(os.chdir, prior)
+        os.chdir(repo)
+        terminal, why = resumeturn._close_recovery_task(
+            "h3", "generation-3", ensure_terminal=True)
+        os.chdir(prior)
+        self.assertTrue(terminal, why)
+        ident = resumeturn._recovery_task_identity("h3", "generation-3")
+        self.assertEqual(tasks.rows()[ident["id"]]["project"], "recproj")
 
-    def test_no_non_owner_candidate_persists_an_offerable_unowned_task(self):  # noqa: VACUOUS_ASSERTION — the persisted open unowned row positively controls no DM
-        with mock.patch.object(resumeturn, "_recovery_owner",
-                               return_value=(None, None)), \
-                mock.patch.object(seats, "dm") as dm:
-            row, err = resumeturn._route_recovery(
-                "codex", self.INJECTION, "stuck")
-        self.assertIsNone(err)
-        self.assertEqual((row["owner"], row["status"]), (None, "open"))
-        dm.assert_not_called()
+    def test_an_unregistered_fallback_still_files_and_warns(self):  # noqa: VACUOUS_ASSERTION — registering helm and filing again writes no warning, so the first warning is the unregistered name and the filed row is the positive control
+        """The cwd names no project and helm itself is not registered. The
+        recovery row is still filed under helm, and stderr says that name
+        is not a home any list will select (task/3994)."""
+        self.assertEqual(tasks.current_project(), None)
+        known, _err = tasks.registered_projects()
+        self.assertNotIn(tasks.OWN_PROJECT, known or [])
+        err_buf = io.StringIO()
+        with contextlib.redirect_stderr(err_buf):
+            terminal, why = resumeturn._close_recovery_task(
+                "h4", "generation-4", ensure_terminal=True)
+        self.assertTrue(terminal, why)
+        ident = resumeturn._recovery_task_identity("h4", "generation-4")
+        self.assertEqual(tasks.rows()[ident["id"]]["project"],
+                         tasks.OWN_PROJECT)
+        said = err_buf.getvalue()
+        self.assertIn(tasks.OWN_PROJECT, said)
+        self.assertIn("not a registered project", said)
+        repo = os.path.realpath(os.path.join(self.tmp, "helm-registered"))
+        os.makedirs(repo)
+        pk.write_json(os.path.join(os.path.dirname(tasks.ledger_path()),
+                                   "registry.json"),
+                      {"version": 1, "projects": {tasks.OWN_PROJECT: {
+                          "name": tasks.OWN_PROJECT, "path": repo}}})
+        quiet = io.StringIO()
+        with contextlib.redirect_stderr(quiet):
+            terminal, why = resumeturn._close_recovery_task(
+                "h5", "generation-5", ensure_terminal=True)
+        self.assertTrue(terminal, why)
+        ident = resumeturn._recovery_task_identity("h5", "generation-5")
+        self.assertEqual(tasks.rows()[ident["id"]]["project"],
+                         tasks.OWN_PROJECT)
+        self.assertEqual(quiet.getvalue(), "")
+        reg = os.path.join(os.path.dirname(tasks.ledger_path()),
+                           "registry.json")
+        with open(reg, "w", encoding="utf-8") as fh:
+            fh.write("{ this is not registry json\n")
+        unknown = io.StringIO()
+        with contextlib.redirect_stderr(unknown):
+            terminal, why = resumeturn._close_recovery_task(
+                "h6", "generation-6", ensure_terminal=True)
+        self.assertTrue(terminal, why)
+        ident = resumeturn._recovery_task_identity("h6", "generation-6")
+        self.assertEqual(tasks.rows()[ident["id"]]["project"],
+                         tasks.OWN_PROJECT)
+        said = unknown.getvalue()
+        self.assertIn("UNKNOWN", said)
+        self.assertIn(tasks.OWN_PROJECT, said)
+        self.assertNotIn("not a registered project", said)
+        self.assertEqual(
+            err_buf.getvalue().count("not a registered project"), 1)
+        self.assertEqual(unknown.getvalue().count("UNKNOWN"), 1)
 
-    def test_repeated_route_reuses_the_exact_task_identity(self):  # noqa: VACUOUS_ASSERTION — equal returned ids and the one-row ledger positively control deduplication
-        with mock.patch.object(resumeturn, "_recovery_owner",
-                               return_value=(None, None)):
-            first, err = resumeturn._route_recovery(
-                "codex", self.INJECTION, "stuck")
-            self.assertIsNone(err)
-            second, err = resumeturn._route_recovery(
-                "codex", self.INJECTION, "stuck again")
-        self.assertIsNone(err)
-        self.assertEqual(first["id"], second["id"])
-        rows, unavailable = tasks.snapshot(strict=True)
-        self.assertIsNone(unavailable)
-        self.assertEqual(list(rows), [first["id"]])
+    def test_a_failed_fallback_names_the_failure_and_not_a_filed_row(self):  # noqa: VACUOUS_ASSERTION — the returned failure names the write error, so an empty stderr is the refusal to claim a row and not a path that prints nothing
+        """The warning is printed after the row exists. A failed write
+        reports the failure and does not say a row was filed."""
+        self.assertEqual(tasks.current_project(), None)
+        err_buf = io.StringIO()
+        with mock.patch.object(
+                tasks, "add", return_value=(None, "disk full")), \
+                contextlib.redirect_stderr(err_buf):
+            terminal, why = resumeturn._close_recovery_task(
+                "h7", "generation-7", ensure_terminal=True)
+        self.assertFalse(terminal)
+        self.assertIn("disk full", why)
+        self.assertIn("write failed", why)
+        self.assertNotIn("recovery row filed", err_buf.getvalue())
+        ident = resumeturn._recovery_task_identity("h7", "generation-7")
+        self.assertNotIn(ident["id"], tasks.rows())
 
-    def test_task_write_refusal_stays_explicit_and_never_dms(self):  # noqa: VACUOUS_ASSERTION — the explicit write error positively controls the absent row and DM
-        with mock.patch.object(resumeturn, "_recovery_owner",
-                               return_value=("peer-a", None)), \
-                mock.patch.object(tasks, "add",
-                                  return_value=(None, "ledger refused write")), \
-                mock.patch.object(seats, "dm") as dm:
-            row, err = resumeturn._route_recovery(
-                "codex", self.INJECTION, "stuck")
-        self.assertIsNone(row)
-        self.assertIn("recovery task write failed", err)
-        dm.assert_not_called()
-
-    def test_candidate_probe_exception_files_unowned_and_never_owner_alerts(self):  # noqa: VACUOUS_ASSERTION — the persisted degraded-route task positively controls no owner alert
-        class UnreadableAfterEnter(FakeAdapter):
-            def read(self, handle, limit=3000, timeout=60):
-                if self.enter_attempted:
-                    raise harness.HarnessError("composer tail scrolled away")
-                return super().read(handle, limit=limit, timeout=timeout)
-
-        ad = UnreadableAfterEnter()
-        with mock.patch.object(seats, "owner_names", return_value={"captain"}), \
-                mock.patch("helm.seats_work_offer._live_seats",
-                           side_effect=RuntimeError("presence store broke")), \
-                mock.patch.object(seats, "roster_checked",
-                                  side_effect=RuntimeError("roster broke")), \
-                mock.patch.object(resumeturn, "_alert") as alert:
-            mode, detail = resumeturn.child(
-                "codex", SID, "GO NOW", 0, adapter=ad)
-        self.assertEqual(mode, "unverified", detail)
-        self.assertIn("recovery task task/resume-turn-", detail)
-        self.assertIn("live-seat probe failed", detail)
-        self.assertIn("checked roster failed", detail)
-        rows, unavailable = tasks.snapshot(strict=True)
-        self.assertIsNone(unavailable)
-        row = next(iter(rows.values()))
-        self.assertEqual((row["owner"], row["status"]), (None, "open"))
-        alert.assert_not_called()
-
-    def test_failed_peer_dm_keeps_task_and_never_falls_to_owner_alert(self):  # noqa: VACUOUS_ASSERTION — the owned persisted task and exact send pair positively control no owner fallback
-        class UnreadableAfterEnter(FakeAdapter):
-            def read(self, handle, limit=3000, timeout=60):
-                if self.enter_attempted:
-                    raise harness.HarnessError("composer tail scrolled away")
-                return super().read(handle, limit=limit, timeout=timeout)
-
-        ad = UnreadableAfterEnter()
-        with mock.patch.object(resumeturn, "_recovery_owner",
-                               return_value=("peer-a", None)), \
-                mock.patch.object(seats, "dm",
-                                  return_value=(None, "peer route offline")), \
-                mock.patch.object(resumeturn, "_alert") as alert:
-            mode, detail = resumeturn.child(
-                "codex", SID, "GO NOW", 0, adapter=ad)
-        self.assertEqual(mode, "unverified", detail)
-        self.assertIn("recovery task task/resume-turn-", detail)
-        row = next(iter(tasks.rows().values()))
-        self.assertEqual((row["owner"], row["status"]),
-                         ("peer-a", "in_progress"))
-        self.assertEqual(ad.sent,
-                         [("h1", "GO NOW", False), ("h1", "", True)])
-        alert.assert_not_called()
-
-    def test_task_instructions_establish_proof_then_delivery_closes_it(self):  # noqa: VACUOUS_ASSERTION — pending→stranded→delivered states and the closed row positively control the workflow
+    def test_a_legacy_row_closes_when_its_strand_is_delivered(self):  # noqa: VACUOUS_ASSERTION — pending→stranded→delivered states and the closed row positively control the workflow
         text = "GO NOW"
         generation = resumeturn._record_injection("codex", SID, "h1", text)
         injection = resumeturn.recorded_injections()["h1"]
         self.assertIsNone(injection["held_at"])
-        with mock.patch.object(resumeturn, "_recovery_owner",
-                               return_value=(None, None)), \
-                mock.patch.object(resumeturn, "recovery_persist_s",
-                                  return_value=30):
-            task, err = resumeturn._route_recovery(
-                "codex", injection, "composer unreadable")
-        self.assertIsNone(err)
-        self.assertLess(task["note"].index("helm seat composers`"),
-                        task["note"].index("wait at least 30.0s"))
-        self.assertLess(task["note"].index("wait at least 30.0s"),
-                        task["note"].index("scan again"))
-        self.assertLess(task["note"].index("scan again"),
-                        task["note"].index("--submit h1"))
+        task = self.legacy_row(injection)
 
         held = "\n".join(("─" * 40, "❯\xa0" + text, "─" * 40,
                            "  opus-5 | ~/dev/example/repo"))
@@ -2637,11 +2708,7 @@ class RecoveryRoutingTest(ResumeTurnBase):
         resumeturn._observe_injection(
             "codex", "h1", text, generation, now=time.time() - 1)
         injection = resumeturn.recorded_injections()["h1"]
-        with mock.patch.object(resumeturn, "_recovery_owner",
-                               return_value=(None, None)):
-            task, err = resumeturn._route_recovery(
-                "codex", injection, "stuck")
-        self.assertIsNone(err)
+        task = self.legacy_row(injection)
         held = "\n".join(("─" * 40, "❯\xa0" + text, "─" * 40,
                            "  opus-5 | ~/dev/example/repo"))
 
@@ -2671,11 +2738,7 @@ class RecoveryRoutingTest(ResumeTurnBase):
         resumeturn._observe_injection(
             "codex", "h1", text, generation, now=time.time() - 1)
         injection = resumeturn.recorded_injections()["h1"]
-        with mock.patch.object(resumeturn, "_recovery_owner",
-                               return_value=(None, None)):
-            task, err = resumeturn._route_recovery(
-                "codex", injection, "stuck")
-        self.assertIsNone(err)
+        task = self.legacy_row(injection)
         held = "\n".join(("─" * 40, "❯\xa0" + text, "─" * 40,
                            "  opus-5 | ~/dev/example/repo"))
 
@@ -2713,11 +2776,7 @@ class RecoveryRoutingTest(ResumeTurnBase):
         resumeturn._observe_injection(
             "codex", "h1", text, generation, now=time.time() - 1)
         injection = resumeturn.recorded_injections()["h1"]
-        with mock.patch.object(resumeturn, "_recovery_owner",
-                               return_value=(None, None)):
-            task, err = resumeturn._route_recovery(
-                "codex", injection, "stuck")
-        self.assertIsNone(err)
+        task = self.legacy_row(injection)
         held = "\n".join(("─" * 40, "❯\xa0" + text, "─" * 40,
                            "  opus-5 | ~/dev/example/repo"))
 
@@ -2861,11 +2920,7 @@ class RecoveryRoutingTest(ResumeTurnBase):
                 resumeturn._observe_injection(
                     "codex", "h1", text, generation, now=time.time() - 1)
                 injection = resumeturn.recorded_injections()["h1"]
-                with mock.patch.object(resumeturn, "_recovery_owner",
-                                       return_value=(None, None)):
-                    task, err = resumeturn._route_recovery(
-                        "codex", injection, name)
-                self.assertIsNone(err)
+                task = self.legacy_row(injection)
 
                 class Static(FakeAdapter):
                     def read(self, handle, limit=3000, timeout=60):
@@ -6161,6 +6216,13 @@ _READ_PATH_LITERALS = (
     # that they claim contents, and the claim is one the door measured.
     "not showing a dialog that owns input",
     "a composer holding text is rendered below the run",
+    # The take-back door (`clear_placed`) says what its own read of the
+    # composer returned, before its key and after it (task/1818).
+    "composer holds text that is not exactly Helm's",
+    "composer shows a paste chip, which hides whose text it is",
+    "composer shows only part of Helm's line",
+    "its composer holds other text now",
+    "still holds Helm's text after the clear key",
 )
 
 
@@ -7360,8 +7422,9 @@ else:
 
 class APlacedDirectiveKeepsItsOwnerTest(ResumeTurnBase):
     """A refusal AFTER placement is not a refusal before it. Once Helm has
-    typed into the composer the injection record exists, so withholding the
-    unauthorized Enter is right and walking away from the obligation is not."""
+    typed into the composer, withholding the unauthorized Enter is right and
+    leaving the line there is not: helm takes it back out (task/1818), and the
+    repair's episode, not a ledger row, carries what is still owed."""
 
     class Held(FakeAdapter):
         """The composer keeps the text after Enter: the real producer's
@@ -7390,7 +7453,7 @@ class APlacedDirectiveKeepsItsOwnerTest(ResumeTurnBase):
                                             record_key="deaf:codex:%s" % SID)
         return mode, detail, reached
 
-    def test_a_refusal_after_placement_routes_the_obligation(self):
+    def test_a_refusal_after_placement_takes_the_line_back(self):  # noqa: VACUOUS_ASSERTION — the asked recovery door, the refusal in the detail and the one clear key positively control the empty composer and the empty ledger
         from helm import tasks
         ad = self.Held()
         book = DoorBook(recovery=_refused(
@@ -7399,9 +7462,11 @@ class APlacedDirectiveKeepsItsOwnerTest(ResumeTurnBase):
         self.assertIn("recovery", book.asked,
                       "fixture: the recovery preparation was never asked")
         self.assertIn("drained while the injection held", detail)
-        self.assertIn("recovery task task/resume-turn-", detail,
-                      "a typed directive was abandoned without an owner")
-        self.assertTrue(tasks.rows(), "no durable row carries the obligation")
+        self.assertEqual([s for s in ad.sent if s[1] == KILL_LINE],
+                         [("h1", KILL_LINE, False)], detail)
+        self.assertIn("Helm's own line cleared", detail)
+        self.assertEqual(ad.typed, "", "Helm's line was left in the composer")
+        self.assertEqual(tasks.rows(), {}, "a recovery row was filed")
         self.assertNotEqual(mode, "resumed")
 
     def test_every_recovery_attempt_reauthorizes(self):
@@ -7442,7 +7507,7 @@ class APlacedDirectiveKeepsItsOwnerTest(ResumeTurnBase):
         self.assertIn("drained before the second Enter", detail)
         self.assertNotEqual(mode, "resumed")
 
-    def test_a_refusal_BEFORE_placement_routes_nothing(self):  # noqa: VACUOUS_ASSERTION — the absence is nothing typed and no task; test_a_refusal_after_placement_routes_the_obligation drives the same child on the same adapter, types, and mints the task
+    def test_a_refusal_BEFORE_placement_routes_nothing(self):  # noqa: VACUOUS_ASSERTION — the absence is nothing typed and no task; test_a_refusal_after_placement_takes_the_line_back drives the same child on the same adapter, types, and takes the line back
         """THE CONTROL: a refusal before anything was typed has no obligation
         to hand over, and minting a recovery task for it would invent one."""
         from helm import tasks
@@ -8293,10 +8358,14 @@ class TheSharedChildServesTwoQuestionsTest(ResumeTurnBase):
         from helm import harness, resumeturn
         recovered = []
 
+        class Pane(object):
+            def clear_placed(self, handle, text):
+                return harness.CLEARED, "the line came back out"
+
         def submitted(*_a, **kw):
             cb = kw.get("on_submit")
             if cb:
-                cb(object(), "h1", harness.NOT_DELIVERED, None, "g1")
+                cb(Pane(), "h1", harness.NOT_DELIVERED, None, "g1")
             return "unverified", "held"
 
         book = DoorBook(recovery=_refused("the wall went up mid-settle",
@@ -8314,14 +8383,13 @@ class TheSharedChildServesTwoQuestionsTest(ResumeTurnBase):
                     resumeturn, "recover_injection",
                     side_effect=lambda *a, **k: (recovered.append(a) or
                                                  (harness.DELIVERED, "ok"))), \
-                mock.patch.object(resumeturn, "_prepare_due", side_effect=book), \
-                mock.patch.object(resumeturn, "_route_recovery",
-                                  return_value=(None, "synthetic route")):
-            mode, _d = resumeturn.child("alpha", "s1", "text", 0,
-                                        record_key="deaf:alpha:s1")
+                mock.patch.object(resumeturn, "_prepare_due", side_effect=book):
+            mode, detail = resumeturn.child("alpha", "s1", "text", 0,
+                                            record_key="deaf:alpha:s1")
         self.assertEqual(recovered, [],
                          "Enter was pressed after the pause landed")
         self.assertEqual(mode, "paused")
+        self.assertIn("Helm's own line cleared", detail)
 
 
 class KeyPresenceIsNotAChargeReceiptTest(ResumeTurnBase):
@@ -9355,5 +9423,194 @@ class SpawnChildReaperTest(unittest.TestCase):
                          "the reaper did not see the child exit")
 
 
+
+class LaunchRecordHookTest(ResumeTurnBase):
+    """task/3695: the launch record is written HERE, by the SessionStart hook
+    every helm home runs in every project, for each process start of a
+    session, with the capture of the process that started."""
+
+    PID = 7171
+
+    def _started(self):
+        """The claude process Claude Code names to its hooks (CLAUDE_PID),
+        on a config dir that is no real home."""
+        proc = os.path.join(self.tmp, "proc", str(self.PID))
+        os.makedirs(proc, exist_ok=True)
+        cfg = os.path.join(self.tmp, "cfg")
+        with open(os.path.join(proc, "cmdline"), "wb") as f:
+            f.write(b"/opt/claude/versions/2.1.285\0--model\0"
+                    b"claude-opus-5-5[1m]\0")
+        with open(os.path.join(proc, "environ"), "wb") as f:
+            f.write(("HELM_CHAT_NAME=codex\0CLAUDE_CONFIG_DIR=%s\0" % cfg
+                     ).encode())
+        with open(os.path.join(proc, "stat"), "w") as f:
+            f.write("%d (claude) S %s 500 0 0\n" % (self.PID, " ".join(
+                ["0"] * 18)))
+        return mock.patch.dict(os.environ, {
+            "HELM_PROC": os.path.join(self.tmp, "proc"),
+            "CLAUDE_PID": str(self.PID), "CLAUDE_CODE_SESSION_ID": SID,
+            "CLAUDE_CONFIG_DIR": cfg})
+
+    def _rows(self):
+        from helm import eventledger, home
+        return eventledger.checked_events(
+            os.path.join(home.global_dir(), "seat-launches.jsonl"))
+
+    def test_a_session_start_records_the_launch_it_is(self):
+        """The installed hook, fed Claude Code's own payload: one row for the
+        session, carrying the capture of the process that started. MUTATION:
+        leave the record to helm's own launch lines — a `--continue`, an
+        in-session /resume or Orca's relaunch leaves none."""
+        with self._started():
+            rc, _out = self.run_installed(self.payload(source="startup"))
+        self.assertEqual(rc, 0)
+        rows, unread = self._rows()
+        self.assertIsNone(unread)
+        self.assertEqual([r["session"] for r in rows], [SID])
+        self.assertEqual(rows[0]["capture"]["pid"], self.PID)
+        self.assertEqual(rows[0]["model"], "claude-opus-5-5[1m]")
+
+    def test_a_record_it_cannot_write_never_fails_the_session(self):
+        """The hook fails open for the session and closed for the record: rc
+        0, and the session's marker. MUTATION: let the refused append raise
+        out of the hook — every session start on the host fails."""
+        from helm import home
+        os.makedirs(os.path.join(home.global_dir(), "seat-launches.jsonl"))
+        with self._started():
+            rc, _out = self.run_installed(self.payload(source="resume"))
+        self.assertEqual(rc, 0)
+        self.assertTrue(os.path.exists(os.path.join(
+            home.global_dir(), "seat-launches.unrecorded", SID)))
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class SweepClosesStaleRecoveryRowsTest(unittest.TestCase):
+    """F1: an older recovery row on a key that a newer nudge overwrote is
+    never closed by the current _drop_injection, so its row stays open.
+    This is the RED state the brief asks for before the sweep fix."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-sweep-f1-")
+        self._env = {k: os.environ.pop(k, None) for k in _ENV}
+        os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm-home")
+        os.environ["HELM_CHAT_DIR"] = os.path.join(self.tmp, "chat")
+        os.environ["HELM_CHAT_NAME"] = "codex"
+        for k in ("HELM_RESUME_TURN_SETTLE_S", "HELM_SUBMIT_SETTLE_S",
+                  "HELM_RESUME_TURN_RECOVERY_PERSIST_S",
+                  "HELM_RESUME_TURN_RECOVERY_BACKOFF_S"):
+            os.environ.setdefault(k, "0")
+
+    def tearDown(self):
+        for k, v in self._env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _file_recovery(self, handle, generation):
+        identity = resumeturn._recovery_task_identity(handle, generation)
+        tasks.add(identity["title"], None,
+                  note="stale recovery row",
+                  refs=[identity["ref"]], source=identity["source"],
+                  tid=identity["id"], status="open", origin="agent",
+                  project=tasks.current_project(), force_new=True)
+
+    def _record_injection(self, key, handle, generation, text):
+        now = time.time()
+        def change(entry):
+            entry["injection"] = {
+                "generation": generation, "handle": handle,
+                "session": key, "text": text,
+                "digest": resumeturn._injection_digest(text),
+                "adapter": "fake", "pids": [],
+                "recorded_at": now,
+                "expires_at": now + 600, "held_at": None,
+                "deliverer": "",
+            }
+            return generation, True
+        resumeturn._mutate_entry(key, change)
+
+    def test_older_recovery_row_is_not_closed_when_a_newer_nudge_overwrites(self):
+        """Two recovery rows for one key (generations 1 and 2); only
+        generation 2 survives as the live record. The current sweep leaves
+        generation 1's row open."""
+        gen1 = resumeturn._recovery_task_identity("h1", "1")
+        gen2 = resumeturn._recovery_task_identity("h1", "2")
+        self._file_recovery("h1", "1")
+        self._file_recovery("h1", "2")
+        # One nudge on the key (generation 2); generation 1's record was
+        # overwritten and no longer exists.
+        self._record_injection("codex", "h1", "2", "GO")
+
+        ad = FakeAdapter(panes=({"handle": "h1", "title": "codex",
+                                 "status": "connected"},))
+        with mock.patch.object(resumeturn, "_deliverer_alive",
+                               return_value=False):
+            resumeturn.sweep_stranded(adapter=ad)
+
+        rows = {r["id"]: r for r in tasks.rows().values()}
+        self.assertEqual(set(rows), {gen1["id"], gen2["id"]})
+        # gen2 is the live record: the sweep clears its (still-composer) text
+        # and closes its row. gen1 is stale — its record was overwritten — so
+        # the sweep must close it too (the F1 fix).
+        self.assertEqual(rows[gen2["id"]]["status"], "closed")
+        self.assertEqual(rows[gen1["id"]]["status"], "closed",
+                         "generation 1 row left open (RED — F1 fix missing)")
+
+
+class SweepProcessesAmbiguousRecordsTest(unittest.TestCase):
+    """F3: two state keys each hold a record for the same handle. The
+    authoritative `recorded_injections` treats that as ambiguous and omits the
+    handle, so the current sweep sees nothing and leaves both lines in the
+    composer. The sweep must instead decide each record on its own key."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-sweep-f3-")
+        self._env = {k: os.environ.pop(k, None) for k in _ENV}
+        os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm-home")
+        os.environ["HELM_CHAT_DIR"] = os.path.join(self.tmp, "chat")
+        os.environ["HELM_CHAT_NAME"] = "codex"
+        for k in ("HELM_RESUME_TURN_SETTLE_S", "HELM_SUBMIT_SETTLE_S",
+                  "HELM_RESUME_TURN_RECOVERY_PERSIST_S",
+                  "HELM_RESUME_TURN_RECOVERY_BACKOFF_S"):
+            os.environ.setdefault(k, "0")
+
+    def tearDown(self):
+        for k, v in self._env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _record(self, key, handle, text):
+        resumeturn._record_injection(key, key, handle, text, adapter="fake")
+        def stamp(entry):
+            inj = entry["injection"]
+            inj["recorded_at"] -= resumeturn.DELIVERER_S + 1
+            inj["deliverer"] = ""
+            return None, True
+        resumeturn._mutate_entry(key, stamp)
+
+    def test_a_record_on_each_of_two_keys_is_cleared(self):
+        text = "GO"
+        self._record("key-a", "h1", text)
+        self._record("key-b", "h1", text)
+        ad = FakeAdapter(panes=({"handle": "h1", "title": "codex",
+                                 "status": "connected"},))
+        # Both records live in the same composer: the first clear empties it,
+        # so the second reads an empty composer and is dropped as GONE. Both
+        # records are forgotten either way — that is the F3 fix.
+        ad.typed = text
+        with mock.patch.object(resumeturn, "_deliverer_alive",
+                               return_value=False):
+            swe = resumeturn.sweep_stranded(adapter=ad)
+
+        states = {r[1] for r in swe[0]}
+        self.assertEqual(states, {harness.CLEARED, harness.GONE}, swe)
+        # Both records were cleared and forgotten.
+        self.assertEqual(resumeturn.recorded_injections(
+            include_expired=True), {}, "ambiguous records not cleared")

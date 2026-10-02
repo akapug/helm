@@ -776,12 +776,13 @@ def release_lane(root, lane, seat, lease=None, session=None, park=False,
         if rc != 0:
             return 1, ["helm work: park commit failed — %s (room untouched, "
                        "lease kept)" % err]
-        lines.append("helm work: parked WIP onto %s" % onto)
+        dest = _out if isinstance(_out, str) and _out.startswith("refs/") else onto
+        lines.append("helm work: parked WIP onto %s" % dest)
     exists = _has_branch(root, branch)
     # FOUR states through one read (see `_merge_state`): the lane retires on
-    # ancestry OR on patch identity, because our protocol lands work REBASED
-    # and the ancestry-only question made every well-behaved seat keep its
-    # branch forever. `state` rides down to the delete so the line an agent
+    # ancestry OR on patch identity: exact-sha train merges preserve ancestry,
+    # while historical rebases and cherry-picks put the same content under
+    # different shas. The ancestry-only question once kept those branches. `state` rides down to the delete so the line an agent
     # reads at release says WHICH proof retired the lane.
     state = _merge_state(root, branch) if exists else None
     merged = state in RETIRABLE

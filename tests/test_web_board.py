@@ -38,9 +38,9 @@ from tests._ownerverbs import owner_verbs, view_markup  # noqa: E402
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from helm import (burnflags, gatewindow, home, landreq, pk,  # noqa: E402
-                  registry, repofacts, scheduler, tasks, vcs, web, web_board,
-                  web_cache, web_ui_loader)
+from helm import (burnflags, gatewindow, goals, home, landreq, pk,  # noqa: E402
+                  registry, repofacts, scheduler, taskhomes, tasks, vcs,
+                  web, web_board, web_cache, web_ui_loader)
 from helm import seat as seat_mod  # noqa: E402
 
 
@@ -412,7 +412,7 @@ class BoardJoinTest(unittest.TestCase):
             env=dict(os.environ, GIT_AUTHOR_DATE=when, GIT_COMMITTER_DATE=when,
                      GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1"))
 
-    def test_progress_counts_seven_days_of_lands_and_of_tasks(self):
+    def test_progress_counts_seven_days_of_lands_and_the_one_health_line(self):  # noqa: VACUOUS_ASSERTION — the right side is the one reader's line, taskhomes.select(...)[0], which raises if alpha has no line, and the left is a direct index that raises if the board did not ride one, so the equality has a real operand on both sides
         self._repo(self.paths["alpha"], int(self.now) - 10 * 86400)
         for back in (3, 1):                         # two lands this week
             self._commit(self.paths["alpha"], int(self.now) - back * 86400)
@@ -421,11 +421,15 @@ class BoardJoinTest(unittest.TestCase):
         self.assertIsNone(err, err)
         prog = self.board()["projects"]["alpha"]["progress"]
         self.assertEqual(prog["lands7"], 2)         # the ten-day-old one is out
-        # a1..a3 were opened this week and a1 was closed; a4 was BORN closed,
-        # a record of history rather than work, so it is neither
-        self.assertEqual((prog["opened7"], prog["closed7"]), (3, 1))
-        self.assertEqual(self.board()["projects"]["beta"]["progress"]
-                         ["opened7"], 1)            # the per-project control
+        # the week's own task flow is the ONE reader's (`taskhomes.health`)
+        # line, not a second counter of the board's: a1..a3 open this week,
+        # a1 closed, a4 BORN closed (a record of history, neither). Assert
+        # parity, not a number, so the wall clock can't flake the bracket.
+        with mock.patch.object(taskhomes, "_now", return_value=self.now):
+            body = self.board()
+            want = taskhomes.select(taskhomes.health()[0], ["alpha"])[0]
+        self.assertEqual(body["projects"]["alpha"]["health"], want)
+        self.assertIsNotNone(want, "the one reader gave no line for alpha")
 
     def test_a_trunk_idle_for_a_week_counts_zero_lands_without_a_log_walk(self):
         self._repo(self.paths["alpha"], int(self.now) - 10 * 86400)
@@ -444,9 +448,57 @@ class BoardJoinTest(unittest.TestCase):
         self.assertEqual(len(walked), 1)
 
     def test_progress_with_no_readable_trunk_is_unknown_never_zero(self):
-        prog = self.board()["projects"]["beta"]["progress"]
-        self.assertIsNone(prog["lands7"])           # beta is a plain directory
-        self.assertEqual(prog["opened7"], 1)        # the same row's control
+        with mock.patch.object(taskhomes, "_now", return_value=self.now):
+            beta = self.board()["projects"]["beta"]
+        self.assertIsNone(beta["progress"]["lands7"])  # beta is a plain dir
+        self.assertEqual(beta["health"]["opened_today"], 1)  # same row's health
+
+    def _plant_row(self, project, title, filed, closed=None, born_closed=False):
+        """One row's birth (and, when `closed`, its closing) event with those
+        exact stamps, appended to the ledger the way the writer writes it:
+        the only way to plant a row FILED in the past, not `now`."""
+        row = {"id": "task/%s" % title, "ts": filed, "last_updated": filed,
+               "continues": None, "priority": None, "title": title,
+               "status": "closed" if born_closed else "open",
+               "owner": "seat-a", "note": None, "refs": [],
+               "source": "seat-a", "origin": "agent",
+               "closed_reason": "done" if born_closed else None,
+               "project": project, "comments": []}
+        events = [dict(row)]
+        if closed is not None:
+            events.append(dict(row, status="closed", last_updated=closed,
+                               closed_reason="done"))
+        with open(tasks.ledger_path(), "a", encoding="utf-8") as fh:
+            for ev in events:
+                fh.write(json.dumps(ev) + "\n")
+
+    def test_the_board_serves_the_one_health_line_not_a_second_counter(self):
+        """One number per noun (task/3745): the board's per-project line is
+        the ONE reader's (`taskhomes.health`) line, not a second counter. A
+        row filed 1s after local midnight 6 days back is inside the week but
+        not today, so it can come out of that line in only one way."""
+        pinned = self.now
+        day = goals.local_midnight(pinned)
+        # the week's exact start, computed the way taskhomes computes it: the
+        # local midnight of the day six days back. Filed 1s after it, the row
+        # is inside the week but not today — on the boundary, so the board's
+        # week can only match the one reader's if it cuts the same two days.
+        week_start = goals.local_midnight(day - 6 * 86400 + 12 * 3600)
+        self._plant_row("gamma", "g-open", filed=pinned)               # opened today
+        self._plant_row("gamma", "g-closed", filed=pinned,
+                        closed=pinned)                                  # opened+closed today
+        self._plant_row("gamma", "g-back", filed=week_start + 1)        # in the week, not today
+        with mock.patch.object(taskhomes, "_now", return_value=pinned):
+            body = self.board()
+            got = body["projects"]["gamma"].get("health")
+            want = taskhomes.select(taskhomes.health()[0], ["gamma"])[0]
+        self.assertIsNotNone(got, "the board has no per-project health line")
+        self.assertEqual(got, want,
+                         "the board's line is not the one reader's line")
+        # the backdated row is in the week but not today: the window is local
+        # midnights, not a sliding seven days from now
+        self.assertEqual(want["opened_today"], 2)
+        self.assertEqual(want["net_7d"], 2)          # 3 opened, 1 closed, this week
 
     def test_the_quiet_rule_is_decided_on_the_server(self):
         got = self.board()["projects"]
@@ -1434,6 +1486,47 @@ class BoardJoinTest(unittest.TestCase):
             "family": "codex", "colour": "RED", "until": "24h", "reason": ""})
         self.assertEqual(status, 400, body)
 
+    def test_a_declaration_shows_on_the_next_read_pending_until_the_fold(self):
+        """task/4027. The owner declared kimi ORANGE for 7 days from its
+        sheet. The declaration was saved, but after a refresh the sheet still
+        read NOT MEASURED: the flags read served the snapshot, and the
+        watchdog folds a declaration only at its next pass, up to 15 minutes
+        later. The very next read shows the declaration as PENDING, never as
+        measured, and the fold's own reading then replaces it."""
+        from helm import proxywatch
+        before = self.board()["sections"]["flags"]["families"]["kimi"]
+        self.assertEqual(before["colour"], "GREY")
+        self.assertIsNone(before["declared_pending"])
+        body, status = web._api_burn_declare({
+            "family": "kimi", "colour": "ORANGE", "until": "7d",
+            "reason": "kimi is spending down"})
+        self.assertEqual(status, 200, body)
+        got = web.get_flags()
+        kimi = got["families"]["kimi"]
+        self.assertEqual((kimi["declared_pending"]["colour"],
+                          kimi["declared_pending"]["until"]),
+                         ("ORANGE", body["until"]))
+        self.assertEqual(kimi["declared_pending"]["folds_by"],
+                         self.snap_ts + proxywatch.INTERVAL_S)
+        self.assertEqual(got["declared_pending"]["kimi"]["colour"], "ORANGE")
+        # NEVER AS MEASURED: the reading stays the snapshot's own
+        self.assertEqual((kimi["colour"], kimi["provenance"]),
+                         ("GREY", "unmeasured"))
+        # THE SHEET READS THE BOARD, whose kept flags leg is read again
+        after = self.board()["sections"]["flags"]["families"]["kimi"]
+        self.assertEqual(after["declared_pending"]["colour"], "ORANGE")
+        self.assertEqual(after["colour"], "GREY")
+        # CONTROL: the watchdog's fold reads the same file, and the pending
+        # mark goes once the reading carries it
+        self.assertTrue(burnflags.write_snapshot(
+            inputs={"declarations": burnflags.read_declarations()},
+            now=time.time()))
+        web._qstate.pop("flags", None)
+        folded = web.get_flags()["families"]["kimi"]
+        self.assertEqual((folded["colour"], folded["provenance"]),
+                         ("ORANGE", "owner-declared"))
+        self.assertNotIn("declared_pending", folded)
+
     def test_the_endpoint_is_registered_and_served(self):
         self.assertIs(web.API["/api/board"], web._api_board)
         self.assertIs(web.POST_API["/api/projects/team"],
@@ -1474,7 +1567,7 @@ TEAM_FNS = ("teamTokens", "teamRatio", "teamEff", "teamShort", "teamMode",
             "teamFailedText",
             "teamCurrent", "teamDraft", "teamLightRed", "teamAlloc",
             "teamLine", "teamTabHref", "famHref", "shareBar", "slotBar",
-            "teamCredits", "famBilled", "famSheet",
+            "teamCredits", "famBilled", "famPending", "famSheet",
             "teamMini",
             "teamFamRow", "teamMemberRow", "teamAddRow", "teamDiff",
             "teamDriftLines", "teamRoute", "teamHistory", "teamParts",
@@ -1583,7 +1676,9 @@ def _board(running=3, possible=5, green=1, **over):
                                "oldest_age_s": 600, "rows": [
                                    {"plain_title": "lane-a",
                                     "stage_class": "review", "age_s": 600}]}],
-                    "progress": {"lands7": 12, "opened7": 4, "closed7": 9},
+                    "progress": {"lands7": 12},
+                    "health": {"open_stories": 3, "opened_today": 4,
+                               "closed_today": 9, "net_7d": -5},
                     "repos": [_repo_row("origin", "akapug/alpha", "private"),
                               _repo_row("upstream", "emberian/alpha",
                                         "public")],
@@ -1601,8 +1696,9 @@ def _board(running=3, possible=5, green=1, **over):
                                         "state": "CHANGES_REQUESTED"}],
                              "landed": [{"lane": "b-landed", "task": None,
                                          "age_s": 60}]},
-                         "progress": {"lands7": None, "opened7": 1,
-                                      "closed7": 0},
+                         "progress": {"lands7": None},
+                         "health": {"open_stories": 1, "opened_today": 1,
+                                    "closed_today": 0, "net_7d": 1},
                          "repos": None,
                          "repos_unavailable": "no git checkout at the "
                                               "registered path",
@@ -1660,7 +1756,8 @@ class BoardRendererRuntimeTest(unittest.TestCase):
            "flagWhen", "flagsHTML", "boardRank", "boardSort", "boardSec",
            "boardSecState", "boardSecWord", "boardQuiet", "boardLayout",
            "boardCapacity", "boardTeam", "boardCount",
-           "boardLanes", "boardLaneWord", "boardProgress", "boardRepoBadge",
+           "boardLanes", "boardLaneWord", "boardProgress", "boardHealth",
+           "boardRepoBadge",
            "boardRepos", "boardLand", "boardWide", "boardDetail", "projTab",
            "boardRowHTML", "onYouRead", "lrStale") + TEAM_FNS
     CONSTS = ("LIGHTS", "FLAGCOL", "LIGHT_RANK", "PROJ_TABS")
@@ -1747,12 +1844,12 @@ out.lanes_none = boardLanes({running: []}, BOARD);
 out.lanes_claimed_only = boardLanes(BOARD.projects.beta, BOARD);
 out.lanes_stale = boardLanes(BOARD_SEATS_STALE.projects.alpha, BOARD_SEATS_STALE);
 out.p_alpha = boardProgress(BOARD.projects.alpha, BOARD);
-out.p_grow = boardProgress({progress: {lands7: 1, opened7: 5, closed7: 2}}, BOARD);
-out.p_even = boardProgress({progress: {lands7: 0, opened7: 2, closed7: 2}}, BOARD);
+out.p_grow = boardProgress({progress: {lands7: 1}, health: {net_7d: 3}}, BOARD);
+out.p_even = boardProgress({progress: {lands7: 0}, health: {net_7d: 0}}, BOARD);
 out.p_beta = boardProgress(BOARD.projects.beta, BOARD);
 out.p_tasks_stale = boardProgress(BOARD_TASKS_STALE.projects.alpha, BOARD_TASKS_STALE);
 out.p_trunk_stale = boardProgress(BOARD_TRUNK_STALE.projects.alpha, BOARD_TRUNK_STALE);
-out.p_master = boardProgress({progress: {lands7: 3, opened7: 1, closed7: 1},
+out.p_master = boardProgress({progress: {lands7: 3}, health: {net_7d: 0},
   last_land: {at: 1, age_s: 60, how: "push", sha: "4611958e44a2", ref: "master"}}, BOARD);
 out.r_fork = boardRepos(BOARD.projects.alpha);
 out.r_unread = boardRepos(BOARD.projects.beta);
@@ -1932,7 +2029,7 @@ console.log(JSON.stringify(out));
         self.assertIn('href="#roster"', c)
 
     def test_R_says_how_many_of_its_lanes_are_landed_with_the_lease_held(self):
-        """R STAYS LIVE CLAIMS — a land releases no lease — and says how many
+        """R STAYS LIVE CLAIMS — a hand land releases no lease — and says how many
         of them are already on main, off `headline.lanes.landed`, the count
         the server takes from the same running[] verdicts the kanban draws."""
         text = re.sub(r"<[^>]*>", "", self.out["c_landed"])
@@ -2062,10 +2159,11 @@ console.log(JSON.stringify(out));
     def test_a_collapsed_row_carries_light_name_team_and_one_count(self):
         """ONE LINE PER PROJECT (task/3445): light · name · team state ·
         its work, then on a desktop its lanes, last land, activity and repos.
-        No family chips (supply) and no week's progress (the About tab).
+        Under the name is the one reader's health line (task/3745) — its open
+        stories and the week's flow — and no family chips (supply).
         ONE COUNT EVERYWHERE (task/3643 slice 3): the count is the project's
-        share of the Work page's one read, not the board's task tally; what
-        that share says is run in tests/test_web_work_page.py."""
+        share of the Work page's one read, never a bare task tally; what that
+        share says is run in tests/test_web_work_page.py."""
         row = self.out["collapsed"]
         self.assertIn('class="dot green authored"', row)
         self.assertIn(">alpha<", row)
@@ -2074,7 +2172,13 @@ console.log(JSON.stringify(out));
         self.assertEqual(row.count('class="bcount'), 1)
         self.assertIn("work of alpha unread", row)
         self.assertIn("work of alpha read", self.out["collapsed_read"])
-        self.assertNotIn("3 open", row)
+        # the one reader's health line rides under the name (task/3745),
+        # compact (a phone has no hover; the long form is the tooltip's):
+        # "3 open" is the count of the open-story noun, not the count cell
+        # — a bare task tally (">3 open<") is not what it holds
+        self.assertIn('class="bhealth"', row)
+        self.assertIn("3 open", row)
+        self.assertNotIn(">3 open<", row)
         self.assertNotIn("bdetail", row, "a collapsed row drew its detail")
         # everything beyond those four is desktop-only, by class
         wide = row[row.index('class="bwide'):]
@@ -2114,10 +2218,18 @@ console.log(JSON.stringify(out));
             self.assertNotIn(gone, work, gone)
         # ABOUT: its week, its repositories, what is on file
         about = self.out["expanded_about"]
-        self.assertIn("4 opened", about)                # its progress
+        self.assertIn("this week: 12 commits on main · 7-day net -5",
+                      about)                    # its progress, the one reader
         self.assertIn("emberian/alpha", about)          # both halves of a fork
         self.assertIn("akapug/alpha", about)
         self.assertIn("dwrap", about)
+        # THE ROW'S HEALTH LINE, under the name in the sticky head (task/3745):
+        # the one reader's facts, compact, and the same net the About's
+        # progress prints figure
+        self.assertIn('class="bhealth"', self.out["expanded"])
+        self.assertIn("3 open", self.out["expanded"])
+        self.assertIn("today +4 −9", self.out["expanded"])
+        self.assertIn("week −5", self.out["expanded"])
 
     def test_an_open_projects_line_and_tabs_are_one_sticky_head(self):
         """The helm project's Team tab is 4,443 px tall at 1440 px, and its
@@ -2177,11 +2289,15 @@ console.log(JSON.stringify(out));
         cell, line = self.out["p_alpha"]["cell"], self.out["p_alpha"]["line"]
         self.assertIn("12 commits", cell)
         self.assertIn("this week: 12 commits on main", line)
-        self.assertIn("↓5", cell)                       # 9 closed, 4 opened
-        self.assertIn("4 opened", line)
-        self.assertIn("9 closed", line)
-        self.assertIn("↑3", self.out["p_grow"]["cell"])  # 5 opened, 2 closed
+        # THE WEEK'S FIGURE IS THE ONE READER'S net_7d (task/3745): opened
+        # minus closed, the same line `helm task health` prints — today's
+        # opened and closed ride the row's health line, not a second
+        # counter of the page's.
+        self.assertIn("↓5", cell)                       # net_7d = -5
+        self.assertIn("7-day net -5", line)
+        self.assertIn("↑3", self.out["p_grow"]["cell"])  # net_7d = +3
         self.assertIn("1 commit on main", self.out["p_grow"]["line"])
+        self.assertIn("7-day net +3", self.out["p_grow"]["line"])
         self.assertIn("→0", self.out["p_even"]["cell"])
         self.assertIn("0 commits", self.out["p_even"]["cell"])
         # a project trunked on master counts master's commits, and says so,
@@ -2681,6 +2797,50 @@ console.log(JSON.stringify(out));
         self.out2 = json.loads(p.stdout or "{}")
         return self.out2
 
+    def test_a_pending_declaration_is_said_plainly_on_the_sheet(self):
+        """task/4027: a declaration the watchdog has not folded yet shows on
+        its family's sheet as DECLARED by the owner, with its expiry and when
+        the watchdog folds it, beside the reading, which stays NOT MEASURED.
+        With no fresh snapshot there is no sheet, so the card's head says
+        it."""
+        now = time.time()
+        pend = {"colour": "ORANGE", "until": now + 7 * 86400,
+                "declared_at": now, "why": "kimi is spending down",
+                "folds_by": now + 600}
+        board = json.loads(json.dumps(self.BOARD))
+        board["sections"]["flags"]["families"]["kimi"]["declared_pending"] = pend
+        unread = {"unavailable": "no fresh burn-flag snapshot",
+                  "declared_pending": {"kimi": dict(pend, folds_by=None)}}
+        out = self._run_driver(r"""
+FAM_SEL = "kimi";
+out.sheet = flagsHTML(board.sections.flags, board).rows;
+out.chip = flagsHTML(board.sections.flags, board).rows.split("tsheet")[0];
+board.sections.flags.families.kimi.declared_pending.folds_by = %r;
+out.late = flagsHTML(board.sections.flags, board).rows;
+delete board.sections.flags.families.kimi.declared_pending;
+out.bare = flagsHTML(board.sections.flags, board).rows;
+FAM_SEL = null;
+out.unread = flagsHTML(%s).head;
+""" % (now - 60, json.dumps(unread)),
+            "const board = " + json.dumps(board) + ";\nconst out = {};\n")
+
+        def text(h):
+            return re.sub(r"<[^>]+>", "", h)
+        sheet = text(out["sheet"])
+        self.assertIn("NOT MEASURED", sheet)
+        self.assertIn("DECLARED ORANGE by the owner until ", sheet)
+        self.assertIn("the watchdog folds it by ", sheet)
+        self.assertIn("kimi is spending down", sheet)
+        self.assertIn("DECLARED ORANGE by the owner, pending", out["chip"])
+        self.assertIn("at its next pass, which is overdue", text(out["late"]))
+        # CONTROL: the same sheet with nothing pending says none of it
+        self.assertNotIn("DECLARED ORANGE", text(out["bare"]))
+        self.assertIn("NOT MEASURED", text(out["bare"]))
+        head = text(out["unread"])
+        self.assertIn("not measured", head)
+        self.assertIn("kimi DECLARED ORANGE by the owner until ", head)
+        self.assertIn("at its next pass", head)
+
     def test_shareBar_with_raised_teams_section(self):
         """When the teams leg raised, shareBar says UNKNOWN, not 'No project'."""
         teams = dict(self.BOARD["sections"]["teams"],
@@ -3171,6 +3331,8 @@ class BoardWarmStartTest(unittest.TestCase):
                 mock.patch.object(web_server, "make_server",
                                   lambda port: Serving()), \
                 mock.patch.object(web_server, "_prewarm_configs",
+                                  lambda: None), \
+                mock.patch.object(web_server, "_prewarm_catalog",
                                   lambda: None), \
                 mock.patch.object(web, "_api_board", slow_board), \
                 mock.patch.object(webserve, "register"), \

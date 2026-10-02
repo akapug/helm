@@ -2,7 +2,8 @@
 """The review doors teach and REQUIRE that the reader fixes what it finds.
 
 THE PROCEDURE these doors exist to hold: a reader that finds a mechanical
-defect commits the cure on a branch off the exact tip it read and returns FIX
+defect commits the cure off the exact tip it read — in a room it holds, or,
+for a subagent with no room of its own, a scratch clone — and returns FIX
 naming that tip; the lane's author reviews the patch; agreement on the patch is
 what lands the chain. Three doors were open to the failure that the reader
 reports a defect it was standing next to and could have cured:
@@ -50,7 +51,8 @@ class ReviewBriefMayNotForbidTheCureTest(td.DispatchBase):
         return run(dispatches.cmd_dispatch,
                    ["send", "seat-b", "lane/read-%d" % self._lane_seq, body,
                     "--ref", self.side, "--kind", kind, "--new-work",
-                    "--repo", self.repo, *flags])
+                    "--repo", self.repo, *(["--task", self.review_task["id"], "--part"]
+                                          if kind == "review" else []), *flags])
 
     def test_every_declared_phrase_refuses_and_the_reason_admits_it(self):  # noqa: VACUOUS_ASSERTION — each refusal is paired IN THIS METHOD with the same body admitted under --read-only-because, and the sweep ends on an unconditional exact count
         seen = 0
@@ -159,6 +161,11 @@ class ReviewBriefMayNotForbidTheCureTest(td.DispatchBase):
         self.assertEqual(rc, 0, err)
         self.assertIn("REVIEW PROCEDURE", out)
         self.assertIn("--patch-tip", out)
+        self.assertIn("subagent reviewer has no room of its own", out)
+        self.assertIn("scratch clone", out)
+        self.assertIn("--no-write-fetch-head", out)
+        self.assertIn("no refspec", out)
+        self.assertIn("no shared branch or worktree", out)
         self.assertIn("agreement on the patch", out)
         rc, out, err = self.send("build the census", kind="build")
         self.assertEqual(rc, 0, err)
@@ -174,7 +181,8 @@ class ReviewBriefMayNotForbidTheCureTest(td.DispatchBase):
         self.assertIn("tells the reader not to edit", err)
         rc, _out, err = run(
             dispatches.cmd_dispatch,
-            argv("lane/added-two") + ["--read-only-because", "a frozen mirror"])
+            argv("lane/added-two") + ["--task", self.review_task["id"],
+                                       "--part", "--read-only-because", "a frozen mirror"])
         self.assertEqual(rc, 0, err)
 
     def test_the_library_door_refuses_a_caller_that_skips_the_cli(self):  # noqa: VACUOUS_ASSERTION — the refusal is paired with the same call admitted under read_only_because in this method
@@ -187,7 +195,8 @@ class ReviewBriefMayNotForbidTheCureTest(td.DispatchBase):
         row, why, _sent = dispatches.send(
             "seat-b", "lane/direct", "please do not edit anything here",
             self.side, repo=self.repo, kind="review", new_work=True,
-            sign=False, read_only_because="the reader reviews a vendored drop")
+            sign=False, task=self.review_task["id"],
+            read_only_because="the reader reviews a vendored drop")
         self.assertIsNone(why, why)
         self.assertEqual(row["read_only_because"],
                          "the reader reviews a vendored drop")
@@ -211,7 +220,8 @@ class AFixWithNoCureSaysWhyTest(td.DispatchBase):
             return run(dispatches.cmd_dispatch, [
                 "verdict", row["id"], row["tip"], "--fix", "--measured",
                 "--finding-count", "1", "--prior-relation", "new",
-                "--worse-than-main", "helm/dispatches.py", *flags,
+                "--worse-than-main", "helm/dispatches.py",
+                "--finding", "the guard is inverted", *flags,
                 "the guard is inverted"])
 
     def test_a_FIX_with_no_cure_and_no_reason_refuses_and_the_reason_admits(self):  # noqa: VACUOUS_ASSERTION — the refusal is paired with the same call admitted under --no-patch-because in this method, and the row's state is read back off disk both times
@@ -219,6 +229,9 @@ class AFixWithNoCureSaysWhyTest(td.DispatchBase):
         rc, _out, err = self.verdict(row)
         self.assertEqual(rc, 2, err)
         self.assertIn("A READER FIXES WHAT IT FINDS", err)
+        self.assertIn("subagent reviewer has no room of its own by default", err)
+        self.assertIn("scratch clone", err)
+        self.assertIn("registered BUILD room", err)
         self.assertIn("--patch-tip", err)
         # no such trailer exists, and the trailer rung refuses authoring lines
         self.assertNotIn("trailer", err)
@@ -297,14 +310,15 @@ class AFixWithNoCureSaysWhyTest(td.DispatchBase):
         again, why = dispatches.mark_verdict(
             row["id"], row["tip"], "the guard is inverted", "fix",
             basis="measured", worse_than_main_paths=["helm/dispatches.py"],
-            no_patch_because="a meld", finding_count=1, prior_relation="new")
+            no_patch_because="a meld", finding_count=1, prior_relation="new",
+            findings=["the guard is inverted"])
         self.assertIsNone(why, why)
         self.assertEqual(again["no_patch_because"], "a meld")
         conflicting, why = dispatches.mark_verdict(
             row["id"], row["tip"], "the guard is inverted", "fix",
             basis="measured", worse_than_main_paths=["helm/dispatches.py"],
             no_patch_because="a different reason entirely", finding_count=1,
-            prior_relation="new")
+            prior_relation="new", findings=["the guard is inverted"])
         self.assertIsNone(conflicting)
         self.assertIn("already has a verdict", why)
 
@@ -325,7 +339,8 @@ class ACleanReadThatCarriesACureHasADoorTest(td.DispatchBase):
             return run(dispatches.cmd_dispatch, [
                 "verdict", row["id"], row["tip"], "--fix", "--measured",
                 "--finding-count", "1", "--prior-relation", "new",
-                "--imperfect", *flags,
+                "--imperfect", *(["--finding", "the port uses a live socket"]
+                                  if "--patch-tip" not in flags else []), *flags,
                 "not worse than main; moved the port off a live socket"])
 
     def test_imperfect_WITH_a_patch_records_fix_imperfect_and_the_cure(self):
@@ -378,6 +393,7 @@ class ACleanReadThatCarriesACureHasADoorTest(td.DispatchBase):
                 "verdict", other["id"], other["tip"], "--fix", "--measured",
                 "--finding-count", "1", "--prior-relation", "new",
                 "--worse-than-main", "helm/dispatches.py",
+                "--finding", "the design regresses",
                 "--no-patch-because", "a design finding for a meld",
                 "it regresses"])
         self.assertEqual(rc, 0, err)
@@ -525,6 +541,7 @@ class ThePatchIsWhatIsOwedNotTheTipTest(td.DispatchBase):
                 "verdict", row["id"], row["tip"], "--fix", "--measured",
                 "--finding-count", "1", "--prior-relation", "new",
                 "--worse-than-main", "helm/dispatches.py",
+                "--finding", "the shape is wrong",
                 "--no-patch-because", "a DESIGN finding, bound for a meld",
                 "the shape is wrong"])
         self.assertEqual(rc, 0, err)
@@ -579,7 +596,8 @@ class TheAuthorsAgreementOnThePatchLandsTheChainTest(td.DispatchBase):
             recipient, lane, "review the delta at " + ref[:12], ref,
             repo=self.repo, kind="review", sign=False,
             key="key-" + lane, new_work=supersedes is None,
-            supersedes=supersedes)
+            supersedes=supersedes,
+            **({"task": self.review_task["id"]} if supersedes is None else {}))
         self.assertIsNone(why, why)
         return row
 

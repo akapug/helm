@@ -142,7 +142,8 @@ class RefusingRungTest(RepoBase):
 
     def test_every_listed_name_is_refused_in_every_public_bound_path(self):
         rels = ("helm/a.py", "docs/a.md", "tests/test_a.py", "agents/a.md",
-                "bin/a", "scripts/a.sh", "README.md", "CHANGELOG.md")
+                "bin/a", "scripts/a.sh", "README.md", "CHANGELOG.md",
+                "changes/a-lane.md")
         body = "".join("# the %s box\n" % n for n in private_names.NAMES)
         for rel in rels:
             self.stage(rel, body)
@@ -184,6 +185,20 @@ class RefusingRungTest(RepoBase):
         self.assertEqual(self.refuse(), (0, ""))
         self.assertFalse(private_names.public_bound("journal/notes.md"))
         self.assertTrue(private_names.public_bound("SECURITY.md"))
+
+    def test_a_change_note_is_judged_as_CHANGELOG_md_is(self):
+        """A change note (changes/<lane>.md) is the text the release folds
+        into CHANGELOG.md, so it ships and is judged like CHANGELOG.md; the
+        same name in a path that does not ship is not judged."""
+        self.assertTrue(private_names.public_bound("changes/a-lane.md"))
+        self.assertFalse(private_names.public_bound("notes/a-lane.md"))
+        self.stage("changes/a-lane.md", "- the %s box now answers\n"
+                   % LEAKED[0])
+        self.stage("notes/a-lane.md", "- the %s box now answers\n" % LEAKED[0])
+        rc, err = self.refuse()
+        self.assertEqual(rc, 1)
+        self.assertIn("changes/a-lane.md:1 — private-names list entry 3", err)
+        self.assertNotIn("notes/a-lane.md", err)
 
     def test_only_added_lines_are_judged(self):  # noqa: VACUOUS_ASSERTION — the same refuse() observable returns 1 once the judged line is edited, unconditionally
         self.stage("docs/old.md", "the %s box\nsecond line\n" % LEAKED[0])

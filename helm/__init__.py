@@ -66,4 +66,4 @@ del _ROOT
 
 from . import seat_reachability  # noqa: E402
 
-__version__ = "0.3.2"
+__version__ = "0.3.3"

@@ -36,7 +36,8 @@ _OWNER_NAMES = (
     )),
     ('web_configs', (
         '_api_configs', '_api_config_injection', '_api_inject_pack',
-        '_api_inject_act', '_api_configs_cascade',
+        '_api_inject_act', '_api_seat_contextloop', '_api_inject_turntext',
+        '_api_configs_cascade',
         '_api_configs_tree',
         '_api_configs_homes', '_api_configs_resolve', '_api_configs_file',
         '_api_configs_backups', '_api_configs_file_post',
@@ -82,6 +83,7 @@ _OWNER_NAMES = (
         '_owner_row', '_api_chat_roster', '_api_notes',
         '_api_storage_matrix', '_api_todos', '_ROSTER_GIT_CACHE',
         '_ROSTER_GIT_TTL', '_roster_git_one', '_api_roster_git',
+        '_api_roster_mood',
         '_api_chat_seat', '_api_chat_react',
     )),
     ('web_land_model', (

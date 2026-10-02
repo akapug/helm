@@ -20,7 +20,7 @@ WHAT "QUALIFIED" MEANS, and the whole point is that it is a PREDICATE rather
 than a judgement — these are the checks the integrator already ran by hand:
 
   (i)   holds landlock:helm
-  (ii)  a gate minted on the POST-REBASE TREE it is actually landing
+  (ii)  a gate minted on the COMPOSED TREE it is actually landing
   (iii) an approving cross-family verdict at the exact REVIEWED tip
   (iv)  a changed-file set DISJOINT from every other approved-unlanded lane
   (v)   freeze state admits, and announce + rearm run as steps of the verb
@@ -126,7 +126,7 @@ def gate_binds_tree(receipt, tree, gates=None, repo=None, tip=None,
     its shared admin dir: a declared command's scope is read against the
     location's own declaration."""
     if not receipt:
-        return REFUSE, "no gate receipt cited for the post-rebase tree"
+        return REFUSE, "no gate receipt cited for the composed tree"
     derived = None
     if repo and tip:
         ok, out = _git(repo, "rev-parse", "%s^{tree}" % tip)
@@ -213,7 +213,7 @@ def gate_binds_tree(receipt, tree, gates=None, repo=None, tip=None,
     refusal = gatemod.land_provenance_refusal(rec, repo, answer=answer)
     if refusal:
         return (UNKNOWN if answer[0] is None else REFUSE), refusal
-    return OK, "gate %s binds the post-rebase tree %s%s" % (
+    return OK, "gate %s binds the composed tree %s%s" % (
         receipt, tree[:12], " (%s)" % answer[1] if answer[1] else "")
 
 

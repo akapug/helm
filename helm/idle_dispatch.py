@@ -225,6 +225,11 @@ _USAGE = """usage: helm seat idle-dispatch [--once] [--dry-run] [--apply] [--qui
   obligation seam that answers the wider question does not exist yet, so the
   count is a FLOOR on what is owed, never a total.
 
+  FRICTION AUTOPILOT (task/3899) — every pass also rides `helm friction
+  autopilot` (helm/frictionpilot.py), at most once per 15 min: a guard that
+  keeps refusing gets ONE task row and one #seats post. --dry-run and
+  --quiet print what it would do and write nothing.
+
   DARK-SEAT MOVER (task/3587) — every pass also judges each seat that owes
   work: DARK when `helm burn` reads its family RED on MONEY or REACH, when its
   own last turn ended on a billing or credential refusal, or when its pane is
@@ -240,6 +245,12 @@ _USAGE = """usage: helm seat idle-dispatch [--once] [--dry-run] [--apply] [--qui
   seat-reassign task capability) plus one chat line in #helm. A row with no
   live seat to take it stays and is reported once. An unreadable roster or
   ledger moves nothing and says so in one line.
+
+  OFFICE WEATHER (task/3902) rides every pass: the floor's sunny, cloudy or
+  stormy line (helm/officeweather.py). The bare pass records it and pushes
+  to the owner's phone only a settled storm and its all-clear; --dry-run and
+  --quiet read it without writing or pushing, and HELM_OFFICE_WEATHER=off
+  skips it.
 
   UNREADABLE IS NOT EMPTY, all the way to the exit code. When the ledger
   cannot be read this prints UNKNOWN and exits non-zero, so a caller cannot
@@ -2176,13 +2187,28 @@ def cmd_idle_dispatch(argv=None):
                            "--json"), usage=_USAGE.splitlines()[0])
     if rc is not None:
         return rc
-    res = check(post="--dry-run" not in args, quiet="--quiet" in args)
-    # THE DARK-SEAT MOVER RIDES THIS TICK (task/3587): dry-run unless
-    # --apply, and --dry-run wins over --apply.
+    # THE PASS ITSELF IS A TICK LEG (task/4189): a raise, or a dispatch
+    # ledger it cannot read, counts toward the alarm like any leg's failure.
+    from . import tickalarm
+    res = tickalarm.watch(
+        "idle-dispatch",
+        lambda: check(post="--dry-run" not in args, quiet="--quiet" in args),
+        failed=lambda got: got.get("redeliverable") is None and
+        "the dispatch ledger could not be read")
+    # THE DARK-SEAT MOVER RIDES THIS TICK (task/3587). The bare tick is the
+    # automatic mover, which moves unless local-names `dark-seat-mover` is
+    # "off" (task/3881); --apply and --dry-run decide a hand-run pass, and
+    # --dry-run wins over --apply.
     from . import darkmove
     moved_lines, moves = darkmove.run(
-        apply="--apply" in args and "--dry-run" not in args,
+        apply=False if "--dry-run" in args
+        else True if "--apply" in args else None,
         post="--quiet" not in args)
+    from . import frictionpilot
+    pilot = frictionpilot.ride(apply="--dry-run" not in args
+                               and "--quiet" not in args)
+    for line in pilot if "--json" not in args else ():
+        print(line)
     if "--json" in args:
         # THE SCOPE TRAVELS WITH THE DATA, not in the help text. A burn-down
         # consumer reads this dict and nothing else, so an undeclared list is
@@ -2191,7 +2217,8 @@ def cmd_idle_dispatch(argv=None):
         # obligation seam exists to widen the domain.
         res = dict(res, redeliverable_scope=REDELIVERABLE_SCOPE,
                    redeliverable_complete=REDELIVERABLE_COMPLETE,
-                   dark_moves={"lines": moved_lines, "moves": moves})
+                   dark_moves={"lines": moved_lines, "moves": moves},
+                   friction_autopilot=pilot)
         print(json.dumps(res))
     else:
         for f in res["findings"]:
@@ -2233,6 +2260,17 @@ def cmd_idle_dispatch(argv=None):
             print("owed-undelivered: %d row(s) at %s"
                   % (len(owed_rows), REDELIVERABLE_SCOPE_NOTE))
         for line in moved_lines:
+            print(line)
+    # THE OFFICE WEATHER RIDES THIS TICK TOO (task/3902): the floor's word,
+    # pushed to the owner's phone only on a settled storm and its all-clear.
+    # The bare tick (the timer) pushes; --dry-run and --quiet read without
+    # writing or pushing. It never raises into this tick, and --json output
+    # stays one document.
+    from . import officeweather
+    weather = officeweather.ride(push="--dry-run" not in args
+                                 and "--quiet" not in args)
+    if "--json" not in args:
+        for line in weather:
             print(line)
     # rc carries the tri-state a burn-down caller has to branch on: 0 means
     # ANSWERED, non-zero means the ledger could not be read.

@@ -197,7 +197,8 @@ from ._common import (
     JIT_LINE_CAP, JIT_BUDGET, JIT_LANE_MAX, FIRST_SENTENCE_MIN, FOOTER,
     FOOTER_GATES,
     REPEAT_WINDOW_TURNS,
-    WHO_CAP, WHO_ID, LEDGER_MAX,
+    WHO_CAP, WHO_ID, WHO_OWNER, WHO_LONGTAIL, WHO_AUDIENCES,
+    LEDGER_MAX,
     CF_TIMEOUT,
     COOLDOWN_ESCAPE, SEEN_TTL, COINAGE_STRIKES, COINAGE_CAP,
     WHISPER_ID, WHISPER_CAP, SA_WHISPER_ID, SA_WHISPER, CLAIM_WHISPER_ID,
@@ -205,7 +206,8 @@ from ._common import (
     COUNCIL_TAIL, COUNCIL_OFFER_CAP, _CACHE_VERSION,
 )
 from ._entries import (
-    _entry_line, _who_lines, _sa_whisper, _entry_line_full, _cache_file,
+    _entry_line, _who_lines, _who_audience, _sa_whisper, _entry_line_full,
+    _cache_file,
     _store_sig, load_entries, _lane_entries, _lanes, lane_df, _df_key,
     _df_cache_file, pinned_lane,
     _gate_plan, _gate_line, _gate_dropped, _gate_missing, _gate_cycle, pinned_admission, store_typed_id,

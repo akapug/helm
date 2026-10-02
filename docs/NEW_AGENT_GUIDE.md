@@ -147,6 +147,13 @@ design and must never arm, replace or stop one.
   point.
 - **Reviewed SHAs are immutable.** Once a SHA is posted for review, fix on
   top with a new commit — never amend or rebase it away.
+- **Your change note is its own file.** Write it as `changes/<lane>.md`
+  (markdown bullets, written like a CHANGELOG bullet) and never edit
+  `CHANGELOG.md` in a lane. When every lane added a bullet under
+  `## Unreleased`, any two lanes in one train conflicted there and the train
+  dropped one of them. The tree-wide audit `tests/test_change_notes.py` is
+  red on a line a lane writes under `## Unreleased`; the release's fold is
+  the one writer of notes there ([LANDING](LANDING.md#a-lanes-change-note)).
 - **Obligations live on the dispatch ledger, and only the ones addressed to
   you.** `helm dispatch list --mine --open` is what you owe. Use that spelling
   and not the unfiltered listing: `--mine` keeps only the rows naming you and
@@ -167,8 +174,11 @@ design and must never arm, replace or stop one.
   between the row's sender and its reader, and every later dispatch of the
   same chain (a FIX, the cure, the re-read, a rebind to a new reader) opens
   the next ROUND in that same room. The room is named after the task the
-  chain's first row names in its lane (`task-3112` in the lane is enough),
-  else after the chain root: `meld-0-pair-<project>-task-3112`.
+  chain's first row names in its lane (`task-3112` in the lane is enough):
+  the project, then the task number, as in `helm-3112`. A chain whose first
+  row names no task is named after its chain root:
+  `meld-0-pair-<project>-chain-<id12>`. A task whose room opened under the
+  older `meld-0-pair-<project>-task-<n>` name keeps that room.
   `helm dispatch send` prints "your pair meld for this task: ROOM" and the
   `helm chat meld recv ROOM` that waits for your reader; the reader's DM
   carries the room, and that DM is the only wake. As the reader, join with
@@ -186,6 +196,9 @@ design and must never arm, replace or stop one.
 
   `MELD OUTCOME: AGREED|SPLIT|RESEARCH | BAR: <harms> | FALSIFIERS: <class>; ... | FINDINGS: <id>=<disposition>; ... | TIP: <full sha> | NEXT: <next action>`
 
+  A finding assigned to follow-on work uses `task/N` as its disposition only
+  when that task is open in the reviewed task's story; the citation checks both.
+
   The row stays the ledger: the reader records the outcome with
   `helm dispatch verdict ... --meld ROOM` (the newest round) or
   `--meld ROOM@EPOCH` (a named round). A round's outcome closes only the row
@@ -201,17 +214,27 @@ design and must never arm, replace or stop one.
   pair melds reach AGREED on a row, and what each converged chain cost.
 - **Reviewing? Patch the mechanical findings yourself.** Every family is an
   equal counterpart, so a reviewer who finds a MECHANICAL defect cures it:
-  commit off the exact tip you reviewed, in your own room or, with none, a
-  `git clone --shared <repo> <scratch>/wt` detached at that tip, then bring
+  commit off the exact tip you reviewed. A subagent reviewer has NO room of
+  its own, so its default — and the only route generic reviewer authority
+  grants — is a `git clone --shared <repo> <scratch>/wt` detached at that tip,
+  then bring
   the commit into the repo with `git -C <repo> fetch --no-write-fetch-head
   <scratch>/wt <sha>` (no ref moves; a commit left in the clone is refused as
-  cross-repository proof). Never `git worktree add` or a branch in the shared checkout. Do
-  not push, and name the tip on the verdict:
+  cross-repository proof). For an explicit BUILD, a parent may instead assign
+  its sole delegate a REGISTERED lane room (`helm work claim`); the parent
+  owns the lease through completion or accepted handoff and then returns the
+  room (`helm work release`), never unfinished work. This narrower build
+  allocation is never general reviewer authority. Never raw `git worktree add`
+  or an unregistered shared worktree or unleased shared branch — protected
+  or shared ref writes, permission bypass, config/canon edits, test-home
+  leakage and publication are also out of bounds. Do not push, and name the tip
+  on the verdict:
   `helm dispatch verdict <id> <tip> --fix --measured --finding-count <n>
   --prior-relation <new|uncured|regression-of-cure> --patch-tip <your-sha>`
-  plus the exit answer and evidence. The lane owner or integrator rebases the
-  lane onto that tip or cherry-picks it. A DESIGN finding goes to a meld
-  instead. The lane then has SEVERAL AUTHORS and the ledger records each;
+  plus the exit answer and evidence. The lane owner or integrator merges that
+  exact tip into a NEW composition commit that keeps both submitted shas
+  reachable — never rewrites or cherry-picks away the submitted tip. A DESIGN
+  finding goes to a meld instead. The lane then has SEVERAL AUTHORS and the ledger records each;
   family independence is preserved by the composed tip being re-read once by a
   reader who wrote none of it, not by keeping one family read-only.
 - **INDEPENDENCE IS THE READER'S CONTEXT; MODEL AND FAMILY RANK.** A read is
@@ -251,8 +274,16 @@ design and must never arm, replace or stop one.
   `fab gate` cannot come home, so the round is `fab test` over that selection:
   testimony, not a receipt. A reviewer whose source read is clean HOLDS the
   row: `helm dispatch hold <row> --source-clean <tip> <reason>`. Only the
-  row's recipient, who wrote no round of the lane, can make that hold. Such a
-  row rides `helm train` at its held tip and owes no approve: after the
+  row's recipient, who wrote no round of the lane, can make that hold. A DOOR
+  car needs that holder's exact-session approval proof at the hold; a later
+  proxy cooldown does not erase it. Owner demotion vetoes final admission
+  before the push; after a successful train-issued push, that exact admitted
+  car can close on its recorded push proof without a later policy read undoing
+  the land. The push proof binds its exact remote branch; an explicit local
+  trunk, another remote branch, or a repointed remote push URL cannot borrow it.
+  A manually advanced trunk
+  has no such proof.
+  Such a row rides `helm train` at its held tip and owes no approve: after the
   train's gate and land, `helm lr foldcheck <head> --gate gate:<id> --apply`
   closes it as `source-clean-landed`. A car that rides on an APPROVE still
   binds that approve to the token the train's gate mints. An APPROVE without a
@@ -287,6 +318,17 @@ design and must never arm, replace or stop one.
   and launches the gate through the door above. It merges and does not
   cherry-pick, so each reviewed sha is an ancestor of trunk once the train
   lands.
+- **Done is live AND seen working, not on trunk.** A land that carries its
+  task's whole ask leaves the task LANDED, owing a seen-working check by one
+  named seat: the seat that filed it, else its project's lead, else the
+  integrator (helm/observed.py). The LAND announcement @mentions that seat
+  with the command. When you are named, use the change where it runs, then
+  record what you saw: `helm task observed <id> --evidence "<what was seen
+  working, where>"`. That closes the task. Any seat may record it, and it
+  names who did. A land that owes the leads a relaunch is not LIVE until
+  they relaunch, and the announcement says so. A check left 24 hours moves
+  once to the next seat in that order. While you owe checks, the morning
+  report's ORDER lines name you. No check holds a land.
 
 ## 4. Knowledge
 

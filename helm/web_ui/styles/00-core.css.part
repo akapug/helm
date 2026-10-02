@@ -107,6 +107,13 @@ button{font:inherit}
 #nav .stats .stat{display:flex;flex-direction:column;line-height:1.15;text-align:right}
 #nav .stats .stat b{color:var(--fg);font-weight:var(--w-med);font-size:var(--f2)}
 #nav .stats .stat span{font-size:var(--f0);color:var(--sub);text-transform:uppercase;letter-spacing:.04em}
+/* THE OFFICE WEATHER (task/3902): the nav's last row, full width, at most two
+   lines (the whole line is its title), coloured by the word. */
+#navweather{order:20;flex:1 0 100%;font-size:var(--f1);line-height:1.35;display:-webkit-box;-webkit-box-orient:vertical;-webkit-line-clamp:2;overflow:hidden;overflow-wrap:anywhere}
+#navweather .wx-sunny{color:var(--ok)}
+#navweather .wx-cloudy{color:var(--mut)}
+#navweather .wx-stormy{color:var(--bad);font-weight:var(--w-med)}
+#navweather .wx-unread{color:var(--sub)}
 #nav .icon{width:32px;height:32px;display:grid;place-items:center;border:1px solid var(--line);border-radius:var(--r-sm);background:var(--card);color:var(--mut);cursor:pointer;font-size:var(--f2);flex:none}
 #nav .icon:hover{color:var(--fg);border-color:var(--line2)}
 /* narrow screens (orca mobile is the primary touch surface — this is graceful

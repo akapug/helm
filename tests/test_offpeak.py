@@ -135,12 +135,18 @@ class WindowTest(unittest.TestCase):
 
 class CatalogTest(unittest.TestCase):
 
-    def test_the_direct_key_is_the_pro_familys_only_route(self):
+    def test_the_direct_key_is_the_pro_familys_default_route(self):
+        """The Go row beside it is ungated, and a seat carries one row: an
+        unreadable config stands in as the default, the gated key."""
         fam = seat.FAMILIES[FAMILY]
         self.assertEqual(fam["port"], 8360)
         self.assertEqual(fam["mode"], "proxy-key")
         self.assertEqual(fam["pool_default"], "deepseek")
-        (row,) = fam["pool_providers"].values()
+        self.assertEqual(offpeak.default_routes(fam), {PROVIDER})
+        self.assertEqual([p for p, _w in offpeak.gated_providers(fam)],
+                         [PROVIDER])
+        self.assertNotIn("billing_window", fam["pool_providers"]["opencode-go"])
+        row = fam["pool_providers"]["deepseek"]
         self.assertEqual(row["proxy_provider"], PROVIDER)
         self.assertEqual(row["base_url"], "https://api.deepseek.com/v1")
         self.assertEqual(row["upstream_model"], "deepseek-v4-pro")
@@ -163,19 +169,19 @@ class CatalogTest(unittest.TestCase):
         # the control on the same instant: the direct key IS closed
         self.assertIn("CLOSED", offpeak.status_line(FAMILY, at=PEAK))
 
-    def test_flash_start_and_session_launch_stay_staged(self):
+    def test_flash_start_and_session_launch_are_admitted_at_peak(self):  # noqa: VACUOUS_ASSERTION — the direct-key control above reads CLOSED on the same instant
+        """The flat subscription is never gated, and with the per-conversation
+        session header in the proxy (task/3824) nothing else holds it."""
         flat = seat.FAMILIES[FLAT]
         gate, notes = sla.family_start_refusal(FLAT, flat, "")
-        self.assertEqual(notes, ())
-        self.assertIsNotNone(gate)
-        self.assertIn("x-opencode-session", gate)
+        self.assertEqual((gate, notes), (None, ()))
         with mock.patch.object(sla, "_seat_surface_error", return_value=None), \
                 mock.patch.object(sla, "_nested_surface_error", return_value=None), \
                 mock.patch("helm.hooks.unresolved_externals", return_value=[]):
             refusal, short = sla._launch_surface_refusal(
                 FLAT, FLAT, "/synthetic/ds4flash")
-        self.assertEqual(short, ())
-        self.assertIn("x-opencode-session", refusal)
+        self.assertIsNone(refusal)
+        self.assertFalse(short)
 
 
 def _config(port=8360, providers=((PROVIDER, "https://api.deepseek.com/v1",

@@ -1379,7 +1379,7 @@ class FoldCheckCliTest(FoldCheckBase):
             self.assertIn(name, out)
 
     def test_a_passing_fold_names_the_leases_the_trunk_now_carries(self):
-        """A LAND RELEASES NO LEASE, so a board reading leases draws the lanes
+        """A HAND LAND RELEASES NO LEASE, so a board reading leases draws the lanes
         a land carried as building ("about half the listed lanes already
         landed", the owner). After the five PASS, the fold names
         each held lane whose work is on the trunk with the exact release line,

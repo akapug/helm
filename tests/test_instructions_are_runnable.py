@@ -89,9 +89,9 @@ _NON_COMMAND_MENTIONS = {
         "a substitution-obfuscated beacon arm, quoted as the rung's input",
     ("helm/chat.py", "helm ch<mark>"):
         "the mark-folded form of that same input, quoted as what bash ran",
-    ("docs/HOOKS.md", "helm ch$(echo"):
+    ("docs/hooks/argv-guard.md", "helm ch$(echo"):
         "a substitution-obfuscated beacon arm, quoted as the rung's input",
-    ("docs/HOOKS.md", "helm $V"):
+    ("docs/hooks/argv-guard.md", "helm $V"):
         "a variable-spelled command the rung deliberately PASSES (measured)",
 }
 _FORMATTED_COMMAND_MENTIONS = {

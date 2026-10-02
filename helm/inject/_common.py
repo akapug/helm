@@ -92,6 +92,9 @@ WHO_CAP = 350         # WHO digest's joint byte cap — its WHOLE budget, NOT
                       # a slice of PINNED_BUDGET. The digest is charged here
                       # alone and walks AFTER the rules (2026-08-28 ruling).
 WHO_ID = "who:operator"  # the digest's ledger id (the profile cohort in --lane-report)
+WHO_OWNER = "owner"       # the seats the owner talks to: the full guidance
+WHO_LONGTAIL = "longtail"  # every other seat: the profile's longtail_guidance
+WHO_AUDIENCES = (WHO_OWNER, WHO_LONGTAIL)
 LEDGER_MAX = 5 * 1024 * 1024  # ledger rotates here (one .1 generation)
 CF_TIMEOUT = 1.5      # the CF comparison query's hard timebox (s) — a bounded turn, never a hung one
 

@@ -59,6 +59,11 @@
       <button class="navtab" data-v="boxes">boxes</button>
     </div>
   </div>
+  <!-- THE OFFICE WEATHER (task/3902): the whole floor in one line, sunny,
+       cloudy or stormy, the same line his phone gets when the word changes.
+       A full-width row of the nav, so it heads every view and the sticky
+       offset under the nav counts it. Hidden until the first read. -->
+  <div id="navweather" hidden></div>
 </nav>
 <!-- THE STALE-PAGE TELL. This tab is long-lived and the server is assembled
      fresh per request, so the page he is reading can be hours older than the

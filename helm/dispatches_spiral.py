@@ -323,7 +323,16 @@ def _round_view(bucket, pending=None):
 
 
 def _unread_evidence(dispatched, read):
-    """The UNREAD advisory's sentence: what was measured, and the fix."""
+    """The UNREAD advisory's sentence: what was measured, and the fix.
+
+    Zero recorded reads means there is no reviewer yet (task/2682). Telling
+    the author to record a verdict assumes someone already read the tip and
+    left it out of the ledger, so that sentence is only for a chain that has
+    at least one recorded read.
+    """
+    if not read:
+        return ("%d dispatches and ZERO reads; the reviewer is the missing "
+                "thing, go find one" % dispatched)
     return ("%d dispatches at distinct tips, %d with a recorded read (a "
             "verdict, a source-clean hold or an advisory read), so there is "
             "no recorded finding to converge. The fix: the reader records "

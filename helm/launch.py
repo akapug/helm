@@ -6,8 +6,8 @@ onto helm's own machinery). Use it in place of a bare `claude` invocation:
 
 It (1) wires the hook estate into the target home (inject + the delivery
 lane's deliver/join — hooks.py's installer, idempotent) and runs the
-homes.BENEFITS entries marked `launch` on each home it wires (ultracode +
-Opus xhigh in settings.json, additive), (2) pre-writes the
+homes.BENEFITS entries marked `launch` on each home it wires (effort high
+for every model in settings.json, additive), (2) pre-writes the
 seat's roster row so teammates can address it before the first boundary,
 (3) exports one aligned chat + dregg signer identity so every surface speaks
 and signs as the STABLE seat (meld's agent-join lesson: an addressable identity
@@ -47,11 +47,21 @@ def stable_seat(cwd=None):
     return _SAFE.sub("-", "%s-%s" % (host, base))[:64].strip("-") or "seat"
 
 
+#: helm launch's OWN options. A token starting with one of these belongs to
+#: helm; everything else is claude's and passes through untouched.
+_OWN = ("--seat", "--home", "--room", "--model", "--role")
+
+
+class OwnArgumentError(ValueError):
+    """A helm launch option was given without a value. Its own type so the
+    caller can report it as a usage error rather than an internal fault."""
+
+
 def parse_args(args):
     """-> (opts dict, claude_args). Everything after `--` (or the first
     unknown token) passes through verbatim."""
     opts = {"seat": None, "home": None, "room": None, "model": None,
-            "install": True}
+            "role": None, "install": True}
     rest, i = [], 0
     args = list(args or [])
     while i < len(args):
@@ -59,9 +69,23 @@ def parse_args(args):
         if a == "--":
             rest.extend(args[i + 1:])
             break
-        if a in ("--seat", "--home", "--room", "--model") and i + 1 < len(args):
-            opts[a[2:]] = args[i + 1]
-            i += 2
+        if a in _OWN or a.split("=", 1)[0] in _OWN:
+            # THE EQUALS FORM IS ACCEPTED, AND THE VALUE MAY CONTAIN '=':
+            # split on the FIRST one, so `--room=a=b` is the room `a=b`.
+            name, eq, value = a.partition("=")
+            if not eq:
+                value = args[i + 1] if i + 1 < len(args) else None
+            # A VALUELESS OWN OPTION IS REFUSED BY NAME. Falling through to
+            # claude makes `helm launch --seat` (last, or followed by another
+            # flag) launch a seat nobody named, and nothing says so. An EMPTY
+            # value (`--seat=`, `--seat ""`) is no value either: it reads as
+            # unset downstream and the seat is inherited or derived.
+            if not value or (not eq and value.startswith("--")):
+                raise OwnArgumentError(
+                    "%s wants a value (one token after it, or %s=VALUE)"
+                    % (name, name))
+            opts[name[2:]] = value
+            i += 1 if eq else 2
             continue
         if a == "--no-install":
             opts["install"] = False
@@ -73,7 +97,7 @@ def parse_args(args):
 
 
 def build_env(base, seat, home_path=None, room=None, room_source=None,
-              allocate_scratch=True, attempt_token=None):
+              allocate_scratch=True, attempt_token=None, role=None):
     """The child's env: one aligned chat/signer identity, optional credential-
     home pin, an explicit or derived project room, and the spawn ATTEMPT TOKEN
     this launch was handed (or none). Pure when `allocate_scratch` is False —
@@ -146,6 +170,38 @@ def build_env(base, seat, home_path=None, room=None, room_source=None,
     env["HELM_AGENT_HARNESS"] = "claude"
     env["HELM_MODEL_FAMILY"] = "claude"
     env["HELM_MODEL_BACKEND"] = "native"
+    # A LEAD'S WORKING WINDOW (task/4049). The native claude seat has no
+    # catalog entry (it is not in FAMILIES — it has no proxy), so nothing on
+    # this leg ever taught it a window, and the alternative to this line is
+    # Claude Code's own 200k default: a number nobody chose. The window rides
+    # the LEAD POSTURE, which the spawn register already records, and it is
+    # read through the same helper the autocompact gauge uses, so the number
+    # the pane is taught and the number it is measured against are one value.
+    # BOTH knobs go out together, exactly as on the proxy line: for a claude-
+    # model seat CC reads its capacity from its own table and IGNORES
+    # MAX_CONTEXT_TOKENS (the comment above _spawn_native_plan has the
+    # strings evidence), where AUTO_COMPACT_WINDOW is what CC clamps by it —
+    # so emitting the pair narrows a claude pane correctly and leaves a
+    # non-claude one no worse off. A worker sets neither.
+    if role == "lead":
+        from .seat_catalog import launch_window
+        win = launch_window({}, role="lead")
+        env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"] = str(win)
+        env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(win)
+        # THE LEAD MARKER rides too, as the native spawn's pane command already
+        # sets it: the memory cap (seatlimits.role_of) and the WHO audience
+        # read a lead from the process env, and a lead launched by hand has no
+        # spawn command to put it there.
+        from .seat_role import _launch_env
+        env.update(_launch_env("lead", {}))
+    else:
+        # THE MARKER RIDES THE RECORDED ROLE, NEVER THE LAUNCH SHELL (task/4112).
+        # A worker (or an unregistered seat, which reads worker) must not keep a
+        # lead marker it inherited from the pane that launched it: the memory
+        # cap (seatlimits.role_of) reads a lead from the process env, so a worker
+        # spawned from a lead's pane would otherwise read as one by contagion.
+        from .seat_role import _ROLE_ENV
+        env.pop(_ROLE_ENV, None)
     # Feedback about helm never leaves helm (task/2328): the same pair the
     # proxy families' launch line exports, on the native door — a law about
     # where a seat's feedback goes, so it is not keyed on the backend. Set,
@@ -271,8 +327,23 @@ def carry_model(model, claude_args, config_home):
 
 
 def cmd_launch(args):
-    """launch [--seat S] [--home H] [--room R] [--model M] [--no-install] [--] [args…]"""
-    opts, claude_args = parse_args(args)
+    """launch [--seat S] [--home H] [--room R] [--model M] [--role R] [--no-install] [--] [args…]"""
+    # A VALUELESS OWN OPTION IS A USAGE ERROR, not a crash: one line, and
+    # nothing is launched. (The parser raises; the door reports.)
+    try:
+        opts, claude_args = parse_args(args)
+    except OwnArgumentError as e:
+        print("helm launch: %s; no session was started" % e, file=sys.stderr)
+        return 2
+    if opts["role"] is not None:
+        from .seat_role import SEAT_ROLES
+        if opts["role"] not in SEAT_ROLES or not opts["seat"]:
+            # a role is declared FOR a named seat, never for one inherited
+            # from the launching shell or derived from the cwd
+            print("helm launch: REFUSED — --role takes one of %s and needs "
+                  "--seat; no session was started" % ", ".join(SEAT_ROLES),
+                  file=sys.stderr)
+            return 2
     home_path = None
     if opts["home"]:
         targets, err = hooks._select_homes(opts["home"])
@@ -331,8 +402,9 @@ def cmd_launch(args):
                 return 1
             # THE HOME LIST'S LAUNCH ENTRIES, through homes.provision and not a
             # writer of launch's own: a home made outside `helm homes prepare`
-            # still gets what every Opus seat must carry (ultracode + xhigh)
-            # the first time a launch wires it. A pure read once it is there.
+            # still gets what every seat must carry (effort high) the first
+            # time a launch wires it, and a retired default helm once wrote is
+            # corrected and named. A pure read once it is there.
             notes, err = homes.provision(path, at_launch=True)
             for line in notes + ([err] if err else []):
                 print("[helm launch] %s: %s" % (name, line), file=sys.stderr)
@@ -377,6 +449,22 @@ def cmd_launch(args):
     # identical and only the import path changes.
     from .seat import spawn_attempt_token
     attempt_token = spawn_attempt_token()
+    # THE SEAT'S POSTURE, off the register ITS OWN SPAWN wrote. `helm launch`
+    # is the native leg, and a native seat is spawned by `helm seat spawn
+    # <project>-claude --role lead`; the record it left is what makes the
+    # posture survive a relaunch, hand start or resume. A native seat helm
+    # never spawned (a lead started by hand) declares its role here with
+    # `--role`, which `declare_role` records for it and refuses for a spawned
+    # seat whose register says otherwise; the declaration then outlives this
+    # launch. A seat with neither is an ordinary worker.
+    from .seat_role import declare_role, recorded_role
+    if opts["role"] is not None:
+        why = declare_role(seat, opts["role"])
+        if why:
+            print("helm launch: REFUSED — %s; no session was started" % why,
+                  file=sys.stderr)
+            return 2
+    role = recorded_role(seat)
     if attempt_token:
         print("[helm launch] spawn attempt %s — this pane is that spawn's "
               "child; its SessionStart binds into that attempt's register"
@@ -386,7 +474,46 @@ def cmd_launch(args):
                runtime={"agent_harness": "claude", "family": "claude",
                         "backend": "native"})
     env = build_env(os.environ, seat, home_path, room, room_source,
-                    attempt_token=attempt_token)
+                    attempt_token=attempt_token, role=role)
+    # THE LEAD-LEAN LAYER, delivered HERE because a native lead owns no launch
+    # assets: `claude` is not in FAMILIES, so the native spawn never reaches
+    # `_write_launch_assets`, and `_seed_lead_lean` never runs for the one kind
+    # of seat this profile exists for. The settings ride `--settings`, whose
+    # merge semantics and presence are checked against the installed binary,
+    # and the file lives under the seat's own helm state dir — never a shared
+    # credhome, which leads and workers share on one account. It reads the
+    # same recorded posture the lead window above rode, read once.
+    lean_args = _lead_lean_args(seat, role)
     print("[helm launch] seat '%s'%s — exec claude" % (
         seat, (" home " + opts["home"]) if opts["home"] else ""), file=sys.stderr)
-    return seat_launch_owner.exec_attached(["claude"] + claude_args, env)
+    return seat_launch_owner.exec_attached(["claude"] + lean_args + claude_args,
+                                           env)
+
+
+def _lead_lean_args(seat, role):
+    """['--settings', <path>] for a LEAD, [] for anyone else.
+
+    The file is written fresh from the catalog's one document on every launch
+    (it is small and the launch already touches the disk), so an edit to the
+    profile reaches the next launch with no migration. A write that fails
+    leaves the seat launching exactly as it would have: a missing profile is
+    a heavier seat, never a broken one."""
+    if role != "lead":
+        return []
+    import json
+    from . import home, pk
+    from . import seat as _seat_facade  # noqa: F401 — the facade import the
+    # impl-import guard requires beside a direct seat_catalog import; named
+    # apart so it never rebinds the `seat` parameter this function reads
+    from .seat_catalog import lead_lean_settings_doc
+    path = os.path.join(home.global_dir(), ".state", "lead-lean-%s.json"
+                        % home.validate_seat_arg(seat))
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        pk.write_json(path, lead_lean_settings_doc())
+    except (OSError, TypeError, ValueError) as e:
+        print("[helm launch] lead-lean profile not written (%s: %s); this "
+              "lead launches with its full settings" % (path, e),
+              file=sys.stderr)
+        return []
+    return ["--settings", path]

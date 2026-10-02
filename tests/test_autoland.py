@@ -35,7 +35,9 @@ from tests._tmphome import home as _tmp_home  # noqa: E402
 _tmp_home(prefix="helm-test-autoland-", var="HELM_HOME")
 
 from helm import (autoland, dispatches, eventledger, foldcheck,  # noqa: E402
-                  gate, gatecanary, hostpath_guard, landwindow, store, vcs)
+                  gate, gatecanary, hostpath_guard, landwindow, observed,
+                  registry, store, taskkey, tasks, vcs)
+from helm.store import load as store_load  # noqa: E402
 
 SRC = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
 
@@ -173,15 +175,34 @@ class FakeOps(autoland.Ops):
         self.heads = {}
         self.fold_rc = 0
         self.fold_text = None
+        self.preclosed = set()
         self.changes_by_tip = {}
         self.closed_rows = []
         self.close_fails = []
         self.closed_tasks = []
+        # the LAND step's question to a task's room, and the doors it asks
+        # of the chain's other rows (task/3746)
+        self.room_posts = []
+        self.row_closes = []
+        self.row_close_ok = set()
         self.removed = []
         self.flakes = []
+        self.b_gate = None
         self.composed = []
         # what `console_walk.surface` would say after the land (task/3444)
         self.walk_line = None
+        # THE LANE LEASES A LAND ENDS (task/3674): the claims ledger by lane,
+        # each lane's landedness (a lane absent here is landed), what each
+        # release answers, every release asked in order, and the lanes whose
+        # release crashes the tick once, after it released
+        self.leases = {}
+        self.landed = {}
+        self.release_answers = {}
+        self.released = []
+        self.release_raises = set()
+        # what the web's stop-facts and trunk's tree read (task/3796); None
+        # is a home no `helm web` serves
+        self.web = None
 
     # -- time, plan, flight, chat -------------------------------------
     def now(self):
@@ -222,7 +243,7 @@ class FakeOps(autoland.Ops):
         return post(self.walk_line) if self.walk_line else None
 
     def car_facts(self, root, car):
-        return {"task": "task/%d" % (3000 + int(car["tip"][0])),
+        return {"task": "task/%d" % (3000 + int(car["tip"][0], 16)),
                 "title": "the fleet got lane %s" % car["lane"],
                 "priority": "P1", "doors": [], "author": "builder-seat",
                 "reader": "reader-seat", "model": "a-model",
@@ -262,8 +283,17 @@ class FakeOps(autoland.Ops):
 
     def launch(self, room, name, trunk):
         self.calls.append("launch")
-        return self.launch_rc, {"host": "host-a", "job_id": "gate-x",
+        # FAB KEYS THE JOB by its tree and attempt, and each recorded flake
+        # of the tree is one more attempt (gatewindow.job_identity): a
+        # relaunch with no new flake is answered by the same job.
+        return self.launch_rc, {"host": "host-a",
+                                "job_id": "gate-x%d" % len(self.flakes),
                                 "room": room}, self.launch_text
+
+    def gate_of(self, room):
+        # what the landing-window door recorded for the gate blame's compose
+        # launched on a b-room: unrecorded unless a test names it
+        return dict(self.b_gate or {"host": None, "job_id": None})
 
     def receipts(self):
         return list(self.receipt_rows), None
@@ -368,7 +398,10 @@ class FakeOps(autoland.Ops):
         self.calls.append("postland")
         self.postlands.append(head)
 
-    def fold_apply(self, root, head, gid):
+    def source_clean_closed(self, root, rid, tip, head):
+        return rid in self.preclosed
+
+    def fold_apply(self, root, head, gid, train_car_ids=()):
         self.calls.append("fold_apply")
         if self.fold_text is not None:
             return self.fold_rc, self.fold_text
@@ -378,7 +411,7 @@ class FakeOps(autoland.Ops):
                  "all five PASSED — this fold is provable", "",
                  "SOURCE-CLEAN HOLDS THIS HEAD LANDS (gate:%s, APPLY):" % gid]
         lines += ["  CLOSED    %s  tip %s  held by reader-seat — ok"
-                  % (c["id"][:12], c["tip"][:12]) for c in self.cars
+                  % (c["id"], c["tip"][:12]) for c in self.cars
                   if c["basis"] == "source-clean"]
         return 0, "\n".join(lines)
 
@@ -388,6 +421,18 @@ class FakeOps(autoland.Ops):
             raise autoland.CloseFailed(self.close_fails.pop(0))
         self.closed_rows.append((rid, live, restart))
         return {"id": rid}, None
+
+    def task_room_post(self, room, text, key):
+        self.calls.append("task_room_post")
+        if key not in {k for _room, _text, k in self.room_posts}:
+            self.room_posts.append((room, text, key))
+        return None
+
+    def lr_row_close(self, rid, reason, evidence, live=None, restart=None):
+        self.calls.append("lr_row_close")
+        self.row_closes.append((rid, reason))
+        return None if (rid, reason) in self.row_close_ok \
+            else "the %s door refused in the fake" % reason
 
     def task_close(self, task, reason):
         self.calls.append("task_close")
@@ -402,6 +447,34 @@ class FakeOps(autoland.Ops):
         self.removed.append(room)
         return True, None
 
+    # -- the lane leases a land ends, the web it follows (task/3674) ----
+    def lane_lease(self, root, lane):
+        self.calls.append("lane_lease")
+        row = self.leases.get(lane)
+        return (dict(row), None) if row else (None, None)
+
+    def lane_landed(self, root, lane):
+        state = self.landed.get(lane, vcs.ANCESTOR)
+        return state, "lane/%s reads %s" % (lane, state)
+
+    def release_lease(self, root, lane, holder, lease):
+        self.calls.append("release_lease")
+        self.released.append((lane, holder, lease))
+        ok, text = self.release_answers.get(
+            lane, (True, "helm work: worktree:proj:%s released" % lane))
+        if ok:
+            self.leases.pop(lane, None)
+        if lane in self.release_raises:
+            self.release_raises.discard(lane)
+            raise RuntimeError("injected crash after the release of %s"
+                               % lane)
+        return ok, text
+
+    def web_code(self, root):
+        self.calls.append("web_code")
+        return dict(self.web or {"why": "no stop-facts have been written "
+                                        "(is `helm web` running?)"})
+
 
 class Base(unittest.TestCase):
     def setUp(self):
@@ -409,6 +482,7 @@ class Base(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         env = mock.patch.dict(os.environ, {
             "HELM_HOME": os.path.join(self.tmp, "home"),
+            "HELM_ADOPTED_DIR": os.path.join(self.tmp, "adopted"),
             autoland.VETO_ENV: "300"})
         env.start()
         self.addCleanup(env.stop)
@@ -627,126 +701,161 @@ class VetoArms(Base):
 
 
 class Admission(Base):
-    """A source-clean car whose lane is a door rides only when the approval
-    tier `helm reviewers` applies admits its holder; no model list is named
-    here. THE INTEGRATOR'S RULING (R2) MAKES IT FAIL CLOSED: an unreadable or
-    'none' policy, an unread resolved model, and a read that is input only
-    (or cannot be ruled out as input only) each refuse, and the holder's
-    FAMILY is passed to the input-only check so its spark, gemini and local
-    rungs run."""
+    """Source-clean door admission uses anchored hold evidence, not today's
+    model, runtime or live approval-tier resolver; current owner policy can
+    veto a proven hold but cannot retroactively grant one."""
 
     FACTS = {"task": "task/1", "priority": "P1", "doors": ["guard"],
-             "author": "builder-seat", "reader": "reader-seat",
-             "model": "a-model", "family": "codex"}
+             "author": "builder-seat", "reader": "reader-seat"}
 
-    def admission(self, tier=("ok", None), reads=(False, None), **facts):
-        from helm import dispatches, reviewer_eligibility
+    def setUp(self):
+        super().setUp()
+        projects = mock.patch.object(registry, "load",
+                                     return_value={"projects": {}})
+        projects.start()
+        self.addCleanup(projects.stop)
+
+    @staticmethod
+    def policy(*members):
+        return {"id": "approval-test", "class": "certain",
+                "_policy_confidence_valid": True,
+                "_policy_source_valid": True, "policy_kind": "approval-tier",
+                "policy_members": list(members), "policy_reason": "test owner rule"}
+
+    def hold_row(self, family="codex", model="a-model", recorded=None):
+        authority = {"v": 5, "identity": "reader-seat",
+                     "roster_identity": "reader-seat", "session": "hold-session",
+                     "runtime": {"backend": "native", "family": family},
+                     "runtime_verified": True}
+        row = {"id": ROW1, "hold_actor": "reader-seat", "repo_root": self.root,
+               "source_clean_tip": TIP1, "hold_ts": "2026-09-01T00:00:00Z"}
+        proof = {"v": 1, "row": ROW1, "actor": "reader-seat",
+                 "tip": TIP1, "ts": row["hold_ts"], "family": family,
+                 "model": model, "authority": authority,
+                 "policy": recorded or self.policy("family:" + family)}
+        proof["anchor"] = dispatches._proof_anchor(
+            "source-clean-holder-v1", proof)
+        row["hold_approval"] = proof
+        return row
+
+    def admission(self, row=None, current=None, reads=(False, None), **facts):
+        from helm import reviewer_eligibility
         self.asked = []
 
         def input_only(model, family=None):
             self.asked.append((model, family))
             return reads(model, family) if callable(reads) else reads
 
-        with mock.patch.object(dispatches, "approval_tier",
-                               lambda seat, repo=None, at=None: tier), \
-                mock.patch.object(reviewer_eligibility, "input_only",
-                                  input_only):
+        with mock.patch.object(store_load, "_policy_hits",
+                               return_value=[current or self.policy("family:codex")]), \
+                mock.patch.object(reviewer_eligibility, "input_only", input_only):
             return autoland.Ops()._door_admission(
-                self.root, dict(self.FACTS, **facts))
+                self.root, dict(self.FACTS, hold_row=row, **facts))
 
-    def test_a_tier_reader_carries_a_door(self):
-        self.assertEqual(self.admission(), (True, None))
+    def test_a_proven_tier_reader_carries_a_door(self):
+        self.assertEqual(self.admission(self.hold_row()), (True, None))
         self.assertEqual(self.asked, [("a-model", "codex")])
 
-    def test_a_reader_outside_the_tier_does_not_carry_a_door(self):
-        ok, why = self.admission(tier=("outside", "not in the tier"))
+    def test_a_bare_call_without_hold_proof_fails_closed(self):
+        ok, why = self.admission()
+        self.assertFalse(ok)
+        self.assertIn("no proven approval-tier holder at the hold", why)
+        self.assertEqual(self.asked, [])
+
+    def test_a_reader_outside_the_current_tier_does_not_carry_a_door(self):
+        row = self.hold_row()
+        ok, why = self.admission(row, current=self.policy("family:claude"))
         self.assertFalse(ok)
         self.assertIn("reader-seat", why)
-        ok, why = self.admission(tier=("unknown", "unread policy"))
+        self.assertIn("current approval tier", why)
+        # A later widening cannot grant a hold denied by its recorded policy.
+        row = self.hold_row(recorded=self.policy("family:claude"))
+        ok, why = self.admission(row)
         self.assertFalse(ok)
+        self.assertIn("not admitted at the hold", why)
 
     def test_an_input_only_reader_does_not_carry_a_door(self):
-        ok, why = self.admission(reads=(True, "a local model"))
+        ok, why = self.admission(self.hold_row(), reads=(True, "a local model"))
         self.assertFalse(ok)
         self.assertIn("input only", why)
 
-    def test_no_approval_tier_policy_does_not_carry_a_door(self):
-        """'none' is no policy at all: nothing admits the holder, so a door
-        car is refused (R2), where `helm reviewers` lets it pass."""
-        ok, why = self.admission(tier=("none", "no approval-tier policy"))
+    def test_no_current_approval_tier_policy_does_not_carry_a_door(self):
+        with mock.patch.object(store_load, "_policy_hits", return_value=[]):
+            ok, why = autoland.Ops()._door_admission(
+                self.root, dict(self.FACTS, hold_row=self.hold_row()))
         self.assertFalse(ok)
-        self.assertIn("reader-seat", why)
-        self.assertIn("none", why)
-        # the control: the same holder under a policy that admits it
-        self.assertTrue(self.admission(tier=("ok", None))[0])
+        self.assertIn("unavailable", why)
+        self.assertIn("no live policy declares kind approval-tier", why)
+        self.assertTrue(self.admission(self.hold_row())[0])
 
-    def test_a_policy_that_raises_does_not_carry_a_door(self):
-        from helm import dispatches
-
-        def unreadable(seat, repo=None, at=None):
-            raise OSError("the policy store is unreadable")
-
-        with mock.patch.object(dispatches, "approval_tier", unreadable):
-            ok, why = autoland.Ops()._door_admission(self.root,
-                                                     dict(self.FACTS))
+    def test_a_current_policy_that_raises_does_not_carry_a_door(self):
+        with mock.patch.object(store_load, "_policy_hits",
+                               side_effect=OSError("policy store unreadable")):
+            ok, why = autoland.Ops()._door_admission(
+                self.root, dict(self.FACTS, hold_row=self.hold_row()))
         self.assertFalse(ok)
-        self.assertIn("unreadable", why)
+        self.assertIn("unreadable (OSError)", why)
 
-    def test_an_unread_model_does_not_carry_a_door(self):
-        """An unread model is a caveat to `helm reviewers`, but a door car
-        auto-land pushes on no person's read is refused on it (R2)."""
-        ok, why = self.admission(model=None)
+    def test_an_unread_hold_model_does_not_carry_a_door(self):
+        ok, why = self.admission(self.hold_row(model=None))
         self.assertFalse(ok)
-        self.assertIn("model", why)
-        self.assertIn("unread", why)
-        # the control: the same holder with its model read rides
-        self.assertTrue(self.admission(model="a-model")[0])
+        self.assertIn("runtime is unproven", why)
+        self.assertTrue(self.admission(self.hold_row())[0])
 
-    def test_the_holders_family_reaches_the_input_only_check(self):
-        """A model helm cannot name is judged by its holder's family: a
-        gemini holder is input only whatever its model string reads."""
+    def test_the_frozen_holders_family_reaches_the_input_only_check(self):
         def by_family(model, family):
             return ((True, "family %s reads as input only" % family)
                     if family == "gemini" else (False, None))
 
-        ok, why = self.admission(reads=by_family, model="mystery-model",
-                                 family="gemini")
+        row = self.hold_row(family="gemini", model="mystery-model")
+        ok, why = self.admission(row, current=self.policy("family:gemini"),
+                                 reads=by_family, family="codex",
+                                 model="a different live model")
         self.assertEqual(self.asked, [("mystery-model", "gemini")])
         self.assertFalse(ok)
         self.assertIn("input only", why)
-        # the control: the same model under a family that is not input only
-        self.assertTrue(self.admission(reads=by_family, model="mystery-model",
-                                       family="codex")[0])
+        row = self.hold_row(model="mystery-model")
+        self.assertTrue(self.admission(row, reads=by_family)[0])
 
     def test_a_read_that_cannot_be_ruled_out_as_input_only_is_refused(self):
-        ok, why = self.admission(reads=(None, "cannot rule out codex-spark"))
+        ok, why = self.admission(self.hold_row(),
+                                 reads=(None, "cannot rule out codex-spark"))
         self.assertFalse(ok)
-        self.assertIn("codex-spark", why)
+        self.assertIn("input only or unknown", why)
 
-    def test_the_real_facts_resolve_the_holders_family(self):
-        """`car_facts` reads the holder's family off the same verdict-time
-        family evidence the approval tier reads, and hands it on."""
-        from helm import dispatches, reviewer_eligibility
+    def test_the_real_facts_use_frozen_holder_identity_not_live_resolvers(self):
+        from helm import review_door, reviewer_eligibility
+        row = self.hold_row(family="gemini", model="mystery-model")
         seen = []
 
         def input_only(model, family=None):
             seen.append((model, family))
             return False, None
 
-        with mock.patch.object(dispatches, "_approval_identity_families",
-                               lambda seat: ({"gemini"}, None)), \
+        with mock.patch.object(dispatches, "snapshot",
+                               return_value=({ROW1: row}, None)), \
+                mock.patch.object(review_door, "lane_doors",
+                                  return_value={"doors": [("guard", None)]}), \
                 mock.patch.object(dispatches, "approval_tier",
-                                  lambda seat, repo=None, at=None:
-                                  ("ok", None)), \
+                                  side_effect=AssertionError("live tier read")), \
                 mock.patch.object(reviewer_eligibility, "read_model",
-                                  lambda seat, runtime_model=None, at=None:
-                                  "mystery-model"), \
-                mock.patch.object(reviewer_eligibility, "input_only",
-                                  input_only):
+                                  side_effect=AssertionError("live model read")), \
+                mock.patch.object(store_load, "_policy_hits",
+                                  return_value=[self.policy("family:gemini")]), \
+                mock.patch.object(reviewer_eligibility, "input_only", input_only):
             facts = autoland.Ops().car_facts(self.root,
                                              _car(ROW1, "one", TIP1))
-        self.assertEqual(facts["family"], "gemini")
+        self.assertEqual((facts["model"], facts["family"]),
+                         ("mystery-model", "gemini"))
+        self.assertEqual(facts["admit"], (True, None))
         self.assertEqual(seen, [("mystery-model", "gemini")])
+
+    def test_an_altered_hold_proof_cannot_be_reanchored_by_the_reader(self):
+        row = self.hold_row()
+        row["hold_approval"]["model"] = "another-model"
+        ok, why = self.admission(row)
+        self.assertFalse(ok)
+        self.assertIn("does not match its anchor", why)
 
     def test_a_barred_car_stays_out_of_the_intent_and_is_posted_once(self):
         self.ops.cars = [_car(ROW1, "one", TIP1), _car(ROW2, "two", TIP2)]
@@ -772,13 +881,212 @@ class Admission(Base):
                               if "does not ride" in p]), 1)
 
 
+class PushAdmission(Base):
+    """A pushed train records its exact current DOOR hold only on git success."""
+
+    def setUp(self):
+        super().setUp()
+        from helm import dispatches_tier, reviewer_eligibility
+        self.row = Admission.hold_row(
+            self, recorded=Admission.policy("family:codex"))
+        self.row.update(status="held", lane="one")
+        self.car = _car(ROW1, "one", TIP1)
+        self.car["lr"]["hold_ts"] = self.row["hold_ts"]
+        self.ops.target = autoland.PushTarget(
+            "private://trunk", "refs/heads/main", "origin")
+        push = self.ops.push
+        settle = self.ops.settled_trunk
+        self.ops.push = lambda root, head, target, keep=(), lease=None: push(
+            root, head, target.url, keep, lease=lease)
+        self.ops.settled_trunk = lambda root, target: settle(root, target.url)
+        real = self.ops.car_facts
+        self.ops.car_facts = lambda root, car: dict(real(root, car),
+                                                     doors=["guard"])
+        for patch in (mock.patch.object(registry, "load",
+                                        return_value={"projects": {}}),
+                      mock.patch.object(store_load, "_policy_hits",
+                                        return_value=[Admission.policy(
+                                            "family:codex")]),
+                      mock.patch.object(reviewer_eligibility, "input_only",
+                                        return_value=(False, None))):
+            patch.start()
+            self.addCleanup(patch.stop)
+        snap = mock.patch.object(dispatches, "snapshot",
+                                 return_value=({ROW1: self.row}, None))
+        self.snapshot = snap.start()
+        self.addCleanup(snap.stop)
+        self.assertTrue(dispatches_tier.hold_approval(
+            self.row, self.root)[0])
+
+    def landing(self):
+        st = self.to_gating([self.car])
+        self.green(st)
+        self.ops.ff_answer = (False, "pause after push")
+        self.ops.calls = []
+        return st
+
+    def test_successful_last_word_saves_the_current_hold_with_pushed(self):
+        st = self.landing()
+        seen = []
+        push = self.ops.push
+
+        def before_push(*args, **kwargs):
+            sending = self.current()
+            self.assertTrue(sending["sending"])
+            self.assertNotIn("push_admission", sending)
+            return push(*args, **kwargs)
+
+        self.ops.push = before_push
+        save = autoland._Tick.save
+
+        def record(tick, state, note=None, create=False):
+            save(tick, state, note, create)
+            if note and note.startswith("pushed "):
+                seen.append(autoland.read_train(self.root, state["train"]))
+
+        with mock.patch.object(autoland._Tick, "save", record):
+            self.tick()
+        self.assertEqual(self.ops.pushes, 1)
+        self.assertEqual(len(seen), 1)
+        recorded = seen[0]
+        self.assertEqual(recorded["step"], "pushed")
+        marker = recorded["push_admission"]
+        self.assertEqual(marker, {
+            "v": 2, "repo": self.root,
+            "repo_id": dispatches._repo_info(self.root)["repo_id"],
+            "head": st["head"], "gate": GID,
+            "target": "refs/heads/main at private://trunk", "remote": "origin",
+            "cars": [{"id": ROW1, "lane": "one", "tip": TIP1,
+                      "hold_ts": self.row["hold_ts"],
+                      "hold_actor": self.row["hold_actor"],
+                      "anchor": self.row["hold_approval"]["anchor"]}]})
+        self.assertEqual(self.current()["push_admission"], marker)
+
+    def test_marker_remote_is_the_one_in_the_vetted_push_target(self):
+        self.ops.target = autoland.PushTarget(
+            "private://trunk", "refs/heads/main", "upstream")
+        self.landing()
+        self.tick()
+        marker = self.current()["push_admission"]
+        self.assertEqual(self.ops.pushes, 1)
+        self.assertEqual(marker["remote"], "upstream")
+        self.assertEqual(marker["target"],
+                         "refs/heads/main at private://trunk")
+
+    def test_untyped_successful_push_mints_no_door_authority(self):
+        self.ops.target = "private://trunk"
+        self.ops.push = FakeOps.push.__get__(self.ops)
+        self.landing()
+        self.tick()
+        self.assertEqual(self.ops.pushes, 1)
+        train = self.current()
+        self.assertEqual(train["step"], "pushed")
+        self.assertNotIn("push_admission", train)
+
+    def test_final_door_added_after_compose_is_in_push_snapshot(self):
+        self.ops.car_facts = FakeOps.car_facts.__get__(self.ops)
+        self.landing()
+        real = self.ops.car_facts
+        self.ops.car_facts = lambda root, car: dict(real(root, car),
+                                                     doors=["guard"])
+        self.tick()
+        self.assertEqual(self.ops.pushes, 1)
+        cars = self.current()["push_admission"]["cars"]
+        self.assertGreater(len(cars), 0)
+        self.assertEqual(cars[0]["id"], ROW1)
+
+    def test_remote_already_carrying_head_mints_no_admission(self):
+        st = self.landing()
+        self.ops.remote = st["head"]
+        self.tick()
+        self.assertEqual(self.ops.pushes, 0)
+        self.assertIn("ff", self.ops.calls)
+        train = self.current()
+        self.assertTrue(train)
+        self.assertEqual(train["step"], "pushed")
+        self.assertNotIn("push_admission", train)
+
+    def test_ambiguous_push_settling_at_head_mints_no_admission(self):
+        st = self.landing()
+
+        def lost_answer(root, head, target, keep=(), lease=None):
+            self.ops.remote = head
+            return False, "lost answer"
+
+        self.ops.push = lost_answer
+        with mock.patch.object(autoland, "PUSH_SETTLE_S", 0):
+            self.tick()
+        train = self.current()
+        self.assertEqual(train["step"], "pushed")
+        self.assertEqual(self.ops.remote, st["head"])
+        self.assertIn("settled_trunk", self.ops.calls)
+        self.assertNotIn("push_admission", train)
+
+    def test_mismatched_ledger_row_stops_before_push(self):
+        st = self.landing()
+        self.row["lane"] = "another-lane"
+        self.tick()
+        self.assertEqual(self.ops.pushes, 0)
+        self.assertIn("plan", self.ops.calls)
+        train = self.current()
+        self.assertTrue(train)
+        self.assertEqual(train["stopped"]["step"], "verified")
+        self.assertNotIn("push_admission", train)
+        self.assertIn("matching standing hold", train["stopped"]["why"])
+
+    def test_mismatched_hold_identity_stops_before_push(self):
+        self.landing()
+        self.row["hold_actor"] = "different-holder"
+        self.tick()
+        self.assertEqual(self.ops.pushes, 0)
+        self.assertIn("plan", self.ops.calls)
+        train = self.current()
+        self.assertTrue(train)
+        self.assertNotIn("push_admission", train)
+        self.assertIn("not admitted", train["stopped"]["why"])
+
+    def test_unreadable_door_hold_stops_before_push(self):
+        self.landing()
+        self.snapshot.return_value = (None, "ledger unreadable")
+        self.tick()
+        self.assertEqual(self.ops.pushes, 0)
+        self.assertIn("plan", self.ops.calls)
+        train = self.current()
+        self.assertTrue(train)
+        self.assertNotIn("push_admission", train)
+        self.assertIn("ledger unreadable", train["stopped"]["why"])
+
+
+class PushAdmissionNonDoor(Base):
+    def test_non_door_car_pushes_with_unreadable_ledger(self):
+        st = self.to_gating([_car(ROW1, "one", TIP1)])
+        self.green(st)
+        self.ops.ff_answer = (False, "pause after push")
+        with mock.patch.object(dispatches, "snapshot",
+                               side_effect=OSError("ledger unreadable")):
+            self.tick()
+        self.assertEqual(self.ops.pushes, 1)
+        train = self.current()
+        self.assertEqual(train["step"], "pushed")
+        self.assertNotIn("push_admission", train)
+
+    def test_non_door_unreadable_checkout_identity_does_not_stop_push(self):
+        st = self.to_gating([_car(ROW1, "one", TIP1)])
+        self.green(st)
+        self.ops.ff_answer = (False, "pause after push")
+        with mock.patch.object(dispatches, "_repo_info", return_value=None):
+            self.tick()
+        self.assertEqual(self.ops.pushes, 1)
+        train = self.current()
+        self.assertTrue(train)
+        self.assertEqual(train["step"], "pushed")
+        self.assertNotIn("push_admission", train)
+
+
 class NativeHoldAdmission(Base):
-    """A DOOR held source-clean by a NATIVE Claude seat (task/3508). The
-    roster records no model for a native seat, so auto-land refused every
-    such door as an unread model. The model is now read from the seat's own
-    transcript AT THE HOLD'S RECORDED TIME, never its newest turn: a seat
-    that held on Sonnet and switched to Opus afterwards must not be
-    admitted as Opus."""
+    """The native transcript is read by the hold-proof WRITER at the hold's
+    recorded time, not by compose. A later Opus turn cannot upgrade a Sonnet
+    hold, and an ambiguous subagent turn cannot mint a holder proof."""
 
     T0 = 1790500000.0
     SESSION = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
@@ -789,6 +1097,10 @@ class NativeHoldAdmission(Base):
         env = mock.patch.dict(os.environ, {"HELM_CLAUDE_DIR": self.claude})
         env.start()
         self.addCleanup(env.stop)
+        projects = mock.patch.object(registry, "load",
+                                     return_value={"projects": {}})
+        projects.start()
+        self.addCleanup(projects.stop)
 
     def transcript(self, turns):
         directory = os.path.join(self.claude, "projects", "proj")
@@ -803,29 +1115,43 @@ class NativeHoldAdmission(Base):
                      "message": {"role": "assistant", "model": name}}) + "\n")
 
     def facts(self, hold_epoch):
-        from helm import dispatches
+        from helm import dispatches_tier, home, review_door
         evidence = {"v": 5, "identity": "reader-seat",
                     "roster_identity": "reader-seat", "session": self.SESSION,
                     "runtime": {"agent_harness": "claude", "family": "claude",
                                 "backend": "native"},
                     "runtime_verified": True}
-        self.tier_at = []
-
-        def tier(seat, repo=None, at=None):
-            self.tier_at.append(at)
-            return "ok", None
-
         car = _car(ROW1, "one", TIP1)
-        if hold_epoch is not None:
-            car["lr"]["hold_ts"] = time.strftime(
-                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(hold_epoch))
-        with mock.patch.object(dispatches,
-                               "_approval_identity_family_evidence",
-                               lambda recipient, session=None,
-                               require_exact_session=False:
-                               ({"claude"}, evidence, "anchor", None)), \
-                mock.patch.object(dispatches, "approval_tier", tier):
-            return autoland.Ops().car_facts(self.root, car), car
+        stamp = (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(hold_epoch))
+                 if hold_epoch is not None else "")
+        car["lr"]["hold_ts"] = stamp
+        row = {"id": ROW1, "hold_actor": "reader-seat", "repo_root": self.root,
+               "source_clean_tip": TIP1, "hold_ts": stamp}
+        policy = Admission.policy("family:claude")
+        with mock.patch.object(home, "session_id", return_value=self.SESSION), \
+                mock.patch.object(dispatches,
+                                  "_approval_identity_family_evidence",
+                                  return_value=({"claude"}, evidence,
+                                                dispatches._subsumed_family_anchor(evidence),
+                                                None)), \
+                mock.patch.object(store_load, "_policy_hits",
+                                  return_value=[policy]):
+            proof = dispatches_tier.record_hold_approval(
+                dict(row, repo_root=self.root), "reader-seat", TIP1, stamp)
+        if proof:
+            row["hold_approval"] = proof
+        # Compose reads the frozen row, even if today's transcript, roster or
+        # upstream now says something else. It may still read current policy.
+        with mock.patch.object(dispatches, "snapshot",
+                               return_value=({ROW1: row}, None)), \
+                mock.patch.object(review_door, "lane_doors",
+                                  return_value={"doors": [("guard", None)]}), \
+                mock.patch.object(dispatches, "approval_tier",
+                                  side_effect=AssertionError("live tier read")), \
+                mock.patch.object(store_load, "_policy_hits",
+                                  return_value=[policy]):
+            facts = autoland.Ops().car_facts(self.root, car)
+        return facts, car
 
     def test_a_native_opus_hold_rides(self):
         self.transcript([(self.T0, "claude-opus-5-5"),
@@ -834,18 +1160,20 @@ class NativeHoldAdmission(Base):
         self.assertEqual(facts["model"], "claude-opus-5-5")
         self.assertEqual(facts["family"], "claude")
         self.assertEqual(facts["admit"], (True, None))
-        # The approval tier is asked AT the hold, too.
-        self.assertEqual(self.tier_at, [car["lr"]["hold_ts"]])
+        self.assertEqual(facts["hold_row"]["hold_approval"]["ts"],
+                         car["lr"]["hold_ts"])
+        self.assertEqual(facts["hold_row"]["hold_approval"]["policy"],
+                         Admission.policy("family:claude"))
 
     def test_a_native_sonnet_hold_does_not_ride(self):
         self.transcript([(self.T0, "claude-sonnet-5"),
                          (self.T0 + 300, "claude-sonnet-5")])
         facts, _car_ = self.facts(self.T0 + 320)
-        self.assertEqual(facts["model"], "claude-sonnet-5")
+        self.assertIsNone(facts["model"])
+        self.assertNotIn("hold_approval", facts["hold_row"])
         ok, why = facts["admit"]
         self.assertFalse(ok)
-        self.assertIn("claude-sonnet-5", why)
-        self.assertIn("input only", why)
+        self.assertIn("no proven approval-tier holder at the hold", why)
 
     def test_a_hold_in_the_sonnet_phase_does_not_ride_as_the_later_opus(self):
         # THE FAIL-OPEN ARM: Sonnet until T0+1200, Opus from T0+2400.
@@ -860,19 +1188,21 @@ class NativeHoldAdmission(Base):
         self.assertEqual((facts["model"], facts["admit"]),
                          ("claude-opus-5-5", (True, None)))
         facts, _car_ = self.facts(self.T0 + 1260)
-        self.assertEqual(facts["model"], "claude-sonnet-5")
+        self.assertIsNone(facts["model"])
+        self.assertNotIn("hold_approval", facts["hold_row"])
         ok, why = facts["admit"]
         self.assertFalse(ok)
-        self.assertIn("input only", why)
+        self.assertIn("no proven approval-tier holder at the hold", why)
 
     def test_a_hold_with_no_recorded_time_does_not_ride(self):
         # The transcript's newest turn is Opus, but a hold whose moment is
-        # not recorded cannot be pinned to it: the model stays unread.
+        # not recorded cannot pin it and cannot mint an approval proof.
         self.transcript([(self.T0, "claude-opus-5-5")])
         facts, _car_ = self.facts(None)
+        self.assertNotIn("hold_approval", facts["hold_row"])
         ok, why = facts["admit"]
         self.assertFalse(ok)
-        self.assertIn("unread resolved model", why)
+        self.assertIn("no proven approval-tier holder at the hold", why)
         # POSITIVE CONTROL: the same transcript with the hold's time rides.
         facts, _car_ = self.facts(self.T0 + 60)
         self.assertEqual(facts["admit"], (True, None))
@@ -896,8 +1226,8 @@ class NativeHoldAdmission(Base):
     def test_an_opus_seats_sonnet_subagent_at_the_hold_does_not_ride(self):
         # F1 (review FIX b7c5e42b4398): a subagent runs `helm
         # dispatch hold` in its seat's name. An Opus seat whose Sonnet
-        # subagent wrote a turn three minutes before the hold is not an Opus
-        # holder, so the model is UNKNOWN and the door does not ride.
+        # subagent wrote a turn three minutes before the hold has no proven
+        # model, so the hold writer mints no proof and the door does not ride.
         hold = self.T0 + 960
         self.transcript([(self.T0 + s, "claude-opus-5-5")
                          for s in (0, 300, 600, 900)])
@@ -907,9 +1237,10 @@ class NativeHoldAdmission(Base):
         self.subagent(hold - 180, "claude-sonnet-5", hold - 180)
         facts, _car_ = self.facts(hold)
         self.assertIsNone(facts["model"])
+        self.assertNotIn("hold_approval", facts["hold_row"])
         ok, why = facts["admit"]
         self.assertFalse(ok)
-        self.assertIn("unread resolved model", why)
+        self.assertIn("no proven approval-tier holder at the hold", why)
 
     def test_a_subagent_turn_past_the_window_leaves_the_opus_hold(self):
         # The same Sonnet turn eleven minutes before the hold, in a file
@@ -1092,16 +1423,33 @@ class HappyPath(Base):
         self.assertEqual([d["state"] for d in self.archived()],
                          [autoland.DONE])
 
-    def test_a_ran_delta_that_is_not_the_ast_delta_stops_the_land(self):
+    def test_a_ran_delta_below_the_ast_delta_stops_the_land(self):
         st = self.to_gating()
         self.green(st)
-        self.ops.ast = 18
+        self.ops.ast = 20
         self.tick()
         self.assertNotIn("push", self.ops.calls)
         st = self.current()
         self.assertEqual(st["state"], autoland.STOPPED)
-        self.assertTrue(any("+19" in p and "+18" in p
+        self.assertTrue(any("+19" in p and "+20" in p
                             for p in self.ops.posts), self.ops.posts)
+
+    def test_a_ran_delta_above_the_ast_delta_lands_and_names_the_surplus(
+            self):
+        """ONE-SIDED (task/3906): a surplus over the AST count is an
+        inherited arm, not a shortfall — it lands, named in the note."""
+        st = self.to_gating()
+        self.green(st)
+        self.ops.ast = 18
+        rc, out = self.tick()
+        self.assertEqual(rc, 0, out)
+        done, = self.archived()
+        self.assertEqual(done["state"], autoland.DONE)
+        notes = [h["note"] for h in done["history"] if " GREEN, " in
+                 (h.get("note") or "")]
+        self.assertEqual(len(notes), 1, done["history"])
+        self.assertIn("AST +18: +1 collected beyond the AST count: "
+                      "inherited arms or a new base", notes[0])
 
     def test_a_needs_restart_car_is_posted_to_the_integrator(self):
         autoland.seed_counter(self.root, 383, TRUNK)
@@ -1158,6 +1506,32 @@ LANE_RAN, LANE_PLANNED = 27217, 27227
 DROPPED = "a module stopped being collected or a test was dropped"
 
 
+class LandFirstCar(Base):
+    """task/4223: a land-first car rides the train like any other and lands
+    marked landed before review; its row is never closed at the LAND, so it
+    stays open as the post-land read of the landed merge."""
+
+    def test_the_landed_cars_row_stays_open_as_a_post_land_read(self):
+        st = self.to_gating([_car(ROW1, "one", TIP1, basis="approved"),
+                             _car(ROW2, "two", TIP2,
+                                  basis=landwindow.LAND_FIRST)])
+        self.assertIn("lane two, task/3002, tip %s, row %s, landed before "
+                      "review; its row stays open for reader-seat's "
+                      "post-land read" % (TIP2[:12], ROW2[:12]),
+                      self.ops.posts[0])
+        self.green(st)
+        rc, out = self.tick()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.ops.pushes, 1)
+        # CONTROL: the approved car closes landed; the land-first one does not
+        self.assertEqual(self.ops.closed_rows, [(ROW1, True, None)])
+        self.assertIn("lane two (row %s, landed before review; its row stays "
+                      "open for reader-seat's post-land read)" % ROW2[:12],
+                      self.ops.posts[-1])
+        self.assertEqual([d["state"] for d in self.archived()],
+                         [autoland.DONE])
+
+
 class PlannedCount(Base):
     """THE PLANNED DELTA IS THE QUESTION THE CHECK ASKS (task/3613). Ran is
     what ran on that host: a class whose setUpClass skips records one skip
@@ -1202,9 +1576,68 @@ class PlannedCount(Base):
                           LANE_RAN, TRUNK_RAN))
         note = self.green_note(done)
         self.assertIn(" GREEN, planned ", note)
-        self.assertEqual(note, "gate:%s GREEN, planned -100 = AST -100" % GID)
+        self.assertEqual(note, "gate:%s GREEN, planned -100, AST -100" % GID)
         self.assertIn("gate:%s whole-suite OK, Ran %d, planned -100 = AST "
                       "-100" % (GID, LANE_RAN), self.ops.posts[-1])
+
+    def test_train520s_inherited_surplus_lands_and_is_named_in_the_note(
+            self):
+        """MUST-HIT (task/3906, the scope cut): train520's own numbers — the
+        diff adds 205 test methods by the AST count while discovery
+        collected +208, the 3 extra being a base class's new arms handed to
+        descendants the diff never touched. The check is ONE-SIDED: the
+        surplus lands and the land note names it."""
+        st = self.to_gating()
+        self.green(st, ran=25249 + 208, prev_ran=25249,
+                   planned=25260 + 208, prev_planned=25260)
+        self.ops.ast = 205
+        rc, out = self.tick()
+        self.assertEqual(rc, 0, out)
+        done = self.landed()
+        self.assertEqual((done["receipt"]["rule"], done["receipt"]["delta"],
+                          done["receipt"]["ast"]), ("planned", 208, 205))
+        note = self.green_note(done)
+        self.assertEqual(note, "gate:%s GREEN, planned +208, AST +205: +3 "
+                         "collected beyond the AST count: inherited arms or "
+                         "a new base" % GID)
+        # The PUBLIC LAND line names the surplus too (helm-codex's
+        # MELD-DIFF): never a false equality over +208 vs +205.
+        self.assertIn("+208 vs AST +205: +3 collected beyond the AST count",
+                      self.ops.posts[-1])
+        self.assertNotIn("+208 = AST +205", self.ops.posts[-1])
+
+    def test_a_deleted_test_module_lands(self):
+        """MUST-HIT: a module DELETED in the diff is seen by the AST count
+        too (-2 = -2), so it lands — the STOP is a module PRESENT in head
+        that discovery fails to collect, never a deleted one."""
+        st = self.to_gating()
+        self.green(st, ran=25249 - 2, prev_ran=25249,
+                   planned=25260 - 2, prev_planned=25260)
+        self.ops.ast = -2
+        rc, out = self.tick()
+        self.assertEqual(rc, 0, out)
+        done = self.landed()
+        self.assertEqual((done["receipt"]["delta"], done["receipt"]["ast"]),
+                         (-2, -2))
+        self.assertEqual(self.green_note(done),
+                         "gate:%s GREEN, planned -2, AST -2" % GID)
+
+    def test_a_present_but_uncollected_module_stops_naming_the_shortfall(
+            self):
+        """MUST-MISS: a module PRESENT in head that discovery fails to
+        collect (an import error, a renamed base, a load_tests filter):
+        the diff adds 2 by the AST count while discovery collected -2 —
+        collected -2 vs AST 0 is the shortfall shape, here pushed plainly
+        negative. The STOP names the shortfall exactly."""
+        st = self.to_gating()
+        self.green(st, ran=25249 - 2, prev_ran=25249,
+                   planned=25260 - 2, prev_planned=25260)
+        self.ops.ast = 0
+        self.tick()
+        post = self.stopped_post()
+        self.assertIn("gate:%s planned -2 tests over trunk's gate:%s (25260 "
+                      "planned), but the diff adds +0 test methods: %s"
+                      % (GID, PREV_GID, DROPPED), post)
 
     def test_a_module_that_stops_being_collected_still_stops(self):
         """MUST-MISS: the diff adds 19 test methods while a 40-test module
@@ -1246,68 +1679,139 @@ class PlannedCount(Base):
         self.assertEqual((done["receipt"]["rule"], done["receipt"]["delta"]),
                          ("ran", 19))
         note = self.green_note(done)
-        self.assertTrue(note.startswith("gate:%s GREEN, Ran +19 = AST +19 "
-                                        "(the Ran rule: " % GID), note)
+        self.assertTrue(note.startswith("gate:%s GREEN, Ran +19 (the Ran "
+                                        "rule: " % GID), note)
+        self.assertIn("), AST +19", note)
         self.assertIn("gate:%s" % PREV_GID, note)
         self.assertIn("Ran 25268, +19 = AST +19", self.ops.posts[-1])
 
     def test_a_trunk_receipt_without_a_planned_count_stops_by_the_ran_rule(
             self):
-        """The control of the must-hit arm: train452's own counts, with
-        trunk's receipt a serial one, stop exactly as they did."""
+        """The control of the must-hit arm, in the one-sided shortfall
+        shape (task/3906): the Ran delta falls SHORT of the diff (the diff
+        deletes 98 while Ran moves -99), so the land stops exactly as it
+        did — a two-sided mismatch by more deletion now lands, so the
+        stop shape is collected short."""
         st = self.to_gating()
-        self.green(st, ran=LANE_RAN, prev_ran=TRUNK_RAN, planned=LANE_PLANNED)
-        self.ops.ast = -100
+        self.green(st, ran=TRUNK_RAN - 99, prev_ran=TRUNK_RAN,
+                   planned=LANE_PLANNED)
+        self.ops.ast = -98
         self.tick()
         post = self.stopped_post()
         self.assertIn("gate:%s ran -99 over trunk's gate:%s (%d), but the "
-                      "diff adds -100 test methods: %s"
+                      "diff adds -98 test methods: %s"
                       % (GID, PREV_GID, TRUNK_RAN, DROPPED), post)
         self.assertIn("the Ran rule", post)
 
     def test_a_train_receipt_without_a_planned_count_stops_by_the_ran_rule(
             self):
         st = self.to_gating()
-        self.green(st, ran=LANE_RAN, prev_ran=TRUNK_RAN,
+        self.green(st, ran=TRUNK_RAN - 99, prev_ran=TRUNK_RAN,
                    prev_planned=TRUNK_PLANNED)
-        self.ops.ast = -100
+        self.ops.ast = -98
         self.tick()
         post = self.stopped_post()
         self.assertIn("gate:%s ran -99" % GID, post)
         self.assertIn("the Ran rule", post)
         self.assertIn("gate:%s" % GID, post.split("the Ran rule", 1)[1])
 
-    def malformed(self, planned, prev_planned):
-        """One planted count that WOULD pass read naively: the diff is set
-        to the coerced planned delta, which the Ran delta (-99) is not, so
-        only reading the count as UNKNOWN stops the land."""
+    def test_a_bool_planned_count_is_unknown_and_never_a_pass(self):
+        """DISCRIMINATING: a naive isinstance read takes the bool True for
+        the int 1, reading planned +1 = the diff's +1 — a naive LAND; the
+        real read refuses a bool (type is not int), the Ran rule applies,
+        and its -99 falls SHORT of +1."""
         st = self.to_gating()
-        self.green(st, ran=LANE_RAN, prev_ran=TRUNK_RAN, planned=planned,
-                   prev_planned=prev_planned)
-        self.ops.ast = int(planned) - int(prev_planned)
+        self.green(st, ran=TRUNK_RAN - 99, prev_ran=TRUNK_RAN,
+                   planned=True, prev_planned=TRUNK_PLANNED)
+        self.ops.ast = 1
         self.tick()
         post = self.stopped_post()
+        self.assertIn("planned count True is UNKNOWN", post)
         self.assertIn("gate:%s ran -99" % GID, post)
         self.assertIn("the Ran rule", post)
-        self.assertIn("UNKNOWN", post)
-        return post
-
-    def test_a_bool_planned_count_is_unknown_and_never_a_pass(self):
-        post = self.malformed(LANE_PLANNED, True)
-        self.assertIn("gate:%s's planned count True is UNKNOWN" % PREV_GID,
-                      post)
+        self.assertIn("the diff adds +1 test methods", post)
 
     def test_a_negative_planned_count_is_unknown_and_never_a_pass(self):
-        post = self.malformed(-5, TRUNK_PLANNED)
-        self.assertIn("planned count -5 is UNKNOWN", post)
+        """DISCRIMINATING (helm-codex's MELD-DIFF): the naive reader coerces
+        -5 to its absolute and reads planned +2 = the diff's +2 — a naive
+        LAND; the real read stops on the Ran rule's -99 short of +2."""
+        st = self.to_gating()
+        self.green(st, ran=TRUNK_RAN - 99, prev_ran=TRUNK_RAN,
+                   planned=-TRUNK_PLANNED - 2, prev_planned=TRUNK_PLANNED)
+        self.ops.ast = 2
+        self.tick()
+        post = self.stopped_post()
+        self.assertIn("planned count -%d is UNKNOWN" % (TRUNK_PLANNED + 2),
+                      post)
+        self.assertIn("gate:%s ran -99" % GID, post)
+        self.assertIn("the Ran rule", post)
+        self.assertIn("the diff adds +2 test methods", post)
 
     def test_a_string_planned_count_is_unknown_and_never_a_pass(self):
-        post = self.malformed(str(LANE_PLANNED), TRUNK_PLANNED)
-        self.assertIn("planned count '%d' is UNKNOWN" % LANE_PLANNED, post)
+        """DISCRIMINATING: a string count int()s cleanly, so the naive read
+        is planned +2 = the diff's +2 — a naive LAND; the real read stops
+        on the Ran rule's -99 short of +2."""
+        st = self.to_gating()
+        self.green(st, ran=TRUNK_RAN - 99, prev_ran=TRUNK_RAN,
+                   planned=str(TRUNK_PLANNED + 2), prev_planned=TRUNK_PLANNED)
+        self.ops.ast = 2
+        self.tick()
+        post = self.stopped_post()
+        self.assertIn("planned count '%d' is UNKNOWN" % (TRUNK_PLANNED + 2),
+                      post)
+        self.assertIn("gate:%s ran -99" % GID, post)
+        self.assertIn("the Ran rule", post)
+        self.assertIn("the diff adds +2 test methods", post)
 
     def test_a_planned_count_below_its_own_ran_is_unknown(self):
-        post = self.malformed(LANE_RAN - 1, TRUNK_PLANNED)
-        self.assertIn("below its own Ran %d" % LANE_RAN, post)
+        """UNKNOWN-REASON-ONLY (no naive-pass claim: a count below the
+        receipt's own Ran gives no coherent naive reading)."""
+        st = self.to_gating()
+        self.green(st, ran=TRUNK_RAN - 99, prev_ran=TRUNK_RAN,
+                   planned=TRUNK_RAN - 100, prev_planned=TRUNK_PLANNED)
+        self.ops.ast = -98
+        self.tick()
+        post = self.stopped_post()
+        self.assertIn("below its own Ran %d" % (TRUNK_RAN - 99), post)
+        self.assertIn("the Ran rule", post)
+
+    def test_a_receipt_with_no_ran_stops_the_delta_unknown(self):
+        """A green receipt whose Ran does not read gives the Ran rule no
+        delta at all: the cross-check cannot be asked, so the land stops
+        UNKNOWN rather than comparing None (helm-codex's read of 18d78b)."""
+        st = self.to_gating()
+        self.green(st)
+        self.ops.receipt_rows[1] = dict(self.ops.receipt_rows[1])
+        del self.ops.receipt_rows[1]["ran"]
+        self.tick()
+        post = self.stopped_post()
+        self.assertIn("an UNKNOWN count", post)
+        self.assertIn("the collected delta is UNKNOWN", post)
+
+    def bool_ran(self, idx):
+        """A serial receipt carrying a bool Ran (the v4/v5 schema takes
+        one) stops the delta UNKNOWN. The fixture is DISCRIMINATING: an
+        isinstance read takes True for 1, so the naive delta -25248
+        equals the diff's -25248 — a naive LAND (helm-codex's MELD-DIFF
+        numbers)."""
+        st = self.to_gating()
+        self.green(st)  # serial receipts: the Ran rule decides
+        self.ops.receipt_rows[idx] = dict(self.ops.receipt_rows[idx])
+        self.ops.receipt_rows[idx]["ran"] = True
+        self.ops.ast = -25248
+        self.tick()
+        post = self.stopped_post()
+        self.assertIn("the collected delta is UNKNOWN", post)
+
+    def test_a_bool_ran_on_the_train_receipt_stops_the_delta_unknown(self):
+        """isinstance would read the train receipt's True as 1; type is
+        not int, so the delta is UNKNOWN and the land stops."""
+        self.bool_ran(1)
+
+    def test_a_bool_ran_on_trunks_receipt_stops_the_delta_unknown(self):
+        """The converse: a bool Ran on TRUNK's receipt stops the same
+        way."""
+        self.bool_ran(0)
 
     def test_a_newer_serial_trunk_receipt_does_not_hide_the_sliced_one(self):
         """Trunk's exact tree can hold both kinds. A serial run of it minted
@@ -1425,6 +1929,25 @@ class DoorText(Base):
         # AND EVERY TICK AFTER IT, which re-prints the stop from the record.
         _rc, again = self.tick()
         self.assertIn(_CAUSE, again)
+
+    def test_resume_after_a_refused_door_relaunches_and_restarts_no_wait(self):  # noqa: VACUOUS_ASSERTION — the one relaunch and the launched gate job are positive
+        """A refused door launched nothing, so --resume has no gate to wait
+        on: the next tick launches, and the resume never says a wait
+        restarted."""
+        st, _out = self.refused(4, _ROUTED + _HELD)
+        self.assertEqual(st["state"], autoland.STOPPED, st)
+        self.assertFalse(st["launched"])
+        said, why = autoland.resume(self.root, "integrator",
+                                    now=self.ops.clock)
+        self.assertIsNone(why, why)
+        self.assertNotIn("wait restart", said)
+        self.ops.launch_rc = 0
+        self.ops.calls = []
+        self.tick()
+        self.assertEqual(self.ops.calls.count("launch"), 1)
+        st = self.current()
+        self.assertEqual((st["state"], st["gate"]["job_id"]),
+                         (autoland.GATING, "gate-x0"))
 
     def test_a_long_answer_keeps_its_head_and_its_cause_and_says_what_it_cut(self):
         # A 200-line answer (a traceback, a long push) would otherwise land in
@@ -1659,6 +2182,297 @@ class RedPath(Base):
         self.tick()
         self.assertEqual(self.current()["state"], autoland.STOPPED)
         self.assertEqual(self.ops.calls.count("launch"), 1)
+
+    def second_flake_stop(self):
+        """A red, a flake and its one re-gate, red again and passing alone
+        again: STOPPED at GATING on the second flake."""
+        st = self.to_gating()
+        self.red(st)
+        self.ops.recheck_answer = ("GREEN", "passes alone on host-a")
+        self.tick()
+        st = self.current()
+        self.assertEqual((st["state"], st["gate"]["job_id"]),
+                         (autoland.GATING, "gate-x1"))
+        self.ops.receipt_rows.append(dict(self.ops.receipt_rows[0],
+                                          id="77" * 8,
+                                          ts="2026-01-01T02:00:00Z"))
+        self.tick()
+        st = self.current()
+        self.assertEqual(st["state"], autoland.STOPPED)
+        self.assertEqual(st["stopped"]["state"], autoland.GATING)
+        self.assertIn("a second flake", st["stopped"]["why"])
+        return st
+
+    def test_the_first_flake_re_gate_waits_on_its_own_fresh_gate(self):
+        """The one automatic re-gate is unchanged: the flake is recorded, a
+        gate of a new attempt (a new job) launches in the same tick, and the
+        next tick waits on that gate."""
+        st = self.to_gating()
+        self.red(st)
+        self.ops.recheck_answer = ("GREEN", "passes alone on host-a")
+        self.ops.calls = []
+        self.tick()
+        self.assertEqual(self.ops.calls.count("launch"), 1)
+        st = self.current()
+        self.assertEqual((st["state"], st["flakes"], st["gate"]["job_id"]),
+                         (autoland.GATING, 1, "gate-x1"))
+        _rc, out = self.tick()
+        self.assertIn("waiting on the gate", out)
+        self.assertEqual(self.ops.calls.count("launch"), 1)
+
+    def test_resume_after_a_second_flake_launches_a_fresh_gate(self):  # noqa: VACUOUS_ASSERTION — the launch count and the fresh job id are positive
+        """--resume after a second-flake STOP put the train back
+        at GATING still holding its finished gate, and every tick printed
+        'waiting' on a job that had exited red. The second flake is recorded
+        (so the relaunch is a new attempt, a new job), and the resumed tick
+        launches it on the same head."""
+        st = self.second_flake_stop()
+        head = st["head"]
+        # the second flake is recorded too: the next attempt is a new job
+        self.assertEqual(len(self.ops.flakes), 2)
+        self.assertEqual(self.ops.flakes[1]["gate"], "77" * 8)
+        said, why = autoland.resume(self.root, "integrator",
+                                    now=self.ops.clock)
+        self.assertIsNone(why, why)
+        self.assertIn("fresh gate", said)
+        self.ops.calls = []
+        _rc, out = self.tick()
+        self.assertNotIn("waiting on the gate", out)
+        self.assertEqual(self.ops.calls.count("launch"), 1)
+        st = self.current()
+        self.assertEqual((st["state"], st["head"], st["gate"]["job_id"]),
+                         (autoland.GATING, head, "gate-x2"))
+        self.assertEqual(st["launch_ts"], self.ops.clock)
+        # the flake bound stands: the fresh gate red and passing alone once
+        # more stops again, and launches nothing on its own
+        self.ops.receipt_rows.append(dict(self.ops.receipt_rows[0],
+                                          id="88" * 8,
+                                          ts="2026-01-01T03:00:00Z"))
+        self.tick()
+        st = self.current()
+        self.assertEqual(st["state"], autoland.STOPPED)
+        self.assertIn("a second flake", st["stopped"]["why"])
+        self.assertEqual(self.ops.calls.count("launch"), 1)
+
+    def test_a_finished_gate_already_read_is_not_waited_on(self):  # noqa: VACUOUS_ASSERTION — the STOPPED state naming the spent job and its red is positive
+        """The defensive arm: the launched gate job is the one whose red
+        this train already read (here the second flake could not be
+        recorded, so the relaunch is the same tree and attempt, and Fab
+        answers with that same finished job). The tick stops naming it; it
+        never reports 'waiting'."""
+        st = self.to_gating()
+        self.red(st)
+        self.ops.recheck_answer = ("GREEN", "passes alone on host-a")
+        self.tick()
+        self.ops.record_flake = lambda root, record: (
+            None, "the flake store is locked")
+        self.ops.receipt_rows.append(dict(self.ops.receipt_rows[0],
+                                          id="77" * 8,
+                                          ts="2026-01-01T02:00:00Z"))
+        self.tick()
+        self.assertEqual(self.current()["state"], autoland.STOPPED)
+        autoland.resume(self.root, "integrator", now=self.ops.clock)
+        self.ops.calls = []
+        _rc, out = self.tick()
+        self.assertEqual(self.ops.calls.count("launch"), 1)
+        self.assertEqual(self.current()["gate"]["job_id"], "gate-x1")
+        _rc, out = self.tick()
+        self.assertNotIn("waiting on the gate", out)
+        st = self.current()
+        self.assertEqual(st["state"], autoland.STOPPED)
+        self.assertIn("gate-x1", st["stopped"]["why"])
+        self.assertIn("77" * 8, st["stopped"]["why"])
+
+    def test_a_resumed_fresh_gate_that_reads_green_lands(self):  # noqa: VACUOUS_ASSERTION — the verify call, one push and the DONE archive are positive
+        """The resumed gate finishes OK: the tick reads it and lands."""
+        st = self.second_flake_stop()
+        autoland.resume(self.root, "integrator", now=self.ops.clock)
+        self.tick()
+        self.green(self.current())
+        self.ops.calls = []
+        rc, out = self.tick()
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("waiting on the gate", out)
+        self.assertIn("verify", self.ops.calls)
+        self.assertEqual(self.ops.pushes, 1)
+        self.assertEqual([d["state"] for d in self.archived()],
+                         [autoland.DONE])
+
+    def test_resume_after_a_second_flake_in_a_b_room_launches_a_fresh_gate(self):  # noqa: VACUOUS_ASSERTION — the launch count and the b-room head are positive
+        """The gate blame's compose launched on a b-room records its job
+        too, so a second flake there is spent like any other, and --resume
+        gates the b-room afresh rather than waiting on its finished job."""
+        st = self.to_gating([_car(ROW1, "one", TIP1),
+                             _car(ROW2, "two", TIP2)])
+        self.red(st)
+        self.ops.recheck_answer = ("GREEN", "passes alone on host-a")
+        self.tick()
+        broom = autoland.Ops.room_path(self.ops, self.root, "train7b")
+        self.ops.heads[broom] = "9" * 40
+        self.ops.b_gate = {"host": "host-b", "job_id": "gate-b"}
+        self.ops.recheck_answer = ("RED", "fails alone")
+        self.ops.blame_answer = (0, {"verdict": {
+            "kind": "EJECT", "car": {"n": 2, "id": ROW2, "lane": "two",
+                                     "tip": TIP2}}})
+        self.ops.receipt_rows.append(dict(self.ops.receipt_rows[0],
+                                          id="77" * 8,
+                                          ts="2026-01-01T02:00:00Z"))
+        self.tick()
+        st = self.current()
+        self.assertEqual((st["state"], st["room"], st["gate"]["job_id"]),
+                         (autoland.GATING, broom, "gate-b"))
+        self.ops.recheck_answer = ("GREEN", "passes alone on host-b")
+        self.ops.receipt_rows.append(dict(self.ops.receipt_rows[0],
+                                          id="88" * 8, head="9" * 40,
+                                          ts="2026-01-01T03:00:00Z"))
+        self.tick()
+        st = self.current()
+        self.assertEqual(st["state"], autoland.STOPPED)
+        self.assertIn("a second flake", st["stopped"]["why"])
+        said, why = autoland.resume(self.root, "integrator",
+                                    now=self.ops.clock)
+        self.assertIsNone(why, why)
+        self.assertIn("fresh gate", said)
+        self.ops.calls = []
+        _rc, out = self.tick()
+        self.assertNotIn("waiting on the gate", out)
+        self.assertEqual(self.ops.calls.count("launch"), 1)
+        st = self.current()
+        self.assertEqual((st["state"], st["room"], st["head"]),
+                         (autoland.GATING, broom, "9" * 40))
+        self.assertNotEqual(st["gate"]["job_id"], "gate-b")
+
+    def test_resume_after_an_unreadable_red_reads_that_red_again(self):  # noqa: VACUOUS_ASSERTION — the recheck call and the blame of that red are positive
+        """A red that could not be read for blame was never acted on, so
+        --resume reads it again rather than waiting on a finished gate."""
+        st = self.to_gating()
+        self.red(st)
+        facts = self.ops.red_facts
+        self.ops.red_facts = lambda room, gid: (None, None, "ledger locked")
+        self.tick()
+        st = self.current()
+        self.assertEqual(st["state"], autoland.STOPPED)
+        self.assertNotIn(RED_GID, st["red"])
+        self.ops.red_facts = facts
+        self.ops.blame_answer = (0, {"verdict": {"kind": "TRUNK-RED",
+                                                 "car": None}})
+        autoland.resume(self.root, "integrator", now=self.ops.clock)
+        self.ops.calls = []
+        _rc, out = self.tick()
+        self.assertNotIn("waiting on the gate", out)
+        self.assertIn("recheck", self.ops.calls)
+        self.assertEqual(self.ops.blamed[-1][1], RED_GID)
+
+    def no_receipt_timeout_stop(self):
+        """GATING with no receipt names the head, past GATE_WAIT_S: STOPPED
+        at GATING with the launch_ts exactly where it timed out."""
+        st = self.to_gating()
+        self.red(st)
+        self.ops.recheck_answer = ("GREEN", "passes alone on host-a")
+        self.ops.calls = []
+        self.ops.flakes = []
+        self.tick()  # red -> a flake re-gate launches gate-x1
+        st = self.current()
+        self.assertEqual(st["gate"]["job_id"], "gate-x1")
+        self.ops.receipt_rows = []  # nothing ever names the head
+        self.ops.clock += 7300  # past GATE_WAIT_S
+        _rc, out = self.tick()
+        st = self.current()
+        self.assertEqual(st["state"], autoland.STOPPED)
+        self.assertEqual(st["stopped"]["state"], autoland.GATING)
+        self.assertIn("no receipt names the head", st["stopped"]["why"])
+        return st
+
+    def test_resume_after_a_no_receipt_timeout_waits_a_fresh_gate_wait_s(self):  # noqa: VACUOUS_ASSERTION — the wait post and the same job id are positive
+        """task/4123: --resume after a no-receipt TIMEOUT stop at GATING kept
+        launch_ts exactly where it timed out, so the next tick timed out again
+        at once. The wait starts again on the SAME gate job: the resumed tick
+        prints 'waiting', not a stop, and relaunches nothing. The same job is
+        kept (Fab answers it if still running); a receipt arriving after the
+        resume is read and lands."""
+        st = self.no_receipt_timeout_stop()
+        self.assertEqual(st["gate"]["job_id"], "gate-x1")
+        old_launch_ts = st["launch_ts"]
+        said, why = autoland.resume(self.root, "integrator",
+                                    now=self.ops.clock)
+        self.assertIsNone(why, why)
+        self.assertIn("wait restarted", said, said)
+        # launch_ts moved forward to now, not the old timed-out value
+        self.assertGreater(self.ops.clock, old_launch_ts)
+        self.assertEqual(self.current()["launch_ts"], self.ops.clock)
+        self.ops.calls = []
+        # ONE tick on the fresh wait: waiting, not a second timeout stop, and
+        # nothing relaunched (the same job stays)
+        _rc, out = self.tick()
+        self.assertIn("waiting on the gate", out)
+        self.assertNotIn("with a fresh gate", out)
+        self.assertEqual(self.ops.calls.count("launch"), 0)
+        st = self.current()
+        self.assertEqual(st["state"], autoland.GATING)
+        self.assertEqual(st["gate"]["job_id"], "gate-x1")
+        self.assertEqual(st["launch_ts"], self.ops.clock)
+        # A receipt that arrives after the resume is read and lands:
+        self.green(st)
+        _rc, out = self.tick()
+        self.assertNotIn("waiting on the gate", out)
+        self.assertIn("verify", self.ops.calls)
+        self.assertEqual(self.ops.pushes, 1)
+        self.assertEqual([d["state"] for d in self.archived()],
+                         [autoland.DONE])
+
+    def test_resume_after_an_unreadable_red_names_the_unspent_job_not_a_timeout(self):  # noqa: VACUOUS_ASSERTION — the history note naming the job and the re-read recheck are positive
+        """The wait restart rides every launched, unspent GATING stop, not
+        only the timeout: a stop whose receipt is still there reads it again
+        (the clock is never asked), and the record says what is true of it
+        (the job is unspent), never that no receipt named the head."""
+        st = self.to_gating()
+        self.red(st)
+        facts = self.ops.red_facts
+        self.ops.red_facts = lambda room, gid: (None, None, "ledger locked")
+        self.tick()
+        self.assertEqual(self.current()["state"], autoland.STOPPED)
+        self.ops.red_facts = facts
+        said, why = autoland.resume(self.root, "integrator",
+                                    now=self.ops.clock)
+        self.assertIsNone(why, why)
+        note = self.current()["history"][-1]["note"]
+        self.assertIn("gate job gate-x0 is not spent", note)
+        self.assertNotIn("no receipt named the head", note)
+        self.ops.blame_answer = (0, {"verdict": {"kind": "TRUNK-RED",
+                                                 "car": None}})
+        self.ops.calls = []
+        _rc, out = self.tick()
+        self.assertNotIn("waiting on the gate", out)
+        self.assertIn("recheck", self.ops.calls)
+
+    def test_resume_on_a_b_room_gate_with_no_recorded_job_says_no_id_recorded(self):  # noqa: VACUOUS_ASSERTION — the history note naming the unrecorded job is positive
+        """Blame's b-room gate whose door row named no job: a no-receipt
+        timeout stop there, resumed, restarts the wait and the record says
+        the job's id was not recorded, never 'gate job None'."""
+        st = self.to_gating()
+        self.red(st)
+        broom = autoland.Ops.room_path(self.ops, self.root, "train7b")
+        self.ops.blame_answer = (0, {"verdict": {
+            "kind": "EJECT", "car": {"n": 2, "id": ROW2, "lane": "two",
+                                     "tip": TIP2}}})
+        self.ops.heads[broom] = "9" * 40
+        self.tick()
+        st = self.current()
+        self.assertEqual((st["state"], st["room"], st["gate"]["job_id"]),
+                         (autoland.GATING, broom, None))
+        self.ops.clock += 7300  # past GATE_WAIT_S, no receipt for the b-room
+        self.tick()
+        st = self.current()
+        self.assertEqual(st["state"], autoland.STOPPED)
+        self.assertIn("no receipt names the head", st["stopped"]["why"])
+        said, why = autoland.resume(self.root, "integrator",
+                                    now=self.ops.clock)
+        self.assertIsNone(why, why)
+        self.assertIn("wait restarted", said, said)
+        note = self.current()["history"][-1]["note"]
+        self.assertIn("its gate job (no id recorded) is not spent", note)
+        self.assertNotIn("None", note)
+        self.assertEqual(self.current()["launch_ts"], self.ops.clock)
 
 
 class AuditRedPath(Base):
@@ -3520,14 +4334,123 @@ class RealSeams(Base):
         car = _car(ROW1, "one", TIP1)
         facts = autoland.Ops().car_facts(self.root, car)
         self.assertEqual(sorted(facts), ["admit", "author", "doors",
-                                         "family", "model", "priority",
+                                         "family", "findings_unread",
+                                         "hold_row", "model", "priority",
                                          "read_at", "reader", "task",
                                          "task_unknown", "title"])
         self.assertEqual(facts["reader"], "reader-seat")
+        # its findings could not be read, and the LAND says so (task/3862)
+        self.assertEqual(facts["findings_unread"],
+                         "the compose could not read them: row %s is not in "
+                         "the dispatch ledger" % ROW1[:12])
         # a source-clean car whose doors could not be read is judged as a
         # door: its admission is asked, never assumed
         self.assertIsNone(facts["doors"])
-        self.assertEqual(len(facts["admit"]), 2)
+        self.assertIsNone(facts["hold_row"])
+        self.assertFalse(facts["admit"][0])
+        self.assertIn("no proven approval-tier holder at the hold",
+                      facts["admit"][1])
+
+    def test_a_land_first_car_rides_only_when_its_lane_is_no_door(self):
+        """The plan asks the doors; the admission asks them again, so a
+        land-first car whose doors read as a door or not at all is barred."""
+        car = _car(ROW1, "one", TIP1, basis=landwindow.LAND_FIRST)
+        facts = autoland.Ops().car_facts(self.root, car)
+        self.assertIsNone(facts["doors"])
+        self.assertEqual(facts["admit"], (False, (
+            "unread and its doors could not be read, and only a lane with "
+            "no door lands before review")))
+        rows = {ROW1: {"id": ROW1, "chain_root": ROW1, "lane": "one",
+                       "repo_id": self.repo}}
+        for found, admit in (([("prod", "planted")], (False, (
+                "unread and a DOOR (prod), and only a lane with no door "
+                "lands before review"))), ([], (True, None))):
+            with self.subTest(doors=found), \
+                    mock.patch.object(dispatches, "snapshot",
+                                      return_value=(rows, None)), \
+                    mock.patch("helm.review_door.lane_doors",
+                               lambda row, current=None, found=found: {
+                                   "doors": found, "paths": []}):
+                facts = autoland.Ops().car_facts(self.root, car)
+            self.assertEqual(facts["admit"], admit)
+
+    def test_each_car_uses_its_own_proof_or_says_task_unknown(self):
+        first = tasks.add("first ask", "builder-seat", force_new=True)[0]["id"]
+        other = tasks.add("other ask", "builder-seat", force_new=True)[0]["id"]
+        fallback = tasks.add("numbered ask", "builder-seat", tid="3991",
+                             force_new=True)[0]["id"]
+        for lane, tid in (("one", first), ("two", other),
+                          ("three", other)):
+            _git(self.repo, "branch", "lane/" + lane)
+            self.assertEqual(taskkey.record_lane(self.repo, lane, tid),
+                             (True, None))
+        plain = "e4" * 8
+        rows = {ROW1: {"id": ROW1, "chain_root": ROW1, "lane": "one",
+                       "task": first, "repo_id": self.repo},
+                ROW2: {"id": ROW2, "chain_root": ROW1, "lane": "two",
+                       "repo_id": self.repo},
+                ROW3: {"id": ROW3, "chain_root": ROW3, "lane": "three",
+                       "task": other, "repo_id": self.repo},
+                plain: {"id": plain, "chain_root": plain,
+                        "lane": "plain-3991", "repo_id": self.repo}}
+        with mock.patch.object(dispatches, "snapshot",
+                               return_value=(rows, None)):
+            cars = [_car(rid, lane, TIP1, basis="approved")
+                    for rid, lane in ((ROW1, "one"), (ROW2, "two"),
+                                      (ROW3, "three"),
+                                      (plain, "plain-3991"))]
+            facts = [autoland.Ops().car_facts(self.root, car)
+                     for car in cars]
+            admitted, barred = autoland._Tick(
+                self.root, False, autoland.Ops(), io.StringIO()).admitted(cars)
+        self.assertEqual(barred, [])
+        self.assertEqual([(c["task"], c["task_unknown"])
+                          for c in admitted],
+                         [(f["task"], f["task_unknown"]) for f in facts])
+        self.assertIn("task UNKNOWN", autoland._merge_detail(admitted[1]))
+        self.assertEqual(facts[0]["task"], first)
+        self.assertIsNone(facts[1]["task"])
+        self.assertIn(first, facts[1]["task_unknown"])
+        self.assertIn(other, facts[1]["task_unknown"])
+        self.assertEqual(facts[2]["task"], other)
+        self.assertEqual(facts[3]["task"], fallback)
+        self.assertIsNone(facts[3]["task_unknown"])
+
+    def test_a_disputed_cars_land_leaves_its_chain_findings_and_rows_open(self):
+        from helm import review_findings
+        first = tasks.add("first ask", "builder-seat", force_new=True)[0]["id"]
+        other = tasks.add("other ask", "builder-seat", force_new=True)[0]["id"]
+        _git(self.repo, "branch", "lane/two")
+        self.assertEqual(taskkey.record_lane(self.repo, "two", other),
+                         (True, None))
+        rows = {ROW1: {"id": ROW1, "chain_root": ROW1, "lane": "one",
+                       "task": first, "repo_id": self.repo},
+                ROW2: {"id": ROW2, "chain_root": ROW1, "lane": "two",
+                       "repo_id": self.repo},
+                ROW3: {"id": ROW3, "chain_root": ROW1, "lane": "one",
+                       "repo_id": self.repo, "status": "open", "kind": "review"}}
+        ops = autoland.Ops()
+        car = _car(ROW2, "two", TIP1, basis="approved")
+        with mock.patch.object(dispatches, "snapshot",
+                               return_value=(rows, None)), \
+                mock.patch.object(review_findings, "named_at",
+                                  return_value=([other], None)), \
+                mock.patch.object(review_findings, "lane_tasks",
+                                  return_value=(set(), None)):
+            facts = ops.car_facts(self.root, car)
+        self.assertIsNone(facts["task"])
+        self.assertIn("proves", facts["task_unknown"])
+        close_findings = mock.Mock(return_value=([other], []))
+        close_row = mock.Mock(return_value=None)
+        ops.close_findings = close_findings
+        ops.lr_row_close = close_row
+        report = ops.land_step(self.root, dict(car, **facts), "LAND 1", TIP1)
+        close_findings.assert_not_called()
+        close_row.assert_not_called()
+        self.assertEqual(report["findings_closed"], [])
+        self.assertEqual(report["discharged"], [])
+        self.assertIn("UNKNOWN", " ".join(report["findings_errors"] +
+                                            report["errors"]))
 
     def test_the_real_facts_carry_the_task_title_as_plain_words(self):
         from helm import tasks, trainblame
@@ -3561,6 +4484,191 @@ class RealSeams(Base):
                 reader="b"))
             self.assertTrue(detail.startswith("task UNKNOWN"), detail)
             self.assertNotIn("no task", detail)
+
+    def test_a_newer_proven_car_task_overrules_a_transient_blame_refusal(self):
+        from helm import trainblame
+        mine = tasks.add("the same lane task", "builder-seat",
+                         force_new=True)[0]["id"]
+        _git(self.repo, "branch", "lane/one")
+        self.assertEqual(taskkey.record_lane(self.repo, "one", mine),
+                         (True, None))
+        rows = {ROW1: {"id": ROW1, "chain_root": ROW1, "lane": "one",
+                       "task": mine, "repo_id": self.repo}}
+        with mock.patch.object(trainblame, "lane_task", return_value=(
+                None, "the first read was refused", "the first read was refused")), \
+                mock.patch.object(dispatches, "snapshot",
+                                  return_value=(rows, None)):
+            facts = autoland.Ops().car_facts(
+                self.root, _car(ROW1, "one", TIP1, basis="approved"))
+        self.assertEqual(facts["task"], mine)
+        self.assertIsNone(facts["task_unknown"])
+        self.assertEqual(facts["chain"], ROW1)
+        self.assertNotIn("step_unread", facts)
+
+    def test_push_readiness_and_resumed_land_cannot_use_an_old_task(self):
+        from helm import review_findings
+        first = tasks.add("chain ask", "builder-seat", force_new=True)[0]["id"]
+        other = tasks.add("different lane ask", "builder-seat",
+                          force_new=True)[0]["id"]
+        for lane in ("one", "two"):
+            _git(self.repo, "branch", "lane/" + lane)
+            self.assertEqual(taskkey.record_lane(self.repo, lane, first),
+                             (True, None))
+        before = _git(self.repo, "rev-parse", "HEAD")
+        _git(self.repo, "commit", "-q", "--allow-empty", "-m", "child tip")
+        tip = _git(self.repo, "rev-parse", "HEAD")
+        fix, sibling = "f1" * 8, "e1" * 8
+        rows = {ROW1: {"id": ROW1, "chain_root": ROW1, "lane": "one",
+                       "task": first, "repo_id": self.repo},
+                ROW2: {"id": ROW2, "chain_root": ROW1, "lane": "two",
+                       "repo_id": self.repo, "status": "held", "tip": tip},
+                fix: {"id": fix, "chain_root": ROW1, "lane": "one",
+                      "polarity": "fix", "reviewed_tip": before,
+                      "status": "verdict"},
+                sibling: {"id": sibling, "chain_root": ROW1,
+                          "lane": "two", "status": "open"}}
+        finding = tasks.add("finding of the chain", "builder-seat",
+                            force_new=True, found_in=fix,
+                            found_chain=ROW1)[0]["id"]
+        ops = self.ops
+
+        def car_facts(root, car):
+            return dict(autoland.Ops.car_facts(ops, root, car),
+                        admit=(True, None))
+
+        self.ops.car_facts = car_facts
+        with mock.patch.object(dispatches, "snapshot",
+                               return_value=(rows, None)), \
+                mock.patch.object(review_findings, "lane_tasks",
+                                  return_value=(set(), None)):
+            st = self.to_gating([_car(ROW2, "two", tip, basis="approved")])
+            self.assertEqual((st["cars"][0]["task"], st["cars"][0]["chain"]),
+                             (first, ROW1))
+            _git(self.repo, "config", "branch.lane/two.helmTask", other)
+            tick = autoland._Tick(self.root, True, self.ops, io.StringIO())
+            self.assertIsNone(tick.ready_at_the_push(st, st["head"]))
+            self.assertIsNone(tick._ready_cars[0]["task"])
+            self.assertIn("proves", tick._ready_cars[0]["task_unknown"])
+            # A killed tick resumes with only its saved state, not _ready_cars.
+            saved = self.current()
+            self.assertIsNone(saved["cars"][0]["task"])
+            self.assertIn("proves", saved["cars"][0]["task_unknown"])
+            # Also model an older sent record from before the refresh: the
+            # post-push process must not trust even that saved compose proof.
+            saved["cars"][0].update(task=first, task_unknown=None, chain=ROW1,
+                                    findings_unread=None, step_unread=None)
+            saved["land"] = 384
+            saved["fold"] = {"closed": [], "foreign": []}
+            self.assertIsNone(autoland._Tick(
+                self.root, True, self.ops, io.StringIO()).closes(saved))
+        self.assertIsNone(saved["cars"][0]["task"])
+        self.assertIn("proves", saved["cars"][0]["task_unknown"])
+        self.assertEqual(tasks.rows()[finding]["status"], "open")
+        self.assertEqual(self.ops.row_closes, [])
+
+    def test_a_later_proof_never_forgets_earlier_protected_findings(self):
+        merged = autoland._Tick._car_proof(
+            {"task_unknown": None, "tasks_named": ["task/1"],
+             "findings_kept": ["task/2"]},
+            {"task_unknown": None, "tasks_named": ["task/3"],
+             "findings_kept": ["task/4"]})
+        self.assertEqual(merged["tasks_named"], ["task/1", "task/3"])
+        self.assertEqual(merged["findings_kept"], ["task/2", "task/4"])
+
+    def test_the_webs_code_is_read_off_its_stop_facts_and_trunks_tree(self):
+        """The console web writes the digest of the code it imported into
+        every stop-facts snapshot; trunk's is the same digest of the landed
+        tree. Both are a file read and a stat walk (task/3796)."""
+        from helm import stopfacts
+        pkg = os.path.join(self.root, "helm")
+        os.makedirs(pkg)
+        source = os.path.join(pkg, "a.py")
+        with open(source, "w") as fh:
+            fh.write("x = 1\n")
+        digest = stopfacts.code_policy(pkg=pkg, fresh=True)
+        loaded = time.time() - 100
+        snap = {"schema": stopfacts.SCHEMA, "written_at": time.time(),
+                "policy": digest,
+                "resident": {"pid": os.getpid(),
+                             "starttime": stopfacts.own_starttime(),
+                             "started_at": loaded, "replaying_since": None,
+                             "code_root": os.path.realpath(pkg)}}
+        os.makedirs(os.path.dirname(stopfacts.path()), exist_ok=True)
+        with open(stopfacts.path(), "w") as fh:
+            json.dump(snap, fh)
+        got = autoland.Ops().web_code(self.root)
+        self.assertEqual((got["served"], got["trunk"], got["alive"],
+                          got["why"]), (digest, digest, True, None))
+        self.assertIsNone(autoland.web_follows(got, loaded + 10)[0])
+        # the land changes the tree after the resident loaded it, and it
+        # did not follow
+        with open(source, "a") as fh:
+            fh.write("y = 2\n")
+        got = autoland.Ops().web_code(self.root)
+        self.assertNotEqual(got["trunk"], digest)
+        stale, _note = autoland.web_follows(got, loaded + 10)
+        self.assertIn(digest[:12], stale)
+        self.assertIn(got["trunk"][:12], stale)
+        # no snapshot: unknown, never stale
+        os.remove(stopfacts.path())
+        got = autoland.Ops().web_code(self.root)
+        self.assertTrue(got["why"], got)
+        self.assertIsNone(autoland.web_follows(got, loaded + 10)[0])
+
+    def test_the_real_lease_seams_release_a_landed_lane_whoever_holds_it(
+            self):
+        """The claims ledger read, the stop guard's own landedness read and
+        `helm work release` in a child, on a temp repository and an empty
+        helm home (task/3674)."""
+        from helm import seats_claims
+        _git(self.repo, "checkout", "-q", "-b", "lane/one")
+        _git(self.repo, "commit", "-q", "--allow-empty", "-m", "one")
+        _git(self.repo, "checkout", "-q", "main")
+        _git(self.repo, "merge", "-q", "--ff-only", "lane/one")
+        _git(self.repo, "checkout", "-q", "-b", "lane/two")
+        _git(self.repo, "commit", "-q", "--allow-empty", "-m", "two")
+        _git(self.repo, "checkout", "-q", "main")
+        leases = {}
+        for lane, holder in (("one", "builder-a"), ("two", "builder-b")):
+            ok, said, lease = seats_claims.claim(
+                _lanes_resource(self.root, lane), holder,
+                session="session-of-" + holder)
+            self.assertTrue(ok, said)
+            leases[lane] = lease
+        ops = autoland.Ops()
+        row, why = ops.lane_lease(self.root, "one")
+        self.assertIsNone(why, why)
+        self.assertEqual((row["holder"], row["lease"]),
+                         ("builder-a", leases["one"]))
+        self.assertIsInstance(row["fence"], int)
+        self.assertIn(ops.lane_landed(self.root, "one")[0],
+                      (vcs.ANCESTOR, vcs.PATCH_EQUIVALENT))
+        state, proof = ops.lane_landed(self.root, "two")
+        self.assertEqual(state, vcs.NOT_ANCESTOR, proof)
+        self.assertEqual(ops.lane_landed(self.root, "three")[0], vcs.UNKNOWN)
+        # the tick's own session is never the holder's, and the child is
+        # not refused for it
+        with mock.patch.dict(os.environ, {
+                "CLAUDE_CODE_SESSION_ID": "the-seat-running-the-tick",
+                "HELM_LANE_COORDINATION": "1"}):
+            ok, text = ops.release_lease(self.root, "one", "builder-a",
+                                         leases["one"])
+            self.assertTrue(ok, text)
+            self.assertEqual(ops.lane_lease(self.root, "one"), (None, None))
+            self.assertEqual(ops.lane_lease(self.root, "two")[0]["holder"],
+                             "builder-b")
+            # the control: a lease the land did not read stays held
+            ok, text = ops.release_lease(self.root, "two", "builder-b",
+                                         "0" * 16)
+            self.assertFalse(ok, text)
+            self.assertIn("stays held", text)
+            self.assertEqual(ops.lane_lease(self.root, "two")[0]["holder"],
+                             "builder-b")
+
+
+def _lanes_resource(root, lane):
+    from helm.work import _lanes
+    return _lanes.resource(root, lane)
 
 
 class LockArms(Base):
@@ -3747,10 +4855,257 @@ class Counter(Base):
                          {383: TRUNK})
 
 
+class LandAbsorbs(Base):
+    """Two of the integrator's post-land hand steps, done by the land itself
+    (task/3674, owner-asked): the web restart a land no longer
+    owes, read instead of asked (task/3796), and each landed car's lane
+    lease, released at land whoever holds it."""
+
+    WEB = {"helm/web_board.py": "+x\n"}
+
+    def land(self, cars=None):
+        st = self.to_gating(cars or [_car(ROW1, "one", TIP1),
+                                     _car(ROW2, "two", TIP2,
+                                          basis="approved")])
+        self.green(st)
+        return self.tick()
+
+    def land_line(self):
+        lines = [p for p in self.ops.posts if "@all LAND 384" in p]
+        self.assertEqual(len(lines), 1, self.ops.posts)
+        return lines[0]
+
+    def web(self, served, trunk, started_at, alive=True):
+        pkg = os.path.join(self.root, "helm")
+        self.ops.web = {"served": served, "trunk": trunk, "pkg": pkg,
+                        "code_root": pkg, "pid": 4242, "alive": alive,
+                        "started_at": started_at, "why": None}
+
+    def stale_posts(self):
+        return [p for p in self.ops.posts if "still serves" in p]
+
+    def ended(self):
+        return [d["state"] for d in self.archived()]
+
+    # -- the web restart it no longer owes (task/3796) --------------------
+    def test_a_web_only_land_posts_no_restart_and_says_none(self):  # noqa: VACUOUS_ASSERTION — the absence of a restart post is the contract; land_line() asserts the one LAND post exists
+        self.ops.changes_by_tip = {TIP2: dict(self.WEB)}
+        rc, out = self.land()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.ops.closed_rows, [(ROW2, True, None)])
+        self.assertFalse(any("restart" in p for p in self.ops.posts),
+                         self.ops.posts)
+        self.assertNotIn("needs restart", self.land_line())
+
+    def test_a_land_on_a_service_that_does_not_follow_its_code_still_posts(
+            self):
+        self.ops.changes_by_tip = {TIP2: dict(self.WEB, **{
+            "helm/chatnode.py": "+x\n"})}
+        rc, out = self.land()
+        self.assertEqual(rc, 0, out)
+        (rid, live, restart), = self.ops.closed_rows
+        self.assertEqual((rid, live), (ROW2, False))
+        self.assertIn("chat node", restart)
+        self.assertNotIn("web", restart)
+        self.assertTrue(any(p.startswith("@integrator") and "chat node" in p
+                            and "needs a restart" in p
+                            for p in self.ops.posts), self.ops.posts)
+        land = self.land_line()
+        self.assertIn("needs restart", land)
+        self.assertIn("chat node", land)
+        self.assertNotIn("web service", land)
+
+    def test_a_web_still_on_old_code_a_minute_after_the_land_is_posted_once(  # noqa: VACUOUS_ASSERTION — the read and the archive absent before the minute are re-read present after it
+            self):
+        """The web re-execs itself within seconds of a changed tree, so it
+        is read once WEB_FOLLOW_S after the fast-forward, never before;
+        still on the code from before the land, it is ONE line naming both
+        digests, and nothing is restarted."""
+        self.ops.changes_by_tip = {TIP2: dict(self.WEB)}
+        served, trunk = "0" * 32, "f" * 32
+        self.web(served, trunk, started_at=T0 - 3600)
+        rc, out = self.land()
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("web_code", self.ops.calls)
+        self.assertEqual(self.current()["state"], autoland.LANDING)
+        self.assertEqual(self.ended(), [])
+        # a tick inside the minute still does not read it
+        self.ops.clock += autoland.WEB_FOLLOW_S - 1
+        self.tick()
+        self.assertNotIn("web_code", self.ops.calls)
+        self.ops.clock += 1
+        rc, out = self.tick()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.ops.calls.count("web_code"), 1)
+        stale, = self.stale_posts()
+        self.assertTrue(stale.startswith("@integrator"), stale)
+        self.assertIn("LAND 384", stale)
+        self.assertIn(served[:12], stale)
+        self.assertIn(trunk[:12], stale)
+        self.assertIn("restarts nothing", stale)
+        self.assertEqual(self.ended(), [autoland.DONE])
+        self.tick()
+        self.assertEqual(len(self.stale_posts()), 1, self.ops.posts)
+
+    def test_a_web_serving_trunks_code_is_not_posted(self):  # noqa: VACUOUS_ASSERTION — no stale post is the contract; the read is counted once and its note asserted
+        self.ops.changes_by_tip = {TIP2: dict(self.WEB)}
+        self.web("f" * 32, "f" * 32, started_at=T0 - 3600)
+        self.land()
+        self.ops.clock += autoland.WEB_FOLLOW_S
+        rc, out = self.tick()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.ops.calls.count("web_code"), 1)
+        self.assertEqual(self.stale_posts(), [])
+        self.assertEqual(self.ended(), [autoland.DONE])
+        notes = [h["note"] for h in self.archived()[0]["history"]]
+        self.assertTrue(any("serves trunk's code" in n for n in notes), notes)
+
+    def test_a_web_that_re_execd_after_the_land_follows_while_it_refolds(  # noqa: VACUOUS_ASSERTION — no stale post is the contract; the control reads the same facts stale
+            self):
+        """A resident that re-exec'd keeps the facts it found, and their
+        digest, until its first refresh: a start after the land's
+        fast-forward is the re-exec, not old code."""
+        self.ops.changes_by_tip = {TIP2: dict(self.WEB)}
+        self.web("0" * 32, "f" * 32, started_at=None)
+        self.land()
+        self.ops.web["started_at"] = self.ops.clock + 5
+        self.ops.clock += autoland.WEB_FOLLOW_S
+        rc, out = self.tick()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.stale_posts(), [])
+        self.assertEqual(self.ended(), [autoland.DONE])
+        # the control: the same reading with the start before the land
+        # is old code
+        got = dict(self.ops.web, started_at=T0)
+        stale, _note = autoland.web_follows(got, T0 + 301)
+        self.assertIn("0" * 12, stale)
+
+    def test_a_web_that_cannot_be_read_is_recorded_and_not_posted(self):  # noqa: VACUOUS_ASSERTION — no post is the contract; the UNKNOWN note is asserted in the archived history
+        self.ops.changes_by_tip = {TIP2: dict(self.WEB)}
+        self.land()
+        self.ops.clock += autoland.WEB_FOLLOW_S
+        rc, out = self.tick()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.stale_posts(), [])
+        self.assertEqual(self.ended(), [autoland.DONE])
+        notes = [h["note"] for h in self.archived()[0]["history"]]
+        self.assertTrue(any("UNKNOWN" in n and "stop-facts" in n
+                            for n in notes), notes)
+        # a dead resident and another tree's resident are not this land's
+        for got in (dict(self.ops.web or {}, why=None, served="0" * 32,
+                         trunk="f" * 32, alive=False, started_at=T0,
+                         code_root="/x/helm", pkg="/x/helm"),
+                    dict(why=None, served="0" * 32, trunk="f" * 32,
+                         alive=True, started_at=T0, code_root="/y/helm",
+                         pkg="/x/helm")):
+            stale, note = autoland.web_follows(got, T0 + 301)
+            self.assertIsNone(stale, note)
+
+    def test_a_land_that_touches_no_web_path_never_waits_on_the_web(self):  # noqa: VACUOUS_ASSERTION — no web read is the contract; the land is asserted DONE in the same tick
+        self.web("0" * 32, "f" * 32, started_at=T0 - 3600)
+        rc, out = self.land()
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("web_code", self.ops.calls)
+        self.assertEqual(self.ended(), [autoland.DONE])
+
+    def test_the_read_waits_as_long_as_a_resident_may_take_to_follow(self):  # noqa: VACUOUS_ASSERTION — a comparison of two constants, no observable can be empty
+        from helm import stopfacts_resident
+        self.assertGreaterEqual(autoland.WEB_FOLLOW_S,
+                                stopfacts_resident.REEXEC_WITHIN_S)
+
+    # -- the lane lease, released at land (task/3674) ---------------------
+    def hold(self, **lanes):
+        for lane, (holder, fence) in lanes.items():
+            self.ops.leases[lane] = {"holder": holder, "lease": "L%d" % fence,
+                                     "session": "s-%s" % holder,
+                                     "fence": fence}
+
+    def test_a_landed_cars_lease_is_released_and_named_on_the_land_line(
+            self):
+        self.hold(one=("builder-a", 1), two=("builder-b", 2))
+        rc, out = self.land()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.ops.released, [("one", "builder-a", "L1"),
+                                             ("two", "builder-b", "L2")])
+        self.assertEqual(self.ops.leases, {})
+        self.assertLess(self.ops.calls.index("lr_close"),
+                        self.ops.calls.index("release_lease"))
+        land = self.land_line()
+        self.assertIn("leases released: one, two", land)
+        # the lease token is never posted
+        self.assertNotIn("L1", land.replace("LAND", ""))
+        self.assertEqual(self.ended(), [autoland.DONE])
+
+    def test_a_lease_on_a_lane_whose_tip_is_not_on_trunk_stays_held(self):
+        self.hold(one=("builder-a", 1), two=("builder-b", 2))
+        self.ops.landed = {"two": vcs.NOT_ANCESTOR}
+        rc, out = self.land()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.ops.released, [("one", "builder-a", "L1")])
+        self.assertEqual(self.ops.leases["two"]["holder"], "builder-b")
+        land = self.land_line()
+        self.assertIn("leases released: one", land)
+        self.assertNotIn("one, two", land)
+        self.assertEqual(self.ended(), [autoland.DONE])
+        car = [c for c in self.archived()[0]["cars"] if c["lane"] == "two"][0]
+        self.assertEqual(car["lease"]["state"], "kept")
+
+    def test_a_release_that_refuses_is_named_and_the_land_completes(self):
+        self.hold(one=("builder-a", 1), two=("builder-b", 2))
+        occupied = ("helm work: /x-wt/one is OCCUPIED — room and lease "
+                    "kept. Each process below is live work:\n  pid 7 ...")
+        self.ops.release_answers = {"one": (False, occupied)}
+        rc, out = self.land()
+        self.assertEqual(rc, 0, out)
+        land = self.land_line()
+        self.assertIn("lease release refused: lane one", land)
+        self.assertIn("OCCUPIED", land)
+        self.assertIn("live work. CL", land)
+        self.assertNotIn("pid 7", land)
+        self.assertIn("leases released: two", land)
+        self.assertEqual(self.ops.leases["one"]["holder"], "builder-a")
+        self.assertEqual(self.ended(), [autoland.DONE])
+        self.assertEqual(autoland.read_counter(self.root)["n"], 384)
+
+    def test_a_re_run_of_the_step_releases_nothing_twice(self):  # noqa: VACUOUS_ASSERTION — no second release is the contract; the released list is asserted whole before and after
+        """A tick killed after a release and before its answer was
+        recorded: the next one asks the ledger again, releases nothing
+        the land already released, and never a lease granted since."""
+        self.hold(one=("builder-a", 1), two=("builder-b", 2))
+        self.ops.release_raises = {"one"}
+        with self.assertRaises(RuntimeError):
+            self.land()
+        self.assertEqual(self.current()["step"], "numbered")
+        self.assertEqual(self.ops.released, [("one", "builder-a", "L1")])
+        # the lane is claimed again before the next tick
+        self.hold(one=("builder-c", 9))
+        rc, out = self.tick()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.ops.released, [("one", "builder-a", "L1"),
+                                             ("two", "builder-b", "L2")])
+        self.assertEqual(self.ops.leases["one"]["holder"], "builder-c")
+        land = self.land_line()
+        self.assertIn("leases released: two", land)
+        self.assertNotIn("builder-c", land)
+        self.assertEqual(self.ended(), [autoland.DONE])
+        # and a step asked again once every answer is recorded asks nothing
+        st = self.archived()[0]
+        self.ops.calls = []
+        tick = autoland._Tick(self.root, True, self.ops, io.StringIO())
+        self.assertIsNone(tick.releases(st))
+        self.assertNotIn("release_lease", self.ops.calls)
+        self.assertNotIn("lane_lease", self.ops.calls)
+
+    def test_a_car_whose_lane_holds_no_lease_releases_nothing(self):  # noqa: VACUOUS_ASSERTION — no release is the contract; land_line() asserts the one LAND post exists
+        rc, out = self.land()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.ops.released, [])
+        self.assertNotIn("leases released", self.land_line())
+
+
 class Classify(unittest.TestCase):
-    def test_restart_is_decided_by_touched_paths(self):
+    def test_restart_is_decided_by_touched_paths(self):  # noqa: VACUOUS_ASSERTION — the loop runs a fixed non-empty tuple of cases
         cases = (({"helm/hooks.py": "+x\n"}, "hooks"),
-                 ({"helm/web_board.py": "+x\n"}, "web board"),
                  ({"helm/chatnode.py": "+x\n"}, "chat node"),
                  ({"helm/proxywatch.py": "+x\n"}, "proxywatch"),
                  ({"helm/seat_catalog.py": ' "sidecar": {\n+  "pin": 1\n'},
@@ -3764,20 +5119,89 @@ class Classify(unittest.TestCase):
         self.assertEqual(autoland.needs_restart(
             {"helm/seat_catalog.py": "+  window = 1\n"}), [])
 
+    def test_lead_posture_owes_a_relaunch_of_the_leads(self):  # noqa: VACUOUS_ASSERTION — the loop runs a fixed non-empty tuple of cases, each asserting the relaunch words; the empty answers are the controls
+        """A running lead keeps the hooks, skills, WHO digest and settings it
+        started with, so a land that changes them is not LIVE until the
+        leads relaunch, and the owed line says so."""
+        cases = ({"helm/hooks.py": "+x\n"},
+                 {"bin/helm-hook": "+x\n"},
+                 {"agents/claudecode/skills/build/SKILL.md": "+x\n"},
+                 {"helm/inject/_entries.py": "+x\n"},
+                 {"helm/whoami.py": "+x\n"},
+                 {"helm/seat_catalog.py":
+                  "@@ -1 +1 @@ def lead_lean_settings():\n+    x = 1\n"},
+                 {"helm/seat_launch_assets.py":
+                  "@@ -1 +1 @@ def _apply_lead_lean(s):\n+    x = 1\n"},
+                 {"helm/launch.py":
+                  "@@ -1 +1 @@ def _lead_lean_args(seat, role):\n+ x\n"})
+        for changes in cases:
+            with self.subTest(changes=sorted(changes)):
+                got = "; ".join(autoland.needs_restart(changes))
+                self.assertIn("relaunch the leads", got)
+                self.assertIn("not LIVE until they do", got)
+        # CONTROL: a seat_catalog change away from the lead settings, and a
+        # plain module, owe no relaunch
+        for changes in ({"helm/seat_catalog.py": "+  window = 1\n"},
+                        {"helm/pi.py": "+x = 1\n"}):
+            with self.subTest(changes=sorted(changes)):
+                self.assertEqual(autoland.needs_restart(changes), [])
+
+    def test_the_web_follows_its_code_and_owes_no_restart(self):
+        """`helm web` re-execs itself onto a changed tree (task/3132), so a
+        web path owes the fleet no restart (task/3796): it is read a minute
+        after the land instead. A path beside it that does not follow its
+        code still owes one."""
+        web = {"helm/web_board.py": "+x\n", "helm/web_ui/x.js.part": "+y\n"}
+        self.assertEqual(autoland.needs_restart(web), [])
+        self.assertEqual(autoland.follows_code(web), ["the web board"])
+        both = dict(web, **{"helm/proxywatch.py": "+x\n"})
+        owed = autoland.needs_restart(both)
+        self.assertEqual(len(owed), 1, owed)
+        self.assertIn("proxywatch", owed[0])
+        self.assertEqual(autoland.follows_code({"helm/pi.py": "+x\n"}), [])
+        self.assertEqual(autoland.follows_code(
+            {"tests/test_web_board.py": "+x\n"}), [])
+
     def test_the_merge_subject_leads_with_the_task_title(self):
         """Trunk's subject is where the morning report reads a land's plain
         words, so auto-land's own merge carries the task's title first;
-        with no title the subject keeps the shape it always had."""
+        with no title the subject carries its labels only."""
         car = {"id": ROW1, "task": "task/9", "title": "the fleet got nine",
                "priority": "P2", "doors": [], "author": "a", "reader": "r",
                "model": "m", "basis": "source-clean"}
         self.assertEqual(autoland._merge_detail(car),
-                         "task/9: the fleet got nine; P2, not a door; "
-                         "author a; r (m) read SOURCE-CLEAN %s" % ROW1[:12])
+                         "task/9: the fleet got nine; P2, not a door")
         del car["title"]
         self.assertEqual(autoland._merge_detail(car),
-                         "task/9, P2, not a door; author a; r (m) read "
-                         "SOURCE-CLEAN %s" % ROW1[:12])
+                         "task/9, P2, not a door")
+
+    def test_a_merge_subject_names_no_seat_and_no_model(self):  # noqa: VACUOUS_ASSERTION — each absence sits beside an exact assertEqual on the same detail, and the control pins the task words positively
+        """task/4033: commit metadata is akapug's alone (the owner's canon), so
+        a car's merge subject says the task, its title, the priority and the
+        door, and never who built the lane, who read it or on which model.
+        That provenance stays in the ledger: the row, its verdict or hold,
+        and the AUTHORS line a landed close prints."""
+        seats, model = ("seat-a", "seat-b"), "claude-opus-5-5"
+        for basis, doors, title, said in (
+                ("source-clean", [], "the fleet got nine",
+                 "task/9: the fleet got nine; P1, not a door"),
+                ("approved", ["guard"], None, "task/9, P1, a DOOR: guard"),
+                ("source-clean", None, None, "task/9, P1, doors UNKNOWN")):
+            car = {"id": ROW1, "lane": "one", "task": "task/9",
+                   "title": title, "priority": "P1", "doors": doors,
+                   "author": seats[0], "reader": seats[1], "model": model,
+                   "basis": basis}
+            with self.subTest(basis=basis, doors=doors, title=title):
+                detail = autoland._merge_detail(car)
+                self.assertEqual(detail, said)
+                for name in seats + (model, "author", "read", ROW1[:12]):
+                    self.assertNotIn(name, detail)
+        # CONTROL: the car's own task words still ride, so the subject still
+        # says what landed; only the provenance left it.
+        self.assertEqual(autoland._merge_detail(
+            {"id": ROW1, "lane": "one", "task": None, "doors": [],
+             "author": seats[0], "reader": seats[1], "model": model}),
+            "no task, P?, not a door")
 
     def test_one_diff_splits_by_path(self):
         text = ("diff --git a/helm/a.py b/helm/a.py\n@@ -1 +1 @@\n-x\n+y\n"
@@ -4291,6 +5715,63 @@ class AbandonAfterAPush(Base):
         self.assertIn("helm lr foldcheck", out.getvalue())
 
 
+
+class AbandonDrop(Base):
+    """Blame that names no car leaves the train STOPPED. Ending it with the
+    car named keeps that tip out of the next plan, and the other cars stay."""
+
+    def test_a_one_car_drop_is_not_composed_again(self):  # noqa: VACUOUS_ASSERTION — the recorded tip and the IDLE line are the positive controls; no active train is that same outcome
+        self.ops.cars = [_car(ROW1, "one", TIP1)]
+        self.tick()
+        self.ops.real_ejections = True
+        row, why = autoland.abandon(
+            self.root, "the-integrator", "the audit named nobody",
+            ops=self.ops, drop="one")
+        self.assertIsNone(why, why)
+        self.assertEqual(row["abandoned"]["dropped"]["tip"], TIP1)
+        standing, err = landwindow.read_ejections(self.root)
+        self.assertIsNone(err, err)
+        self.assertIn(TIP1, standing)
+        _rc, out = self.tick()
+        self.assertIsNone(self.current())
+        self.assertIn("IDLE", out)
+
+    def test_the_other_cars_of_a_dropped_train_stay_ready(self):  # noqa: VACUOUS_ASSERTION — the next train carrying the other tip is the positive control; the ejection set is the dropped car
+        self.ops.cars = [_car(ROW1, "one", TIP1), _car(ROW2, "two", TIP2)]
+        self.tick()
+        self.ops.real_ejections = True
+        row, why = autoland.abandon(
+            self.root, "the-integrator", "keep the rest",
+            ops=self.ops, drop=ROW1)
+        self.assertIsNone(why, why)
+        self.tick()
+        st = self.current()
+        self.assertEqual([c["tip"] for c in st["cars"]], [TIP2])
+        standing, err = landwindow.read_ejections(self.root)
+        self.assertIsNone(err, err)
+        self.assertEqual(set(standing), {TIP1})
+
+    def test_a_drop_that_names_nobody_abandons_nothing(self):  # noqa: VACUOUS_ASSERTION — the train still INTENT is the positive control; an empty ejection store is that same refusal
+        self.ops.cars = [_car(ROW1, "one", TIP1)]
+        self.tick()
+        row, why = autoland.abandon(
+            self.root, "the-integrator", "no such car",
+            ops=self.ops, drop="missing")
+        self.assertIsNone(row)
+        self.assertIn("no car", why)
+        self.assertEqual(self.current()["state"], autoland.INTENT)
+        standing, err = landwindow.read_ejections(self.root)
+        self.assertIsNone(err, err)
+        self.assertEqual(standing, {})
+
+    def test_drop_is_only_an_abandon_flag(self):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = autoland.cmd(["--drop", "one", "--repo", self.repo])
+        self.assertEqual(rc, 2)
+        self.assertIn("--abandon", err.getvalue())
+
+
 class SingleFlight(Base):
     """THE INTEGRATOR'S RULING R4: a STOPPED auto-land train still holds the
     flight, so `helm train --apply` refuses beside it and names `--resume`
@@ -4310,6 +5791,8 @@ class SingleFlight(Base):
         why = autoland.flight_refusal(self.root)
         self.assertIn("--resume --repo %s" % self.root, why)
         self.assertIn("--abandon --repo %s" % self.root, why)
+        self.assertIn("--reason R` ends it;", why)
+        self.assertIn("add `--drop ROW|LANE` to keep", why)
         _row, err = autoland.abandon(self.root, "the-integrator", "clear it",
                                      ops=self.ops)
         self.assertIsNone(err, err)
@@ -4358,6 +5841,9 @@ class FoldProof(Base):
     FIVE = ["ok    tip-exists     x", "ok    tree-vs-gate   x",
             "ok    ff-able        x", "ok    head-clean     x",
             "ok    origin-has-it  x is on origin/main"]
+    CLOSED_OWN = ["  CLOSED    %s  tip %s  held by reader-seat — ok"
+                  % (rid, tip[:12]) for rid, tip in
+                  ((ROW1, TIP1), (ROW2, TIP2))]
 
     def fold(self, text):
         autoland.seed_counter(self.root, 383, TRUNK)
@@ -4393,9 +5879,108 @@ class FoldProof(Base):
         self.assertIsNone(why, why)
         self.assertIn("retries from LANDING/guarded", said)
         self.ops.fold_text = "\n".join(
-            self.FIVE + ["all five PASSED — this fold is provable"])
+            self.FIVE + ["all five PASSED — this fold is provable"]
+            + self.CLOSED_OWN)
         self.tick()
         self.assertEqual(autoland.read_counter(self.root)["n"], 384)
+
+    def test_a_refused_source_clean_row_cannot_be_a_proven_fold(self):
+        self.fold(self.FIVE + [
+            "all five PASSED — this fold is provable", "",
+            "  REFUSED d1d1d1d1d1d1  holder not admitted by current policy"])
+        self.assert_not_proven()
+        self.assertIn("REFUSED", self.current()["stopped"]["why"])
+        _said, why = autoland.resume(self.root, "the-integrator",
+                                    now=self.ops.clock)
+        self.assertIsNone(why, why)
+        self.ops.fold_text = "\n".join(
+            self.FIVE + ["all five PASSED — this fold is provable"]
+            + self.CLOSED_OWN)
+        self.tick()
+        self.assertEqual(autoland.read_counter(self.root)["n"], 384)
+
+    def test_missing_own_close_stops_before_numbering(self):
+        self.fold(self.FIVE + ["all five PASSED — this fold is provable"])
+        self.assert_not_proven()
+        self.assertIn(ROW1, self.current()["stopped"]["why"])
+        self.assertIn(ROW2, self.current()["stopped"]["why"])
+        _said, why = autoland.resume(self.root, "the-integrator",
+                                    now=self.ops.clock)
+        self.assertIsNone(why, why)
+        self.ops.preclosed.update((ROW1, ROW2))
+        self.tick()
+        self.assertEqual([d["state"] for d in self.archived()],
+                         [autoland.DONE])
+
+    def test_one_missing_own_close_is_not_hidden_by_another(self):
+        self.fold(self.FIVE + ["all five PASSED — this fold is provable"]
+                  + self.CLOSED_OWN[:1])
+        self.assert_not_proven()
+        self.assertIn(ROW2, self.current()["stopped"]["why"])
+
+    def test_a_closed_foreign_row_with_the_same_prefix_is_not_an_own_close(self):
+        foreign = ROW1[:12] + ("f" * 20)
+        self.fold(self.FIVE + ["all five PASSED — this fold is provable",
+                               "  CLOSED    %s  tip %s  held by reader-seat — ok"
+                               % (foreign, TIP1[:12])] + self.CLOSED_OWN[1:])
+        self.assert_not_proven()
+        self.assertIn(ROW1, self.current()["stopped"]["why"])
+
+    def test_a_foreign_refusal_is_reported_without_stopping_own_cars(self):
+        self.fold(self.FIVE + [
+            "all five PASSED — this fold is provable", "",
+            "SOURCE-CLEAN HOLDS THIS HEAD LANDS (gate:%s, APPLY):" % GID,
+            "  REPORTED  %s  tip %s  held by reader-seat — REFUSED: no hold proof"
+            % (ROW3, TIP3[:12])] + self.CLOSED_OWN)
+        self.assertEqual([d["state"] for d in self.archived()], [autoland.DONE])
+        self.assertEqual(autoland.read_counter(self.root)["n"], 384)
+        self.assertIn(ROW3[:12], self.ops.posts[-1])
+        self.assertIn("foreign source-clean holds", self.ops.posts[-1])
+
+    def test_a_foreign_failed_close_is_reported_without_stopping_own_cars(self):
+        self.fold(self.FIVE + [
+            "all five PASSED — this fold is provable", "",
+            "SOURCE-CLEAN HOLDS THIS HEAD LANDS (gate:%s, APPLY):" % GID,
+            "  REPORTED  %s  tip %s  held by reader-seat — FAILED: write refused"
+            % (ROW3, TIP3[:12])] + self.CLOSED_OWN)
+        self.assertEqual([d["state"] for d in self.archived()], [autoland.DONE])
+        self.assertEqual(autoland.read_counter(self.root)["n"], 384)
+        self.assertIn(ROW3[:12], self.ops.posts[-1])
+
+    def test_an_own_car_labeled_foreign_stops_even_with_closed_lines(self):
+        self.fold(self.FIVE + ["all five PASSED — this fold is provable",
+                               "  REPORTED  %s  tip %s — REFUSED: no proof"
+                               % (ROW1, TIP1[:12])] + self.CLOSED_OWN)
+        self.assert_not_proven()
+        self.assertIn("own car as foreign", self.current()["stopped"]["why"])
+
+    def test_a_nonzero_fold_with_a_foreign_report_still_stops(self):
+        self.ops.fold_rc = 1
+        self.fold(self.FIVE + [
+            "all five PASSED — this fold is provable", "",
+            "SOURCE-CLEAN HOLDS THIS HEAD LANDS (gate:%s, APPLY):" % GID,
+            "  REPORTED  %s  tip %s  held by reader-seat — FAILED: write refused"
+            % (ROW3, TIP3[:12])])
+        self.assert_not_proven()
+        self.assertIn("exited 1", self.current()["stopped"]["why"])
+
+    def test_own_car_missing_from_the_head_stops_the_fold(self):
+        self.fold(self.FIVE + [
+            "all five PASSED — this fold is provable", "",
+            "SOURCE-CLEAN HOLDS THIS HEAD LANDS (gate:%s, APPLY):" % GID,
+            "  REFUSED   %s  tip %s  held by reader-seat — own train car "
+            "NOT-IN-HEAD" % (ROW1[:12], TIP1[:12])])
+        self.assert_not_proven()
+        self.assertIn("NOT-IN-HEAD", self.current()["stopped"]["why"])
+
+    def test_own_car_refusal_still_stops_the_fold(self):
+        self.fold(self.FIVE + [
+            "all five PASSED — this fold is provable", "",
+            "SOURCE-CLEAN HOLDS THIS HEAD LANDS (gate:%s, APPLY):" % GID,
+            "  REFUSED   %s  tip %s  held by reader-seat — no hold proof"
+            % (ROW1[:12], TIP1[:12])])
+        self.assert_not_proven()
+        self.assertIn(ROW1[:12], self.current()["stopped"]["why"])
 
     def test_a_nonzero_fold_apply_is_not_proven(self):  # noqa: VACUOUS_ASSERTION — the zero-rc control immediately resumes and completes the same pushed land
         self.ops.fold_rc = 1
@@ -4407,6 +5992,7 @@ class FoldProof(Base):
                                     now=self.ops.clock)
         self.assertIsNone(why, why)
         self.ops.fold_rc = 0
+        self.ops.fold_text += "\n" + "\n".join(self.CLOSED_OWN)
         self.tick()
         self.assertEqual([d["state"] for d in self.archived()],
                          [autoland.DONE])
@@ -4425,7 +6011,8 @@ class FoldProof(Base):
                                      now=self.ops.clock)
         self.assertIsNone(why, why)
         self.ops.fold_text = "\n".join(
-            ln for ln in proof if not ln.startswith("????"))
+            [ln for ln in proof if not ln.startswith("????")]
+            + self.CLOSED_OWN)
         self.tick()
         self.assertEqual([d["state"] for d in self.archived()],
                          [autoland.DONE])
@@ -4613,6 +6200,634 @@ class OrphanedPush(unittest.TestCase):
         # the push ends, the locks go with it, and the push it ran landed
         self.assertTrue(self.released(60), self.held())
         self.assertEqual(_git(self.remote, "rev-parse", "main"), self.head)
+
+
+class TheLandClosesTheReviewFindingsOfItsCarsTest(Base):
+    """task/3742: the LAND step closes every open finding a car's chain
+    filed, "cured in LAND N" (helm/review_findings.py); a finding of a chain
+    the land did not carry stays open, and no car's task is closed."""
+
+    CHAIN, OTHER = "c1" * 8, "c9" * 8
+    FIX = "f1" * 8
+
+    def setUp(self):
+        super().setUp()
+        self.earlier_tip = _git(self.repo, "rev-parse", "HEAD")
+        _git(self.repo, "commit", "-q", "--allow-empty", "-m", "held tip")
+        self.held_tip = _git(self.repo, "rev-parse", "HEAD")
+        facts = self.ops.car_facts
+
+        def car_facts(root, car):
+            return dict(facts(root, car),
+                        chain=self.CHAIN if car["id"] == ROW1 else None)
+        self.ops.car_facts = car_facts
+        # THE LAND READS THE DISPATCH LEDGER AGAIN for the chain's FIX
+        # at an ancestor tip. Both tips exist in this scratch Git repository:
+        # an unrecorded FIX or invented SHA cannot prove a cure.
+        ledger = {self.CHAIN: {"id": self.CHAIN, "lane": "one"},
+                  ROW1: {"id": ROW1, "chain_root": self.CHAIN, "lane": "one",
+                         "tip": self.held_tip, "status": "held",
+                         "source_clean_tip": self.held_tip},
+                  self.FIX: {"id": self.FIX, "chain_root": self.CHAIN,
+                             "polarity": "fix", "reviewed_tip": self.earlier_tip,
+                             "status": "verdict", "lane": "one"}}
+        self.ledger = ledger
+        read = mock.patch.object(dispatches, "snapshot",
+                                 return_value=(self.ledger, None))
+        read.start()
+        self.addCleanup(read.stop)
+
+    def to_gating(self, cars=None):
+        cars = [_car(c["id"], c["lane"], self.held_tip, c["basis"])
+                if c["id"] == ROW1 and c["tip"] == TIP1 else c
+                for c in cars or ()]
+        return super().to_gating(cars)
+
+    def finding(self, title, chain):
+        row, why = tasks.add(title, "builder-seat", force_new=True,
+                             found_in=self.FIX if chain == self.CHAIN
+                             else chain, found_chain=chain)
+        self.assertIsNone(why, why)
+        return row
+
+    def test_a_land_closes_the_findings_of_the_chain_it_landed(self):  # noqa: VACUOUS_ASSERTION — no task close is the product law; the finding close is asserted exactly on the same land
+        ours = self.finding("the retry drops the lock", self.CHAIN)
+        theirs = self.finding("a finding of a chain that did not land",
+                              self.OTHER)
+        st = self.to_gating([_car(ROW1, "one", TIP1),
+                             _car(ROW2, "two", TIP2, basis="approved")])
+        self.assertEqual([c.get("chain") for c in st["cars"]],
+                         [self.CHAIN, None])
+        self.green(st)
+        rc, out = self.tick()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual([d["state"] for d in self.archived()],
+                         [autoland.DONE])
+        rows = tasks.rows()
+        self.assertEqual((rows[ours["id"]]["status"],
+                          rows[ours["id"]]["closed_reason"]),
+                         ("closed", "cured in LAND 384"))
+        self.assertEqual(rows[theirs["id"]]["status"], "open")
+        self.assertEqual(self.ops.closed_tasks, [])
+
+    def test_a_missing_FIX_after_compose_cannot_close_its_orphaned_finding(self):  # noqa: VACUOUS_ASSERTION — missing namer is paired with a real ancestral FIX control proving eligibility
+        from helm import review_findings
+        ours = self.finding("the orphaned finding stays open", self.CHAIN)
+        st = self.to_gating([_car(ROW1, "one", TIP1),
+                             _car(ROW2, "two", TIP2, basis="approved")])
+        self.assertEqual(st["cars"][0].get("chain"), self.CHAIN)
+        del self.ledger[self.FIX]
+        self.green(st)
+        rc, out = self.tick()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(tasks.rows()[ours["id"]]["status"], "open")
+        self.assertIn("no surviving FIX names open finding(s) %s"
+                      % ours["id"], " ".join(self.ops.posts))
+        # CONTROL: with its naming FIX, the same land closes the finding.
+        self.ledger[self.FIX] = {"id": self.FIX, "chain_root": self.CHAIN,
+                                 "polarity": "fix",
+                                 "reviewed_tip": self.earlier_tip,
+                                 "status": "verdict", "lane": "one"}
+        again, why = review_findings.named_at(
+            self.CHAIN, self.held_tip, self.ledger, self.root)
+        self.assertIsNone(why, why)
+        self.assertNotIn(ours["id"], again)
+
+    def test_a_land_never_closes_the_car_s_own_task(self):
+        """task/3626/3643: the car's task is its owner's to close, even when
+        that task is a finding its own chain filed."""
+        mine = self.finding("the lane took this finding as its task",
+                            self.CHAIN)
+        facts = self.ops.car_facts
+
+        def car_facts(root, car):
+            got = facts(root, car)
+            return dict(got, task=mine["id"]) if car["id"] == ROW1 else got
+        self.ops.car_facts = car_facts
+        st = self.to_gating([_car(ROW1, "one", TIP1),
+                             _car(ROW2, "two", TIP2, basis="approved")])
+        self.green(st)
+        rc, out = self.tick()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual([d["state"] for d in self.archived()],
+                         [autoland.DONE])
+        self.assertEqual(tasks.rows()[mine["id"]]["status"], "open")
+
+    def land(self):
+        st = self.to_gating([_car(ROW1, "one", TIP1),
+                             _car(ROW2, "two", TIP2, basis="approved")])
+        self.green(st)
+        rc, out = self.tick()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual([d["state"] for d in self.archived()],
+                         [autoland.DONE])
+
+    def test_a_land_closes_no_task_of_any_car_it_carries(self):
+        """ROW2's task is a finding ROW1's chain filed: ROW1's LAND leaves
+        it open, and closes the chain's other finding."""
+        theirs = self.finding("the other lane took this finding", self.CHAIN)
+        ours = self.finding("the retry drops the lock", self.CHAIN)
+        facts = self.ops.car_facts
+
+        def car_facts(root, car):
+            got = facts(root, car)
+            return dict(got, task=theirs["id"]) if car["id"] == ROW2 else got
+        self.ops.car_facts = car_facts
+        self.land()
+        self.assertEqual(tasks.rows()[theirs["id"]]["status"], "open")
+        self.assertEqual(tasks.rows()[ours["id"]]["closed_reason"],
+                         "cured in LAND 384")
+
+    def test_a_land_that_cannot_reread_the_dispatch_ledger_closes_nothing(self):
+        ours = self.finding("the retry drops the lock", self.CHAIN)
+        with mock.patch.object(dispatches, "snapshot",
+                               return_value=(None, "a torn line")):
+            self.land()
+        self.assertEqual(tasks.rows()[ours["id"]]["status"], "open")
+        said = [p for p in self.ops.posts
+                if "the review findings of lane one were not all closed" in p]
+        self.assertEqual(len(said), 1, self.ops.posts)
+        self.assertIn("could not be read at the LAND (a torn line)", said[0])
+        self.assertIn("nothing was closed", said[0])
+
+    def test_a_land_keeps_every_task_an_unknown_car_s_records_name(self):
+        theirs = self.finding("the other lane took this finding", self.CHAIN)
+        facts = self.ops.car_facts
+
+        def car_facts(root, car):
+            got = facts(root, car)
+            return dict(got, task=None, tasks_named=[theirs["id"]]) \
+                if car["id"] == ROW2 else got
+        self.ops.car_facts = car_facts
+        self.land()
+        self.assertEqual(tasks.rows()[theirs["id"]]["status"], "open")
+
+
+class TheLandLeavesAFindingOpenAtTheTipItWasFoundInTest(Base):
+    """A LAND of the exact tree a FIX found work in answers nothing: the
+    compose records, through the real car facts, which findings of the
+    car's chain were named at its tip, and the LAND leaves them open. The
+    dispatch ledger is `self.ledger` for the whole test, so a row an arm
+    adds after the compose is what the LAND step reads."""
+
+    CHAIN = "c1" * 8
+    FIX_HERE, FIX_EARLIER = "f1" * 8, "f2" * 8
+    FIX_PAST, FIX_BEFORE = "f3" * 8, "f4" * 8
+
+    def setUp(self):
+        super().setUp()
+        from helm import review_door, reviewer_eligibility, trainblame
+        # These findings ask REAL git ancestry: the train's symbolic TIP1/TIP3
+        # cannot prove a cure and must not silently act as an empty keep-set.
+        self.earlier_tip = _git(self.repo, "rev-parse", "HEAD")
+        self.held_tip = self.commit("the held tip")
+        self.ledger = {
+            self.CHAIN: {"id": self.CHAIN, "lane": "one",
+                         "tip": self.earlier_tip, "repo_root": self.root},
+            ROW1: {"id": ROW1, "chain_root": self.CHAIN,
+                   "tip": self.held_tip, "lane": "one", "status": "held",
+                   "source_clean_tip": self.held_tip},
+            self.FIX_HERE: {"id": self.FIX_HERE, "chain_root": self.CHAIN,
+                            "status": "verdict", "polarity": "fix",
+                            "reviewed_tip": self.held_tip, "lane": "one"},
+            self.FIX_EARLIER: {"id": self.FIX_EARLIER,
+                               "chain_root": self.CHAIN, "status": "verdict",
+                               "polarity": "fix",
+                               "reviewed_tip": self.earlier_tip,
+                               "lane": "one"}}
+        read = mock.patch.object(dispatches, "snapshot",
+                                 side_effect=lambda *a, **k: (self.ledger,
+                                                              None))
+        read.start()
+        self.addCleanup(read.stop)
+        ops = self.ops
+
+        def car_facts(root, car):
+            with mock.patch.object(review_door, "lane_doors",
+                                   return_value={"doors": []}), \
+                    mock.patch.object(trainblame, "lane_task",
+                                      return_value=(None, None, None)), \
+                    mock.patch.object(reviewer_eligibility, "read_model",
+                                      return_value="a-model"):
+                return autoland.Ops.car_facts(ops, root, car)
+        self.ops.car_facts = car_facts
+
+    def to_gating(self, cars=None):
+        # Only this fixture's ROW1 is a real finding-closure ancestry probe.
+        cars = [_car(c["id"], c["lane"], self.held_tip, c["basis"])
+                if c["id"] == ROW1 and c["tip"] == TIP1 else c
+                for c in cars or ()]
+        return super().to_gating(cars)
+
+    def fix(self, rid, tip):
+        """A FIX of the chain, read at `tip`."""
+        self.ledger[rid] = {"id": rid, "chain_root": self.CHAIN,
+                             "status": "verdict", "polarity": "fix",
+                             "reviewed_tip": tip, "lane": "one"}
+
+    def commit(self, text):
+        _git(self.repo, "commit", "-q", "--allow-empty", "-m", text)
+        return _git(self.repo, "rev-parse", "HEAD")
+
+    def land_cars(self, cars):
+        st = self.to_gating(cars)
+        self.assertEqual(st["cars"][0].get("chain"), self.CHAIN)
+        return st
+
+    def landed(self, st):
+        self.green(st)
+        rc, out = self.tick()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual([d["state"] for d in self.archived()],
+                         [autoland.DONE])
+        return tasks.rows()
+
+    def test_a_land_never_closes_a_finding_another_live_lane_took(self):  # noqa: VACUOUS_ASSERTION — the open finding is paired with the chain's other finding closed exactly by the same LAND
+        theirs = self.finding("another lane took this finding",
+                              self.FIX_EARLIER)
+        ours = self.finding("the cap is off by one", self.FIX_EARLIER)
+        _git(self.repo, "branch", "lane/finding-lane")
+        _wrote, why = taskkey.record_lane(self.root, "finding-lane",
+                                          theirs["id"])
+        self.assertIsNone(why, why)
+        rows = self.landed(self.land_cars([
+            _car(ROW1, "one", TIP1),
+            _car(ROW2, "two", TIP2, basis="approved")]))
+        self.assertEqual(rows[theirs["id"]]["status"], "open")
+        # CONTROL: the chain's other finding closes at the same LAND
+        self.assertEqual(rows[ours["id"]]["closed_reason"],
+                         "cured in LAND 384")
+
+    def test_a_numbered_lane_without_a_record_is_protected_at_compose_and_land(self):
+        mine, why = tasks.add("numbered lane took this finding", "builder-seat",
+                              tid="699999", force_new=True,
+                              found_in=self.FIX_EARLIER,
+                              found_chain=self.CHAIN)
+        self.assertIsNone(why, why)
+        other = self.finding("other chain work", self.FIX_EARLIER)
+        _git(self.repo, "branch", "lane/review-699999")
+        st = self.land_cars([_car(ROW1, "one", TIP1),
+                             _car(ROW2, "two", TIP2, basis="approved")])
+        self.assertIn(mine["id"], st["cars"][0]["tasks_named"])
+        rows = self.landed(st)
+        self.assertEqual(rows[mine["id"]]["status"], "open")
+        self.assertEqual(rows[other["id"]]["closed_reason"],
+                         "cured in LAND 384")
+
+    def test_a_numbered_lane_claimed_after_compose_is_protected_at_land(self):  # noqa: VACUOUS_ASSERTION — the absent compose task is paired with the open task and other finding closed by the same LAND
+        mine, why = tasks.add("numbered lane took this finding", "builder-seat",
+                              tid="699999", force_new=True,
+                              found_in=self.FIX_EARLIER,
+                              found_chain=self.CHAIN)
+        self.assertIsNone(why, why)
+        other = self.finding("other chain work", self.FIX_EARLIER)
+        st = self.land_cars([_car(ROW1, "one", TIP1),
+                             _car(ROW2, "two", TIP2, basis="approved")])
+        self.assertNotIn(mine["id"], st["cars"][0]["tasks_named"])
+        _git(self.repo, "branch", "lane/review-699999")
+        rows = self.landed(st)
+        self.assertEqual(rows[mine["id"]]["status"], "open")
+        self.assertEqual(rows[other["id"]]["closed_reason"],
+                         "cured in LAND 384")
+
+    def test_a_FIX_recorded_after_the_compose_past_the_landed_tip_stays(self):  # noqa: VACUOUS_ASSERTION — the open finding is paired with the finding named before the landed tip closed exactly by the same LAND
+        before = _git(self.repo, "rev-parse", "HEAD")
+        tip = self.commit("the held tip")
+        past = self.commit("a round past the held tip")
+        self.ledger[ROW1] = dict(self.ledger[ROW1], tip=tip,
+                                  source_clean_tip=tip)
+        st = self.land_cars([_car(ROW1, "one", tip),
+                             _car(ROW2, "two", TIP2, basis="approved")])
+        # AFTER THE COMPOSE: a later round reads a tree past the held tip
+        # and files work; another FIX read the tree before it
+        self.fix(self.FIX_PAST, past)
+        self.fix(self.FIX_BEFORE, before)
+        later = self.finding("a round past the land found this",
+                             self.FIX_PAST)
+        earlier = self.finding("a round before the land found this",
+                               self.FIX_BEFORE)
+        rows = self.landed(st)
+        self.assertEqual(rows[later["id"]]["status"], "open")
+        # CONTROL: work read in a tree the LAND contains closes
+        self.assertEqual(rows[earlier["id"]]["closed_reason"],
+                         "cured in LAND 384")
+
+    def finding(self, title, fix):
+        row, why = tasks.add(title, "builder-seat", force_new=True,
+                             found_in=fix, found_chain=self.CHAIN)
+        self.assertIsNone(why, why)
+        return row
+
+    def unread_posts(self, lane):
+        return [p for p in self.ops.posts
+                if "the review findings of lane %s were not all closed"
+                % lane in p]
+
+    def test_unknown_ancestry_at_compose_reports_and_keeps_the_chain(self):  # noqa: VACUOUS_ASSERTION — the missing chain is paired with the open finding and exact ancestry refusal posted at the same LAND
+        from helm import vcs
+        ours = self.finding("the cap is off by one", self.FIX_EARLIER)
+        with mock.patch.object(vcs.backend(self.root), "ancestry",
+                               return_value=vcs.UNKNOWN):
+            st = self.to_gating([_car(ROW1, "one", TIP1),
+                                 _car(ROW2, "two", TIP2, basis="approved")])
+        self.assertIsNone(st["cars"][0].get("chain"))
+        rows = self.landed(st)
+        self.assertEqual(rows[ours["id"]]["status"], "open")
+        self.assertIn("git ancestry could not prove", " ".join(
+            self.unread_posts("one")))
+
+    def test_unknown_ancestry_at_land_reports_and_keeps_the_chain(self):
+        from helm import vcs
+        ours = self.finding("the cap is off by one", self.FIX_EARLIER)
+        st = self.land_cars([_car(ROW1, "one", TIP1),
+                             _car(ROW2, "two", TIP2, basis="approved")])
+        with mock.patch.object(vcs.backend(self.root), "ancestry",
+                               return_value=vcs.UNKNOWN):
+            rows = self.landed(st)
+        self.assertEqual(rows[ours["id"]]["status"], "open")
+        self.assertIn("git ancestry could not prove", " ".join(
+            self.unread_posts("one")))
+
+    def test_a_compose_that_cannot_read_the_findings_says_so_at_the_land(self):
+        """task/3862 L2: the car's doors are read before its findings, so a
+        findings read that raises at the compose leaves the doors known; and
+        the LAND says the failure, instead of closing nothing in silence."""
+        from helm import review_findings
+        ours = self.finding("the cap is off by one", self.FIX_EARLIER)
+        with mock.patch.object(review_findings, "named_at",
+                               side_effect=OSError("a torn read")):
+            st = self.to_gating([_car(ROW1, "one", TIP1),
+                                 _car(ROW2, "two", TIP2, basis="approved")])
+        car = st["cars"][0]
+        self.assertEqual((car["id"], car.get("chain"), car.get("doors")),
+                         (ROW1, None, []))
+        rows = self.landed(st)
+        self.assertEqual(rows[ours["id"]]["status"], "open")
+        said = self.unread_posts("one")
+        self.assertEqual(len(said), 1, self.ops.posts)
+        self.assertIn("the compose could not read them (OSError: a torn "
+                      "read); nothing was closed", said[0])
+
+    def test_a_compose_read_that_names_an_unknown_lane_is_said(self):
+        """A read that answers with a reason, not a raise, is said too."""
+        from helm import review_findings
+        ours = self.finding("the cap is off by one", self.FIX_EARLIER)
+        with mock.patch.object(review_findings, "lane_tasks",
+                               return_value=(set(), "the lane records of r "
+                                             "could not be read (torn)")):
+            st = self.to_gating([_car(ROW1, "one", TIP1),
+                                 _car(ROW2, "two", TIP2, basis="approved")])
+        rows = self.landed(st)
+        self.assertEqual(rows[ours["id"]]["status"], "open")
+        said = self.unread_posts("one")
+        self.assertEqual(len(said), 1, self.ops.posts)
+        self.assertIn("the compose could not read them: the lane records of "
+                      "r could not be read (torn); nothing was closed",
+                      said[0])
+
+    def test_a_compose_that_cannot_read_the_land_step_facts_says_so(self):
+        """task/3862 L2, for the land step's own compose reads (task/3746):
+        whole or part, the task's room and the chain's other rows. A raise
+        there leaves the doors and the findings known, and the LAND says
+        its land step did not finish."""
+        from helm import landtask
+        with mock.patch.object(landtask, "chain_facts",
+                               side_effect=OSError("a torn read")):
+            st = self.to_gating([_car(ROW1, "one", TIP1),
+                                 _car(ROW2, "two", TIP2, basis="approved")])
+        car = st["cars"][0]
+        self.assertEqual((car["id"], car.get("chain"), car.get("doors")),
+                         (ROW1, self.CHAIN, []))
+        self.landed(st)
+        said = [p for p in self.ops.posts
+                if "the land step of lane one did not finish" in p]
+        self.assertEqual(len(said), 1, self.ops.posts)
+        self.assertIn("the compose could not read whether the lane carried "
+                      "the whole ask, its task's room or its chain's other "
+                      "rows (OSError: a torn read)", said[0])
+
+    def test_a_finding_named_at_the_landed_tip_stays_open(self):  # noqa: VACUOUS_ASSERTION — the open finding is paired with the earlier-tip finding closed exactly by the same LAND
+        here = self.finding("the retry drops the lock", self.FIX_HERE)
+        earlier = self.finding("the cap is off by one", self.FIX_EARLIER)
+        st = self.to_gating([_car(ROW1, "one", TIP1),
+                             _car(ROW2, "two", TIP2, basis="approved")])
+        self.assertEqual(st["cars"][0].get("chain"), self.CHAIN)
+        self.green(st)
+        rc, out = self.tick()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual([d["state"] for d in self.archived()],
+                         [autoland.DONE])
+        rows = tasks.rows()
+        self.assertEqual(rows[here["id"]]["status"], "open")
+        # CONTROL: the finding named at an earlier tip closes at the LAND
+        self.assertEqual(rows[earlier["id"]]["closed_reason"],
+                         "cured in LAND 384")
+
+
+class TheLandClosesOrAsksTheCarsTaskTest(Base):
+    """task/3746: the LAND step closes a car's task when its lane carried
+    the whole ask (helm/landtask.py), unless open sub-tasks stay; any other
+    land comments the one question on the task and asks it in the task's
+    room, addressed to the lane's author. The chain's other open rows are
+    offered to their own doors, and a same-lane row with no chain link is
+    flagged. The land line says what each car's step did."""
+
+    def file(self, title, **kw):
+        row, why = tasks.add(title, "builder-seat", force_new=True, **kw)
+        self.assertIsNone(why, why)
+        return row["id"]
+
+    def facts(self, **by_row):
+        """car_facts answering the fake's facts updated by `by_row`."""
+        base = self.ops.car_facts
+
+        def car_facts(root, car):
+            return dict(base(root, car), **by_row.get(car["id"], {}))
+        self.ops.car_facts = car_facts
+
+    def land(self):
+        st = self.to_gating([_car(ROW1, "one", TIP1),
+                             _car(ROW2, "two", TIP2, basis="approved")])
+        self.green(st)
+        rc, out = self.tick()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual([d["state"] for d in self.archived()],
+                         [autoland.DONE])
+        return st["head"], self.ops.posts[-1]
+
+    def said(self, tid):
+        return [c["text"] for c in tasks.comments_of(tasks.get(tid))]
+
+    def test_a_whole_car_leaves_a_landed_task_owing_a_check(self):  # noqa: VACUOUS_ASSERTION — status, owner and land are asserted exactly beside the empty room; noqa: ORPHANED_MOCK — the doubles are reached through land_step -> landtask.run -> observed.stamp -> owner_for, cross-module calls the walker does not follow
+        """helm/observed.py: a whole land is not done until someone named
+        has seen it working, so the task stays open, LANDED, and the
+        announcement @mentions its one check owner with the command."""
+        tid = self.file("the lane carries all of this", source="asker-seat")
+        self.facts(**{ROW1: {"task": tid, "whole": True, "scope": "helm"}})
+        with mock.patch.object(observed, "_roster",
+                               lambda: {"asker-seat"}), \
+                mock.patch.object(observed, "_dark", lambda seat: None), \
+                mock.patch.object(observed, "_role", lambda seat: None):
+            head, announce = self.land()
+        got = tasks.get(tid)
+        self.assertEqual((got["status"], got["landed"]["owner"],
+                          got["landed"]["land"]),
+                         ("open", "asker-seat", "LAND 384"))
+        self.assertIn("%s LANDED — owes a seen-working check by @asker-seat"
+                      % tid, announce)
+        self.assertIn("helm task observed %s --evidence" % tid, announce)
+        self.assertEqual(self.ops.room_posts, [])
+
+    def test_an_unobserved_task_never_holds_the_train(self):  # noqa: ORPHANED_MOCK — observed.stamp reads _roster through owner_for, a call inside the module the walker does not follow
+        """A task that owes a check, even one past its 24 hours, never holds
+        a land: the next train lands, and a sweep that raises is said and
+        changes nothing about the tick."""
+        owed = self.file("an earlier land nobody has seen working",
+                         source="asker-seat")
+        with mock.patch.object(observed, "_roster", lambda: set()):
+            observed.stamp(owed, tasks.get(owed), {
+                "label": "LAND 300", "sha": TRUNK, "lane": "old",
+                "tip": TIP3}, now=T0 - 3 * 86400)
+        tid = self.file("the lane carries all of this")
+        self.facts(**{ROW1: {"task": tid, "whole": True, "scope": "helm"}})
+        with mock.patch.object(observed, "sweep",
+                               side_effect=RuntimeError("injected")):
+            head, announce = self.land()
+        self.assertIn("LAND 384", announce)
+        self.assertEqual(tasks.get(owed)["status"], "open")
+        self.assertEqual(tasks.get(tid)["status"], "open")
+        self.assertIn("owes a seen-working check", announce)
+
+    def test_the_tick_sweeps_checks_past_their_day(self):  # noqa: ORPHANED_MOCK — stamp and the tick's sweep reach every double through owner_for and Ops.observed_sweep, calls the walker does not follow; the moved owner asserted exactly proves they fired
+        """The auto-land tick is the one actor that moves a check past 24h
+        to its fallback owner; it posts the one @mention itself."""
+        owed = self.file("an earlier land nobody has seen working",
+                         source="asker-seat")
+        with mock.patch.object(observed, "_roster",
+                               lambda: {"asker-seat", "lead-seat"}), \
+                mock.patch.object(observed, "_dark", lambda seat: None), \
+                mock.patch.object(observed, "_role", lambda seat: None), \
+                mock.patch.object(observed, "_lead",
+                                  lambda project: ("lead-seat", None)):
+            observed.stamp(owed, tasks.get(owed), {
+                "label": "LAND 300", "sha": TRUNK, "lane": "old",
+                "tip": TIP3}, now=T0 - 3 * 86400)
+            rc, out = self.tick()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(tasks.get(owed)["landed"]["owner"], "lead-seat")
+        told = [p for p in self.ops.posts if owed in p]
+        self.assertEqual(len(told), 1, self.ops.posts)
+        self.assertTrue(told[0].startswith("@lead-seat %s " % owed), told)
+        # the next tick moves nothing and says nothing
+        self.ops.clock += 3600
+        self.tick()
+        self.assertEqual(len([p for p in self.ops.posts if owed in p]), 1)
+
+    def test_a_whole_car_over_an_open_sub_task_leaves_it_open(self):
+        tid = self.file("the lane carries all of this")
+        kid = self.file("a remainder filed on it", continues=tid)
+        self.facts(**{ROW1: {"task": tid, "whole": True, "scope": "helm"}})
+        head, announce = self.land()
+        self.assertEqual(tasks.get(tid)["status"], "open")
+        self.assertEqual(self.said(tid), [
+            "landed whole in LAND 384 %s (lane one at %s): not closed, "
+            "because its sub-task %s is open" % (head[:12], TIP1[:12], kid)])
+        self.assertIn("%s stays open" % tid, announce)
+
+    def test_a_part_car_asks_its_task_room_whether_the_whole_ask_is_done(self):
+        tid = self.file("the lane carries part of this")
+        self.facts(**{ROW1: {"task": tid, "whole": False, "scope": "helm"}})
+        head, announce = self.land()
+        self.assertEqual(tasks.get(tid)["status"], "open")
+        question = ("landed LAND 384 %s (lane one at %s): is the whole ask "
+                    "done? close it, narrow its title, or file the remainder "
+                    "with --continues %s" % (head[:12], TIP1[:12], tid))
+        self.assertEqual(self.said(tid), [question])
+        room = "helm-%s" % tid.split("/")[1]
+        self.assertEqual([(r, t.split(" ")[:2]) for r, t, _k
+                          in self.ops.room_posts],
+                         [(room, ["@builder-seat", tid])])
+        self.assertIn("asked in %s" % room, announce)
+        # THE STEP AGAIN, as a retried tick would run it: nothing twice
+        car = self.archived()[0]["cars"][0]
+        self.ops.land_step(self.root, car, "LAND 384", head, [])
+        self.assertEqual(self.said(tid), [question])
+        self.assertEqual(len(self.ops.room_posts), 1)
+
+    def test_the_chain_rows_are_discharged_and_a_same_lane_row_flagged(self):
+        tid = self.file("the lane's task")
+        build, stray = "e1" * 16, "e2" * 16
+        self.ops.row_close_ok = {(build, "landed")}
+        self.facts(**{ROW1: {
+            "task": tid, "whole": False, "scope": "helm",
+            "chain_rows": [{"id": build, "kind": "build", "status": "open",
+                            "polarity": None}],
+            "lane_rows": [{"id": stray, "task": tid}]}})
+        _head, announce = self.land()
+        self.assertEqual(self.ops.row_closes, [(build, "landed")])
+        self.assertIn("discharged row %s" % build[:12], announce)
+        self.assertIn("FLAGGED row %s" % stray[:12], announce)
+        flag = [t for t in self.said(tid) if stray[:12] in t]
+        self.assertEqual(len(flag), 1, self.said(tid))
+        self.assertIn("no chain link", flag[0])
+
+    def test_a_car_with_no_task_says_so_and_closes_nothing(self):  # noqa: VACUOUS_ASSERTION — the land line's no-task words are asserted; no question is the point
+        self.facts(**{ROW1: {"task": None, "task_unknown": None}})
+        _head, announce = self.land()
+        self.assertIn("lane one: no task", announce)
+        self.assertEqual(self.ops.room_posts, [])
+
+    def test_the_verbs_auto_land_runs_leave_the_land_step_to_it(self):
+        """Its fold and closes are the hand verbs, run as children: each
+        child is told the LAND step runs the land step, with the number."""
+        from helm import landtask
+        seen = []
+
+        def child(argv, **kw):
+            seen.append((argv[3], (kw.get("env") or {}).get(
+                landtask.DEFER_ENV), argv))
+            return subprocess.CompletedProcess(argv, 0, "{}", "")
+        ops = autoland.Ops()
+        with mock.patch.object(autoland.subprocess, "run", child), \
+                mock.patch.object(ops, "declared",
+                                  return_value=("r", "origin", "main")):
+            answers = [ops.fold_apply(self.root, TIP1, GID, (ROW1, ROW2)),
+                       ops.lr_close(ROW1, True, None),
+                       ops.lr_row_close(ROW2, "discharged", "LAND 384 x")]
+        self.assertEqual(answers, [(0, "{}"), ({}, None), None])
+        self.assertEqual([(verb, env) for verb, env, _argv in seen],
+                         [("foldcheck", landtask.AUTO_LAND),
+                          ("close", landtask.AUTO_LAND),
+                          ("close", landtask.AUTO_LAND)])
+        self.assertEqual(seen[0][2][-2:],
+                         ["--train-cars", "%s,%s" % (ROW1, ROW2)])
+
+
+class TheLaneNumberNamesTheCarsTaskTest(Base):
+    """task/3746 D1: a car whose chain and lane record name no task takes
+    the OPEN task its lane's trailing -<N> names, and the merge subject says
+    it instead of "no task" (task/3693 landed as train482 and stayed open)."""
+
+    def test_an_open_task_named_by_the_lane_number_is_the_car_s(self):
+        from helm import trainblame
+        tid = tasks.add("the numbered ask", "builder-seat", tid="3693",
+                        force_new=True)[0]["id"]
+        n = tid.split("/")[1]
+        with mock.patch.object(trainblame, "lane_task",
+                               lambda rid: (None, None, None)):
+            facts = autoland.Ops().car_facts(
+                self.root, _car(ROW1, "fix-the-thing-%s" % n, TIP1))
+            self.assertEqual((facts["task"], facts["title"]),
+                             (tid, "the numbered ask"))
+            detail = autoland._merge_detail(dict(
+                _car(ROW1, "fix-the-thing-%s" % n, TIP1), task=tid,
+                title=facts["title"], doors=[], author="a", reader="b"))
+            self.assertTrue(detail.startswith(tid), detail)
+            tasks.close(tid, "closed before its lane landed")
+            facts = autoland.Ops().car_facts(
+                self.root, _car(ROW1, "fix-the-thing-%s" % n, TIP1))
+        self.assertIsNone(facts["task"])
+
 
 if __name__ == "__main__":
     unittest.main()

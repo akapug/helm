@@ -44,8 +44,8 @@ ACK = ("rows you already handled clear in ONE call, helm chat ack <id> "
 READS = ("a row addressed to no one, an @all row, a reaction or room "
          "chatter, clears by reading, not by ack, so pull, and read what is "
          "addressed first")
-AGAIN = ("it rings again when a new row lands, or in 12 min while these "
-         "stay unread")
+AGAIN = ("it rings again when a new row lands, or in 12 min while a row it "
+         "only counted stays unread")
 #: A brief ring's tail: the facts, then the closing parenthesis.
 BRIEF = re.compile(r" \(\+(\d+) waiting — (helm chat read [^·()]*) · "
                    r"doorbell: (\d+) unread = ([^·()]*) · (\d+) new since "

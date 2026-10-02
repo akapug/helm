@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """End-to-end controls for the retired-name pre-commit rung."""
 import ast
+import collections
+import io
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import tokenize
+import tracemalloc
+import unicodedata
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -194,6 +201,133 @@ class OutsiderFindingsTest(RungBase):
                              % (rel, r.stderr))
             self.assertEqual(self.git("commit", "-qm", "x", env={
                 "HELM_RETIRED_NAME_SKIP": "1"}).returncode, 0)
+
+
+CORRECTED = "corrected: "
+
+
+class ReplacementParserTest(unittest.TestCase):
+    """The replacement a refusal names is read from the same staged diff."""
+
+    def test_a_rename_in_one_hunk_names_the_new_name(self):
+        diff = ("--- a/helm/m.py\n+++ b/helm/m.py\n@@ -1 +1 @@\n"
+                "-_USAGE = 1\n+_SYNOPSIS = 1\n")
+        self.assertEqual({("helm/m.py", "_USAGE"): ("helm/m.py", "_SYNOPSIS")},
+                         retired_name_rung.replacements(diff))
+
+    def test_a_move_to_another_file_names_that_module(self):
+        diff = ("--- a/helm/a.py\n+++ b/helm/a.py\n@@ -1 +0,0 @@\n"
+                "-def moved():\n"
+                "--- a/helm/b.py\n+++ b/helm/b.py\n@@ -0,0 +1 @@\n"
+                "+def moved():\n")
+        self.assertEqual({("helm/a.py", "moved"): ("helm/b.py", "moved")},
+                         retired_name_rung.replacements(diff))
+
+    def test_an_uneven_hunk_names_no_replacement(self):
+        diff = ("--- a/helm/m.py\n+++ b/helm/m.py\n@@ -1,2 +1 @@\n"
+                "-ONE = 1\n-TWO = 2\n+BOTH = 3\n")
+        self.assertEqual({}, retired_name_rung.replacements(diff))
+        self.assertEqual({("helm/m.py", "ONE"): ("helm/m.py", "UNO"),
+                          ("helm/m.py", "TWO"): ("helm/m.py", "DOS")},
+                         retired_name_rung.replacements(
+                             "--- a/helm/m.py\n+++ b/helm/m.py\n"
+                             "@@ -1,2 +1,2 @@\n-ONE = 1\n-TWO = 2\n"
+                             "+UNO = 1\n+DOS = 2\n"),
+                         "MUST-HIT: an even hunk pairs in order, or the "
+                         "empty answer above is free")
+
+    def test_a_name_changed_in_place_is_not_a_replacement(self):
+        diff = ("--- a/helm/m.py\n+++ b/helm/m.py\n@@ -1,2 +1,2 @@\n"
+                "-KEEP = 1\n-GONE = 2\n+KEEP = 3\n+NEW = 4\n")
+        self.assertEqual({("helm/m.py", "GONE"): ("helm/m.py", "NEW")},
+                         retired_name_rung.replacements(diff))
+
+
+class CureNamesTheLivePathTest(unittest.TestCase):
+    """A renamed file is read by its NEW module token, so the cure names it."""
+
+    def test_a_renamed_file_names_the_module_its_readers_spell(self):
+        diff = ("--- a/helm/chatnode.py\n+++ b/helm/node.py\n@@ -1 +0,0 @@\n"
+                "-_USAGE = 1\n")
+        out = io.StringIO()
+        retired_name_rung.report(
+            {("helm/chatnode.py", "_USAGE"): [
+                ("tests/t.py", 4, "node._USAGE"),
+                ("helm/node.py", 9, "return _USAGE")]}, out=out, diff=diff)
+        self.assertEqual(
+            ["corrected: tests/t.py:4: node._USAGE -> (this commit adds no "
+             "replacement: rewrite this read, or keep _USAGE defined in "
+             "helm/node.py)",
+             "corrected: helm/node.py:9: _USAGE -> (this commit adds no "
+             "replacement: rewrite this read, or keep _USAGE defined in "
+             "helm/node.py)"],
+            [l for l in out.getvalue().splitlines()
+             if l.startswith(CORRECTED)])
+
+
+class RefusalPrintsItsCureTest(RungBase):
+    """Each read the rung refuses ends in a `corrected:` line naming the
+    retired name and what replaces it."""
+
+    def _corrected(self, err):
+        return [l for l in err.splitlines() if l.startswith(CORRECTED)]
+
+    def rename_usage(self):
+        self.stage("helm/chatnode.py",
+                   MODULE.replace('_USAGE = "helm chatnode ..."\n',
+                                  '_SYNOPSIS = "helm chatnode ..."\n')
+                   .replace("    return _USAGE\n", "    return _SYNOPSIS\n"))
+
+    def test_a_rename_names_the_new_name_at_each_read(self):
+        self.rename_usage()
+        r = self.rung()
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertEqual(
+            ["corrected: tests/test_synopsis.py:5: chatnode._USAGE -> "
+             "chatnode._SYNOPSIS"], self._corrected(r.stderr))
+
+    def test_applying_the_corrected_line_clears_the_rung(self):  # noqa: VACUOUS_ASSERTION — the refusal on the same staged rename, asserted first, is the unconditional positive control
+        self.rename_usage()
+        self.assertEqual(self.rung().returncode, 1)
+        self.stage("tests/test_synopsis.py",
+                   CONSUMER.replace("chatnode._USAGE", "chatnode._SYNOPSIS"))
+        r = self.rung()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual("", r.stderr)
+
+    def test_a_stale_spelling_in_the_retiring_file_takes_the_bare_name(self):
+        self.stage("helm/chatnode.py",
+                   MODULE.replace('_USAGE = "helm chatnode ..."\n',
+                                  '_SYNOPSIS = "helm chatnode ..."\n'))
+        self.stage("tests/test_synopsis.py",
+                   CONSUMER.replace("chatnode._USAGE", "chatnode._SYNOPSIS"))
+        r = self.rung()
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertEqual(["corrected: helm/chatnode.py:5: _USAGE -> _SYNOPSIS"],
+                         self._corrected(r.stderr))
+
+    def test_a_move_names_the_module_that_now_holds_it(self):
+        self.stage("helm/chatnode.py",
+                   MODULE.replace('_USAGE = "helm chatnode ..."\n', "")
+                   .replace("    return _USAGE\n",
+                            "    return 'helm chatnode ...'\n"))
+        self.stage("helm/synopsis.py", '_USAGE = "helm chatnode ..."\n')
+        r = self.rung()
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertEqual(
+            ["corrected: tests/test_synopsis.py:5: chatnode._USAGE -> "
+             "synopsis._USAGE (import it from helm/synopsis.py)"],
+            self._corrected(r.stderr))
+
+    def test_no_replacement_in_the_commit_names_both_ways_out(self):
+        self.retire_usage()
+        r = self.rung()
+        self.assertEqual(r.returncode, 1, r.stderr)
+        self.assertEqual(
+            ["corrected: tests/test_synopsis.py:5: chatnode._USAGE -> "
+             "(this commit adds no replacement: rewrite this read, or keep "
+             "_USAGE defined in helm/chatnode.py)"],
+            self._corrected(r.stderr))
 
 
 class StagedScanTest(RungBase):
@@ -391,18 +525,18 @@ class NfkcIdentifierLimitTest(RungBase):
         self.assertIn("RETIRED", ns)
 
     def test_the_TEST_half_finds_an_nfkc_equivalent_token(self):
-        names, _strings = retired_name_rung._names_and_strings(
+        names, _values = retired_name_rung._tokens(
             "from pkg.mod import %s\nprint(%s)\n" % (self.WIDE, self.WIDE))
         self.assertIn("RETIRED", names,
                       "tokens are NFKC-normalised so the test asks the "
                       "question Python asks")
 
     def test_the_RAW_spelling_is_kept_too_so_a_grep_still_agrees(self):
-        names, _strings = retired_name_rung._names_and_strings("%s = 1\n" % self.WIDE)
+        names, _values = retired_name_rung._tokens("%s = 1\n" % self.WIDE)
         self.assertIn(self.WIDE, names)
 
     def test_an_ASCII_token_is_unaffected_so_the_change_is_not_broad(self):
-        names, _strings = retired_name_rung._names_and_strings("RETIRED = 1\n")
+        names, _values = retired_name_rung._tokens("RETIRED = 1\n")
         self.assertEqual({n for n in names if "RETIRE" in n}, {"RETIRED"})
 
     def test_the_PREFILTER_half_is_the_NAMED_LIMIT_and_still_misses(self):
@@ -1406,16 +1540,15 @@ class TheGateFifoReplayTest(RungBase):
 class UnparseableSourceIsNotCleanTest(RungBase):
     """A FILE THIS RUNG CANNOT READ IS NOT A FILE IT CLEARED.
 
-    `_names_and_strings` answers empty sets for an unparseable source, and
+    `_tokens` once answered empty sets for an unparseable source, and
     empty sets are indistinguishable from "holds nothing" -- so a consumer
     with a live use at the TOP and a syntax error at the BOTTOM was dropped
     in silence and the commit passed unchecked. A guard may not turn "I
     cannot read this" into "this is clean". Found by gemini."""
 
-    def test_a_source_that_does_not_parse_answers_false(self):
-        self.assertFalse(
-            retired_name_rung._source_parses("x = [\n"))
-        self.assertTrue(retired_name_rung._source_parses("x = 1\n"))
+    def test_a_source_that_does_not_parse_answers_none(self):
+        self.assertIsNone(retired_name_rung._tokens("x = [\n"))
+        self.assertIsNotNone(retired_name_rung._tokens("x = 1\n"))
 
     def test_an_UNPARSEABLE_consumer_is_reported_not_dropped(self):
         self.stage("pkg/__init__.py", "")
@@ -1436,14 +1569,20 @@ class UnparseableSourceIsNotCleanTest(RungBase):
     DEEP = "X = " + "-" * 100000 + "1\n"
 
     def test_a_parser_stack_overflow_is_unparsed_at_every_parse(self):
-        self.assertTrue(retired_name_rung._source_parses(self.DEEP))
+        self.assertIsNotNone(retired_name_rung._tokens(self.DEEP))
         with self.assertRaises(MemoryError):
             ast.parse(self.DEEP)
+        source = retired_name_rung._Source
+        self.assertTrue(retired_name_rung.still_defines(
+            source("def f():\n    pass\n"), "f"))      # the control
         self.assertFalse(retired_name_rung.still_defines(
-            self.DEEP + "def f():\n    pass\n", "f"))
-        self.assertFalse(retired_name_rung.defines_at_top_level(
-            self.DEEP + "f = 1\n", "f"))
-        self.assertIsNone(retired_name_rung.owner_declarations(self.DEEP))
+            source(self.DEEP + "def f():\n    pass\n"), "f"))
+        self.assertIn("f", retired_name_rung._top_level_names(
+            source("f = 1\n")))                         # the control
+        self.assertEqual(set(), retired_name_rung._top_level_names(
+            source(self.DEEP + "f = 1\n")))
+        # No tree, so no `_OWNER_NAMES` declaration can be read from it.
+        self.assertIsNone(source(self.DEEP).index)
         self.assertFalse(retired_name_rung._patch_site(
             "from helm import chat\n" + self.DEEP
             + "getattr(chat, 'f')\n", "chat", "f"))
@@ -1859,8 +1998,8 @@ class StillDefinedIsAnUnconditionalDefOrClassTest(unittest.TestCase):
     def test_each_statement_shape(self):  # noqa: VACUOUS_ASSERTION — assertIs against a table holding rows of both polarities; every True row is an unconditional positive control on the same predicate
         for src, defined in self.ROWS:
             with self.subTest(src):
-                self.assertIs(
-                    retired_name_rung.still_defines(src, "X"), defined)
+                self.assertIs(retired_name_rung.still_defines(
+                    retired_name_rung._Source(src), "X"), defined)
 
 
 class AMergeIsJudgedAgainstItsFirstParentTest(_CellFixture):
@@ -1961,6 +2100,600 @@ class AMergeIsJudgedAgainstItsFirstParentTest(_CellFixture):
         self.assertIn("cell.profile_name (retired from helm/cell.py)",
                       r.stderr)
         self.assertNotIn("cell.roster_path", r.stderr)
+
+
+R = retired_name_rung
+
+# THE PER-PAIR PATH AS IT STOOD AT d7a57105d0c, kept here as the parity
+# oracle for the index (task/3840) and nowhere in the rung. Each function
+# walks the whole tree for ONE (module, name) pair -- the cost the index
+# removes -- and its answers are the ones the index must keep. The node
+# predicates (`_reach`, `_module_test`, ...) are the rung's own, so the
+# oracle pins the walk and the filing, not a second copy of the grammar.
+
+
+def _oracle_string_reads(tree, mod, name, to_mod):
+    on_mod = R._module_test(mod, to_mod)
+    found = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and R._dotted_hit(node.value, mod,
+                                                            name):
+            found[node.lineno] = R.PATCH_DOTTED
+            continue
+        reach = R._reach(node, on_mod)
+        keys = [k for k in reach[0] if R._spells(k, name, reach[1])] \
+            if reach else []
+        if isinstance(node, ast.Call) and R._spelling(node.func) in R._REACHERS:
+            args = list(node.args) + [kw.value for kw in node.keywords]
+            if any(map(on_mod, args)):
+                keys.extend(a for a in args if R._spells(a, name))
+        for key in keys:
+            found.setdefault(key.lineno, R.PATCH_STRUCTURAL)
+    return found
+
+
+def _oracle_dynamic_reads(tree, mod, name, to_mod):
+    on_mod = R._module_test(mod, to_mod)
+    nodes = list(ast.walk(tree))
+    star = any(R._globals_from(n, on_mod) for n in nodes)
+    if not star and not any(R._multiple_on(n, mod, on_mod)
+                            or R._computed(R._reach(n, on_mod))
+                            for n in nodes):
+        return set()
+    at = {n.lineno for n in nodes
+          if (isinstance(n, ast.keyword) and n.arg == name)
+          or (isinstance(n, ast.Constant) and n.value == name)}
+    if star:
+        at.update(n.lineno for n in nodes
+                  if isinstance(n, ast.Name) and n.id == name)
+    return at
+
+
+def _oracle_bindings(tree, mod):
+    to_mod, to_other = {mod}, set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.asname:
+                    last = a.name.rpartition(".")[2]
+                    (to_mod if last == mod else to_other).add(a.asname)
+                else:
+                    (to_mod if a.name == mod else to_other).add(
+                        a.name.partition(".")[0])
+        elif isinstance(node, ast.ImportFrom):
+            for a in node.names:
+                (to_mod if a.name == mod else to_other).add(a.asname or a.name)
+    return to_mod, to_other
+
+
+def _oracle_module_reads(tree, names, mod, name, cand, retiring):
+    to_mod, to_other = _oracle_bindings(tree, mod)
+    at = set(_oracle_string_reads(tree, mod, name, to_mod))
+    at |= _oracle_dynamic_reads(tree, mod, name, to_mod)
+    here = os.path.dirname(cand)
+    at.update(line for token, owned, line in R._owner_pairs(tree)
+              if owned == name and R._satellite_paths(here, token) & retiring)
+    if mod not in names:
+        return at
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            src = (node.module or "").rpartition(".")[2]
+            if src == mod or not node.module:
+                at.update(getattr(a, "lineno", node.lineno)
+                          for a in node.names if a.name in (name, "*"))
+        elif isinstance(node, ast.Attribute) and node.attr == name:
+            recv = node.value
+            if not (isinstance(recv, ast.Name) and recv.id in to_other
+                    and recv.id not in to_mod):
+                at.add(node.end_lineno)
+    return at
+
+
+class TheIndexAnswersWhatThePerPairWalkAnsweredTest(unittest.TestCase):
+    """PARITY (task/3840): the per-scan index answers every (module, name)
+    pair exactly as the per-pair walk above did, line for line and, for a
+    string read, kind for kind.
+
+    ONE `_Index` PER FILE SERVES EVERY PAIR, as it does in a scan, so a memo
+    that carried one module's answer into another's shows here. The corpus
+    is every string reach `_reach` reads, against five receivers, with
+    constant and with computed keys; the import, attribute, dotted,
+    patch.multiple, globals().update, keyword-helper, facade and
+    own-binding shapes; and the rung's own source as a real-size file."""
+
+    HEAD = ("import inspect\n"
+            "import pkg.a as m\n"
+            "from operator import attrgetter\n"
+            "from unittest import mock\n"
+            "from unittest.mock import patch\n"
+            "from pkg import a, c\n"
+            "from pkg.c import g\n\n"
+            "NAME = 'f'\n\n\n"
+            "def run(self, q, k):\n"
+            "    return (\n")
+    REACHES = ("getattr(@, %s)", "hasattr(@, %s)", "setattr(@, %s, 1)",
+               "delattr(@, %s)", "inspect.getattr_static(@, %s)",
+               "@.__getattribute__(%s)", "object.__getattribute__(@, %s)",
+               "vars(@).get(%s)", "@.__dict__.get(%s)", "vars(@)[%s]",
+               "@.__dict__[%s]", "attrgetter(%s)(@)",
+               "attrgetter('y', %s)(@)", "mock.patch.object(@, %s, 1)",
+               "mock.patch.object(target=@, attribute=%s)", "patch(@, %s)",
+               "log(@, %s)", "getattr(%s, @)",
+               "mock.patch.multiple(@, **{%s: 1})", "run(@, name=%s)",
+               "@.x.__getattribute__(%s)")
+    RECEIVERS = ("a", "c", "m", "pkg.a", "q")
+    KEYS = (("'f'", "'f.x'", "'x.f'", "'g'", "'NAME'"),
+            ("'f'", "'g'", "NAME", "k[0]"))
+    OTHERS = (
+        "from pkg.a import (\n    f,\n    g as gg,\n)\n"
+        "from pkg.c import *\nfrom . import f, x\nfrom .a import NAME\n"
+        "try:\n    from pkg.a import Klass\nexcept ImportError:\n"
+        "    Klass = None\n"
+        "import pkg.a\nimport pkg.c as a2\nfrom pkg import a as m, c as a\n"
+        "\n\ndef run(r, pkg, self):\n"
+        "    return (pkg.a.f, a.f, m.g, r.x, a2.NAME, c.Klass,\n"
+        "            self.f, f().g, pkg.c.g)\n",
+        "from unittest import mock\n\n\n"
+        "@mock.patch('pkg.a.f')\n@mock.patch('helm.a.g', new=1)\n"
+        "def test_it(x):\n"
+        "    s = ['a.f', 'pkg.c.f', 'a.f.x', 'pkg.a', 'f', 'm.NAME',\n"
+        "         'c.g', 'x.a.g']\n"
+        "    return s, 'pkg.a.Klass', 'pkg.m.x'\n",
+        "from unittest import mock\nfrom unittest.mock import patch\n\n"
+        "from pkg import a, c\n\n\n"
+        "def test_it():\n"
+        "    with mock.patch.multiple(a, f=1, x=2):\n        pass\n"
+        "    with mock.patch.multiple('pkg.c', g=1):\n        pass\n"
+        "    with patch.multiple(target='pkg.a.Klass', NAME=1):\n"
+        "        pass\n"
+        "    with patch.multiple(c, **{'f': 1}):\n"
+        "        return run(f=1, g=2), 'x'\n",
+        "from pkg import a, c\n\n"
+        "globals().update(vars(a))\nglobals().update(c.__dict__)\n\n\n"
+        "def run():\n    return f(), g(), x, NAME(f=1), 'Klass'\n",
+        "from unittest import mock\n\nfrom pkg import a, c  # noqa: F401\n"
+        "\n\ndef patched(**patches):\n"
+        "    return [mock.patch.object(a, name, value)\n"
+        "            for name, value in patches.items()]\n\n\n"
+        "def test_it():\n    c.g()\n"
+        "    return patched(\n        f=1), patched(g=2, x=3)\n",
+        "_OWNER_NAMES = (\n    ('a', ('f', 'g')),\n    ('c', ('f', 'x')),\n"
+        "    ('pkg', ('NAME',)),\n    'bad',\n    ('a', 'f'),\n)\n",
+        "from pkg import a\n\n\ndef f():\n    return a.keep()\n\n\n"
+        "g = x = NAME = Klass = None\n",
+        "import pkg.a as c\nfrom pkg import c as a\n\n\n"
+        "def run():\n    return a.f, c.f, getattr(a, 'g'), getattr(c, 'g')\n",
+        "def run(m):\n    global f\n    return m.f, m.g, vars(m)['x']\n")
+    MODS = ("a", "c", "m", None)
+    NAMES = ("f", "g", "NAME")
+    #: A facade entry names a satellite beside the file, so the retiring
+    #: set only changes an answer for the hand-written files.
+    RETIRING = ({"pkg/a.py"}, {"pkg/c.py", "pkg/pkg/__init__.py"})
+
+    def corpus(self):
+        """[(label, source, retiring sets)] -- every generated and
+        hand-written file."""
+        out = []
+        for reach in self.REACHES:
+            for recv in self.RECEIVERS:
+                for keys in self.KEYS:
+                    body = "".join("        %s,\n"
+                                   % (reach.replace("@", recv) % key)
+                                   for key in keys)
+                    out.append(("%s on %s %s" % (reach, recv, keys),
+                                self.HEAD + body + "    )\n",
+                                self.RETIRING[:1]))
+        out.extend(("other %d" % i, src, self.RETIRING)
+                   for i, src in enumerate(self.OTHERS))
+        return out
+
+    def compare(self, label, src, mods, names, retirings):
+        """([mismatch], hits, misses) for every pair asked of one file."""
+        tree = ast.parse(src)
+        ix = R._Index(tree)
+        tokens = R._tokens(src)[0]
+        bad, hits, misses = [], 0, 0
+        for mod in mods:
+            to_mod = _oracle_bindings(tree, mod)[0]
+            for name in names:
+                pair = (label, mod, name)
+                want = _oracle_string_reads(tree, mod, name, to_mod)
+                got = R._string_reads(ix, mod, name, to_mod)
+                if got != want:
+                    bad.append(("string", pair, want, got))
+                for retiring in retirings:
+                    want = _oracle_module_reads(tree, tokens, mod, name,
+                                                "pkg/b.py", retiring)
+                    got = R._module_reads(ix, tokens, mod, name,
+                                          "pkg/b.py", retiring)
+                    if got != want:
+                        bad.append(("module", pair, sorted(retiring),
+                                    sorted(want), sorted(got)))
+                    hits, misses = hits + bool(want), misses + (not want)
+        return bad, hits, misses
+
+    def test_every_pair_of_the_corpus_answers_as_the_walk_did(self):  # noqa: VACUOUS_ASSERTION — the empty mismatch list is paired with unconditional must-hits on both poles: over 200 pairs answer non-empty and over 200 answer empty
+        bad, hits, misses = [], 0, 0
+        for label, src, retirings in self.corpus():
+            b, h, m = self.compare(label, src, self.MODS, self.NAMES,
+                                   retirings)
+            bad, hits, misses = bad + b, hits + h, misses + m
+        self.assertEqual([], bad[:10], "%d mismatches" % len(bad))
+        # MUST-HIT, BOTH POLES: a corpus of all-empty answers would agree
+        # with any index, and so would one of all-full answers.
+        self.assertGreater(hits, 200, (hits, misses))
+        self.assertGreater(misses, 200, (hits, misses))
+
+    def test_the_rungs_own_source_answers_as_the_walk_did(self):
+        with open(RUNG, encoding="utf-8") as f:
+            src = f.read()
+        bad, hits, misses = self.compare(
+            "retired_name_rung.py", src, ("ast", "os", None),
+            ("parse", "walk", "path", "_reach"), ({"helm/ast.py"},))
+        self.assertEqual([], bad[:10], "%d mismatches" % len(bad))
+        # MUST-HIT: ast.parse, ast.walk and os.path are read in it, and
+        # nothing of the None module is.
+        self.assertGreaterEqual(hits, 3, (hits, misses))
+        self.assertGreaterEqual(misses, 4, (hits, misses))
+
+
+class EachFileIsReadOncePerScanTest(RungBase):
+    """THE COST ARM (task/3840): one scan shows, parses and walks each file
+    at most ONCE, however many (module, name) pairs ask about it.
+
+    py-spy measured `retired_name_rung.py --staged` at 6+ minutes and 55%
+    CPU on one 9-file commit, the stack ending in `_string_reads` ->
+    `_reach`: the scan walked every candidate's whole tree several times
+    for EACH retired name, so its cost was names x files x nodes. Counting
+    calls cannot flake the way a timing can. The fixture retires five names
+    from pkg/a.py and one from pkg/c.py, and every consumer is a candidate
+    for most of the six; the recorded verdict is asserted first, so a scan
+    that read less cannot pass by answering less."""
+
+    B = ("from unittest import mock\n\n"
+         "from pkg import a, c\n\n\n"
+         "def run():\n"
+         "    return a.f(), a.g(), a.h(), a.K, a.Klass, c.f(), c.g()\n\n\n"
+         "def test_it():\n"
+         "    with mock.patch.object(a, \"h\", 1):\n"
+         "        return getattr(c, \"g\")\n")
+    D = ("from pkg.a import (\n    K,\n    Klass,\n    f,\n)\n"
+         "from pkg.c import g\n\n\n"
+         "def test_d():\n    return K, Klass, f(), g()\n")
+    E = ("from pkg import a\n\n\n"
+         "def f():\n    return a.keep()\n\n\n"
+         "g = h = K = Klass = None\n")
+    KEPT_A = "def keep():\n    return 4\n"
+    KEPT_C = "def f():\n    return 5\n"
+    FILES = (("pkg/__init__.py", ""),
+             ("pkg/a.py", "K = 1\n\n\ndef f():\n    return K\n\n\n"
+                          "def g():\n    return 2\n\n\ndef h():\n"
+                          "    return 3\n\n\nclass Klass:\n    pass\n\n\n"
+                          + KEPT_A),
+             ("pkg/c.py", KEPT_C + "\n\ndef g():\n    return 6\n"),
+             ("pkg/b.py", B), ("tests/test_d.py", D), ("pkg/e.py", E))
+    B7 = "    return a.f(), a.g(), a.h(), a.K, a.Klass, c.f(), c.g()"
+    VERDICT = {
+        ("pkg/a.py", "K"): [("pkg/b.py", 7, B7),
+                            ("tests/test_d.py", 2, "    K,")],
+        ("pkg/a.py", "f"): [("pkg/b.py", 7, B7),
+                            ("tests/test_d.py", 4, "    f,")],
+        ("pkg/a.py", "g"): [("pkg/b.py", 7, B7)],
+        ("pkg/a.py", "h"): [("pkg/b.py", 7, B7),
+                            ("pkg/b.py", 11,
+                             "    with mock.patch.object(a, \"h\", 1):")],
+        ("pkg/a.py", "Klass"): [("pkg/b.py", 7, B7),
+                                ("tests/test_d.py", 3, "    Klass,")],
+        ("pkg/c.py", "g"): [("pkg/b.py", 7, B7),
+                            ("pkg/b.py", 12,
+                             "        return getattr(c, \"g\")"),
+                            ("tests/test_d.py", 6, "from pkg.c import g")]}
+
+    def setUp(self):
+        super().setUp()
+        for rel, text in self.FILES:
+            self.stage(rel, text)
+        self.assertEqual(self.git("commit", "-qm", "pkg").returncode, 0)
+        self.stage("pkg/a.py", self.KEPT_A)
+        self.stage("pkg/c.py", self.KEPT_C)
+        self.staged = dict(self.FILES, **{"pkg/a.py": self.KEPT_A,
+                                          "pkg/c.py": self.KEPT_C})
+
+    def test_the_scan_answers_the_recorded_verdict(self):  # noqa: VACUOUS_ASSERTION — asserts the exact non-empty verdict dict: six refused names and their path:line reads
+        found, err = retired_name_rung.scan_staged(self.root)
+        self.assertIsNone(err)
+        self.assertEqual(self.VERDICT, found)
+
+    def test_each_file_is_shown_parsed_and_walked_once(self):  # noqa: VACUOUS_ASSERTION — the exact non-empty verdict and the six pairs asked are asserted unconditionally before the bounds, and each consumer must appear in the parse count
+        path_of = {text: rel for rel, text in self.staged.items()}
+        real_parse, real_walk = ast.parse, ast.walk
+        tree_of, parsed, walked, shown, asked = {}, [], [], [], []
+
+        def parse(text, *args, **kwargs):
+            # A LIST, NOT A DICT BY id(): a tree the scan drops frees its id
+            # for the next parse, and counting by id would lose parses.
+            tree = real_parse(text, *args, **kwargs)
+            parsed.append(path_of.get(text, "?"))
+            tree_of[id(tree)] = parsed[-1]
+            return tree
+
+        def walk(node):
+            walked.append(tree_of.get(id(node), "a subtree"))
+            return real_walk(node)
+
+        def show(root, path):
+            shown.append(path)
+            return real_show(root, path)
+
+        def git(root, *args):
+            if args[0] == "grep":
+                asked.append(args[-3])
+            return real_git(root, *args)
+
+        real_show = retired_name_rung._index_text
+        real_git = retired_name_rung._git
+        with mock.patch.object(ast, "parse", side_effect=parse), \
+                mock.patch.object(ast, "walk", side_effect=walk), \
+                mock.patch.object(retired_name_rung, "_index_text",
+                                  side_effect=show), \
+                mock.patch.object(retired_name_rung, "_git",
+                                  side_effect=git):
+            found, err = retired_name_rung.scan_staged(self.root)
+        self.assertIsNone(err)
+        self.assertEqual(self.VERDICT, found)
+        counts = {"pairs asked": len(asked),
+                  "parses": collections.Counter(parsed),
+                  "walks": collections.Counter(walked),
+                  "shows": collections.Counter(shown)}
+        self.assertEqual(6, len(asked), counts)
+        # MUST-HIT: every consumer was read at all, so the bound below is
+        # about reading ONCE and not about reading nothing.
+        for rel in ("pkg/b.py", "tests/test_d.py", "pkg/e.py"):
+            self.assertIn(rel, counts["parses"], counts)
+        for what in ("parses", "walks", "shows"):
+            self.assertEqual({}, {rel: n for rel, n in counts[what].items()
+                                  if n > 1}, counts)
+
+
+def _oracle_names(text):
+    """The rung's tokenizer at d7a57105d0c: every NAME token, raw and
+    NFKC-normalised, or None for a source that does not tokenize."""
+    names = set()
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(text).readline):
+            if tok.type == tokenize.NAME:
+                names.add(tok.string)
+                names.add(unicodedata.normalize("NFKC", tok.string))
+    except (tokenize.TokenError, IndentationError, SyntaxError, ValueError):
+        return None
+    return names
+
+
+def _oracle_reads(text, cand, mod, name, retiring):
+    """One candidate's answer as `consumers` gave it at d7a57105d0c: the
+    file tokenized, then ALWAYS parsed and asked the per-pair walk."""
+    names = _oracle_names(text)
+    every = [(cand, n, t) for n, t in R._lines_with(text, name)]
+    if names is None:
+        return every
+    if cand in retiring:
+        return every if name in names else []
+    try:
+        tree = ast.parse(text)
+    except R._UNPARSED:
+        return every if name in names and mod in names else []
+    lines = R._source_lines(text)
+    return [(cand, n, lines[n - 1].rstrip()) for n in sorted(
+        _oracle_module_reads(tree, names, mod, name, cand, retiring))]
+
+
+class TheNarrowingAnswersAsTheParseDidTest(unittest.TestCase):
+    """PARITY FOR THE NARROWING (task/3840, round 2): a candidate that holds
+    no spelling of the module is answered from its tokens and never parsed
+    (`_may_read`), and every answer is the one the always-parse path gave.
+
+    A TEXT GREP FOR THE MODULE COULD NOT PASS THIS. ADVERSARIAL holds the
+    files it would drop while the parse refuses them: a module spelled
+    across an implicit concatenation, through an escape, across a line
+    continuation, inside an f-string, in fullwidth latin; a file that does
+    not tokenize; and a facade token naming the old path of a rename."""
+
+    ADVERSARIAL = (
+        'from unittest import mock\n\n\n@mock.patch("pkg.m" "od.NAME")\n'
+        'def test_it(m):\n    pass\n',
+        'from unittest import mock\n\n\n@mock.patch("pkg.\\x6dod.NAME")\n'
+        'def test_it(m):\n    pass\n',
+        'from unittest import mock\n\n\n@mock.patch("pkg.m\\\nod.NAME")\n'
+        'def test_it(m):\n    pass\n',
+        'from unittest import mock\n\n\n@mock.patch(f"pkg.\\x6dod.NAME")\n'
+        'def test_it(m):\n    pass\n',
+        'x = f"{0}.mod.NAME"\n',
+        'from unittest import mock\n\n\ndef test_it():\n'
+        '    with mock.patch.multiple("pkg.m" "od", NAME=1):\n        pass\n',
+        'from pkg import ｍｏｄ\n\n\n'
+        'def run():\n    return ｍｏｄ.NAME\n',
+        'NAME = [\n',
+        'import mod\nprint(mod.NAME)\nx = = 1\n',
+        '_OWNER_NAMES = (("o" "ld", ("NAME",)),)\n',
+        'x = b"pkg.mod.NAME"\n',
+        'def NAME():\n    return 1\n\n\nNAME()\n',
+        '"""pkg.mod.NAME is gone."""\n',
+        'x = r"pkg.mod.NAME\\d", rf"{x}.mod.NAME"\n')
+    MODS = ("a", "c", "m", "mod", "zeta", None)
+    NAMES = ("f", "g", "NAME")
+    RETIRING = ({"pkg/a.py"}, {"pkg/c.py", "pkg/pkg/__init__.py"},
+                {"pkg/old.py", "pkg/mod.py"})
+
+    def test_every_candidate_answers_as_the_parse_did(self):  # noqa: VACUOUS_ASSERTION — the empty mismatch list is paired with unconditional must-hits: each of ten adversarial shapes refused, over 300 unparsed readings and over 200 non-empty answers
+        parity = TheIndexAnswersWhatThePerPairWalkAnsweredTest()
+        others = len(parity.OTHERS)
+        files = [(label, src, retirings)
+                 for label, src, retirings in parity.corpus()[:-others]]
+        files += [(label, src, self.RETIRING)
+                  for label, src, _r in parity.corpus()[-others:]]
+        files += [("adversarial %d" % i, src, self.RETIRING)
+                  for i, src in enumerate(self.ADVERSARIAL)]
+        bad, hits, skipped, asked = [], collections.Counter(), 0, 0
+        for label, text, retirings in files:
+            for mod in self.MODS:
+                src = R._Source(text)
+                for name in self.NAMES:
+                    for retiring in retirings:
+                        for cand in ("pkg/b.py", sorted(retiring)[0]):
+                            want = _oracle_reads(text, cand, mod, name,
+                                                 retiring)
+                            got = R._reads(src, cand, mod, name, retiring)
+                            asked += 1
+                            if got != want:
+                                bad.append((label, mod, name, cand,
+                                            sorted(retiring), want, got))
+                            hits[label] += cand not in retiring and bool(
+                                want)
+                skipped += "index" not in vars(src)
+        self.assertEqual([], bad[:10], "%d mismatches" % len(bad))
+        # MUST-HIT, EACH ADVERSARIAL SHAPE THE MODULE GREP WOULD DROP: the
+        # parse refuses it in a file that is not the retiring one, so the
+        # narrowing had to refuse it too.
+        for i in range(10):
+            self.assertGreater(hits["adversarial %d" % i], 0, i)
+        # AND THE NARROWING IS REAL: many (file, module) readings never
+        # parsed, and many other-file answers were non-empty.
+        self.assertGreater(skipped, 300, (skipped, asked))
+        self.assertGreater(sum(hits.values()), 200, (hits, asked))
+
+
+class AScanHoldsOneFileAtATimeTest(RungBase):
+    """THE MEMORY ARM (task/3840, round 2): the scan's peak is ONE file's
+    reading, not the tree's.
+
+    Round 1 cached every candidate's text, tokens and tree for the scan's
+    life. A fresh reader measured it on fab: retiring one `path` (1001
+    candidates) peaked at 2293 MB against 89 MB on trunk, a retained file
+    costing about 23x its size, times every seat committing at once. The
+    fixture retires `a.f` read by twelve like-sized consumers; the peak of
+    the scan is bounded against the peak of reading ONE of them the way the
+    scan reads it. Holding all twelve is twelve times that."""
+
+    N = 12
+
+    def consumer(self, i):
+        return "from pkg import a\n\n\n" + "".join(
+            "def g%d_%d(x):\n    return [x, x + %d, {'k': (x, %d)}]\n\n\n"
+            % (i, j, j, j) for j in range(300)) + \
+            "def use():\n    return a.f()\n"
+
+    def test_the_peak_is_one_file_not_the_tree(self):  # noqa: VACUOUS_ASSERTION — the exact twelve refused consumers are asserted before the bound
+        self.stage("pkg/__init__.py", "")
+        self.stage("pkg/a.py", "def f():\n    return 1\n\n\n"
+                               "def keep():\n    return 2\n")
+        for i in range(self.N):
+            self.stage("pkg/c%d.py" % i, self.consumer(i))
+        self.assertEqual(self.git("commit", "-qm", "pkg").returncode, 0)
+        self.stage("pkg/a.py", "def keep():\n    return 2\n")
+        tracemalloc.start()
+        try:
+            tracemalloc.reset_peak()
+            base = tracemalloc.get_traced_memory()[0]
+            src = retired_name_rung._Source(self.consumer(0))
+            self.assertIsNotNone(src.tokens)
+            self.assertIsNotNone(src.index)
+            self.assertTrue(src.lines)
+            one = tracemalloc.get_traced_memory()[1] - base
+            del src
+            tracemalloc.reset_peak()
+            base = tracemalloc.get_traced_memory()[0]
+            found, err = retired_name_rung.scan_staged(self.root)
+            peak = tracemalloc.get_traced_memory()[1] - base
+        finally:
+            tracemalloc.stop()
+        self.assertIsNone(err)
+        # MUST-HIT: every consumer was read, parsed and refused, so the
+        # bound is on reading them all and not on reading none.
+        hits = found[("pkg/a.py", "f")]
+        self.assertEqual({"pkg/c%d.py" % i for i in range(self.N)},
+                         {h[0] for h in hits})
+        self.assertEqual({"    return a.f()"}, {h[2] for h in hits})
+        self.assertLess(peak, 3 * one, "scan peak %d B, one file %d B"
+                        % (peak, one))
+
+
+class ADirectoryNameIsNotAModuleSpellingTest(RungBase):
+    """ONLY A PACKAGE IS SPELLED BY ITS DIRECTORY (task/3840, round 3).
+
+    Round 2 added the directory name of EVERY retiring path to the module's
+    spellings, and `helm/x.py` then counted every file holding the string
+    "helm" as one that may read it -- nearly every file in this tree. A
+    fresh reader measured the parse-skip firing almost never: 1073 of 1073
+    candidates parsed for a new module, 1001 for the rung's own file, 1014
+    for landreq. A facade names a retiring file by its directory only when
+    that file is the package itself (`pkg/__init__.py`), so only then is the
+    directory a spelling. The fixture is that shape: twelve files in a
+    package directory whose name is in a string in each of them, one real
+    reader, and a facade naming a renamed package."""
+
+    OTHER = ('"""A helm module; helm runs it."""\nHOME = "helm"\n\n\n'
+             "def run():\n    return HOME\n")
+    READER = "from helm import zzmod\n\n\ndef go():\n    return zzmod.run()\n"
+    ZZMOD = "def run():\n    return 1\n\n\ndef keep():\n    return 2\n"
+    KEPT = "def keep():\n    return 2\n"
+
+    def setUp(self):
+        super().setUp()
+        self.files = {"helm/__init__.py": "", "helm/zzmod.py": self.ZZMOD,
+                      "helm/reader.py": self.READER}
+        self.files.update(("helm/c%d.py" % i, self.OTHER.replace(
+            "HOME", "HOME%d" % i)) for i in range(12))
+        for rel, text in self.files.items():
+            self.stage(rel, text)
+        self.assertEqual(self.git("commit", "-qm", "helm").returncode, 0)
+        self.stage("helm/zzmod.py", self.KEPT)
+        self.files["helm/zzmod.py"] = self.KEPT
+
+    def test_a_directory_named_everywhere_sends_no_file_to_the_parse(self):  # noqa: VACUOUS_ASSERTION — the exact refusal of the one reader and the oracle's answer are asserted before the parse census
+        real_parse, parsed = ast.parse, []
+        path_of = {text: rel for rel, text in self.files.items()}
+
+        def parse(text, *args, **kwargs):
+            parsed.append(path_of.get(text, "?"))
+            return real_parse(text, *args, **kwargs)
+
+        with mock.patch.object(ast, "parse", side_effect=parse):
+            found, err = retired_name_rung.scan_staged(self.root)
+        self.assertIsNone(err)
+        # THE ORACLE'S ANSWER: every candidate parsed and asked the per-pair
+        # walk, in the grep's order.
+        word = re.compile(r"\brun\b")
+        want = [hit for rel in sorted(self.files)
+                if word.search(self.files[rel])
+                for hit in _oracle_reads(self.files[rel], rel, "zzmod",
+                                         "run", {"helm/zzmod.py"})]
+        self.assertEqual([("helm/reader.py", 5, "    return zzmod.run()")],
+                         want)
+        self.assertEqual({("helm/zzmod.py", "run"): want}, found)
+        # The retiring file (still_defines) and the one file that spells
+        # the module: the twelve that only say "helm" are answered from
+        # their tokens.
+        self.assertEqual({"helm/zzmod.py": 1, "helm/reader.py": 1},
+                         dict(collections.Counter(parsed)))
+
+    def test_a_renamed_package_is_still_spelled_by_its_directory(self):  # noqa: VACUOUS_ASSERTION — the oracle's exact one-line refusal is asserted first and the narrowing must equal it; the empty answer is the paired control
+        """The one case the directory is a spelling: a facade beside the
+        package names it by its directory, and a rename leaves that token
+        on the OLD path only. The parse refuses; so must the narrowing."""
+        text = '_OWNER_NAMES = (("pkg", ("NAME",)),)\n'
+        retiring = {"helm/pkg/__init__.py", "helm/newpkg/__init__.py"}
+        want = _oracle_reads(text, "helm/facade.py", "newpkg", "NAME",
+                             retiring)
+        self.assertEqual([("helm/facade.py", 1, text.rstrip())], want)
+        self.assertEqual(want, retired_name_rung._reads(
+            retired_name_rung._Source(text), "helm/facade.py", "newpkg",
+            "NAME", retiring))
+        # CONTROL: a plain module's directory is not a spelling, so the
+        # same file beside a retiring helm/zzmod.py is not parsed at all.
+        src = retired_name_rung._Source('X = "helm"\n' + text)
+        self.assertEqual([], retired_name_rung._reads(
+            src, "helm/facade.py", "zzmod", "NAME", {"helm/zzmod.py"}))
+        self.assertNotIn("index", vars(src))
 
 
 if __name__ == "__main__":

@@ -69,6 +69,34 @@ def _api_inject_pack(qs):
                 "why": "the injection pack could not be read: %s" % exc}, 200
 
 
+def _api_seat_contextloop(qs):
+    """THE LOOP EDITOR'S READ: one seat's per-request context series, its
+    compactions, the floor every request re-sends, and its window.
+
+    Same opt-in posture as the pack: it streams the seat's transcript (cached
+    by size and mtime, resumed from the last line read), which has no business
+    on a presence poll. A seat with no transcript answers `state: "none"` and
+    the reason, never a 500."""
+    try:
+        from . import contextloop
+        return contextloop.view(_q1(qs, "seat"), _q1(qs, "session")), 200
+    except Exception as exc:
+        return {"state": "none", "S": [], "C": [], "unavailable": ["loop"],
+                "why": "the context loop could not be read: %s" % exc}, 200
+
+
+def _api_inject_turntext(qs):
+    """The exact text helm injected into one turn, from the seat's transcript
+    (the fire ledger keeps ids and bytes, never the text)."""
+    try:
+        from . import contextloop
+        return contextloop.turn_text(_q1(qs, "seat"), _q1(qs, "session"),
+                                     _q1(qs, "ts")), 200
+    except Exception as exc:
+        return {"text": None, "why": "the turn's text could not be read: %s"
+                                     % exc}, 200
+
+
 def _api_inject_act(payload):
     """One owner click on one entry — the store's own writer, never a file poke.
 
@@ -82,7 +110,9 @@ def _api_inject_act(payload):
                               payload.get("id") or "",
                               reason=payload.get("reason") or "",
                               owner=payload.get("owner"),
-                              project=payload.get("project") or None)
+                              project=payload.get("project") or None,
+                              text=payload.get("text"),
+                              keywords=payload.get("keywords"))
     if err:
         return {"error": err, "code": "refused"}, 400
     return dict(out, ok=True), 200

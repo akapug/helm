@@ -704,6 +704,15 @@ SKIP = {
     "58e6f94a": "claude session id (the sibling sid from the same passage)",
     "69d709b0": "dregg cell id (faucet grant incident)",
     "a2f8ba2a": "request id inside a verbatim-quoted proxy log line",
+    # DISPATCH ROW IDS IN ANOTHER PROJECT'S LEDGER (task/4000): the simbi
+    # review chain whose taskless mint motivated attach-task, and the new
+    # --task chain that refused its findings. Rows of the SIMBI project's
+    # dispatch ledger, not commits of any repo this clone can resolve and
+    # not rows of THIS repo's ledger (LEDGER_CITED would lie), cited in
+    # helm/dispatches.py and changes/chain-task-attach-4000.md as the
+    # measured case — evidence, not citations.
+    "89dea44a1662": "simbi dispatch row id (the taskless chain of task/4000's "
+                    "measured case), cited as evidence, not a commit",
     # shaguard.py exhibits — the module documents sha-fabrication incidents,
     # so two of these are deliberately fake and the real ones are pre-rebase
     # history. They must stay verbatim: they are evidence, not citations.
@@ -725,7 +734,7 @@ SKIP = {
     # a DATA VALUE the supervisor compares, not a citation: the commit of the
     # cursor bridge checkout (its own repository, never this one) that the
     # catalog vetted; seat_sidecar.vetting_gaps reads it off the checkout.
-    "a34a5ad34790c19646edd246c2d44dcb7efb637f": "the cursor family's "
+    "726050f3185c0f40c042087dc21f7473bd7094c9": "the cursor family's "
         "sidecar `pin` in seat_catalog: a commit in the vendored bridge "
         "checkout's repository, compared against that checkout's HEAD",
 }

@@ -31,7 +31,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from helm import projscope, scratch  # noqa: E402
+from helm import projscope, scratch, scratch_evict  # noqa: E402
 
 PKG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                    "helm")
@@ -47,6 +47,23 @@ class Stat(object):
         self.f_blocks, self.f_bfree, self.f_bavail = blocks, bfree, bavail
         self.f_files, self.f_ffree, self.f_favail = files, ffree, favail
         self.f_frsize = self.f_bsize = frsize
+
+
+def ram_case(test):
+    """THE RAM CASE, pinned for an arm that drives an applying pass. A
+    fixture tree and the eviction archive share the tempdir's filesystem, so
+    eviction would RENAME the unit; production scratch sits on tmpfs and the
+    archive on disk, so the arms pin the copy-then-remove path their removal
+    pins are about, and the archive disk reads roomy whatever box runs them
+    (tests/test_scratch_evict.py owns both branches). The archive reads as
+    disk too, whatever filesystem the box's tempdir is on."""
+    for name, value in (("_same_fs", False),
+                        ("_volatile_fs", None),
+                        ("_disk_usage", shutil._ntuple_diskusage(
+                            10 ** 12, 10 ** 11, 9 * 10 ** 11))):
+        patch = mock.patch.object(scratch_evict, name, return_value=value)
+        patch.start()
+        test.addCleanup(patch.stop)
 
 
 HOST_OK = {"level": "ok", "why": "", "avail_pct": 90, "swap_used_pct": 0,
@@ -571,6 +588,7 @@ class GcTest(unittest.TestCase):
             "slices": {}, "sessions": {}, "slice_seats": {}, "trouble": None})
         calm.start()
         self.addCleanup(calm.stop)
+        ram_case(self)
 
     def tearDown(self):
         for k, v in self.prior.items():
@@ -1519,6 +1537,7 @@ class SecondTierTest(unittest.TestCase):
         os.makedirs(self.pad)
         self.fresh(os.path.join(self.tree, "now.txt"))
         self.live_proc("999", self.LIVE)
+        ram_case(self)
 
     def restore(self):
         for k, v in self.prior.items():
@@ -4023,6 +4042,7 @@ class SeatPressurePlaneTest(unittest.TestCase):
         self.live_proc("777", self.OTHER)
         self.slice("seat-under-test", "999", 10 * MB, 100 * MB)
         self.slice("seat-b", "777", 10 * MB, 100 * MB)
+        ram_case(self)
 
     def restore(self):
         for k, v in self.prior.items():

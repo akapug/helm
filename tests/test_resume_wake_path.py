@@ -33,6 +33,7 @@ import unittest
 from unittest import mock
 
 from helm import harness, orcaadopt, seat, seats
+from tests import _launchrecipe
 
 
 # A pane whose composer is EMPTY — one that took its turn. Synthetic, but a
@@ -112,7 +113,9 @@ class ResumeFixture(unittest.TestCase):
         os.makedirs(d, exist_ok=True)
         launch = os.path.join(d, "launch.sh")
         with open(launch, "w") as f:
-            f.write("#!/bin/sh\nexec env FAKE=1 claude \"$@\"\n")
+            # a launch helm itself would mint: the resume restores the recipe
+            # a launch states and refuses a stub that states none (task/3695)
+            f.write(_launchrecipe.launch_sh(family, seat_name))
         os.chmod(launch, 0o700)
         return d, launch
 
@@ -242,7 +245,10 @@ class AdoptedResumeRefusesCompleteOnFailedKickTest(unittest.TestCase):
                 mock.patch("helm.sessions.spawn_resume",
                            return_value=("/p.sh", "h9", "orca")), \
                 mock.patch.object(harness, "detect", return_value=object()):
-            return orcaadopt.resume("console-design")
+            # the kick is this arm's subject, not the recipe: the fixture row
+            # carries no transcript, so the exact resume (task/3695) would
+            # refuse first; --defaults is the resume this arm always drove
+            return orcaadopt.resume("console-design", defaults=True)
 
     def test_failed_kick_is_rc_1_and_says_deaf(self):
         rc, lines = self._resume(kicked=False)

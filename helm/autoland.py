@@ -34,14 +34,23 @@ THE STATES, one JSON file per train under the project's `.state/autoland/`:
              failure list, stops.
   GATING     the receipt for the room's head is read. GREEN must verify for
              a land (`foldcheck`'s tree-vs-gate rung) and its delta over
-             trunk's own receipt must equal the test methods the diff adds
-             less those it removes: the PLANNED delta when both receipts
-             carry the slice runner's planned count (`planned_count`), else
-             the Ran delta, and the words say which. RED is re-run alone on
-             the red gate's own host first: a pass there is a flake
+             trunk's own receipt is checked ONE-SIDED against the test
+             methods the diff adds less those it removes (the PLANNED delta
+             when both receipts carry the slice runner's planned count
+             (`planned_count`), else the Ran delta, and the words say
+             which): a SHORTFALL stops, naming it; a surplus lands and the
+             land note names it (a base gaining an arm hands it to every
+             descendant the AST count never touched). RED is re-run alone
+             on the red gate's own host first: a pass there is a flake
              (recorded, one re-gate), a fail goes to `helm train blame
-             --apply`, whose composed b-room is tracked here. TRUNK-RED and
-             UNKNOWN stop.
+             --apply`, whose composed b-room is tracked here. A host that
+             fails every tree fails that re-run too, so blame runs trunk on
+             the same host before it ejects any car (task/4145): TRUNK-RED
+             and UNKNOWN stop. A second flake is recorded too and stops; a red
+             read and acted on SPENDS the job that made it, so `--resume`
+             at GATING launches a fresh gate of the same head (the recorded
+             flake makes it a new attempt, a new job), and a tick whose
+             launched job is spent stops, naming it, and never waits on it.
   LANDING    the push guard resolves the destination ONCE (the PRIVATE
              helm.trunkUrl and the helm.trunkRef branch, `PushTarget`) and
              foldcheck dry (tree-vs-gate and ff-able by rung) is asked of it,
@@ -70,13 +79,27 @@ THE STATES, one JSON file per train under the project's `.state/autoland/`:
              never a stop), `helm lr foldcheck --apply` (all five rungs,
              failing closed),
              the LAND number and its line in the land log, each car closed
-             (never its task: a land is not a re-read of the whole ask,
-             task/3643), the announcement (the cars' plain words first), a console walk owed said once to the integrator, the
-             rooms removed.
+             and its land step run (helm/landtask.py: the findings its chain
+             filed closed, read again at the LAND; its task LANDED and owing
+             one named seat's seen-working check when its lane carried the
+             whole ask (helm/observed.py), else asked in its room, since a
+             land is not a re-read of the whole ask, task/3643, task/3746;
+             its chain's other rows offered to their doors), each car's lane
+             lease released whoever holds it
+             when the lane's tip is on the trunk (the lease's natural end;
+             a refusal is named on the LAND line and never stops the land,
+             task/3674), the announcement (the cars' plain words first), a
+             console walk owed said once to the integrator, and, for a land
+             that touched the web, the web's code read WEB_FOLLOW_S after
+             the fast-forward (it follows its code, so it is never
+             restarted; still on old code, it is one line to the
+             integrator), then the rooms removed.
   DONE, VETOED, ABANDONED   terminal; the file moves to `done/`.
   STOPPED    a land that needs a person: posted once to the integrator, and
              no later train forms until `--resume` retries it from the step
-             that stopped or `--abandon --reason R` ends it. An abandon
+             that stopped or `--abandon --reason R [--drop ROW|LANE]` ends
+             it. With `--drop`, that one car's tip is ejected, so the next
+             plan leaves it out and the other cars stay. An abandon
              refuses a train whose head is on origin, or whose origin cannot
              be read, and names the owed fold; `--force` ends it anyway and
              records the owed fold (`abandon`).
@@ -88,7 +111,8 @@ of the trunk the train was gated on), a push to a remote that does not read
 PRIVATE through the host-path guard's own visibility probe, a push to any URL
 but the declared `helm.trunkUrl`, a push of a tree no verified whole-suite
 receipt passed on, a stash, a conflict resolution, a trunk cure, a fleet op a
-needs-restart car owes (it is posted to the integrator instead), and a
+needs-restart car owes (it is posted to the integrator instead), a restart
+of the web (it follows its code, and is read instead), and a
 `helm gate canary clear`.
 
 THE THREAT MODEL (task/3265 r4). Auto-land pushes only the exact approved,
@@ -149,8 +173,10 @@ stand, known and not cured:
 
 READINESS IS THE LEDGER'S. A car is exactly what `landwindow.plan` lists: a
 live READY row with its approve, or a held source-clean row the one predicate
-admits, at the held or reviewed tip, never a lane branch. One thing is asked
-here that the plan does not ask: a source-clean car whose lane is a DOOR rides
+admits, or an open review row unread for `landwindow.LAND_FIRST_WAIT_S` whose
+lane is no door, at the held, reviewed or dispatched tip, never a lane
+branch. A land-first car's row is not closed at the LAND: it stays open as
+the post-land read. One thing is asked here that the plan does not ask: a source-clean car whose lane is a DOOR rides
 only when `dispatches.approval_tier` admits its holder, and that admission
 FAILS CLOSED (`Ops._door_admission`). Both are asked again in the last word
 before the push, for the train's own cars at their exact tips.
@@ -179,13 +205,13 @@ import sys
 import time
 
 from . import eventledger, home, landwindow, pk, vcs
-from .work import _lanes
+from .work import _gc, _lanes
 
 PROG = "helm train auto"
 VETO_PROG = "helm train veto"
 USAGE = ("usage: helm train auto [--repo PATH] [--apply] [--status] "
          "[--pause [--reason TEXT] | --resume | --abandon [--force] "
-         "--reason TEXT]\n"
+         "[--drop ROW|LANE] --reason TEXT]\n"
          "       helm train auto seed <n> <sha> [--repo PATH]\n"
          "       helm train auto --install-timer\n"
          "       helm train veto <train> --reason TEXT [--repo PATH]")
@@ -208,6 +234,9 @@ PUSH_TIMEOUT_S = 600
 #: How long the post-land `helm lr foldcheck --apply` child may run
 #: (`Ops.fold_apply`); a cold fold of the live ledger is about two minutes.
 FOLD_APPLY_S = 1800
+#: How long the post-land `helm work release` child may run
+#: (`Ops.release_lease`).
+RELEASE_S = 300
 #: The checkout this helm runs from: `fold_apply` starts its `bin/helm`.
 _HELM_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 #: How much longer than PUSH_TIMEOUT_S the push's git may live once its tick
@@ -224,6 +253,11 @@ PUSH_SETTLE_READ_S = 60
 #: A hand-composed train room older than this reads STALE: it is printed,
 #: and it does not hold auto-land idle.
 FLIGHT_STALE_S = 12 * 3600
+#: How long after a web land's fast-forward the web's code is read
+#: (`_Tick.web_read`): the time a resident may take to re-exec onto a
+#: changed tree (`stopfacts_resident.REEXEC_WITHIN_S`, which an arm holds
+#: this to), so a web still on old code past it has not followed.
+WEB_FOLLOW_S = 60
 
 #: The audits the integrator runs before every gate beside the tree-wide list
 #: and each car's own test modules.
@@ -236,6 +270,10 @@ CL = 90
 #: How long a posted refusal that no longer stands is remembered, so one that
 #: comes and goes inside it is not posted again.
 FORGET_S = 6 * 3600
+#: How often the tick sweeps the seen-working checks (helm/observed.py), and
+#: where it records the last sweep.
+SWEEP_S = 15 * 60
+SWEEP_STAMP = "observed-sweep.json"
 
 INTENT, COMPOSING, GATING, LANDING = "INTENT", "COMPOSING", "GATING", "LANDING"
 DONE, VETOED, ABANDONED, STOPPED = "DONE", "VETOED", "ABANDONED", "STOPPED"
@@ -251,6 +289,12 @@ GREEN, RED, UNKNOWN, WAIT = "GREEN", "RED", "UNKNOWN", "WAIT"
 #: What a red pre-gate audit run is recorded as where a red gate's id would
 #: be (a blame in flight, an ejection): no gate ran (task/3674).
 AUDITS = "audits"
+
+#: WHAT BECAME OF EACH CAR'S LANE LEASE AT LAND (`_Tick.releases`), recorded
+#: on the car. ASKED is written before the release runs, so a tick killed
+#: under it is told apart from one that never asked.
+L_RELEASED, L_KEPT, L_NONE = "released", "kept", "none"
+L_REFUSED, L_ASKED = "refused", "asked"
 
 STATE_SUBDIR = "autoland"
 DONE_SUBDIR = "done"
@@ -586,6 +630,27 @@ def read_control(root):
     return got, None
 
 
+def off_reason(root, timer=True):
+    """None when the switch is ON, else why auto-land takes no car now: the
+    switch cannot be read, it is PAUSED, or (`timer`) no timer is installed
+    on this host to tick it. One reader for every caller that asks "will
+    auto-land do this by itself?": a tick's push (`halted`, which is already
+    running and so asks no timer) and the source-clean hold notice, which
+    wakes the integrator only when the answer is no."""
+    control, why = read_control(root)
+    if why:
+        return "the switch is unreadable (%s)" % why
+    paused = control.get("paused")
+    if paused:
+        return "paused by %s (%s); `%s --resume` lands it" % (
+            paused.get("by"), paused.get("reason") or "no reason given",
+            PROG)
+    if timer and not timer_installed():
+        return ("no timer ticks it on this host (`%s --install-timer`)"
+                % PROG)
+    return None
+
+
 def pause(root, by, reason=None):
     """The integrator's switch: no tick acts until `resume`."""
     # UNDER THE STORE'S LOCK, the one a tick's `finish` rewrites the switch
@@ -604,7 +669,9 @@ def pause(root, by, reason=None):
 
 def resume(root, by, now=None):
     """Clear the pause; a STOPPED train is put back at the step that
-    stopped, so the next tick retries it. -> (message, why)."""
+    stopped, so the next tick retries it; at GATING with its launched gate
+    spent, the next tick launches a fresh gate, and with it unspent, any wait
+    on that same gate starts again from now. -> (message, why)."""
     said = []
     with _state_lock(root) as held:
         if not held:
@@ -626,12 +693,57 @@ def resume(root, by, now=None):
             _history(st, now or time.time(), "resumed by %s after: %s"
                      % (by, stop.get("why")))
             st["stopped"] = None
+            # A SPENT GATE IS NOT WAITED ON AGAIN: the train already read
+            # and acted on the red of the job it launched, so resumed it
+            # launches a fresh gate of the same head on the next tick, as
+            # the one automatic re-gate does. The red stays read: it is
+            # never asked again.
+            spent = _spent(st)
+            fresh = st["state"] == GATING and spent
+            # A LIVE GATE IS WAITED ON AFRESH: at GATING with a launched,
+            # unspent gate job, the wait starts again from now on that same
+            # job (Fab answers it if it still runs); nothing is relaunched.
+            # Without this a no-receipt timeout stop timed out again on the
+            # resumed tick, never waiting. The clock is read only while no
+            # receipt names the head, so a stop whose receipt is still there
+            # (an unreadable red, a green that cannot authorize) reads that
+            # receipt again, untouched; one GATE_WAIT_S later a dead job
+            # stops the train again, and only a person's resume restarts it.
+            rewait = st["state"] == GATING and not spent \
+                and st.get("launched")
+            if fresh:
+                st["launched"], st["launch_ts"], st["gate"] = \
+                    False, None, None
+                _history(st, now or time.time(), "gate job %s is spent "
+                         "(its red gate:%s was read); the next tick "
+                         "launches a fresh gate" % fresh)
+            elif rewait:
+                # A b-room's gate whose door row named no job (`gate_of`)
+                # is named as unrecorded, never as a job called None.
+                job = (st.get("gate") or {}).get("job_id")
+                st["launch_ts"] = now or time.time()
+                _history(st, now or time.time(), "%s is not spent: any "
+                         "wait on it starts again from now, and it is not "
+                         "relaunched" % ("gate job %s" % job if job else
+                                         "its gate job (no id recorded)"))
             _bump(st)
             _write_json(train_path(root, st["train"]), st)
-            said.append("%s retries from %s%s" % (
+            said.append("%s retries from %s%s%s" % (
                 st["train"], st["state"],
-                "/" + st["step"] if st.get("step") else ""))
+                "/" + st["step"] if st.get("step") else "",
+                " with a fresh gate" if fresh else
+                ", its gate's wait restarted" if rewait else ""))
     return "; ".join(said) or "nothing was paused or stopped", None
+
+
+def _spent(st):
+    """(job, gid) when the gate job the train launched is SPENT, its red
+    `gid` read and acted on, else None. Fab keys a job by its tree and
+    attempt, so a relaunch of the same tree with no flake recorded since
+    is answered by that same finished job and runs nothing new."""
+    job = (st.get("gate") or {}).get("job_id")
+    gid = (st.get("spent") or {}).get(job) if job else None
+    return (job, gid) if gid and st.get("launched") else None
 
 
 def head_on_origin(root, st, ops):
@@ -656,16 +768,47 @@ def head_on_origin(root, st, ops):
                   % (_short(remote), _short(head), state))
 
 
+def _child_env():
+    """The environment of a hand verb auto-land runs as a child: it says the
+    LAND step runs the land step itself (helm/landtask.py DEFER_ENV), with
+    the LAND number the child cannot know."""
+    from . import landtask
+    return dict(os.environ, **{landtask.DEFER_ENV: landtask.AUTO_LAND})
+
+
 def owed_fold(st):
     """The acts a train whose head is (or may be) on origin still owes, as
-    the lines a person runs: the fold. No task close is owed: a land closes
-    no task (see `_Tick.closes`)."""
+    the lines a person runs: the fold, which runs the land step for each row
+    it closes (helm/landtask.py)."""
     gid = (st.get("receipt") or {}).get("id") or "<the green gate's id>"
     return ["helm lr foldcheck %s --gate gate:%s --apply"
             % (st.get("head"), gid)]
 
 
-def abandon(root, by, reason, ops=None, now=None, force=False):
+
+def _dropped_car(st, drop):
+    """The one car `drop` names, None when none was asked, or a refusal.
+
+    A drop is a row id or a lane, matched exactly. Zero matches and two
+    matches are not a car: ending the train anyway would leave every tip
+    ready, which is the re-pick naming one car prevents.
+    """
+    if drop is None:
+        return None
+    token = " ".join(str(drop).split())
+    if not token:
+        return "a drop names the car's row or lane"
+    cars = [c for c in st.get("cars") or []
+            if c.get("id") == token or c.get("lane") == token]
+    if len(cars) != 1:
+        return ("%s names %s of %s; nothing is abandoned" % (
+            token, "no car" if not cars else "%d cars" % len(cars),
+            st.get("name") or st.get("train")))
+    return {"id": cars[0].get("id"), "lane": cars[0].get("lane"),
+            "tip": str(cars[0].get("tip") or "")}
+
+
+def abandon(root, by, reason, ops=None, now=None, force=False, drop=None):
     """End the active train, remove its rooms and archive it ABANDONED.
     -> (state, why).
 
@@ -677,7 +820,12 @@ def abandon(root, by, reason, ops=None, now=None, force=False):
     and records the owed lines in the archive and in a post to the
     integrator. A train LANDING past its push decision is also refused while
     a tick runs (the tick lock is held from here to the archive, so none
-    starts), force or not: that tick may be folding it."""
+    starts), force or not: that tick may be folding it.
+
+    `drop` is one car's row id or lane. The ejection is recorded at that
+    car's exact tip before anything is archived. The next plan leaves that
+    tip out, and every other car stays. No match, or two, abandons nothing.
+    """
     ops = ops or Ops()
     now = now if now is not None else ops.now()
     with _state_lock(root) as held, contextlib.ExitStack() as stack:
@@ -707,6 +855,19 @@ def abandon(root, by, reason, ops=None, now=None, force=False):
                     "is pushed (on the declared trunk)" if pushed
                     else "may be pushed: %s" % unread, PROG,
                     "`, then `".join(owed), PROG))
+        dropped = _dropped_car(st, drop)
+        if isinstance(dropped, str):
+            return None, dropped
+        if dropped:
+            _row, err = landwindow.record_ejection(root, {
+                "tip": dropped["tip"], "lr": dropped["id"],
+                "lane": dropped["lane"], "train": name, "reason": reason,
+                "verdict": "drop", "by": by})
+            if err:
+                return None, (
+                    "%s is not abandoned: the ejection of tip %s could not "
+                    "be recorded (%s), so the next plan would compose it "
+                    "again" % (name, dropped["tip"], err))
         left = _remove_rooms(root, st, ops)
         st["state"] = ABANDONED
         st["abandoned"] = {"by": by, "reason": reason, "ts": now,
@@ -714,9 +875,12 @@ def abandon(root, by, reason, ops=None, now=None, force=False):
         if owed:
             st["abandoned"].update(forced=True, owed=owed,
                                    pushed="yes" if pushed else unread)
-        _history(st, now, "abandoned by %s: %s%s" % (
-            by, reason, "; FORCED, owed: %s" % "; ".join(owed)
-            if owed else ""))
+        if dropped:
+            st["abandoned"]["dropped"] = dropped
+        _history(st, now, "abandoned by %s: %s%s%s" % (
+            by, reason,
+            "; dropped %s" % dropped["lane"] if dropped else "",
+            "; FORCED, owed: %s" % "; ".join(owed) if owed else ""))
         _archive(root, st, now)
     if owed:
         text = ops.address(
@@ -776,7 +940,8 @@ def flight_refusal(root):
         return ("auto-land's %s is STOPPED at %s%s (room %s): %s. A stopped "
                 "train still holds the flight, and one train flies at a "
                 "time. `%s --resume --repo %s` retries it once the cause is "
-                "cured, and `%s --abandon --repo %s --reason R` ends it" % (
+                "cured, and `%s --abandon --repo %s --reason R` ends it; "
+                "add `--drop ROW|LANE` to keep that selected car's tip out" % (
                     name, stop.get("state"),
                     "/" + stop["step"] if stop.get("step") else "",
                     st.get("room") or "not minted", stop.get("why"), PROG,
@@ -880,23 +1045,50 @@ _UNIT_LINE = re.compile(
     r"OnUnitActiveSec|OnBootSec|WantedBy|EnvironmentFile|WorkingDirectory)="
     r"|\b(?:install_user_timer|ensure_timer|user_unit_dir)\b")
 
+#: A lead's posture is read when its session starts, so a running lead keeps
+#: the old one: its hook registrations, its skills, the WHO digest and pinned
+#: rules the inject delivers once per context (helm/inject, the whoami
+#: profile reader), and its lean settings (seat_catalog.lead_lean_settings,
+#: written by seat_launch_assets._apply_lead_lean, homes.py's lead-lean pass,
+#: launch._lead_lean_args and seat_recipe._lead_posture). A land that
+#: changes one is not LIVE until the leads relaunch.
+RELAUNCH_LEADS = "relaunch the leads; the land is not LIVE until they do"
+_LEAD_SETTINGS = re.compile(r"lead_lean|_lead_posture|LEAD_(?:DENIED|SKILL|"
+                            r"DISABLED)")
+
 #: WHAT A LANDED CAR OWES THE RUNNING FLEET, by the paths it touches. A rule
 #: matches a path (exact, prefix or a `hooks` directory) and, when it names a
 #: `context` or `changed` pattern, the car's diff of that path too. Every
 #: other car is live at land. `helm rearm` reports stale processes and
-#: classifies no path, so the table is here.
+#: classifies no path, so the table is here. Only what does NOT follow its
+#: code is in it: what does is in FOLLOWS_RULES.
 RESTART_RULES = (
-    {"what": "the hooks: re-sync them",
+    {"what": "the hooks: re-sync them, then " + RELAUNCH_LEADS,
      "paths": ("helm/hooks.py", "bin/helm-hook"), "dir": "hooks"},
+    {"what": "lead posture (skills, the inject and its whoami profile "
+             "reader): " + RELAUNCH_LEADS,
+     "paths": ("helm/whoami.py",),
+     "prefix": ("agents/claudecode/skills/", "helm/inject/")},
+    {"what": "the lead settings: " + RELAUNCH_LEADS,
+     "paths": ("helm/seat_catalog.py", "helm/seat_launch_assets.py",
+               "helm/homes.py", "helm/launch.py", "helm/seat_recipe.py"),
+     "context": _LEAD_SETTINGS},
     {"what": "the seat_catalog sidecar pin: fast-forward the vendored bridge "
              "and restart it while its seat is idle",
      "paths": ("helm/seat_catalog.py",), "context": re.compile(r"sidecar")},
     {"what": "a systemd unit or timer installer: reinstall the unit",
      "prefix": ("helm/",), "changed": _UNIT_LINE},
-    {"what": "the web board: restart the web service",
-     "prefix": ("helm/web",)},
     {"what": "the chat node: restart it", "paths": ("helm/chatnode.py",)},
     {"what": "proxywatch: restart it", "paths": ("helm/proxywatch.py",)},
+)
+
+#: WHAT FOLLOWS ITS CODE BY ITSELF, so a land owes it no restart (task/3796):
+#: every `helm web` re-execs itself onto a changed tree (task/3132,
+#: `stopfacts_resident.Follower`). A land that touches one is READ instead,
+#: WEB_FOLLOW_S after its fast-forward (`_Tick.web_read`), and a web still on
+#: the code from before the land is posted, never restarted.
+FOLLOWS_RULES = (
+    {"what": "the web board", "prefix": ("helm/web",)},
 )
 
 
@@ -919,11 +1111,11 @@ def _rule_matches(rule, path, diff):
     return True
 
 
-def needs_restart(changes):
-    """The restarts a car owes, in RESTART_RULES order, from `changes`
-    {path: that path's diff}; [] means live at land. Tests owe none."""
+def _matched(rules, changes):
+    """Each rule's `what` that a path of `changes` {path: that path's diff}
+    matches, in the rules' order. A test path matches none."""
     owed = []
-    for rule in RESTART_RULES:
+    for rule in rules:
         for path, diff in sorted((changes or {}).items()):
             if path.startswith("tests/"):
                 continue
@@ -931,6 +1123,64 @@ def needs_restart(changes):
                 owed.append(rule["what"])
                 break
     return owed
+
+
+def needs_restart(changes):
+    """The restarts a car owes, in RESTART_RULES order, from `changes`
+    {path: that path's diff}; [] means live at land. Tests owe none."""
+    return _matched(RESTART_RULES, changes)
+
+
+def follows_code(changes):
+    """What the car touches that follows its code by itself (FOLLOWS_RULES):
+    each is read after the land, never restarted."""
+    return _matched(FOLLOWS_RULES, changes)
+
+
+def web_follows(got, since):
+    """(stale, note) from what `Ops.web_code` read once WEB_FOLLOW_S had
+    passed since a land's fast-forward at `since`. `stale` is the one line
+    owed when the console web still serves the code from before the land,
+    else None; `note` is what was read, for the train's history.
+
+    STALE IS MEASURED, NEVER INFERRED. Only a live resident that serves THIS
+    tree (its code root is trunk's package), whose digest is not trunk's and
+    that has not started since the land is stale. A resident that started
+    after the land re-exec'd onto it: it keeps the facts it found, and their
+    digest, until its first refresh (`stopfacts_resident.Leg.announce`). No
+    snapshot, a digest that cannot be read, a resident that is not running
+    and one that serves another tree say nothing about this land, so they are
+    noted and never posted."""
+    got = got or {}
+    unknown = "whether the web follows the land is UNKNOWN: %s"
+    if got.get("why"):
+        return None, unknown % got["why"]
+    served, trunk = got.get("served"), got.get("trunk")
+    if not got.get("alive"):
+        return None, unknown % ("the resident that wrote its stop-facts "
+                                "(pid %s) is not running" % got.get("pid"))
+    if got.get("code_root") != got.get("pkg"):
+        return None, ("the web serves %s, not this tree (%s), so this land "
+                      "is not its code" % (got.get("code_root"),
+                                           got.get("pkg")))
+    if not served or not trunk:
+        return None, unknown % ("a digest could not be read (served %s, "
+                                "trunk %s)" % (served, trunk))
+    if served == trunk:
+        return None, "the web serves trunk's code (%s)" % trunk[:12]
+    started = got.get("started_at")
+    if isinstance(started, (int, float)) and started >= since:
+        return None, ("the web re-exec'd after the land and reads the facts "
+                      "it found (digest %s) until its first refresh"
+                      % served[:12])
+    stale = ("the web still serves code %s, not trunk's %s, at least %d s "
+             "after the land's fast-forward. It re-execs itself onto a "
+             "changed tree "
+             "(task/3132), and auto-land restarts nothing: `journalctl "
+             "--user -u helm-web` says why it has not (a tree that does not "
+             "import is never exec'd onto)." % (served[:12], trunk[:12],
+                                                WEB_FOLLOW_S))
+    return stale, stale
 
 
 def split_diff(text):
@@ -1003,8 +1253,9 @@ def planned_count(row):
 #: A line of `helm lr foldcheck` that stops a proof wherever it stands: a
 #: rung that refused (STOP) or could not be measured (????), in the five or
 #: in the composition proof, and the two verdict lines.
-_FOLD_BAD = re.compile(r"^(?:STOP|\?\?\?\?)\s|^(?:REFUSED by|NOT PROVEN)\b",
-                       re.M)
+_FOLD_BAD = re.compile(
+    r"^[ \t]*(?:(?:STOP|\?\?\?\?)[ \t]|(?:REFUSED|FAILED|NOT PROVEN)\b)",
+    re.M)
 
 
 def fold_unproven(text):
@@ -1068,6 +1319,17 @@ def _whole(text):
 
 def _short(sha):
     return (sha or "?")[:12]
+
+
+def _work_line(text):
+    """The first `helm work:` line of what a release child said, else its
+    first line: a banner the child printed first is not its answer. A colon
+    that introduced the lines under it is dropped, since they are not
+    quoted with it."""
+    for line in (text or "").splitlines():
+        if line.strip().startswith("helm work:"):
+            return line.strip().rstrip(":").rstrip()
+    return _first(text).rstrip(":").rstrip()
 
 
 class Ops(object):
@@ -1144,15 +1406,17 @@ class Ops(object):
     def car_facts(self, root, car):
         """The car's task, priority, doors, author and reader, and whether
         its reader may carry it: {task, priority, doors, author, reader,
-        read_at, model, family, admit: (ok, why)}. Every read that fails
-        leaves its field None; only the admission refuses on one.
+        read_at, model, family, admit: (ok, why)}, and what its LAND step
+        reads (chain, findings_kept, tasks_named, whole, scope, chain_rows,
+        lane_rows). Every read that fails leaves its field None; only the
+        admission refuses on one, and the doors are read before the rest of
+        the fold, so no later read leaves them UNKNOWN. A findings read or a
+        land-step read that fails is said at the LAND (`findings_unread`,
+        `step_unread`, task/3862), never a silent nothing.
 
-        `read_at` is the moment the reader's read was RECORDED: the hold's
-        stamp for a source-clean car (task/3508). The holder's model is read
-        AT it, never its newest turn: a native seat that held on Sonnet and
-        switched to Opus afterwards is not an Opus holder. An approve car's
-        model is the one its verdict froze, a label here; the lr row carries
-        no verdict stamp, so a native reviewer's stays unread."""
+        A source-clean door reads only the holder model and family FROZEN on
+        its hold, never the current runtime: a later proxy cooldown is not a
+        revocation. An approve car's model is the one its verdict froze."""
         lr = car.get("lr") or {}
         clean = car.get("basis") == "source-clean"
         facts = {"task": None, "task_unknown": None, "title": None,
@@ -1164,95 +1428,149 @@ class Ops(object):
                  "model": None if clean else lr.get("reviewer_model"),
                  "family": None, "admit": (True, None)}
         from . import dispatches, review_door, reviewer_eligibility, tasks
-        from . import trainblame
+        from . import landtask, trainblame
         try:
             facts["task"], facts["task_unknown"], refused = \
                 trainblame.lane_task(car["id"])
             # A READ THAT WAS REFUSED IS UNKNOWN, NEVER "no task" (task/3643):
             # the merge line is the fact the sweep links by
             facts["task_unknown"] = facts["task_unknown"] or refused
-            row = tasks.get(facts["task"]) if facts["task"] else None
-            facts["priority"] = (row or {}).get("priority")
-            facts["title"] = _title((row or {}).get("title"))
         except Exception as exc:            # noqa: BLE001 — said, not raised
             if not facts["task"]:
                 facts["task_unknown"] = ("the task could not be read (%s)"
                                          % type(exc).__name__)
+        current = row = None
         try:
             current, unavailable = dispatches.snapshot()
             row = None if unavailable else (current or {}).get(car["id"])
+            # THE DOORS FIRST (task/3862): the admission reads them, so no
+            # later read of this fold can leave them UNKNOWN.
             if row is not None:
                 facts["doors"] = sorted({cls for cls, _ev in
                                          review_door.lane_doors(
-                                             row, current)["doors"]})
-        except Exception:                   # noqa: BLE001 — UNKNOWN below
-            facts["doors"] = None
-        if facts["reader"] and not facts["model"]:
-            # "" when no moment is recorded: a RECORDED read, unplaced, which
-            # a native seat answers None for (`dispatches._runtime_model`).
+                                             dict(row, tip=car["tip"]) if clean
+                                             else row, current)["doors"]})
+            else:
+                facts["findings_unread"] = (
+                    "the compose could not read them: %s" % (
+                        "the dispatch ledger could not be read (%s)"
+                        % unavailable if unavailable else
+                        "row %s is not in the dispatch ledger"
+                        % car["id"][:12]))
+        except Exception as exc:            # noqa: BLE001 — UNKNOWN below
+            facts["doors"], row = None, None
+            facts["findings_unread"] = ("the compose could not read them "
+                                        "(%s: %s)" % (type(exc).__name__,
+                                                      exc))
+        # The first row's task is chain identity, not proof that a different
+        # car's lane serves it. Prefer that car's own record, or say UNKNOWN
+        # when its proof contradicts the root; a suffix is only the historical
+        # no-task fallback and cannot overrule either record (task/3995).
+        try:
+            if row is not None:
+                from . import taskkey
+                key = taskkey.car_key(row, current, lane=car["lane"],
+                                      repo=row.get("repo_root") or root)
+                if key.why and key.why != taskkey.NO_TASK:
+                    facts["task"], facts["task_unknown"] = None, key.why
+                elif key.task:
+                    # A successful, later own-row/record join supersedes a
+                    # transient refused first read, not a conflicting join.
+                    facts["task"], facts["task_unknown"] = key.task, None
+                elif not facts["task_unknown"]:
+                    facts["task"] = key.task
+            if not facts["task"] and not facts["task_unknown"]:
+                facts["task"] = landtask.lane_number(car["lane"])
+            task = tasks.get(facts["task"]) if facts["task"] else None
+            facts["priority"] = (task or {}).get("priority")
+            facts["title"] = _title((task or {}).get("title"))
+        except Exception as exc:            # noqa: BLE001 — said, not raised
+            facts["task"], facts["task_unknown"] = None, (
+                "the car's task could not be read (%s)" % type(exc).__name__)
+        if row is not None and facts["task_unknown"]:
+            # A task-UNKNOWN car cannot authorize closing findings or sibling
+            # rows of a chain whose task this car may not serve. Still land its
+            # reviewed tip; report what was left for independent custody.
+            facts["findings_unread"] = (
+                "the car's task is UNKNOWN (%s); its chain findings stay open"
+                % facts["task_unknown"])
+            facts["step_unread"] = (
+                "the car's task is UNKNOWN; its chain's other rows stay open")
+        if row is not None and not facts["task_unknown"]:
+            # THE CHAIN THE LAND ANSWERS, read now from the fold this compose
+            # already holds. A FINDING NOT PROVEN NAMED BEFORE THIS TIP
+            # stays open at the LAND of this tree, and so does EVERY TASK A
+            # LIVE LANE MAY SERVE BY RECORD OR NUMBER, an UNKNOWN join's
+            # included (task/3643);
+            # the LAND reads both again (`close_findings`). The chain is
+            # recorded last: a read that fails or raises closes nothing of
+            # the chain at the LAND, and the LAND says why
+            # (`findings_unread`, task/3862).
+            try:
+                rf = dispatches.review_findings
+                chain = rf.chain_of(row)
+                kept, why = rf.named_at(chain, car.get("tip"), current, root)
+                named, unread = rf.lane_tasks(row, current)
+                facts["findings_kept"] = kept
+                facts["tasks_named"] = sorted(named)
+                facts["chain"] = None if why or unread else chain
+                if chain is not None and (why or unread):
+                    facts["findings_unread"] = ("the compose could not read "
+                                                "them: %s" % (why or unread))
+            except Exception as exc:        # noqa: BLE001 — said at the LAND
+                facts["findings_unread"] = ("the compose could not read them "
+                                            "(%s: %s)" % (type(exc).__name__,
+                                                          exc))
+            try:
+                # WHOLE OR PART, AND THE TASK'S ROOM (task/3746), read from
+                # the same fold: the LAND step closes a whole lane's task and
+                # asks every other's room whether the whole ask is done.
+                facts["whole"] = landtask.whole_of(facts["task"], row,
+                                                   current)
+                facts["scope"] = review_door.pair_scope(row, current)
+                # THE CHAIN'S OTHER ROWS, which the land discharges, and the
+                # lane's rows with no chain link, which it flags
+                facts.update(landtask.chain_facts(row, current))
+            except Exception as exc:        # noqa: BLE001 — said at the LAND
+                facts["step_unread"] = (
+                    "the compose could not read whether the lane carried "
+                    "the whole ask, its task's room or its chain's other "
+                    "rows (%s: %s)" % (type(exc).__name__, exc))
+        if clean:
+            proof = row.get("hold_approval") if isinstance(row, dict) else None
+            if isinstance(proof, dict):
+                facts["model"] = proof.get("model")
+                facts["family"] = proof.get("family")
+        elif facts["reader"] and not facts["model"]:
             facts["model"] = reviewer_eligibility.read_model(
                 facts["reader"], at=facts["read_at"] or "")
         if clean and facts["doors"] != []:
-            facts["family"] = self.reader_family(facts["reader"])
+            facts["hold_row"] = row
             facts["admit"] = self._door_admission(root, facts)
+        if car.get("basis") == landwindow.LAND_FIRST and facts["doors"] != []:
+            # A DOOR WAITS FOR ITS READ, asked again here and at the push.
+            facts["admit"] = (False, "unread and %s, and only a lane with no "
+                              "door lands before review" % (
+                                  "a DOOR (%s)" % ", ".join(facts["doors"])
+                                  if facts["doors"] else
+                                  "its doors could not be read"))
         return facts
 
-    def reader_family(self, seat):
-        """The one family the seat's verdict-time runtime evidence names
-        (`dispatches._approval_identity_families`, the evidence the approval
-        tier reads and `helm reviewers` joins), or None when it names none,
-        several, or cannot be read."""
-        from . import dispatches
-        if not seat:
-            return None
-        try:
-            families, why = dispatches._approval_identity_families(seat)
-        except Exception:                   # noqa: BLE001 — unread is None
-            return None
-        found = sorted(families or ()) if not why else []
-        return found[0] if len(found) == 1 else None
-
     def _door_admission(self, root, facts):
-        """(ok, why) for a source-clean car that is a door, or whose doors
-        could not be read. It FAILS CLOSED, because auto-land pushes it on no
-        person's read (the integrator's ruling R2): the holder must be
-        admitted by the approval tier (`dispatches.approval_tier` reads
-        `ok`; a policy that is unreadable, UNKNOWN or `none` refuses), its
-        RESOLVED model must be read, and `reviewer_eligibility.input_only`,
-        asked with the holder's family so its spark, gemini and local rungs
-        run, must answer False (True, or None for a read it cannot rule out
-        as input only, refuses). The tier is asked AT the hold's recorded
-        moment (`read_at`), as the model was (task/3508)."""
-        from . import dispatches, reviewer_eligibility
-        reader = facts["reader"]
+        """Fail closed on absent hold-time proof or a later owner demotion.
+
+        The holder's exact-session runtime was proven at the hold, not at this
+        compose or final readiness check; the current owner policy remains a
+        separate veto over that frozen identity."""
+        from . import dispatches_tier
         what = ("a DOOR (%s)" % ", ".join(facts["doors"])
                 if facts["doors"] else "possibly a door (its doors could not "
                 "be read)")
-        if not reader:
-            return False, "%s held by nobody named" % what
-        try:
-            state, why = dispatches.approval_tier(
-                reader, repo=root, at=facts.get("read_at") or "")
-        except Exception as exc:            # noqa: BLE001 — UNKNOWN refuses
-            state, why = "unknown", "%s: %s" % (type(exc).__name__, exc)
-        if state != "ok":
-            return False, ("%s whose holder %s is not admitted by the "
-                           "approval tier (%s: %s)" % (
-                               what, reader, state,
-                               why or ("no approval-tier policy admits it"
-                                       if state == "none" else "unread")))
-        model, family = facts.get("model"), facts.get("family")
-        if not model:
-            return False, ("%s whose holder %s has an unread resolved model, "
-                           "so it cannot be shown to be approval tier"
-                           % (what, reader))
-        verdict, why = reviewer_eligibility.input_only(model, family)
-        if verdict is not False:
-            return False, ("%s whose holder %s (%s, family %s) %s (%s)" % (
-                what, reader, model, family or "unresolved",
-                "reads as input only" if verdict else
-                "cannot be ruled out as input only", why))
-        return True, None
+        ok, why = dispatches_tier.hold_approval(
+            facts.get("hold_row"), root)
+        return (True, None) if ok else (
+            False, "%s whose holder %s is not admitted by the approval tier: "
+            "%s" % (what, facts.get("reader") or "(unnamed)", why))
 
     # -- compose, audits, gate --------------------------------------------
     def compose(self, got):
@@ -1349,15 +1667,17 @@ class Ops(object):
                                         out=buf)
         return rc, request, buf.getvalue()
 
-    def gate_host(self, room):
-        """The host the landing-window door recorded for `room`'s gate, or
-        None: blame launches a b-room's gate itself, and its host is read
-        back from the door's own store."""
+    def gate_of(self, room):
+        """{host, job_id} the landing-window door recorded for `room`'s
+        gate, each None when unrecorded: blame launches a b-room's gate
+        itself, and both are read back from the door's own store. The job
+        is what makes that gate's red SPENT once it is read (`_spent`)."""
         from . import gatewindow
         real = os.path.realpath(room)
         rows = [r for r in gatewindow.read_runs(gatewindow.runs_path())
                 if r.get("room") == real]
-        return rows[-1].get("host") if rows else None
+        last = rows[-1] if rows else {}
+        return {"host": last.get("host"), "job_id": last.get("job_id")}
 
     def receipts(self):
         from . import gate
@@ -1739,7 +2059,28 @@ class Ops(object):
         except Exception:                                # noqa: BLE001
             pass
 
-    def fold_apply(self, root, head, gid):
+    def source_clean_closed(self, root, rid, tip, head):
+        """An earlier fold already closed this exact source-clean car."""
+        from . import dispatches
+        try:
+            rows, err = dispatches.snapshot()
+            row = rows.get(rid) if rows else None
+            info = dispatches._repo_info(root)
+            in_head = vcs.backend(root).ancestry(root, tip, head) == vcs.ANCESTOR
+        except Exception:                       # noqa: BLE001 — unknown is not proof
+            return False
+        return bool(not err and info and in_head and row and row.get("id") == rid
+                    and row.get("repo_id") == info["repo_id"]
+                    and row.get("closing_repo_id") == info["repo_id"]
+                    and row.get("status") == "closed"
+                    and row.get("close_reason") == "source-clean-landed"
+                    and row.get("reviewed_tip") == tip
+                    and row.get("source_clean_tip") == tip
+                    and row.get("close_proof_mode") == "ancestor"
+                    and row.get("source_clean_gate")
+                    and row.get("source_clean_anchor"))
+
+    def fold_apply(self, root, head, gid, train_car_ids=()):
         """(rc, text): `helm lr foldcheck <head> --gate gate:<gid> --apply`,
         run in a CHILD of the installed helm, never in this process
         (task/3562).
@@ -1760,11 +2101,14 @@ class Ops(object):
                 "lr", "foldcheck", head, "--gate", "gate:" + gid,
                 "--repo", root, "--remote", remote or "origin",
                 "--branch", branch or "main", "--apply"]
+        if train_car_ids:
+            argv += ["--train-cars", ",".join(train_car_ids)]
         try:
             done = subprocess.run(argv, stdin=subprocess.DEVNULL,
                                   stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, encoding="utf-8",
-                                  errors="replace", timeout=FOLD_APPLY_S)
+                                  errors="replace", timeout=FOLD_APPLY_S,
+                                  env=_child_env())
         except subprocess.TimeoutExpired:
             return 124, ("`helm lr foldcheck --apply` ran past %d s and was "
                          "stopped" % FOLD_APPLY_S)
@@ -1794,7 +2138,8 @@ class Ops(object):
             done = subprocess.run(argv, stdin=subprocess.DEVNULL,
                                   stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, encoding="utf-8",
-                                  errors="replace", timeout=FOLD_APPLY_S)
+                                  errors="replace", timeout=FOLD_APPLY_S,
+                                  env=_child_env())
         except subprocess.TimeoutExpired:
             raise CloseFailed("%s ran past %d s and was stopped"
                               % (what, FOLD_APPLY_S))
@@ -1815,6 +2160,96 @@ class Ops(object):
         raise CloseFailed("%s exited %d: %s" % (what, done.returncode,
                                                 _whole(said)))
 
+    def land_step(self, root, car, land, head, owed=(), keep=()):
+        """The land step of one car (helm/landtask.py): the findings its
+        chain filed closed by `close_findings`, which reads the dispatch
+        ledger again at the LAND, then its task stamped LANDED, owing a
+        seen-working check, when its lane carried the whole ask
+        (helm/observed.py), else the one question commented on it and asked in
+        its room, and its chain's other rows offered to their doors. -> the
+        step's report. It reads and writes the task ledger, posts to the
+        task's room, and asks each door in a child (`lr_row_close`)."""
+        from . import landtask
+        return landtask.run(
+            landtask.of_car(car, land, head, owed, keep),
+            close_row=self.lr_row_close, post=self.task_room_post,
+            close_findings=lambda _chain, label, kept: self.close_findings(
+                root, car, label, kept))
+
+    def lr_row_close(self, rid, reason, evidence, live=None, restart=None):
+        """None, or why the door refused: `helm lr close <rid> --reason
+        <reason> --evidence E --json` for one row of a landed car's chain,
+        in a CHILD of the installed helm (`lr_close`'s reason), told the
+        LAND step runs the land step. It never raises: a child that did not
+        answer is a refusal in words, and the row stays open."""
+        argv = [sys.executable, os.path.join(_HELM_ROOT, "bin", "helm"),
+                "lr", "close", rid, "--reason", reason, "--evidence",
+                evidence, "--json"]
+        if reason == "landed":
+            argv += ["--live"] if live else ["--needs-restart",
+                                             restart or "UNKNOWN"]
+        try:
+            done = subprocess.run(argv, stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, encoding="utf-8",
+                                  errors="replace", timeout=FOLD_APPLY_S,
+                                  env=_child_env())
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            return "the close did not run: %s" % _first(str(exc))
+        if done.returncode == 0:
+            return None
+        try:
+            out = json.loads(done.stdout or "")
+        except ValueError:
+            out = None
+        why = out.get("reason") if isinstance(out, dict) else None
+        return _first(str(why or done.stderr or done.stdout
+                          or "exit %d" % done.returncode))
+
+    def task_room_post(self, room, text, key):
+        """None, or why the question was not posted: one row in the task's
+        room as auto-land, keyed so a retried tick posts it once. It is
+        signed as every auto-land row is: the label's class decides
+        (machine_senders, task/3851)."""
+        from . import chat
+        try:
+            row = chat.post(text, room=room, who=WHO, event_id=key)
+        except Exception as exc:            # noqa: BLE001 — named, retried
+            return "%s: %s" % (type(exc).__name__, exc)
+        return None if row else "it wrote nothing"
+
+    def close_findings(self, root, car, land, keep=()):
+        """(closed, errors): every open finding a FIX of the car's chain
+        filed, closed "cured in <land>" (helm/review_findings.py), never one
+        of the ids in `keep` (what the compose read) nor one the dispatch
+        ledger read NOW keeps: a finding whose naming tip is not proven
+        earlier than the landed tip, and a task a live lane serves by record
+        or number, each recorded after the compose as well as before. A read
+        that fails closes nothing."""
+        from . import dispatches, review_findings
+        chain = car.get("chain")
+        if not chain:
+            return [], []
+        try:
+            current, unavailable = dispatches.snapshot()
+            row = None if unavailable else (current or {}).get(car["id"])
+            if row is None:
+                return [], ["the dispatch ledger could not be read at the "
+                             "LAND (%s), so what a later round named is "
+                             "unknown; nothing was closed"
+                             % (unavailable or "row %s is not in it"
+                                % car["id"][:12])]
+            kept, why = review_findings.named_at(chain, car.get("tip"),
+                                                 current, root)
+            named, unread = review_findings.lane_tasks(row, current)
+        except Exception as exc:            # noqa: BLE001 — said, not raised
+            return [], ["the findings could not be closed (%s: %s)"
+                        % (type(exc).__name__, exc)]
+        if why or unread:
+            return [], ["%s; nothing was closed" % (why or unread)]
+        return review_findings.close_landed(
+            chain, land, set(keep or ()) | set(kept) | named)
+
     def changes(self, root, trunk, tip):
         rc, out, err = vcs.backend(root).text(
             root, "diff", "--no-color", "--no-ext-diff", "%s...%s"
@@ -1822,6 +2257,125 @@ class Ops(object):
         if rc != 0:
             return None, _first(err)
         return split_diff(out), None
+
+    # -- the lane leases a land ends (task/3674) ---------------------------
+    def lane_lease(self, root, lane):
+        """(row, why): the live claim on `lane`'s worktree lease, as
+        {holder, lease, session, fence}; (None, None) when none is held;
+        (None, why) when the claims ledger cannot be read. The strict reader
+        every claims writer takes (`seats_claims._claims_read`), expired rows
+        swept in memory: no lock and no write."""
+        from . import seats_claims
+        try:
+            rows = seats_claims._sweep(seats_claims._claims_read(strict=True))
+        except OSError as exc:
+            return None, _first(str(exc))
+        row = rows.get(_lanes.resource(root, lane))
+        if not isinstance(row, dict) or not row.get("lease"):
+            return None, None
+        return {k: row.get(k) for k in ("holder", "lease", "session",
+                                        "fence")}, None
+
+    def lane_landed(self, root, lane):
+        """(state, proof): is `lane`'s tip on the trunk? The stop guard's own
+        landedness read (`work._gc._merge_state`: ancestry OR patch identity,
+        against the trunk ref), asked of the lane branch and, when its room
+        is on disk, of the room's HEAD too, since a release retires the room
+        on what it holds. The first read that is not landed answers; a lane
+        with no branch, and a read that raised, are UNKNOWN."""
+        branch = _lanes.lane_branch(lane)
+        try:
+            if not _gc._has_branch(root, branch):
+                return vcs.UNKNOWN, "%s does not exist" % branch
+            asks = [(branch, branch)]
+            room = _lanes.lane_path(root, lane)
+            if os.path.lexists(os.path.join(room, ".git")):
+                head = vcs.backend(room).head_sha(room)
+                if not head:
+                    return vcs.UNKNOWN, ("the HEAD of room %s could not be "
+                                         "read" % room)
+                asks.append((head, "the HEAD of room %s (%s)"
+                             % (room, _short(head))))
+            for ref, what in asks:
+                state = _gc._merge_state(root, ref)
+                if state not in _gc.RETIRABLE:
+                    return state, "%s is %s" % (what, _gc._proof_word(state))
+        except Exception as exc:            # noqa: BLE001 — named, kept
+            return vcs.UNKNOWN, "the landedness read raised %s: %s" % (
+                type(exc).__name__, _first(str(exc)))
+        return state, "%s is %s" % (branch, _gc._proof_word(state))
+
+    def release_lease(self, root, lane, holder, lease):
+        """(ok, text): `helm work release <lane> --lease L --seat H --repo
+        <root>` in a CHILD of the installed helm, for the reason `lr_close`
+        is (task/3562): the release, the room's retirement and the branch's
+        run the landed code, and the KEPT rule is work release's own (a
+        branch is deleted only on its own proof). The holder's lease token
+        is the binding release asks for, read off the claims ledger
+        (`lane_lease`): the land is the lease's natural end (task/3674). The
+        child runs from `root`, never from the room it may retire, and
+        without this process's harness session, which is never the
+        holder's. `ok` is the child's exit status; `text` all it said."""
+        what = "`helm work release %s`" % lane
+        argv = [sys.executable, os.path.join(_HELM_ROOT, "bin", "helm"),
+                "work", "release", lane, "--lease", lease, "--seat", holder,
+                "--repo", root]
+        env = {k: v for k, v in os.environ.items()
+               if k not in home._SESSION_ENV}
+        try:
+            done = subprocess.run(argv, cwd=root, env=env,
+                                  stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, encoding="utf-8",
+                                  errors="replace", timeout=RELEASE_S)
+        except subprocess.TimeoutExpired:
+            return False, "%s ran past %d s and was stopped" % (what,
+                                                                 RELEASE_S)
+        except OSError as exc:
+            return False, "%s could not start: %s" % (what, _first(str(exc)))
+        said = "\n".join(t for t in (done.stdout, done.stderr)
+                         if (t or "").strip())
+        return done.returncode == 0, said or "%s exited %d" % (
+            what, done.returncode)
+
+    def web_code(self, root):
+        """What the console `helm web` serves beside what trunk's tree is:
+        {served, trunk, pkg, code_root, pid, alive, started_at, why}. The
+        resident writes the digest of the code it imported into every
+        stop-facts snapshot (`stopfacts_resident.LOADED_POLICY`, its
+        `policy`), and trunk's is the same digest of the landed package,
+        taken fresh (`stopfacts.code_policy`). A file read and a stat walk:
+        no spawn and no request. `why` says why there is no snapshot."""
+        from . import stopfacts
+        pkg = os.path.realpath(os.path.join(root, "helm"))
+        view = stopfacts.read()
+        snap = view.snap or {}
+        res = snap.get("resident")
+        res = res if isinstance(res, dict) else {}
+        return {"served": snap.get("policy"),
+                "trunk": stopfacts.code_policy(pkg=pkg, fresh=True)
+                if os.path.isdir(pkg) else None,
+                "pkg": pkg, "code_root": res.get("code_root"),
+                "pid": res.get("pid"), "alive": view.resident_alive(),
+                "started_at": res.get("started_at"),
+                "why": None if view.snap is not None
+                else view.why or "no stop-facts snapshot"}
+
+    def observed_sweep(self, root, now, post):
+        """The seen-working checks past their day, each moved once
+        (helm/observed.py) -> what moved. At most once per SWEEP_S per
+        project store: the task ledger is read whole, and a tick runs every
+        INTERVAL_S."""
+        from . import observed
+        # BESIDE the train store, never in it: every JSON file there is read
+        # as a train.
+        path = os.path.join(os.path.dirname(state_dir(root)), SWEEP_STAMP)
+        got, _why = _read_json(path)
+        if isinstance(got, dict) and 0 <= now - float(got.get("ts") or 0) \
+                < SWEEP_S:
+            return []
+        _write_json(path, {"ts": now})
+        return observed.sweep(post, now=now)
 
     def remove_room(self, root, room):
         be = vcs.backend(root)
@@ -1855,6 +2409,9 @@ def _basis_words(car):
     """How the car's reader cleared it. The reader is NAMED, never
     mentioned: a post about a car must not wake the seat that read it."""
     who = car.get("reader") or "?"
+    if car.get("basis") == landwindow.LAND_FIRST:
+        return "%s; its row stays open for %s's post-land read" % (
+            landwindow.LAND_FIRST_MARK, who)
     return ("held source-clean by %s" % who
             if car.get("basis") == "source-clean" else "APPROVE by %s" % who)
 
@@ -1901,19 +2458,19 @@ def _red_name(gid):
 def _merge_detail(car):
     """The parenthesis the car's merge subject carries: task (and its title
     first, when it has one: trunk's subject is where the morning report
-    reads a land's plain words), priority, whether it is a door, its author
-    and its reader."""
+    reads a land's plain words), priority, and whether it is a door.
+
+    NO SEAT AND NO MODEL (task/4033). Commit metadata is akapug's alone (the
+    owner's canon), so who built the lane, who read it and on which model never
+    ride in a subject. That provenance is the ledger's: the row (its id is
+    in the merge body), its verdict or hold, and the AUTHORS line its landed
+    close prints."""
     doors = car.get("doors")
     door = ("not a door" if doors == [] else "a DOOR: %s" % ", ".join(doors)
             if doors else "doors UNKNOWN")
     what = "%s;" % _car_words(car) if car.get("title") \
         else "%s," % _task_words(car)
-    return "%s %s, %s; author %s; %s (%s) read %s %s" % (
-        what, car.get("priority") or "P?", door,
-        car.get("author") or "?", car.get("reader") or "?",
-        car.get("model") or "model unread",
-        "SOURCE-CLEAN" if car.get("basis") == "source-clean" else "APPROVE",
-        _short(car["id"]))
+    return "%s %s, %s" % (what, car.get("priority") or "P?", door)
 
 
 class _Tick(object):
@@ -1926,6 +2483,9 @@ class _Tick(object):
         self.now = ops.now()
         self.control = None
         self.seen = set()
+        # The final admitted car facts are cached for the push admission;
+        # their task/chain proof is also saved in the train's car records.
+        self._ready_cars = []
         # Whether this tick holds the store's lock right now (`locked`): a
         # save inside it writes straight through and never takes the lock
         # twice, which would wait on itself.
@@ -2102,8 +2662,9 @@ class _Tick(object):
         self.post_once(st, "stopped:%s:%s" % (where, stop.get("why")), (
             "auto-land STOPPED %s at %s: %s. Room %s (head %s) is left as it "
             "stands; nothing more is automated for it. `%s --resume` retries "
-            "from %s once the cause is cured; `%s --abandon --reason R` ends "
-            "it and removes its rooms." % (
+            "from %s once the cause is cured; `%s --abandon --reason R "
+            "[--drop ROW|LANE]` ends it, removes its rooms, and with --drop "
+            "keeps that one car's tip out of the next train." % (
                 st.get("name") or st["train"], where, stop.get("why"),
                 st.get("room") or "not minted", _short(st.get("head")), PROG,
                 where, PROG)))
@@ -2172,7 +2733,28 @@ class _Tick(object):
                          "and the next one reads the store afresh" % exc)
                 rc = 0
         self.finish()
+        self.observed_sweep()
         return rc
+
+    def observed_sweep(self):
+        """A seen-working check older than a day moves once to its fallback
+        owner (helm/observed.py), posted with its one @mention. It runs
+        after the tick's own work and never holds a land: a sweep that
+        fails is said, and the tick's answer is unchanged."""
+        if not self.apply:
+            return
+        try:
+            moved = self.ops.observed_sweep(
+                self.root, self.now,
+                lambda text: None if self.post(text) else "not posted")
+        except Exception as exc:            # noqa: BLE001 — never a hold
+            self.say("the seen-working sweep did not run: %s: %s"
+                     % (type(exc).__name__, exc))
+            return
+        for m in moved or ():
+            self.say("%s: its seen-working check moved from @%s to @%s%s"
+                     % (m["task"], m["from"], m["to"], "" if m["posted"]
+                        else " (the @mention was not posted)"))
 
     # -- IDLE ---------------------------------------------------------------
     def idle(self):
@@ -2246,8 +2828,41 @@ class _Tick(object):
                          "doors": facts.get("doors"),
                          "author": facts.get("author"),
                          "reader": facts.get("reader"),
-                         "model": facts.get("model")})
+                         "model": facts.get("model"),
+                         "chain": facts.get("chain"),
+                         "findings_kept": facts.get("findings_kept"),
+                         "tasks_named": facts.get("tasks_named"),
+                         "whole": facts.get("whole"),
+                         "scope": facts.get("scope"),
+                         "chain_rows": facts.get("chain_rows"),
+                         "lane_rows": facts.get("lane_rows"),
+                         "findings_unread": facts.get("findings_unread"),
+                         "step_unread": facts.get("step_unread")})
         return cars, barred
+
+    @staticmethod
+    def _car_proof(old, fresh):
+        """Refresh task custody without erasing an earlier compose refusal.
+
+        A later successful read does not prove that a finding or sibling row
+        unreadable at compose was safe to close. An old task-UNKNOWN is
+        different: the current own-row/lane join can now prove that task.
+        """
+        car = dict(old, **fresh)
+        for key in ("findings_kept", "tasks_named"):
+            # Either read's protected task/finding remains protected even if
+            # the later ledger no longer names it.
+            car[key] = sorted(set(old.get(key) or ()) |
+                              set(fresh.get(key) or ()))
+        if not old.get("task_unknown") and not car.get("task_unknown"):
+            if old.get("findings_unread"):
+                car["findings_unread"], car["chain"] = (
+                    old["findings_unread"], None)
+            if old.get("step_unread"):
+                car["step_unread"] = old["step_unread"]
+                car["whole"], car["chain_rows"], car["lane_rows"] = (
+                    None, [], [])
+        return car
 
     def intent_text(self, st):
         veto_s = _env_seconds(VETO_ENV, VETO_S)
@@ -2566,6 +3181,17 @@ class _Tick(object):
                                % why)
         mine = [r for r in rows or () if r.get("head") == st["head"]
                 and r.get("id") not in st.get("red", ())]
+        spent = _spent(st)
+        if not mine and spent:
+            # A FINISHED GATE IS NEVER WAITED ON: its red is read, so no
+            # receipt is coming for this head from the job it launched.
+            return self.stop(st, "gate job %s is finished and its red "
+                             "gate:%s was already read, so nothing runs for "
+                             "head %s; a relaunch of the same tree and "
+                             "attempt is answered by that same job, so only "
+                             "a flake recorded for its tree, or a new room, "
+                             "launches a fresh gate" % (
+                                 spent[0], spent[1], _short(st["head"])))
         if not mine:
             waited = self.now - (st.get("launch_ts") or self.now)
             if waited > _env_seconds(GATE_WAIT_ENV, GATE_WAIT_S):
@@ -2621,27 +3247,44 @@ class _Tick(object):
                 "runner's planned count"
         else:
             rule = "ran"
-            delta = ran - base.get("ran") if isinstance(ran, int) \
-                and isinstance(base.get("ran"), int) else None
+            delta = ran - base.get("ran") if type(ran) is int \
+                and type(base.get("ran")) is int else None
             said = "gate:%s ran %s over trunk's gate:%s (%s)" % (
                 gid, "%+d" % delta if delta is not None
                 else "an UNKNOWN count", base.get("id"), base.get("ran"))
             because = "the Ran rule: %s" % "; ".join(
                 w for w in (lane_why, base_why) if w)
-        if delta != ast_n:
+        if delta is None:
+            return self.stop(st, "%s: the collected delta is UNKNOWN, so "
+                             "the cross-check cannot be asked (%s)"
+                             % (said, because))
+        if delta < ast_n:
             return self.stop(st, "%s, but the diff adds %+d test methods: a "
                              "module stopped being collected or a test was "
                              "dropped (%s)" % (said, ast_n, because))
+        # ONE-SIDED (task/3906, the scope cut): a collected SURPLUS over the
+        # AST count is what discovery finds through a base class's arms — a
+        # base that gains a test method hands it to every TestCase
+        # descending from it, while the AST count sees only the bodies the
+        # diff touched. The surplus is named in the land note, not stopped.
+        # RESIDUAL: a dropped test netted out by a larger inherited surplus
+        # in the same train is not caught here, and the whole-suite gate's
+        # green does NOT bound it — a dropped, uncollected test cannot fail
+        # the suite either. This check does not see that drop at all.
+        surplus = delta - ast_n
         st["receipt"] = {"id": gid, "ran": ran, "tree": row.get("tree"),
                          "base": base.get("id"), "base_ran": base.get("ran"),
                          "rule": rule, "planned": planned,
                          "base_planned": base_planned, "delta": delta,
                          "ast": ast_n}
         st["state"], st["step"] = LANDING, "verified"
-        self.save(st, "gate:%s GREEN, planned %+d = AST %+d" % (
-            gid, delta, ast_n) if rule == "planned" else
-            "gate:%s GREEN, Ran %+d = AST %+d (%s)" % (gid, delta, ast_n,
-                                                      because))
+        counted = "planned %+d" % delta if rule == "planned" \
+            else "Ran %+d (%s)" % (delta, because)
+        note = "gate:%s GREEN, %s, AST %+d" % (gid, counted, ast_n)
+        if surplus:
+            note += ": %+d collected beyond the AST count: inherited " \
+                "arms or a new base" % surplus
+        self.save(st, note)
         return self.landing(st)
 
     def red(self, st, row):
@@ -2651,7 +3294,7 @@ class _Tick(object):
                               "host, then blame" % gid)
         _train, red, why = self.ops.red_facts(st["room"], gid)
         if why:
-            st["red"].append(gid)
+            # NOT READ, SO NOT SPENT: `--resume` reads this red again.
             return self.stop(st, "gate:%s is RED and cannot be read for "
                              "blame: %s" % (gid, why))
         status, why = self.ops.recheck(st, red)
@@ -2664,17 +3307,20 @@ class _Tick(object):
                                "failing tests could not be re-run alone on "
                                "its host: %s" % (gid, why))
         if status == GREEN:
-            if st.get("flakes", 0) >= 1:
-                st["red"].append(gid)
-                return self.stop(st, "gate:%s is RED and its failing tests "
-                                 "pass alone again (%s): a second flake"
-                                 % (gid, why))
+            # EVERY FLAKE IS RECORDED, the second too: the record is what
+            # makes the next gate of this tree a new attempt (a new job),
+            # so a person's `--resume` after the stop below gates afresh.
             _row, err = self.ops.record_flake(self.root, {
                 "tree": red.get("tree"), "gate": gid, "train": st["name"],
                 "tests": [t["id"] for t in red.get("tests") or ()],
                 "why": "auto-land: %s" % why})
             if err:
                 self.say("FLAKE NOT RECORDED — %s" % err)
+            if st.get("flakes", 0) >= 1:
+                self.spend(st, gid)
+                return self.stop(st, "gate:%s is RED and its failing tests "
+                                 "pass alone again (%s): a second flake"
+                                 % (gid, why))
             return self.regate(st, gid, "the failing tests pass alone on the "
                                "red gate's host (%s)" % why)
         broom = self.ops.room_path(self.root, self.ops.next_name(
@@ -2684,7 +3330,7 @@ class _Tick(object):
         st["blaming"] = {"gate": gid, "broom": broom}
         self.save(st, "blaming gate:%s" % gid)
         rc, result = self.ops.blame(st["room"], gid)
-        st["red"].append(gid)
+        self.spend(st, gid)
         st["blaming"] = None
         verdict = result.get("verdict") or {}
         kind = verdict.get("kind")
@@ -2710,7 +3356,7 @@ class _Tick(object):
                               % _red_name(blaming.get("gate")))
         gid, broom = blaming.get("gate"), blaming.get("broom")
         if gid != AUDITS:
-            st["red"].append(gid)
+            self.spend(st, gid)
         st["blaming"] = None
         head = self.ops.head_of(broom) if broom else None
         if not head:
@@ -2730,10 +3376,19 @@ class _Tick(object):
                   % (_red_name(gid), st["name"]))
         return self.launch(st)
 
-    def regate(self, st, gid, why):
-        st["flakes"] = st.get("flakes", 0) + 1
+    @staticmethod
+    def spend(st, gid):
+        """Red `gid` is read and acted on: it is never read again, and the
+        gate job the train launched, whose red it is, is SPENT (`_spent`)."""
         if gid not in st["red"]:
             st["red"].append(gid)
+        job = (st.get("gate") or {}).get("job_id")
+        if job:
+            st.setdefault("spent", {})[job] = gid
+
+    def regate(self, st, gid, why):
+        st["flakes"] = st.get("flakes", 0) + 1
+        self.spend(st, gid)
         st["launched"] = False
         self.save(st, "gate:%s FLAKE — one re-gate: %s" % (gid, why))
         self.say("FLAKE gate:%s — %s; the room is gated once more" % (gid,
@@ -2787,7 +3442,7 @@ class _Tick(object):
         st["state"], st["step"] = GATING, None
         st["launched"] = rc == 0
         st["launch_ts"] = self.now
-        st["gate"] = {"host": self.ops.gate_host(broom), "job_id": None}
+        st["gate"] = self.ops.gate_of(broom)
         self.save(st, "%s RED — ejected lane %s; gating %s"
                   % (red, car.get("lane"), st["name"]))
         self.say("EJECTED lane %s; GATING %s at %s" % (
@@ -2862,6 +3517,9 @@ class _Tick(object):
             if not ok:
                 return self.stop(st, "%s is PUSHED, but %s" % (_short(head),
                                                                why))
+            # THIS TICK'S START, a moment no later than the fast-forward: a
+            # resident started after it re-exec'd onto the land (web_read)
+            st["ff_ts"] = self.now
             st["step"] = step = "ff"
             self.save(st, "the shared checkout is at %s" % _short(head))
         if step == "ff":
@@ -2876,7 +3534,8 @@ class _Tick(object):
             # THE LAND'S FIRST LEDGER READ, by the landed code, before the fold
             # reads the ledger; recorded once per head (task/3538).
             self.ops.postland(self.root, head)
-            fold_rc, text = self.ops.fold_apply(self.root, head, gid)
+            fold_rc, text = self.ops.fold_apply(
+                self.root, head, gid, tuple(c["id"] for c in st["cars"]))
             if fold_rc != 0:
                 return self.stop(st, "%s is PUSHED, but `helm lr foldcheck "
                                  "--apply` exited %d: %s"
@@ -2886,10 +3545,27 @@ class _Tick(object):
                 return self.stop(st, "%s is PUSHED, but `helm lr foldcheck "
                                  "--apply` did not prove the fold: %s"
                                  % (_short(head), why))
+            closed = re.findall(r"^\s+CLOSED\s+(\S+)", text, re.M)
+            foreign = re.findall(r"^\s+REPORTED\s+(\S+)", text, re.M)
+            own = {c["id"] for c in st["cars"]}
+            if any(rid in own for rid in foreign):
+                return self.stop(st, "%s is PUSHED, but the fold reported "
+                                 "an own car as foreign: %s"
+                                 % (_short(head), ", ".join(sorted(
+                                     own.intersection(foreign)))))
+            missing = [c["id"] for c in st["cars"]
+                       if c.get("basis") == "source-clean" and
+                       c["id"] not in closed and not self.ops.source_clean_closed(
+                           self.root, c["id"], c["tip"], head)]
+            if missing:
+                return self.stop(st, "%s is PUSHED, but the fold did not "
+                                 "prove own source-clean car closure: %s"
+                                 % (_short(head), ", ".join(missing)))
             st["fold"] = {
-                "closed": re.findall(r"^\s+CLOSED\s+(\S+)", text, re.M),
+                "closed": closed,
                 "refused": re.findall(r"^\s+(?:REFUSED|FAILED)\s+(\S+)", text,
-                                      re.M)}
+                                      re.M),
+                "foreign": foreign}
             st["step"] = step = "folded"
             self.save(st, "the fold is proven")
         if step == "folded":
@@ -2927,8 +3603,43 @@ class _Tick(object):
             st["step"] = step = "announced"
             self.save(st, "announced")
             self.walk_owed()
+        if step == "announced":
+            rc = self.web_read(st)
+            if rc is not None:
+                return rc
         return self.archive(st, DONE, "LAND %s %s" % (st.get("land") or "?",
                                                       _short(head)))
+
+    def web_read(self, st):
+        """THE WEB IS READ, NEVER RESTARTED (task/3796). A land whose cars
+        touch what follows its code (FOLLOWS_RULES) is read once
+        WEB_FOLLOW_S have passed since its fast-forward: the console web's
+        served digest against trunk's (`Ops.web_code`, judged by
+        `web_follows`). A web still on the code from before the land is ONE
+        line to the integrator; anything else is noted in the train's
+        history. Nothing is restarted. -> None when the land may end, 0
+        while the minute runs (the train waits for a later tick), 1 when the
+        post did not go (retried next tick)."""
+        if st.get("web") or not any(c.get("follows") for c in st["cars"]):
+            return None
+        since = st.get("ff_ts") or st.get("pushed_ts") or self.now
+        left = since + WEB_FOLLOW_S - self.now
+        if left > 0:
+            self.say("LAND %s: the web's code is read in %d s, once it has "
+                     "had %d s to follow the land" % (
+                         st.get("land") or "?", int(left) or 1,
+                         WEB_FOLLOW_S))
+            return 0
+        stale, note = web_follows(self.ops.web_code(self.root), since)
+        if stale and not self.post_once(st, "web-stale", "auto-land %s "
+                                        "LAND %s: %s" % (
+                                            st["name"], st.get("land") or "?",
+                                            stale)):
+            return 1
+        st["web"] = {"stale": bool(stale), "ts": self.now}
+        self.say(note)
+        self.save(st, note)
+        return None
 
     def prepush(self, head, gid):
         """(target, why): the destination the push guard vets and resolves
@@ -2948,6 +3659,63 @@ class _Tick(object):
                               "%s %s" % (n, seen[n].discriminator)
                               for n in bad if n in seen)))
         return target, None
+
+    def _push_admission_at_readiness(self, st, head):
+        """Snapshot the current DOOR holds under the final readiness lock.
+
+        Nothing returned here is stored until git positively answers the push.
+        An unprovable DOOR stops the push; an unreadable checkout identity does
+        not withhold an otherwise-ready train containing only non-DOOR cars.
+        """
+        from . import dispatches, dispatches_tier
+        fresh = {c["id"]: c for c in self._ready_cars}
+        doors = [c for c in st["cars"] if c.get("basis") == "source-clean"
+                 and (c.get("doors") != [] or
+                      fresh.get(c["id"], {}).get("doors") != [])]
+        try:
+            info = dispatches._repo_info(self.root)
+        except Exception:  # noqa: BLE001 — no checkout identity on failure
+            info = None
+        if not info or info.get("repo") != os.path.realpath(self.root) \
+                or not info.get("repo_id"):
+            return None, "the checkout identity could not be read" if doors else None
+        cars = []
+        if doors:
+            try:
+                rows, why = dispatches.snapshot()
+            except Exception as exc:  # noqa: BLE001 — no proof from an unread ledger
+                rows, why = None, "%s: %s" % (type(exc).__name__, exc)
+            if why or not isinstance(rows, dict):
+                return None, "the dispatch ledger hold cannot be read (%s)" % (
+                    why or "no rows")
+            for car in doors:
+                row = rows.get(car["id"])
+                if not isinstance(row, dict) or row.get("status") != "held" \
+                        or row.get("id") != car["id"] \
+                        or row.get("lane") != car["lane"] \
+                        or dispatches._clean_tip_of(row) != car["tip"]:
+                    return None, "lane %s has no matching standing hold" % car["lane"]
+                proof = row.get("hold_approval")
+                if not isinstance(proof, dict) or not all(
+                        isinstance(row.get(k), str) and row[k] for k in (
+                            "hold_ts", "hold_actor")) \
+                        or not isinstance(proof.get("anchor"), str) \
+                        or not proof["anchor"]:
+                    return None, "lane %s has no readable hold identity" % car["lane"]
+                try:
+                    ok, why = dispatches_tier.hold_approval(row, self.root)
+                except Exception as exc:  # noqa: BLE001 — no proof on failure
+                    ok, why = False, "%s: %s" % (type(exc).__name__, exc)
+                if not ok:
+                    return None, "lane %s hold is not admitted (%s)" % (
+                        car["lane"], why)
+                cars.append({"id": car["id"], "lane": car["lane"],
+                             "tip": car["tip"], "hold_ts": row["hold_ts"],
+                             "hold_actor": row["hold_actor"],
+                             "anchor": proof["anchor"]})
+        return {"v": 2, "repo": info["repo"], "repo_id": info["repo_id"],
+                "head": head, "gate": st["receipt"]["id"],
+                "cars": cars}, None
 
     def last_word(self, st, head, checked):
         """THE LAST WORD BEFORE THE PUSH, and the push, under both locks.
@@ -2997,6 +3765,11 @@ class _Tick(object):
                 rc = self.ready_at_the_push(st, head)
                 if rc is not None:
                     return rc
+                admission, why = self._push_admission_at_readiness(st, head)
+                if why:
+                    st["step"] = "verified"
+                    return self.stop(st, "%s is not pushed: %s" % (
+                        _short(head), why))
                 why = self.land_veto(st, head)
                 if why:
                     return self.stop(st, why)
@@ -3030,6 +3803,13 @@ class _Tick(object):
                 ok, detail = self.ops.push(self.root, head, target, keep,
                                            lease=st["trunk"])
                 st["sending"] = None
+                if ok is True and admission is not None \
+                        and isinstance(target, PushTarget) \
+                        and all(isinstance(value, str) and value for value in (
+                            target.ref, target.remote, target.url)) \
+                        and _TRUNK_REF.match(target.ref):
+                    st["push_admission"] = dict(
+                        admission, target=_dest(target), remote=target.remote)
                 if ok is None:
                     return self.stop(st, "%s is not pushed, and git was not "
                                      "run: %s" % (_short(head),
@@ -3143,15 +3923,52 @@ class _Tick(object):
         was closed by the fold). A needs-restart car's ops item is posted to
         the integrator, never performed. -> None, or the `CloseFailed` text
         of a close that did not answer: that car is not done, nothing after
-        it is closed, and the next tick retries.
+        it is closed, and the next tick retries. Once every car is closed,
+        each car's lane lease is released (`releases`).
 
-        NO TASK IS CLOSED HERE (task/3643, the work-surface design's
-        ruling): a land is not a re-read of the whole ask, and closing at
-        land re-opened two tasks in one night (task/3626). The car's task is
-        named on the merge line and the announcement, and `taskkey
-        .lands_by_task` reports it landed; the task's owner closes it."""
+        NO TASK CLOSES HERE (task/3746, helm/landtask.py): a land is not a
+        re-read of the whole ask, and closing at land re-opened two tasks in
+        one night (task/3626). A lane that says `--whole` leaves its task
+        LANDED, owing one named seat's seen-working check
+        (helm/observed.py); any other land asks the task's room whether the
+        whole ask is done. The car's task is named on the
+        merge line and the announcement, and `taskkey.lands_by_task` reports
+        it landed.
+
+        THE FINDINGS A CAR'S CHAIN FILED DO CLOSE, "cured in LAND N"
+        (task/3742): the chain that found them has landed, so the chain
+        answered them. They are sub-tasks a FIX filed, never the task."""
+        from . import landtask
         done = st.setdefault("closed", [])
         land = "LAND %s" % (st.get("land") or "?")
+        # The push may have succeeded in an earlier process, and lane task
+        # records can move without changing a car's id or tip. Read custody
+        # facts again before computing the protected tasks or ANY LAND close.
+        # Keep the reviewed car's identity and its already-completed steps;
+        # only the live task/chain proof can authorize subsequent writes.
+        proof = ("task", "task_unknown", "title", "priority", "chain",
+                 "findings_kept", "tasks_named", "whole", "scope",
+                 "chain_rows", "lane_rows", "findings_unread", "step_unread")
+        for car in st["cars"]:
+            if car["id"] not in done:
+                try:
+                    facts = self.ops.car_facts(self.root, car)
+                except Exception as exc:  # noqa: BLE001 — no stale close
+                    facts = {"task_unknown": "the LAND could not reread the "
+                             "car's task (%s)" % type(exc).__name__,
+                             "findings_unread": "the LAND could not reread "
+                             "the car's chain; nothing was closed",
+                             "step_unread": "the LAND could not reread the "
+                             "car's chain; its rows stay open"}
+                car.update(self._car_proof(
+                    car, {key: facts.get(key) for key in proof}))
+        if len(done) < len(st["cars"]):
+            self.save(st, "car task and chain facts refreshed before LAND")
+        # NO CAR'S TASK CLOSES AS A FINDING OF ANY CAR'S CHAIN in this LAND:
+        # every car's task, and every id an UNKNOWN car's records name.
+        tasks_of = {t for c in st["cars"]
+                    for t in [c.get("task")] + list(c.get("tasks_named") or ())
+                    if t}
         for car in st["cars"]:
             if car["id"] in done:
                 continue
@@ -3161,18 +3978,29 @@ class _Tick(object):
                 ["UNKNOWN: its diff could not be read (%s); the integrator "
                  "decides" % why]
             car["restart"] = owed
+            car["follows"] = follows_code(changes) if changes is not None \
+                else []
             if car.get("basis") == "source-clean":
-                if car["id"][:12] not in {c[:12] for c in
-                                          st["fold"]["closed"]}:
+                if car["id"] not in st["fold"]["closed"] and not \
+                        self.ops.source_clean_closed(
+                            self.root, car["id"], car["tip"], st["head"]):
                     self.post_once(st, "fold:%s" % car["id"], "auto-land %s "
                                    "%s: row %s (lane %s) was not closed by "
                                    "`helm lr foldcheck --apply`; close it by "
                                    "hand." % (st["name"], land,
                                               _short(car["id"]), car["lane"]))
-            else:
+            # LANDED BEFORE REVIEW: the row is not closed. It stays OPEN as
+            # the post-land read of the landed merge, and a FIX there files a
+            # follow-on task through the findings path, never a revert.
+            elif car.get("basis") != landwindow.LAND_FIRST:
                 try:
                     _row, err = self.ops.lr_close(car["id"], not owed,
                                                   "; ".join(owed) or None)
+                    # THE ROWS ITS OWN CLOSE ALREADY TOOK (the same-tip and
+                    # predecessor sweep): the land step asks no door of them
+                    car["closed_with"] = [
+                        str(p.get("id")) for p in (_row or {}).get(
+                            "closed_siblings") or () if p.get("id")]
                 except CloseFailed as exc:
                     self.post_once(st, "close-failed:%s" % car["id"],
                                    "auto-land %s %s: `helm lr close %s "
@@ -3185,6 +4013,26 @@ class _Tick(object):
                                    "%s: `helm lr close %s --reason landed` "
                                    "refused: %s" % (st["name"], land,
                                                     _short(car["id"]), err))
+            # THE LAND STEP (task/3746): the findings the car's chain filed
+            # close (never a car's task, nor one a FIX named at the landed
+            # tip or past it, read again at the LAND: `close_findings`), then
+            # its task owes a seen-working check when its lane carried the
+            # whole ask, else the one question is asked.
+            report = self.ops.land_step(
+                self.root, car, land, st["head"], owed,
+                keep=tasks_of | set(car.get("findings_kept") or ()))
+            car["land_step"] = landtask.lines(report)
+            if report.get("findings_errors"):
+                self.post_once(st, "findings:%s" % car["id"], "auto-land %s "
+                               "%s: the review findings of lane %s were not "
+                               "all closed: %s" % (
+                                   st["name"], land, car["lane"],
+                                   "; ".join(report["findings_errors"])))
+            if report.get("errors"):
+                self.post_once(st, "land-step:%s" % car["id"], "auto-land %s "
+                               "%s: the land step of lane %s did not finish: "
+                               "%s" % (st["name"], land, car["lane"],
+                                       "; ".join(report["errors"])))
             if owed:
                 self.post_once(st, "restart:%s" % car["id"], "auto-land %s "
                                "%s: %s (lane %s) needs a restart — %s. "
@@ -3195,35 +4043,132 @@ class _Tick(object):
                                   car["lane"], "; ".join(owed)))
             done.append(car["id"])
             self.save(st)
+        return self.releases(st)
+
+    def releases(self, st):
+        """THE LANE LEASE IS RELEASED AT LAND (task/3674): the land is the
+        lease's natural end, so each car's lane lease is released, whoever
+        holds it, when the lane's tip is on the trunk (`Ops.lane_landed`,
+        the stop guard's own landedness read). A lane whose tip is not keeps
+        its lease: its holder is still building. What became of each is
+        recorded on the car (`lease`) and read by the LAND line: the lanes
+        released, and every release that refused, by name. -> None: nothing
+        here stops the land.
+
+        NOTHING IS RELEASED TWICE. A car whose answer is recorded is not
+        asked again. ASKED is recorded before the release runs, so a tick
+        killed under it leaves the next one the lease it saw (its fence): a
+        lease still there under that fence is asked again, one granted since
+        is never released, and one gone is not claimed as released."""
+        for car in st["cars"]:
+            self.release(st, car)
         return None
+
+    def release(self, st, car):
+        """Record what became of `car`'s lane lease (L_*), once."""
+        lane, was = car["lane"], car.get("lease") or {}
+        if was and was.get("state") != L_ASKED:
+            return
+        row, why = self.ops.lane_lease(self.root, lane)
+        if why:
+            rec = {"state": L_REFUSED, "why": "the claims ledger could not "
+                   "be read: %s" % why}
+        elif was and not row:
+            rec = {"state": L_NONE, "holder": was.get("holder"),
+                   "why": "no longer held; the tick that asked for its "
+                          "release did not record the answer"}
+        elif was and row.get("fence") != was.get("fence"):
+            rec = {"state": L_KEPT, "holder": row.get("holder"),
+                   "why": "claimed again (fence %s) since its release was "
+                          "asked; a land never releases a lease it did not "
+                          "read" % row.get("fence")}
+        elif not row:
+            rec = {"state": L_NONE}
+        else:
+            rec = self.release_landed(st, car, row)
+        car["lease"] = rec
+        note = "lane %s lease: %s%s" % (lane, rec["state"], " (%s)"
+                                        % rec["why"] if rec.get("why")
+                                        else "")
+        self.say(note)
+        self.save(st, note)
+
+    def release_landed(self, st, car, row):
+        """The lease `row` on `car`'s lane: released when the lane's tip is
+        on the trunk, else kept. -> its record. What the release did is read
+        back off the claims ledger, never inferred from its exit status: a
+        release can give the lease back and then keep a room it could not
+        retire, and exit non-zero."""
+        lane = car["lane"]
+        state, proof = self.ops.lane_landed(self.root, lane)
+        if state not in _gc.RETIRABLE:
+            return {"state": L_KEPT, "holder": row.get("holder"),
+                    "why": proof}
+        car["lease"] = {"state": L_ASKED, "holder": row.get("holder"),
+                        "fence": row.get("fence")}
+        self.save(st, "lane %s: its lease is released (%s)" % (lane, proof))
+        ok, text = self.ops.release_lease(self.root, lane, row["holder"],
+                                          row["lease"])
+        _history(st, self.now, "lane %s: `helm work release` answered: %s"
+                 % (lane, _whole(text)))
+        after, why = self.ops.lane_lease(self.root, lane)
+        gone = not why and (not after
+                            or after.get("fence") != row.get("fence"))
+        return {"state": L_RELEASED if gone else L_REFUSED,
+                "holder": row.get("holder"),
+                "why": None if gone and ok else _work_line(text)}
 
     def announce_text(self, st):
         """The LAND line the owner reads: what the land changed, in its
         cars' plain words, first; the head, the gate and the provenance
-        after it."""
+        after it, and what the land step did with each car's task."""
         rec, head = st["receipt"], st["head"]
         restart = ["%s: %s" % (c.get("task") or c["lane"],
                                "; ".join(c["restart"]))
                    for c in st["cars"] if c.get("restart")]
+        leases = [(c["lane"], c.get("lease") or {}) for c in st["cars"]]
+        released = [lane for lane, rec in leases
+                    if rec.get("state") == L_RELEASED]
+        refused = ["lane %s: %s" % (lane, rec.get("why"))
+                   for lane, rec in leases if rec.get("state") == L_REFUSED]
+        steps = [line for c in st["cars"] for line in c.get("land_step")
+                 or ()]
         # A receipt record with no `rule` was verified by the Ran rule.
+        # The count relation is the ONE-SIDED truth (task/3906): equality,
+        # or the surplus named — never a false "=" over a surplus.
+        surplus = rec["delta"] - rec["ast"]
+        relation = "= AST %+d" % rec["ast"] if not surplus else \
+            "vs AST %+d: %+d collected beyond the AST count (inherited " \
+            "arms or a new base)" % (rec["ast"], surplus)
         return ("[MEASURED] @all LAND %s: %s. PUSHED %s (gate:%s whole-suite "
-                "OK, Ran %s, %s%+d = AST %+d): %s. Auto-landed as %s with no "
-                "integrator action%s%s. CL %d: falsified if %s is not on %s, "
+                "OK, Ran %s, %s%+d %s): %s. Auto-landed as %s with no "
+                "integrator action%s%s%s%s%s. CL %d: falsified if %s is not on "
+                "%s, "
                 "or gate:%s does not read OK on its tree." % (
                     st.get("land") or "?",
                     "; ".join(_car_words(c) for c in st["cars"]), head[:11],
                     rec["id"], rec["ran"], "planned "
                     if rec.get("rule") == "planned" else "", rec["delta"],
-                    rec["ast"], "; ".join(
+                    relation, "; ".join(
                         "%s lane %s (row %s, %s)" % (
                             _task_words(c), c["lane"],
                             _short(c["id"]), _basis_words(c))
                         for c in st["cars"]), st["name"],
                     "; needs restart (posted to the integrator): %s"
                     % "; ".join(restart) if restart else "",
+                    "; leases released: %s" % ", ".join(released)
+                    if released else "",
+                    "; lease release refused: %s" % "; ".join(refused)
+                    if refused else "",
                     "; the LAND counter refused: %s" % st["land_why"]
-                    if st.get("land_why") else "", CL, head[:11],
-                    st.get("ref") or "trunk", rec["id"]))
+                    if st.get("land_why") else "",
+                    "; foreign source-clean holds reported (not train cars): %s"
+                    % ", ".join(st["fold"]["foreign"])
+                    if st.get("fold", {}).get("foreign") else "",
+                    CL, head[:11],
+                    st.get("ref") or "trunk", rec["id"])) + (
+                        " The land step: %s." % "; ".join(steps)
+                        if steps else "")
 
     def ready_at_the_push(self, st, head):
         """None when every car of the train is still READY at its exact tip
@@ -3250,8 +4195,8 @@ class _Tick(object):
                                   got["ejections_unknown"]))
         still, dropped = self.still_ready(st, got, since="the compose")
         mine = {c["id"] for c in still}
-        _cars, barred = self.admitted([c for c in got["cars"]
-                                       if c["id"] in mine])
+        cars, barred = self.admitted([c for c in got["cars"]
+                                      if c["id"] in mine])
         unready = ["lane %s (row %s, %s, tip %s): %s" % (
             d["lane"], _short(d["id"]), self.car_task(st, d["id"]),
             _short(d["tip"]), d["why"]) for d in dropped]
@@ -3260,6 +4205,13 @@ class _Tick(object):
                        self.car_task(st, car["id"]), _short(car["tip"]), why)
                     for car, why in barred]
         if not unready:
+            # A push may finish in another tick: custody of the final proof
+            # belongs to the train file, not this tick's transient cache.
+            by_id = {c["id"]: c for c in cars}
+            st["cars"] = [self._car_proof(c, by_id[c["id"]])
+                          for c in st["cars"]]
+            self._ready_cars = cars
+            self.save(st, "car facts refreshed at push readiness")
             return None
         st["step"] = "verified"
         return self.stop(st, "%s is not pushed: %d car(s) no longer READY at "
@@ -3317,15 +4269,7 @@ class _Tick(object):
     def halted(self):
         """Why a push must not go now, read under the store's lock: the
         switch was thrown (or cannot be read) since this tick began."""
-        control, why = read_control(self.root)
-        if why:
-            return "the switch is unreadable (%s)" % why
-        paused = control.get("paused")
-        if paused:
-            return "paused by %s (%s); `%s --resume` lands it" % (
-                paused.get("by"), paused.get("reason") or "no reason given",
-                PROG)
-        return None
+        return off_reason(self.root, timer=False)
 
     # -- STOPPED ------------------------------------------------------------
     def stopped(self, st):
@@ -3431,16 +4375,16 @@ def _root_of(repo, prog):
 
 def cmd(args):
     """helm train auto [--repo PATH] [--apply] [--status] [--pause [--reason
-    R] | --resume | --abandon [--force] --reason R] | seed <n> <sha> |
-    --install-timer"""
+    R] | --resume | --abandon [--force] [--drop ROW|LANE] --reason R] |
+    seed <n> <sha> | --install-timer"""
     from .cli import guard_tail
     args = list(args or ())
     if args[:1] == ["seed"]:
         return _cmd_seed(args[1:])
     flags = ("--apply", "--status", "--pause", "--resume", "--abandon",
              "--force", "--install-timer")
-    rc = guard_tail(PROG, args, flags=flags, valued=("--repo", "--reason"),
-                    usage=USAGE)
+    rc = guard_tail(PROG, args, flags=flags,
+                    valued=("--repo", "--reason", "--drop"), usage=USAGE)
     if rc is not None:
         return rc
     acts = [a for a in ("--status", "--pause", "--resume", "--abandon",
@@ -3454,8 +4398,12 @@ def cmd(args):
         print("%s: --force goes only with --abandon (%s)" % (PROG, USAGE),
               file=sys.stderr)
         return 2
+    if "--drop" in args and "--abandon" not in args:
+        print("%s: --drop goes only with --abandon (%s)" % (PROG, USAGE),
+              file=sys.stderr)
+        return 2
     opts = {a: args[i + 1] for i, a in enumerate(args)
-            if a in ("--repo", "--reason")}
+            if a in ("--repo", "--reason", "--drop")}
     reason = " ".join(str(opts.get("--reason") or "").split()) or None
     if "--install-timer" in args:
         ok, detail = ensure_timer()
@@ -3483,15 +4431,18 @@ def cmd(args):
             print("%s: --abandon records why: --reason TEXT (%s)"
                   % (PROG, USAGE), file=sys.stderr)
             return 2
-        st, why = abandon(root, _who(), reason, force="--force" in args)
+        st, why = abandon(root, _who(), reason, force="--force" in args,
+                          drop=opts.get("--drop"))
         if why:
             print("%s: REFUSED — %s" % (PROG, why), file=sys.stderr)
             return 1
         gone = st["abandoned"]
-        print("%s: %s ABANDONED%s%s" % (
+        print("%s: %s ABANDONED%s%s%s" % (
             PROG, st.get("name") or st["train"],
             "; rooms left: %s" % "; ".join(gone["rooms_left"])
             if gone["rooms_left"] else "",
+            "; tip %s stays out of the next train" % _short(
+                gone["dropped"]["tip"]) if gone.get("dropped") else "",
             "; OWED, by hand: `%s`" % "`, then `".join(gone["owed"])
             if gone.get("owed") else ""))
         if gone.get("post_failed"):

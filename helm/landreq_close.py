@@ -1208,10 +1208,10 @@ def chain_credits(lr, lrs=None):
     order the chain's rounds were written: the builder first.
 
     ONE LANE, SEVERAL AUTHORS is the shape the review procedure now has: a
-    reviewer of either family who finds a MECHANICAL defect commits the cure on
-    a branch off the exact reviewed tip and records it on the verdict
-    (`patch_tip`), and the lane owner or integrator rebases onto that tip. The
-    reviewer therefore wrote part of what lands, and the landing record has to
+    reviewer of either family who finds a MECHANICAL defect commits the cure
+    off the exact reviewed tip and records it on the verdict
+    (`patch_tip`), and the lane owner or integrator merges that exact tip
+    into a new composition commit. The reviewer therefore wrote part of what lands, and the landing record has to
     say so — the old procedure had no second name to record because the
     reviewer was never allowed to write code.
 
@@ -3358,8 +3358,9 @@ def source_clean_holder_error(row, rows=None, verdicts=None):
     rung's own (LANE_AUTHOR, UNREADABLE).
 
     THE RULING: the hold was recorded by the row's RECIPIENT, or by its
-    sender or custodian on a fresh-context read it recorded on this row at
-    the held tip (`dispatches.holds_on_its_fresh_read`, task/3658), and
+    sender or custodian on a fresh-context read (or a verified cross-family
+    or fable read, task/3887) it recorded on this row at the held tip
+    (`dispatches.holds_on_its_fresh_read`, task/3658), and
     that seat wrote NO round of the lane, or its claim rests on a reading
     instance that wrote none of it (task/3483) or on a pair agreement on a
     reviewer's patch (task/3561). Both halves are the tree's existing reads,
@@ -3420,7 +3421,8 @@ def source_clean_holder_error(row, rows=None, verdicts=None):
             "the hold was recorded by %s, not by the row's recipient %s — only "
             "the reader the row was sent to can say its read found nothing, "
             "or a party of the row on a fresh-context read it recorded here "
-            "at the held tip" % (actor, recipient or "(unnamed)"),
+            "at the held tip, or a cross-family/fable read whose run the "
+            "verdict verified there" % (actor, recipient or "(unnamed)"),
             landreq.SourceCleanRefusal.NOT_RECIPIENT)
     return landreq.source_clean_author_error(row, actor, rows, verdicts)
 
@@ -3540,11 +3542,13 @@ def source_clean_author_error(row, seat, rows=None, verdicts=None, tip=None,
 
     A LANE AUTHOR'S CLAIM STANDS ON EITHER OF TWO READS BY OTHERS:
       * a fresh-context read `seat` itself recorded on this row, CONCURring
-        at exactly the held tip (`_fresh_instance_read`). The verdict door
-        admitted it only after judging the run as the reading instance
-        (`dispatches.reading_instance_is_fresh`: its own record and its own
-        lineage, never the session that spawned it, task/3658). It binds a
-        door lane as a reversible one;
+        at exactly the held tip (`_fresh_instance_read`), or a cross-family
+        or fable read carrying the verdict writer's `read_run_verified` fact
+        for that tip (task/3887). The verdict door judged the run as the
+        reading instance (`dispatches.reading_instance_is_fresh`: its own
+        record and its own lineage, never the session that spawned it,
+        task/3658) when it recorded the read; replay reads only the ledger.
+        It binds a door lane as a reversible one;
       * PAIR AGREEMENT on a reviewer's patch at exactly the held tip
         (`_pair_agreement`, task/3561, store premise
         pair-agreement-lands-a-mechanical-patch-a-door-patch-owes-a-re-read):
@@ -3635,20 +3639,42 @@ def _pair_agreement(row, seat, tip, rows=None):
 
 
 def _fresh_instance_read(row, seat, tip):
-    """The fresh-context advisory read `seat` recorded on `row` CONCURring at
-    exactly `tip`, or None (task/3483) — the reading instance a lane
-    author's source-clean claim may rest on (`source_clean_author_error`).
-    A FIX or SUPERSEDE found something, and a read of another tip read other
+    """The independent advisory read `seat` recorded on `row` CONCURring at
+    exactly `tip`, or None (task/3483) — the reading instance a lane author's
+    source-clean claim may rest on (`source_clean_author_error`).
+
+    READ FROM THE LEDGER ALONE, NEVER A PROBE (task/3887, the integrator's
+    ruling). A `fresh-context` read was verified when it was recorded, so its
+    label admits it as on main. A `cross-family` or `fable` read is admitted
+    only when IT carries `read_run_verified` for the run and tip it names —
+    the fact the VERDICT WRITER wrote after verifying the run on disk once, at
+    write time. Replay, the train planner and the post-land close read that
+    fact and never touch git or a transcript: after a land the tip has no lane
+    base, so a probe there would refuse and flip closed rows back to held. A
+    FIX or SUPERSEDE found something, and a read of another tip read other
     work, so neither is a clean read of this one."""
     tip = landreq._tip(tip)
     for read in (row or {}).get("advisory_reads") or ():
-        if isinstance(read, dict) and tip \
-                and read.get("independence") == "fresh-context" \
-                and read.get("polarity") == "concur" \
-                and landreq._tip(read.get("reviewed_tip")) == tip \
-                and landreq._same_seat(read.get("recorded_by"), seat):
+        if not (isinstance(read, dict) and tip
+                and read.get("independence") in dispatches.INDEPENDENCE
+                and read.get("polarity") == "concur"
+                and landreq._tip(read.get("reviewed_tip")) == tip
+                and landreq._same_seat(read.get("recorded_by"), seat)):
+            continue
+        if read.get("independence") == "fresh-context" or _read_run_verified(
+                read, tip):
             return read
     return None
+
+
+def _read_run_verified(read, tip):
+    """Does the read `read` carry the verdict writer's `read_run_verified`
+    fact for the run and tip it names (task/3887)? The fact is what lets a
+    cross-family/fable read admit a lane author's hold without a read-side
+    probe."""
+    fact = read.get("read_run_verified")
+    return bool(isinstance(fact, dict) and fact.get("run")
+                and landreq._tip(fact.get("tip")) == tip)
 
 
 def source_clean_rehold(row):
@@ -3838,12 +3864,86 @@ def source_clean_car(lr):
     why = dispatches._source_clean_lineage_error(root, row, tip)
     if why:
         return refuse(why)
+    from . import dispatches_tier
+    try:
+        doors = dispatches.held_tip_doors(row, tip, rows)()
+    except Exception:  # noqa: BLE001 — unread doors could include a door
+        doors = [("unknown", "the lane's doors could not be read")]
+    if doors:
+        ok, why = dispatches_tier.hold_approval(row, root)
+        if not ok:
+            return refuse("its DOOR holder has no standing hold-time approval: %s" % why)
     return tip, None
 
 
 def _source_clean_refusal(rid, failures):
     return ("%s does not qualify for source-clean-landed: %s"
             % (rid[:12], "; ".join("%s: %s" % pair for pair in failures)))
+
+
+def _source_clean_pushed_admission(row, repo, gitdir, trunk_ref, pinned, gate):
+    """A successful train push of this hold, still bound to its remote push URL."""
+    from . import autoland, dispatches_tier, landwindow
+    if not repo or not isinstance(gate, dict) or gate.get("head") != pinned:
+        return False
+    ok, _why = dispatches_tier.hold_approval(row, repo, current=False)
+    if not ok:
+        return False
+    info = dispatches._repo_info(repo)
+    if not info or info["repo_id"] != gitdir:
+        return False
+    train, why = autoland.active(info["repo"])
+    if why or not isinstance(train, dict) or train.get("head") != pinned \
+            or train.get("step") not in ("pushed", "folded") \
+            or not isinstance(train.get("receipt"), dict) \
+            or train["receipt"].get("id") != gate.get("gate") \
+            or type(train.get("pushed_ts")) not in (int, float):
+        return False
+    marker = train.get("push_admission")
+    if not isinstance(marker, dict) or set(marker) != {
+            "v", "repo", "repo_id", "head", "gate", "target", "remote",
+            "cars"} \
+            or type(marker["v"]) is not int or marker["v"] != 2 \
+            or (marker["repo"], marker["repo_id"], marker["head"],
+                marker["gate"]) != (info["repo"], gitdir, pinned,
+                                    gate["gate"]) \
+            or not isinstance(marker["target"], str) \
+            or not isinstance(marker["remote"], str) \
+            or not isinstance(marker["cars"], list):
+        return False
+    ref, sep, url = marker["target"].partition(" at ")
+    if not sep or not url or not autoland._TRUNK_REF.fullmatch(ref) \
+            or not marker["remote"] or trunk_ref != (
+                "refs/remotes/%s/%s" % (marker["remote"],
+                                         ref[len("refs/heads/"):])) \
+            or not dispatches._valid_trunk_ref(trunk_ref):
+        return False
+    root = gitdir[:-5] if gitdir.endswith("/.git") else gitdir
+    # The name may now select another pushurl or several destinations.
+    rc, out, _err = vcs.backend(root).text(
+        root, "remote", "get-url", "--push", "--all", marker["remote"],
+        env=landwindow._env())
+    urls = [u.strip() for u in out.splitlines() if u.strip()] if rc == 0 else []
+    if not urls or any(u != url for u in urls):
+        return False
+    tip = dispatches._clean_tip_of(row)
+    original = [c for c in train.get("cars", []) if isinstance(c, dict)
+                and c.get("id") == row["id"]] if isinstance(
+                    train.get("cars"), list) else []
+    if len(original) != 1 or (original[0].get("lane"),
+            original[0].get("tip"), original[0].get("basis")) != (
+                row.get("lane"), tip, "source-clean"):
+        return False
+    matched = [c for c in marker["cars"] if isinstance(c, dict)
+               and c.get("id") == row["id"]]
+    if len(matched) != 1 or set(matched[0]) != {
+            "id", "lane", "tip", "hold_ts", "hold_actor", "anchor"}:
+        return False
+    proof = row.get("hold_approval")
+    return isinstance(proof, dict) and tuple(matched[0][k] for k in (
+        "id", "lane", "tip", "hold_ts", "hold_actor", "anchor")) == (
+            row["id"], row.get("lane"), tip, row.get("hold_ts"),
+            row.get("hold_actor"), proof.get("anchor"))
 
 
 def _close_ladder_source_clean_landed(lr, evidence, repo, trunk, gate,
@@ -3924,6 +4024,12 @@ def _close_ladder_source_clean_landed(lr, evidence, repo, trunk, gate,
     gitdir, err = landreq._close_repo(lr, repo)
     if err:
         return None, err
+    root = gitdir[:-5] if gitdir.endswith("/.git") else gitdir
+    if not trunk:
+        from . import autoland
+        ref, remote, branch = autoland.Ops().declared(root)
+        if remote and branch and autoland._TRUNK_REF.fullmatch(ref):
+            trunk = "refs/remotes/%s/%s" % (remote, branch)
     trunk_ref, pinned, _target, terr = landreq._close_trunk(lr, gitdir, trunk)
     if terr:
         return None, terr
@@ -3934,7 +4040,16 @@ def _close_ladder_source_clean_landed(lr, evidence, repo, trunk, gate,
         return None, ("the repository at %s cannot prove its own trunk object "
                       "— refusing to adjudicate a landing over an unreadable "
                       "substrate" % gitdir)
-    root = gitdir[:-5] if gitdir.endswith("/.git") else gitdir
+    from . import dispatches_tier
+    try:
+        doors = dispatches.held_tip_doors(row, tip, current)()
+    except Exception:  # noqa: BLE001 — unread doors cannot clear the gate
+        doors = [("unknown", "the lane's doors could not be read")]
+    policy_refusal = None
+    if doors:
+        ok, why = dispatches_tier.hold_approval(row, root)
+        if not ok:
+            policy_refusal = why
     ancestry = []
     proof = landreq._landing_proof(gitdir, tip, pinned)
     if proof != "ancestor":
@@ -3962,6 +4077,14 @@ def _close_ladder_source_clean_landed(lr, evidence, repo, trunk, gate,
     rung, facts = foldcheck.gate_containing(root, tip, gate)
     if rung.verdict != foldcheck.PASS:
         failures.append((SOURCE_CLEAN_CONDITIONS[2], rung.discriminator))
+    if policy_refusal and not (
+            policy_refusal.startswith(
+                "holder is not admitted by the current approval tier (outside:")
+            and rung.verdict == foldcheck.PASS
+            and _target == "upstream"
+            and _source_clean_pushed_admission(row, repo, gitdir, trunk_ref,
+                                               pinned, facts)):
+        failures.insert(0, (SOURCE_CLEAN_CONDITIONS[0], policy_refusal))
     if failures:
         return None, _source_clean_refusal(rid, failures)
     # THE LINE IS THE MEASUREMENT, bounded to the evidence budget, and it
@@ -5280,6 +5403,42 @@ def _close_out_of_scope(rid, evidence, dry_run):
                       "discharged by %s (%s). Closing it here would record "
                       "shipped work as unwanted; %s"
                       % (row["id"], str(by)[:12], tier, route))
+    # #187 part 2: no successor discharged the row, so ask whether the row's
+    # OWN tip landed. A ghost build/review row with no successor and its own
+    # tip on trunk passed the successor check honestly while shipping its
+    # change, and out-of-scope closed it as unwanted. The same tri-state
+    # `landreq._landed` the discharger door uses, against the SAME pinned trunk:
+    # True refuses (the work SHIPPED, naming the `--reason landed` door read
+    # live), None refuses FAIL-CLOSED (same posture as the `terr` case above),
+    # False falls through to the liveness/annotation below unchanged.
+    #
+    # Placed AFTER the discharger: a row that has a discharging successor names
+    # that door (the more specific, successor-bearing message) rather than the
+    # generic "its own tip is on trunk" one; the guard only owns the row whose
+    # ship was never recorded through another row.
+    own_tip = row.get("tip")
+    if own_tip:
+        own_ship = landreq._landed(gitdir_ship, own_tip, pinned)
+        if own_ship is True:
+            # The `landed` door proves this row's own tip is on trunk and closes
+            # it as landed — the opposite of what `out-of-scope` would record.
+            # Read the name live, the same discipline the discharger refusal
+            # above uses for `discharged`; naming a reason this build lacks
+            # would trade a dead end for a wrong turn.
+            route = ("close it `--reason landed` — that door proves this row's "
+                     "own tip is on trunk and credits the landed row instead "
+                     "of recording it as unwanted"
+                     if "landed" in landreq.CLOSE_CLI_REASONS
+                     else "it wants the reason that proves the land")
+            return None, ("%s is not out of scope — its own tip %s is ON "
+                          "TRUNK. Closing it here would record shipped work as "
+                          "unwanted; %s"
+                          % (row["id"], own_tip[:12], route))
+        if own_ship is None:
+            return None, ("%s — whether this work SHIPPED is UNKNOWN and "
+                          "out-of-scope is FAIL-CLOSED on it; its own tip %s "
+                          "could not be checked against trunk"
+                          % (row["id"], own_tip[:12]))
     # LIVENESS BLOCK (D1's law applied here too): a live claim is never
     # orphaned through this door. Tri-state — unreadable refuses.
     gitdir, tiprow = row.get("repo_id"), row.get("tip")

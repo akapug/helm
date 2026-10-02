@@ -209,6 +209,18 @@ class LrApiBase(_landreq.LandReqBase):
         })
         reg.start()
         self.addCleanup(reg.stop)
+        # A COLD READ HERE WAITS FOR ITS BUILD. Every read through the route
+        # after `forget()` is a cold start, and the product answers a cold
+        # start that outlasts `_LR_COLD_WAIT_S` with `{"warming": True}` --
+        # a body with no `loops`, `unavailable` or `stalled_ids`. On a build
+        # host loaded by a whole-suite gate the fixture's build passed that
+        # wait, and four arms raised KeyError about a board they never read.
+        # These arms assert what the board SAYS, so they wait for it; the
+        # warming answer itself has its own arms, which call `_cached_swr`
+        # with their own `cold_wait` and are untouched by this.
+        wait = mock.patch.object(web_land, "_LR_COLD_WAIT_S", 120)
+        wait.start()
+        self.addCleanup(wait.stop)
         self.forget()
 
     def fold(self, lane, tip, extra=""):
@@ -4324,7 +4336,7 @@ class OwnerBoardSurfaceMatrixTest(LrApiBase):
         with mock.patch.object(dispatches, "_acting_author",
                                return_value=(rows[rid]["recipient"], None)):
             _row, err = dispatches.mark_hold(
-                rid, "SOURCE-CLEAN: read clear, the gate is the integrator's",
+                rid, "SOURCE-CLEAN: read clear, the gate is the integrator's; fab Ran 5 tests OK",
                 source_clean_tip=self.b)
         self.assertIsNone(err, err)
         return rid

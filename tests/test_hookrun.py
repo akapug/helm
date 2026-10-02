@@ -361,7 +361,8 @@ class TimerCancellationTest(unittest.TestCase):
         }
 
     def _probe(self, kind, timed_out, sibling_rc=0):
-        from helm import actors, cli, record, seats_cli, seats_rename, toolwhisper
+        from helm import (actors, cli, record, seats_cli, seats_rename,
+                          seats_roomscan, toolwhisper)
 
         # fstat includes mutable file size. Drain output a preceding test left
         # in the runner's buffer before declaring it part of product state; the
@@ -512,6 +513,12 @@ class TimerCancellationTest(unittest.TestCase):
             # as it always was. A False here would mean the hook path had
             # started withholding, which is a behaviour change nobody asked
             # for.
+            # `quiet` is the other intended one (task/3848): a consumer that
+            # keeps no proof, because a hook process ends with its boundary,
+            # and only borrows the room listing the last pass made.
+            quiet = seen["delivery"].pop("quiet")
+            self.assertIsInstance(quiet, seats_roomscan.QuietRooms)
+            self.assertFalse(quiet.remember)
             self.assertEqual(seen["delivery"], {
                 "session": "synthetic-only", "room": "main", "seat": "fake-seat",
                 "cwd": cwd, "channel": "hook", "sink_usable": None,
@@ -631,10 +638,11 @@ class RegistryTest(unittest.TestCase):
         # task/2566: the GitHub-Actions rung reads a Write/Edit file_path
         self.assertIn("argv-guard", names("Write"))
         self.assertIn("argv-guard", names("Edit"))
-        # the agent-model rung reads an Agent call's model key; the Workflow
-        # tool spawns its agents without an Agent call and is not matched
+        # the agent-model rung reads an Agent call's model key; the
+        # narrow-goal rung reads a Workflow call, whose script spawns its
+        # agents without an Agent call
         self.assertIn("argv-guard", names("Agent"))
-        self.assertNotIn("argv-guard", names("Workflow"))
+        self.assertIn("argv-guard", names("Workflow"))
         self.assertNotIn("argv-guard", names("Read"))
         self.assertNotIn("argv-guard", names("BashOutput"))
 

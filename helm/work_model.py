@@ -532,7 +532,7 @@ def _task_snap(row):
 
 
 def read_tasks(path=None):
-    """{rows, history, unavailable}: ONE read of the to-do ledger — every
+    """{rows, history, facts, unavailable}: ONE read of the to-do ledger — every
     row's latest state and every event it kept, in ledger order."""
     from . import tasks                     # DEFERRED — the ledger module
     history = {}
@@ -541,8 +541,9 @@ def read_tasks(path=None):
         history.setdefault(str(row.get("id")), []).append(_task_snap(row))
         return True
     rows, why = tasks.snapshot(path, accept=accept)
+    facts = tasks.story_facts(rows) if not why else {}
     return {"rows": rows if not why else {}, "history": history if not why
-            else {}, "unavailable": str(why) if why else None}
+            else {}, "facts": facts, "unavailable": str(why) if why else None}
 
 
 def read_dispatch(path=None):
@@ -734,6 +735,10 @@ def build(inp):
     board = inp.get("board") or {}
     ledger = (inp.get("tasks") or {}).get("rows") or {}
     tasks_why = (inp.get("tasks") or {}).get("unavailable")
+    facts = (inp.get("tasks") or {}).get("facts")
+    if facts is None and ledger:
+        from . import tasks as _tasks_init
+        facts = _tasks_init.story_facts(ledger)
     disp = inp.get("dispatch") or {"rows": {}, "events": {}, "chains": {}}
     tr = inp.get("trains") or {"trains": [], "lands": {}, "ejections": []}
     trains, lands = tr.get("trains") or [], tr.get("lands") or {}
@@ -981,7 +986,8 @@ def build(inp):
         extra.append(rec)
 
     for card in cards.values():
-        _finish(card, ledger, inp, disp, trains, lands, train_project, served)
+        _finish(card, ledger, inp, disp, trains, lands, train_project, served,
+                facts=facts)
     seen = [r["id"] for c in cards.values() for r in c["actions"]
             if not str(r["id"]).startswith("room:")] \
         + [r["id"] for r in records if not str(r["id"]).startswith("room:")]
@@ -997,6 +1003,7 @@ def build(inp):
             "trains": trains, "lands": lands, "served": served,
             "ejections": tr.get("ejections") or [],
             "history": (inp.get("tasks") or {}).get("history") or {},
+            "facts": facts or {}, "ledger": ledger,
             "dispatch": disp, "events": {}, "zone": inp.get("zone")
             or OWNER_ZONE}
 
@@ -1008,13 +1015,34 @@ def _primary_key(a):
 
 
 def _finish(card, ledger, inp, disp, trains, lands, train_project,
-            served=None):
+            served=None, facts=None):
     """Place one card: its stage, whose move, the stages it reached, its fix
     count, whether it came back, and its debt. A train's car is the card's
     by its lane's name only when it joined the card's task (`_serves`)."""
     now = inp["now"]
     t = ledger.get(card["task"]) if card["task"] else None
     from . import tasks as _tasks           # DEFERRED — the ledger module
+    if card["task"]:
+        f = (facts or {}).get(card["task"])
+        if f:
+            root = f.get("story_root") or card["task"]
+            done, total = _tasks.story_count(facts, card["task"])
+            # the ROOT's own roll-up — every member of the story reads the
+            # same number off it, so the story's group head names it. `done`/
+            # `total` above are THIS card's count; a leaf's is 0 of 0.
+            root_done, root_total = _tasks.story_count(facts, root)
+            children = [{"id": str(c.get("id") or ""),
+                         "status": str(c.get("status") or ""),
+                         "title": str(c.get("title") or "")}
+                        for c in _tasks.story_children(facts, card["task"])]
+            card["story"] = {"root": root, "done": done, "total": total,
+                             "root_done": root_done, "root_total": root_total,
+                             "children": children}
+        else:
+            card["story"] = {"root": card["task"], "done": 0, "total": 0,
+                             "root_done": 0, "root_total": 0, "children": []}
+    else:
+        card["story"] = None
     card["title"] = (t or {}).get("title") or re.sub(
         r"[-_]+", " ", (card["lanes"] or [card["key"].rsplit(":", 1)[-1]])[0]
     ).strip().capitalize()
@@ -1225,6 +1253,7 @@ def _wire_card(card, now, stuck):
         "stuck": stuck, "land": card["land"], "debt": card["debt"],
         "rooms": card["rooms"], "released": card.get("released"),
         "lanes": card["lanes"],
+        "story": card.get("story"),
         "actions": [_wire_row(a, now) for a in card["actions"]],
         "records": card["records"]})
 
@@ -1302,6 +1331,19 @@ def view(snap, now):
     others = {p for p in list(by_project) + reading["counted"]
               + reading["unread"] + reading["unknown"]
               if p not in (tp, "none")}
+    # THE OPEN STORIES, the one count `task list`'s header and `helm task
+    # health`'s line both use: over the shown (open) rows, parents resolved
+    # against the whole ledger, so a story rooted at a closed row still
+    # counts once. Home and Work print it; it is never a second counter.
+    ledger = snap["ledger"]
+    if ledger:
+        from . import tasks as _tasks
+        shown = [r for r in ledger.values()
+                 if isinstance(r, dict)
+                 and r.get("status") in _tasks.OPEN_STATUSES]
+        stories_open = _tasks.open_story_count(shown, ledger, snap["facts"])
+    else:
+        stories_open = 0
     counts = {}
     for s in STAGES:
         n = stages[s]
@@ -1347,6 +1389,7 @@ def view(snap, now):
         "counts": {
             "stages": counts, "cards": len(cards_out), "stuck": stuck,
             "came_back": back, "asked": asked, "no_task": notask,
+            "stories_open": stories_open,
             "whose": whose, "by_project": by_project,
             "settlement": settlements,
             "landed": {"window_s": LANDED_S,

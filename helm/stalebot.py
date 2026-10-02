@@ -116,6 +116,8 @@ PROXY_REDISPATCH = "redispatch-by-proxy"   # integrator must route/operate it
 SOURCE_UNAVAILABLE = "source-unavailable" # a whole source needs an obligated reader
 SOURCE_CLEAN_REHOLD = "source-clean-rehold"  # a source-clean hold records NO HOLDER
 SOURCE_CLEAN_CLOSE = "source-clean-close"  # a stamped source-clean hold: train, then foldcheck
+UNKNOWN_LANDING = "unknown-landing"        # a standing CONCUR answers it; landing unmeasured
+QUALIFIED_CLOSURE = "qualified-closure"    # a standing CONCUR answers it; landing measured
 
 
 class _SourceProblem(str):
@@ -227,7 +229,11 @@ def collect(now=None, task_path=None, repo=None, trunk=None):
             live = dispatches.live_claims()
         except Exception:                # noqa: BLE001 — _is_overdue's own
             live = None                  # contract: unreadable claims leave
-        for r in dispatches.owed(current):   # the clock verdict standing
+        # ONE successor index and ONE cycle map for the whole walk: `owed`
+        # and the standing-concur answer below ask the same graph.
+        index = dispatches._successor_index(current)
+        cycles = dispatches._cycle_components(index)
+        for r in dispatches.owed(current, index):   # the clock verdict standing
             rid = str(r.get("id") or "")
             if rid in lr_ids:
                 continue                 # the lr projection already carries it
@@ -236,12 +242,23 @@ def collect(now=None, task_path=None, repo=None, trunk=None):
                 continue
             if not dispatches._is_overdue(r, now, live):
                 continue
+            # THE SHIELD NAMES A REASON; IT NEVER ADDS A ROW (task/4022). It
+            # runs only on a row main already proposes, so a row with live
+            # progress stays unproposed, and it changes only what the row is
+            # said to be waiting on.
+            age = dispatches._age_s(r, now)
+            answer = _standing_answer(r, current, index, cycles)
+            if answer is None:
+                why = "no visible progress"
+            else:
+                why = "successor %s holds a standing CONCUR (%s)" % (
+                    str(answer.get("id") or "")[:12],
+                    str(answer.get("basis") or "").upper())
             items.append({
                 "kind": "dispatch", "id": rid, "row": r, "lr": None,
-                "age_s": dispatches._age_s(r, now),
-                "why_aged": "%s old, past its %ss deadline, no visible progress"
-                            % (_fmt_age(dispatches._age_s(r, now)),
-                               r.get("deadline_s"))})
+                "age_s": age, "successor": answer,
+                "why_aged": "%s old, past its %ss deadline, %s"
+                            % (_fmt_age(age), r.get("deadline_s"), why)})
         # THE CURED BUCKET rides the SAME snapshot the overdue walk just read.
         # An empty ledger has zero cured rows by construction, so the git-priced
         # index is never built for one (and the hermetic collect tests that
@@ -543,7 +560,37 @@ def _carrier(gitdir, tip, pinned):
     return None
 
 
-def classify_dispatch(row, lr=None, repo=None, trunk=None):
+# The bases a standing CONCUR must record to answer its predecessor here. An
+# UNVERIFIED or unmarked concur says nothing about how its reader knew, so its
+# predecessor keeps main's "no visible progress" reading.
+SHIELD_BASES = ("measured", "inferred")
+
+
+def _standing_answer(row, snap, index=None, cycles=None):
+    """The standing CONCUR that ANSWERS this owed row, or None (task/4022).
+
+    THE REPLAYED VERDICT IS THE EVIDENCE, NOT AN ATTESTATION PROJECTION.
+    `attest_state` and `attest_source` exist only on rows that
+    `dispatches_announce` projected for display; neither `snapshot()` nor
+    `rows()` carries them, so a shield keyed on them never fires on a real
+    row. `attest_source` is also set for EVERY verdict that has a verdict_ref,
+    so it proves nothing about a signature. The ledger's own verdict replay is
+    the record the board acts on, and it is what this reads.
+
+    THE POINTER IS NOT THE ANSWER. `superseded_by` keeps the FIRST successor
+    forever. `dispatches.answered_by` walks the successor SET with the
+    same-chain rule, the pass-throughs (a withdrawn, retracted, stranded or
+    cancelled successor) and the cycle guard, and `_standing_concur` refuses
+    an EXPIRED concur. A later FIX holds the chain, so `owed` never yields
+    its predecessor and this is never asked about it. Anything this cannot
+    read resolves toward None, which keeps main's reading."""
+    ans = dispatches.answered_by(row, snap, index, cycles)
+    if not dispatches._standing_concur(ans):
+        return None
+    return ans if str(ans.get("basis") or "") in SHIELD_BASES else None
+
+
+def classify_dispatch(row, lr=None, repo=None, trunk=None, successor=None):
     """(terminal, evidence, door) for one aged dispatch/lr row.
 
     PRECEDENCE IS THE CLASSIFIER, spelled once:
@@ -551,17 +598,27 @@ def classify_dispatch(row, lr=None, repo=None, trunk=None):
       1. content ON TRUNK (ancestry or patch-id)      -> SUPERSEDE, carrier named
       2. content PROVEN ABSENT and claims ROTTED      -> CANCEL, rot quoted
       3. READY base >= the measured STALE_BASE_BEHIND -> RETIP
-      4. everything else                              -> KEEP, evidence stated
+      4. landing unknown, trunk cites the lane        -> SUPERSEDE (off-chain)
+      5. a STANDING CONCUR answers the row            -> QUALIFIED_CLOSURE, or
+                                                         UNKNOWN_LANDING when
+                                                         landing is unmeasured
+      6. everything else                              -> KEEP, evidence stated
     Landed outranks retip because a base drifting under finished work is
     housekeeping the close already performs; absent+rotted outranks retip
     because a moot row re-tipped is the same moot row with a fresher clock.
     An UNKNOWN landing never cancels: cancel requires the ABSENT proof, so an
     unreadable repo degrades to KEEP with the failure named.
 
-    A SOURCE-CLEAN HOLD OUTRANKS ALL FOUR (task/3053). Its review is finished
+    A SOURCE-CLEAN HOLD OUTRANKS EVERY RUNG (task/3053). Its review is finished
     and never verdicted, so `lr close --reason superseded` cannot close it —
     the landed rung proposed exactly that door for every source-clean row
-    whose tip reached trunk. `_source_clean_door` names the one that can."""
+    whose tip reached trunk. `_source_clean_door` names the one that can.
+
+    THE STANDING CONCUR ONLY REPLACES KEEP (task/4022). `successor` is
+    `_standing_answer`'s row, which `collect` passes. Every rung that names a
+    runnable door outranks it, so a row the concur answers still gets its
+    supersede, cancel or retip door, and the two new words never carry a
+    door of their own."""
     rid = str(row.get("id") or "")
     clean = _source_clean_door(row, lr, repo, trunk)
     if clean:
@@ -646,7 +703,13 @@ def classify_dispatch(row, lr=None, repo=None, trunk=None):
                     "landed under another lane label"
                     % (sha[:12], "lane" if exact else "lane STEM", matched),
                     "helm lr close %s --reason superseded" % rid[:12])
-    return (KEEP, "landing %s; claims %s: %s" % (proof, verdict, detail), "")
+    evidence = "landing %s; claims %s: %s" % (proof, verdict, detail)
+    if successor is not None:
+        return (UNKNOWN_LANDING if proof == "unknown" else QUALIFIED_CLOSURE,
+                "%s; successor %s holds a standing CONCUR/%s verdict"
+                % (evidence, str(successor.get("id") or "")[:12],
+                   str(successor.get("basis") or "").upper()), "")
+    return (KEEP, evidence, "")
 
 
 def _source_clean_door(row, lr=None, repo=None, trunk=None):
@@ -849,8 +912,37 @@ def _family_walled(name, family, wall_snapshot=None):
         family, state or "?")
 
 
+def _verified_native_runtime(runtime, verified):
+    """True for a verified roster runtime whose recorded family IS the native
+    claude family — the one shape for which the proxywatch wall does not exist.
+
+    The family is the discriminator, not the backend: every proxy seat records
+    a proxy family (codex, kimi, glm, ...) and never the native one, while
+    every native claude seat is stamped with the native claude family at
+    spawn (`seat._spawn` records `family=NATIVE_FAMILY`). So `family ==
+    NATIVE_FAMILY` is precisely "this seat has no proxy to put a wall on," and
+    it separates a native claude (family=claude) from a proxy (family=<family>)
+    without relying on the optional backend label. `verified` is the authority
+    gate: a verified-but-contradictory runtime is not native authority and stays
+    UNKNOWN rather than being waved through. The proxy path is untouched — a
+    proxy runtime's family is never the native family, so it falls through to
+    the real `_family_walled` check unchanged."""
+    if not isinstance(runtime, dict):
+        return False
+    from . import seat as smod
+    from . import seats as seatsmod
+    metadata, rejected = seatsmod._runtime_metadata(runtime)
+    return (not rejected and runtime.get("family") == smod.NATIVE_FAMILY
+            and verified)
+
+
 def _author_walled(row, actor, wall_snapshot=None):
-    """(True|False|None, why) using this dispatch's canonical session runtime."""
+    """(True|False|None, why) using this dispatch's canonical session runtime.
+
+    A verified native-claude addressee is never walled: the proxywatch wall is
+    a PROXY-family fact and does not exist for a seat that runs claude natively,
+    so it short-circuits to a clean not-walled BEFORE the family resolver's
+    "claude is not a proxy family" error is mistaken for UNKNOWN."""
     from . import seat as smod
     from . import seats as seatsmod
     name, roster_row = actor
@@ -861,6 +953,8 @@ def _author_walled(row, actor, wall_snapshot=None):
         family, err = smod.family_for(name, runtime, verified)
     except Exception as e:                   # noqa: BLE001 — unreadable is UNKNOWN
         return None, "family resolution failed (%s)" % e
+    if _verified_native_runtime(runtime, verified):
+        return False, "native claude seat — no proxy wall to check"
     if err:
         return None, "family resolution unavailable (%s)" % err
     return _family_walled(name, family, wall_snapshot)
@@ -942,7 +1036,7 @@ def redispatch_cured(rid, reviewer, repo=None):
     # This was the second producer of "run it from that repository's own helm"
     # and it gated on equality with the repository the helm PACKAGE lives in —
     # so a cured row belonging to a registered project could never be
-    # redispatched, and the redispatch `_base` would have refused it anyway.
+    # redispatched, and the redispatch `_base3` would have refused it anyway.
     # One predicate, one refusal text, one place that widens.
     if not row.get("repo_id"):
         return None, ("row records no repository, so its cure cannot be "
@@ -1385,7 +1479,8 @@ def sweep(now=None, post=True, quiet=False, task_path=None, state_path=None,
                 live_seats)[0] or "")
         else:
             term, ev, door = classify_dispatch(it["row"], it.get("lr"),
-                                               repo, trunk)
+                                               repo, trunk,
+                                               successor=it.get("successor"))
             owner = owner_of_item(it)
         it.update({"terminal": term, "evidence": ev, "door": door,
                    "owner": owner, "latched": False})
@@ -1741,11 +1836,24 @@ def cmd_stale(args):
         if "--dry-run" in rest:
             for owner, text in rep["digests"].items():
                 print("\n--- would post (@%s) ---\n%s" % (owner, text))
+        # THE LAUNDERED SUMMARY (task/3852 F2): the old line printed "N
+        # proposal digest(s) posted" whenever ANY one posted, so a sweep where
+        # one of three digests hit a walled author still read as a clean
+        # "3 posted". The honest count is the split of the actual posts, which
+        # is what `sweep` already returns; print it. Zero digests is still a
+        # clean "posted" (nothing to claim), and a dry run keeps "would post".
+        digest_count = len(rep["digests"])
+        if "--dry-run" in rest:
+            status = "would post"
+        elif digest_count:
+            status = "%d of %d posted" % (len(rep["posted"]), digest_count)
+            if rep["failed"]:
+                status += ", %d FAILED" % len(rep["failed"])
+        else:
+            status = "posted"
         print("helm stale sweep: %d aged row(s), %d proposal digest(s) %s, "
               "%d latched, oldest unproposed %s"
-              % (rep["swept"], len(rep["digests"]),
-                 "would post" if "--dry-run" in rest else
-                 ("posted" if rep["posted"] or not rep["digests"] else "FAILED"),
+              % (rep["swept"], digest_count, status,
                  rep["latched"], _fmt_age(rep["oldest_unproposed_s"])))
         if rep["no_deadline"]:
             print("  %d open row(s) predate the deadline field — never "

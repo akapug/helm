@@ -1740,6 +1740,63 @@ class PostsSignThroughTheIdentityGateTest(V2Base):
         self.assertEqual(chat.sign_failures(), [])
 
 
+class SubsystemRowsSignByClassTest(V2Base):
+    """A SUBSYSTEM'S ROW SIGNS BY ITS CLASS (task/3851). A signed chat send
+    costs the chat node about 25 CPU-seconds of proving, and a status row's
+    receipt is checked by nobody. chat.post reads the label's class from
+    machine_senders: a STATUS label's row lands unsigned with no DEGRADED
+    stamp and never reaches the signer; a VERIFY label's row and a seat's
+    row sign as before; an explicit `sign` wins either way. The signer is
+    configured and the node answers, so a row that does not reach
+    `_sign_send` was not signed by choice, not by a missing node."""
+
+    @contextlib.contextmanager
+    def _signing(self):
+        os.environ["HELM_CHAT_NODE_URL"] = "http://127.0.0.1:1"
+        with mock.patch.object(cellmod, "bin_status",
+                               return_value=READY_SIGNER), \
+                mock.patch.object(chat, "node_head",
+                                  return_value={"chain_index": 1}), \
+                mock.patch.object(chat, "_sign_send",
+                                  return_value=(dict(SENT), None)) as ss:
+            yield ss
+
+    def test_a_status_label_posts_unsigned_and_never_reaches_the_signer(self):  # noqa: VACUOUS_ASSERTION — absence is the contract; test_a_verify_label_and_a_seat_still_sign is the positive control on this fixture, and every row is counted landing below
+        for label in ("beacons", "proxywatch", "worktree-gc", "Idle-Dispatch"):
+            with self._signing() as ss:
+                m = chat.post("census from %s" % label, who=label)
+            ss.assert_not_called()
+            self.assertNotIn("chain", m, label)
+            self.assertNotIn("transport", m, "no DEGRADED stamp: %s" % label)
+        self.assertEqual(chat.read()[1], 4, "every row still lands")
+
+    def test_a_status_labels_dm_posts_unsigned_too(self):  # noqa: VACUOUS_ASSERTION — an unreached signer is the contract; the DM row is asserted landed with its text and recipient
+        from helm import seats
+        with self._signing() as ss:
+            row, err = seats.dm("seat-b", "a wake", who="idle-dispatch")
+        self.assertIsNone(err)
+        self.assertEqual((row["text"], row["dm"]), ("a wake", "seat-b"))
+        ss.assert_not_called()
+        self.assertNotIn("chain", row)
+
+    def test_a_verify_label_and_a_seat_still_sign(self):  # noqa: VACUOUS_ASSERTION — the control arm for the status arm above: the same fixture, and _sign_send is called once per row here
+        for who in ("auto-land", "dispatches", "a1"):
+            with self._signing() as ss:
+                m = chat.post("from %s" % who, who=who)
+            ss.assert_called_once()
+            self.assertEqual(m["chain"], 7, who)
+
+    def test_an_explicit_sign_wins_over_the_class(self):
+        with self._signing() as ss:
+            m = chat.post("forced", who="beacons", sign=True)
+        ss.assert_called_once()
+        self.assertEqual(m["chain"], 7)
+        with self._signing() as ss:
+            m = chat.post("skipped", who="auto-land", sign=False)
+        ss.assert_not_called()
+        self.assertNotIn("chain", m)
+
+
 class OwnerExportPostsSignAsTheSeatTest(V2Base):
     """task/3049 on the post, emit and status paths, over a REAL roster file
     and actor store (no mocked `_self_seat`): a seat that inherited the

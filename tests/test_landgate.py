@@ -111,11 +111,11 @@ class GateBindsTreeTest(ProvenIsNotTheQuestion, LandGateBase):
                                          {"abc123": self.REC})
         self.assertEqual(st, landgate.OK, d)
         self.assertIn("ok", st)
-        self.assertIn("post-rebase tree", d)
+        self.assertIn("composed tree", d)
 
     def test_a_receipt_for_a_DIFFERENT_tree_refuses(self):
-        """The whole point of clause (ii): the reviewed tip and the landed tree
-        differ after a rebase, and cross-file coupling lives in that gap."""
+        """Clause (ii): the composed landing tree can differ from a reviewed
+        tip's tree after merging with other cars; test that exact composition."""
         st, d = landgate.gate_binds_tree("abc123", "0000111122223333",
                                          {"abc123": self.REC})
         self.assertEqual(st, landgate.REFUSE)

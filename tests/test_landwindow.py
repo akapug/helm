@@ -26,7 +26,7 @@ import subprocess
 import unittest
 from unittest import mock
 
-from helm import gatewindow, landreq, landwindow, vcs
+from helm import dispatches, gatewindow, landreq, landwindow, vcs
 from tests import test_gatewindow as _gw
 from tests import test_landreq as _landreq
 
@@ -420,6 +420,94 @@ class OnlyLiveApproveReadyRowsAreCars(TrainBase):
         self.assertEqual(len(self.spawns), 1)
 
 
+    def test_two_holds_on_one_lane_compose_only_the_current_tip(self):  # noqa: VACUOUS_ASSERTION — the car map equaling the current tip plus the other lane is the positive control; the superseded why names both tips
+        """task/3991. Two READY rows on one lane at different tips both
+        became cars. Compose admits the row at the lane's current tip and
+        reports the older one superseded. A second lane's single row still
+        rides: the filter is per lane, not a refusal of every car."""
+        old_tip = self.lane("lane/verb-help", "old")
+        old = self.dispatch(ref=old_tip, lane="verb-help")
+        _row, err = self.mark_verdict(old["id"], old_tip, "ok",
+                                      polarity="approve")
+        self.assertIsNone(err, err)
+        self.git("checkout", "-q", "lane/verb-help")
+        new_tip = self.commit("new", path="new")
+        self.git("checkout", "-q", self.main)
+        new = self.dispatch(ref=new_tip, lane="verb-help")
+        _row, err = self.mark_verdict(new["id"], new_tip, "ok",
+                                      polarity="approve")
+        self.assertIsNone(err, err)
+        _other, other_tip = self.ready("other", "z")
+        got, why = landwindow.plan(self.repo, trunk=self.main, name="train1")
+        self.assertIsNone(why, why)
+        by_lane = {c["lane"]: c["tip"] for c in got["cars"]}
+        self.assertEqual(by_lane, {"verb-help": new_tip, "other": other_tip})
+        stale = [c for c in got["excluded"] if c["id"] == old["id"]]
+        self.assertEqual(len(stale), 1)
+        self.assertIn("superseded", stale[0]["why"])
+        self.assertIn(old_tip[:12], stale[0]["why"])
+        self.assertIn(new_tip[:12], stale[0]["why"])
+
+
+    def test_a_hold_follows_its_bound_branch_not_the_lane_label(self):  # noqa: VACUOUS_ASSERTION — the car map equaling the bound branch's tip plus the other lane is the positive control; the superseded why names both tips
+        """task/3991. The lane label is not a branch. A row bound to topic
+        and labeled foo, with no lane/foo when it was written, rides at
+        topic's tip. A later refs/heads/lane/foo parked on the older tip
+        does not make that older hold the car."""
+        old_tip = self.lane("topic", "old")
+        old = self.dispatch(ref=old_tip, lane="foo")
+        _row, err = self.mark_verdict(old["id"], old_tip, "ok",
+                                      polarity="approve")
+        self.assertIsNone(err, err)
+        self.git("checkout", "-q", "topic")
+        new_tip = self.commit("new", path="new")
+        self.git("checkout", "-q", self.main)
+        new = self.dispatch(ref=new_tip, lane="foo")
+        _row, err = self.mark_verdict(new["id"], new_tip, "ok",
+                                      polarity="approve")
+        self.assertIsNone(err, err)
+        self.git("branch", "lane/foo", old_tip)
+        lrs, unavailable = landreq.project()
+        self.assertIsNone(unavailable)
+        self.assertEqual(lrs[old["id"]].get("ref_branch"), "refs/heads/topic")
+        self.assertEqual(lrs[new["id"]].get("ref_branch"), "refs/heads/topic")
+        self.assertEqual(self.git("rev-parse", "refs/heads/lane/foo"), old_tip)
+        self.assertEqual(self.git("rev-parse", "refs/heads/topic"), new_tip)
+        _other, other_tip = self.ready("other", "z")
+        got, why = landwindow.plan(self.repo, trunk=self.main, name="train1")
+        self.assertIsNone(why, why)
+        by_lane = {c["lane"]: c["tip"] for c in got["cars"]}
+        self.assertEqual(by_lane, {"foo": new_tip, "other": other_tip})
+        stale = [c for c in got["excluded"] if c["id"] == old["id"]]
+        self.assertEqual(len(stale), 1)
+        self.assertIn("superseded", stale[0]["why"])
+        self.assertIn(old_tip[:12], stale[0]["why"])
+        self.assertIn(new_tip[:12], stale[0]["why"])
+
+    def test_an_unreadable_bound_branch_is_not_composed(self):  # noqa: VACUOUS_ASSERTION — the other lane riding alone is the positive control; the excluded why names UNKNOWN
+        """task/3991. A bound branch git cannot read excludes the hold.
+        The lane label is not a substitute branch."""
+        tip = self.lane("topic", "gone")
+        row = self.dispatch(ref=tip, lane="foo")
+        _row, err = self.mark_verdict(row["id"], tip, "ok",
+                                      polarity="approve")
+        self.assertIsNone(err, err)
+        lrs, unavailable = landreq.project()
+        self.assertIsNone(unavailable)
+        self.assertEqual(lrs[row["id"]].get("ref_branch"), "refs/heads/topic")
+        self.git("branch", "-D", "topic")
+        _other, other_tip = self.ready("other", "z")
+        got, why = landwindow.plan(self.repo, trunk=self.main, name="train1")
+        self.assertIsNone(why, why)
+        self.assertEqual({c["lane"]: c["tip"] for c in got["cars"]},
+                         {"other": other_tip})
+        gone = [c for c in got["excluded"] if c["id"] == row["id"]]
+        self.assertEqual(len(gone), 1)
+        self.assertIn("UNKNOWN", gone[0]["why"])
+        self.assertIn("refs/heads/topic", gone[0]["why"])
+        self.assertIn("not composed", gone[0]["why"])
+
+
 class UnverifiedIsSortedByItsCause(TrainBase):
     """READY-UNVERIFIED FOLDS SEVERAL UNKNOWNS, and this train's gate answers
     only some of them. An unreadable contributor chain leaves independence
@@ -485,6 +573,130 @@ class UnverifiedIsSortedByItsCause(TrainBase):
         self.assertEqual([m[2] for m in self.merges(self.room())], [one_tip])
         self.assertNotIn("EXCLUDED", text)
         self.assertEqual(len(self.spawns), 1, text)
+
+
+class LandFirstReviewAfter(TrainBase):
+    """task/4223: an open review row nobody has read for LAND_FIRST_WAIT_S
+    rides the train at its dispatched tip, marked landed before review, when
+    its lane is no door. A row any reader touched, a younger one and a door
+    lane follow the normal path. Each arm carries an approve-ready car as
+    its control on the same plan."""
+
+    def unread(self, name, path, age=landwindow.LAND_FIRST_WAIT_S + 60):
+        """(row, tip): a lane off trunk with an open review row, dispatched
+        `age` seconds ago and read by nobody."""
+        tip = self.lane(name, path)
+        row = self.dispatch(ref=tip, lane=name, kind="review")
+        self.age(row["id"], age)
+        return row, tip
+
+    def basis(self, got):
+        return {c["id"]: c["basis"] for c in got["cars"]}
+
+    def state(self, rid):
+        rows, why = dispatches.snapshot()
+        self.assertIsNone(why, why)
+        return rows[rid]
+
+    def plan(self):
+        got, why = landwindow.plan(self.repo, trunk=self.main, name="train1")
+        self.assertIsNone(why, why)
+        return got
+
+    def test_a_non_door_row_unread_for_over_30_min_becomes_a_car(self):
+        ready, ready_tip = self.ready("one", "g")
+        row, tip = self.unread("first", "h")
+        got = self.plan()
+        self.assertEqual(self.basis(got), {ready["id"]: "approved",
+                                           row["id"]: landwindow.LAND_FIRST})
+        car = next(c for c in got["cars"] if c["id"] == row["id"])
+        self.assertEqual((car["tip"], car["word"]),
+                         (tip, landwindow.LAND_FIRST_WORD))
+        rc, text = self.train()
+        self.assertEqual(rc, 0, text)
+        self.assertIn("(1 approve-ready, 0 source-clean, 1 landed before "
+                      "review)", text)
+        self.assertIn("%s  lane first  unread tip %s  UNREAD — no reader in "
+                      "30 min and no door: landed before review"
+                      % (row["id"][:12], tip[:12]), text)
+        room = self.room()
+        self.assertEqual(sorted(m[2] for m in self.merges(room)),
+                         sorted((ready_tip, tip)))
+        body = self.git("log", "-1", "--format=%b", "--merges",
+                        "--grep=merge lane first", cwd=room)
+        self.assertIn("land request %s, landed before review, unread tip %s"
+                      % (row["id"], tip), body)
+        # BLAME READS THE BASIS BACK off the merge body, beside the approve.
+        from helm import trainblame
+        red, why = trainblame.read_room(room)
+        self.assertIsNone(why, why)
+        self.assertEqual({c["id"]: c["basis"] for c in red["cars"]},
+                         {ready["id"]: "approved",
+                          row["id"]: landwindow.LAND_FIRST})
+        self.assertEqual(len(self.spawns), 1, text)
+
+    def test_under_30_min_it_is_not_a_car(self):
+        ready, _ready_tip = self.ready("one", "g")
+        row, _tip = self.unread("young", "h",
+                                age=landwindow.LAND_FIRST_WAIT_S - 120)
+        got = self.plan()
+        self.assertEqual(self.basis(got), {ready["id"]: "approved"})
+        self.assertNotIn(row["id"], [c["id"] for c in got["excluded"]])
+
+    def test_a_door_lane_never_becomes_a_car_this_way(self):
+        ready, _ready_tip = self.ready("one", "g")
+        os.makedirs(os.path.join(self.repo, "migrations"), exist_ok=True)
+        door, _door_tip = self.unread("schema", "migrations/0042_widen.sql")
+        plain, _plain_tip = self.unread("plain", "h")
+        got = self.plan()
+        self.assertEqual(self.basis(got), {ready["id"]: "approved",
+                                           plain["id"]: landwindow.LAND_FIRST})
+        why = {c["id"]: c["why"] for c in got["excluded"]}
+        self.assertIn("is unread and a DOOR (migration)", why[door["id"]])
+        # THE AUTHORITY IS lane_doors: told the plain lane is a door, it
+        # stays out too.
+        with mock.patch("helm.review_door.lane_doors",
+                        lambda row, current=None: {"doors": [
+                            ("prod", "planted")], "paths": []}):
+            got = self.plan()
+        self.assertEqual(self.basis(got), {ready["id"]: "approved"})
+
+    def test_a_row_any_reader_touched_follows_the_normal_path(self):  # noqa: VACUOUS_ASSERTION — the car map equals exactly the approve and the untouched row, a positive on the same observable the three touched rows are absent from
+        ready, _ready_tip = self.ready("one", "g")
+        fixed, fixed_tip = self.unread("fixed", "h")
+        _out, err = self.mark_verdict(fixed["id"], fixed_tip, "FIX",
+                                      polarity="fix")
+        self.assertIsNone(err, err)
+        waited, _tip = self.unread("waited", "i")
+        _out, err = dispatches.mark_hold(waited["id"], "HELD WAIT: reading")
+        self.assertIsNone(err, err)
+        released, _tip = self.unread("released", "j")
+        _out, err = dispatches.mark_hold(released["id"], "HELD WAIT: later")
+        self.assertIsNone(err, err)
+        _out, err = dispatches.mark_release(released["id"])
+        self.assertIsNone(err, err)
+        self.assertEqual(self.state(released["id"])["status"], "open")
+        untouched, _tip = self.unread("untouched", "k")
+        got = self.plan()
+        self.assertEqual(self.basis(got), {
+            ready["id"]: "approved", untouched["id"]: landwindow.LAND_FIRST})
+
+    def test_an_unread_tip_already_on_trunk_is_a_post_land_read(self):
+        row, tip = self.unread("first", "h")
+        self.git("merge", "-q", "--no-ff", "-m", "train1: merge lane first",
+                 tip)
+        got = self.plan()
+        self.assertEqual(got["cars"], [])
+        why = {c["id"]: c["why"] for c in got["excluded"]}
+        self.assertIn("unread tip %s is already on %s with no verdict: its "
+                      "post-land read is owed by its reader"
+                      % (tip[:12], self.main), why[row["id"]])
+        # THE ROW STAYS OPEN, and the read after the land sees the lane's
+        # own range off the landed merge's first parent.
+        self.assertEqual(self.state(row["id"])["status"], "open")
+        from helm import review_door
+        lane = review_door.lane_doors(self.state(row["id"]))
+        self.assertEqual((lane["doors"], lane["paths"]), ([], ["h"]))
 
 
 class TheTrunkIsTheAuthority(TrainBase):
@@ -765,6 +977,33 @@ class TheRoomIsTheRoom(TrainBase):
         self.assertEqual(self.git("rev-list", "--parents", "-n", "1", head,
                                   cwd=room).split()[1:],
                          [before, car["tip"]])
+
+    def test_auto_land_s_car_merge_names_no_seat_and_no_model(self):
+        """task/4033: the merge commit auto-land writes carries no seat and
+        no model in its subject or its body (commit metadata is akapug's
+        alone); the subject keeps the task, its title, priority and door."""
+        from helm import autoland
+        seats, model = ("seat-a", "seat-b"), "claude-opus-5-5"
+        car = dict(self.car(), task="task/9", title="the fleet got nine",
+                   priority="P1", doors=[], author=seats[0], reader=seats[1],
+                   model=model, basis="source-clean")
+        car["detail"] = autoland._merge_detail(car)
+        room = os.path.join(self.tmp, "room")
+        self.git("worktree", "add", "-q", "--detach", room, self.main)
+        outcome, detail, head = landwindow.merge_car(
+            vcs.backend(self.repo), room, car, "train1",
+            os.path.realpath(os.path.join(self.repo, ".git")))
+        self.assertEqual(outcome, landwindow.MERGED, detail)
+        message = self.git("log", "-1", "--format=%B", head, cwd=room)
+        self.assertEqual(message.splitlines()[0],
+                         "train1: merge lane one (task/9: the fleet got nine; "
+                         "P1, not a door)")
+        for name in seats + (model,):
+            self.assertNotIn(name, message)
+        # CONTROL: the body still names the row, which is where the ledger's
+        # provenance is joined.
+        self.assertIn("land request %s, source-clean held tip %s"
+                      % (car["id"], car["tip"]), message)
 
     def test_a_room_that_stops_being_the_room_stops_the_train_and_launches_nothing(self):  # noqa: VACUOUS_ASSERTION — nothing launched is the contract; the refusal text and the two merge calls are asserted positively first
         self.ready_all()

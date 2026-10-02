@@ -24,7 +24,7 @@ from unittest import mock
 import os as _os, sys as _sys  # noqa: E401,E402
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
-from helm import chat, chatdebris, dispatches, meld, pk, seats  # noqa: E402
+from helm import chat, chatdebris, dispatches, meld, pk, seats, tasks  # noqa: E402
 from helm import review_door as RD  # noqa: E402
 from tests import test_dispatches as td  # noqa: E402
 from tests import test_meld as tm  # noqa: E402
@@ -61,12 +61,14 @@ def row(rid=ROOT, root=ROOT, lane="pair-meld-per-task-3112", note=None,
 
 
 class PairRoomNameTest(unittest.TestCase):
-    """P2 and (b): the room is a pure function of the chain."""
+    """P2 and (b): the room is a function of the chain. A task's room is
+    `<scope>-<N>`; tests/test_task_meld_name.py pins the legacy room a task
+    keeps once it has opened."""
 
     def test_a_task_named_on_the_first_row_keys_the_room(self):
         r = row()
         self.assertEqual(RD.pair_room(r, {ROOT: r}),
-                         ("meld-0-pair-helm-task-3112", "task/3112"))
+                         ("helm-3112", "task/3112"))
 
     def test_a_chain_with_no_task_is_keyed_by_its_root(self):
         r = row(lane="fix-the-fold")
@@ -98,7 +100,7 @@ class PairRoomNameTest(unittest.TestCase):
         kid = row(rid=KID, lane="now-names-task-99")
         cur = {ROOT: root, KID: kid}
         self.assertEqual(RD.pair_room(root, cur),
-                         ("meld-0-pair-helm-task-4100", "task/4100"))
+                         ("helm-4100", "task/4100"))
         self.assertEqual(RD.pair_room(kid, cur), RD.pair_room(root, cur))
         # a suffix is never a task: the chain root keys it
         bare = row(lane="canary-seeded-red-0926")
@@ -114,11 +116,9 @@ class PairRoomNameTest(unittest.TestCase):
         kid = row(rid=KID, repo="/x/adopter-project-dev/.git",
                   lane="review-it", sender="seat-c")
         cur = {ROOT: other, KID: kid}
-        self.assertEqual(RD.pair_room(kid, cur)[0],
-                         "meld-0-pair-adopter-afd5094f-task-12")
+        self.assertEqual(RD.pair_room(kid, cur)[0], "adopter-afd5094f-12")
         helm = row(repo="/x/helm/.git", lane="task-12")
-        self.assertEqual(RD.pair_room(helm, {ROOT: helm})[0],
-                         "meld-0-pair-helm-task-12")
+        self.assertEqual(RD.pair_room(helm, {ROOT: helm})[0], "helm-12")
 
     def test_long_project_names_with_one_prefix_keep_distinct_rooms(self):  # noqa: VACUOUS_ASSERTION — both generated room names are positive values and their inequality is the collision falsifier
         one = row(repo="/x/abcdefghijklmnop-one/.git", lane="task-12")
@@ -256,9 +256,11 @@ class PairRoundTest(tm.MeldBase):
             thread.join(5)
         self.assertFalse([t for t in threads if t.is_alive()])
         self.assertEqual(sorted(x["round"] for x in opened), [1, 2])
+        room = RD.pair_room(rows[0], current)[0]
+        self.assertEqual([x["room"] for x in opened], [room, room])
         seeds = {RD._seed_row(text): (epoch, text)
                  for epoch, _convener, text, _i in
-                 meld.seeds(chat.read(self.ROOM)[0])}
+                 meld.seeds(chat.read(room)[0])}
         self.assertEqual(set(seeds), {ROOT[:12], KID[:12]})
         for got in opened:
             rid = RD._seed_row(got["topic"])
@@ -295,6 +297,7 @@ class PairRoundTest(tm.MeldBase):
     def test_retry_repairs_a_seed_only_partial_opening(self):  # noqa: VACUOUS_ASSERTION — the durable seed is asserted before retry repairs the missing invite and lifecycle exactly once
         r = row(recipient="seat-b")
         current = {r["id"]: r}
+        room = RD.pair_room(r, current)[0]
         real = meld._post
         calls = {"n": 0}
 
@@ -308,35 +311,36 @@ class PairRoundTest(tm.MeldBase):
         with mock.patch.object(meld, "_post", side_effect=crash_after_first_post):
             failed = RD.open_pair_round(r, current=current)
         self.assertIn("fixture crash after seed", failed["error"])
-        self.assertEqual(len(meld.seeds(chat.read(self.ROOM)[0])), 1)
-        self.assertIsNone(meld.state(self.ROOM, "seat-a"))
+        self.assertEqual(len(meld.seeds(chat.read(room)[0])), 1)
+        self.assertIsNone(meld.state(room, "seat-a"))
 
         opened = RD.open_pair_round(r, current=current)
-        rows = chat.read(self.ROOM)[0]
+        rows = chat.read(room)[0]
         invites = [m for m in rows if "[MELD-INVITE e:" in
                    str(m.get("text") or "")]
         self.assertEqual(len(meld.seeds(rows)), 1)
         self.assertEqual(len(invites), 1)
-        self.assertEqual(meld.state(self.ROOM, "seat-a")["epoch"],
+        self.assertEqual(meld.state(room, "seat-a")["epoch"],
                          opened["epoch"])
 
     def test_retry_repairs_an_opening_with_no_lifecycle_transition(self):  # noqa: VACUOUS_ASSERTION — seed and invite are positive controls before retry adds the missing state without duplicating either row
         r = row(recipient="seat-b")
         current = {r["id"]: r}
+        room = RD.pair_room(r, current)[0]
         with mock.patch.object(meld, "_transition",
                                side_effect=RuntimeError(
                                    "fixture crash before transition")):
             failed = RD.open_pair_round(r, current=current)
         self.assertIn("fixture crash before transition", failed["error"])
-        before = chat.read(self.ROOM)[0]
+        before = chat.read(room)[0]
         self.assertEqual(len(meld.seeds(before)), 1)
         self.assertEqual(len([m for m in before if "[MELD-INVITE e:" in
                               str(m.get("text") or "")]), 1)
-        self.assertIsNone(meld.state(self.ROOM, "seat-a"))
+        self.assertIsNone(meld.state(room, "seat-a"))
 
         opened = RD.open_pair_round(r, current=current)
-        after = chat.read(self.ROOM)[0]
-        self.assertEqual(meld.state(self.ROOM, "seat-a")["epoch"],
+        after = chat.read(room)[0]
+        self.assertEqual(meld.state(room, "seat-a")["epoch"],
                          opened["epoch"])
         self.assertEqual(len(meld.seeds(after)), 1)
         self.assertEqual(len([m for m in after if "[MELD-INVITE e:" in
@@ -680,6 +684,12 @@ class _PairDoorBase(trd.DoorBase):
         patch.start()
         self.addCleanup(patch.stop)
 
+    def numbered_task(self, n):
+        self.review_task, err = tasks.add(
+            "fixture pair %d" % n, "author", tid=n,
+            project="helm-test", force_new=True)
+        self.assertIsNone(err, err)
+
     def seeds(self, room):
         return meld.seeds(chat.read(room)[0])
 
@@ -692,12 +702,13 @@ class PairDispatchTest(_PairDoorBase):
     fold. The author is `integrator`; the reader is `seat-b`."""
 
     def test_P1_the_first_dispatch_opens_the_plan_round(self):
+        self.numbered_task(7001)
         self.lane = "pair-meld-per-task-7001"
         rc, out, err, sent = self.send(None, self.a, kind="build",
                                        body="build the pair meld")
         self.assertEqual(rc, 0, err)
         room = self.pair_room(sent)
-        self.assertTrue(room.endswith("-task-7001"), room)
+        self.assertEqual(room, RD.pair_scope(sent) + "-7001")
         self.assertIn("your pair meld for this task: %s (task/7001, round 1; "
                       "you and @seat-b" % room, out)
         self.assertIn("helm chat meld recv %s" % room, out)
@@ -720,6 +731,7 @@ class PairDispatchTest(_PairDoorBase):
                     dispatches, "_pair_families",
                     side_effect=lambda seat, families=families:
                     (set(families(seat) or ()), "PROVEN")):
+                self.numbered_task(int(lane.rsplit("-", 1)[1]))
                 self.lane = lane
                 rc, out, err, sent = self.send(None, self.a)
                 self.assertEqual(rc, 0, err)
@@ -728,6 +740,7 @@ class PairDispatchTest(_PairDoorBase):
                               self.latest_seed(self.pair_room(sent)))
 
     def test_P1_an_unproven_runtime_uses_and_labels_its_durable_declaration(self):
+        self.numbered_task(7013)
         self.lane = "pair-meld-per-task-7013"
         answers = {"integrator": ({"claude"}, "PROVEN"),
                    "seat-b": ({"codex"}, "DECLARED")}
@@ -778,6 +791,7 @@ class PairDispatchTest(_PairDoorBase):
                              (set(), "DISAGREEMENT"))
 
     def test_P2_b_every_round_of_a_chain_opens_in_its_one_room(self):  # noqa: VACUOUS_ASSERTION — the three rows' rooms are asserted EQUAL to one named room and its seed count to three; the empty other-room list is the falsifier (b) absence beside them
+        self.numbered_task(7002)
         self.lane = "pair-meld-per-task-7002"
         rc, _out, err, one = self.send(None, self.a)
         self.assertEqual(rc, 0, err)
@@ -797,11 +811,14 @@ class PairDispatchTest(_PairDoorBase):
         self.assertIn("agree the bar", self.latest_seed(room))
         self.assertIn("MELD OPENED %s" % room, out)
         self.assertEqual(self.rooms(), [], "a second room for one chain")
-        mine = [f for f in os.listdir(chat.chat_dir())
-                if f.startswith(RD.PAIR_PREFIX) and ".meld." in f]
+        mine = [f for f in os.listdir(chat.chat_dir()) if ".meld." in f
+                and RD.is_pair_room(f.split(".meld.", 1)[0])]
+        self.assertEqual(mine, [f for f in mine
+                                if f.startswith(room + ".meld.")])
         self.assertEqual(len(mine), 1, mine)
 
     def test_P6_the_dispatch_DM_is_the_only_ring(self):
+        self.numbered_task(7003)
         self.lane = "pair-meld-per-task-7003"
         from helm import seats
         with mock.patch.object(seats, "dm",
@@ -848,6 +865,7 @@ class PairDispatchTest(_PairDoorBase):
         self.assertEqual(sent["status"], "open")
 
     def test_e_a_rebind_invites_the_new_reader_into_the_same_room(self):  # noqa: VACUOUS_ASSERTION — the room's seeds are asserted to grow to two then three naming the new readers; the old reader's empty owed list is the superseded-round absence
+        self.numbered_task(7006)
         self.lane = "pair-meld-per-task-7006"
         rc, _out, err, one = self.send(None, self.a)
         self.assertEqual(rc, 0, err)
@@ -890,7 +908,7 @@ class PairDispatchTest(_PairDoorBase):
                       room=room, who=who, sign=False)
         size = sum(len(m["text"].encode()) for m in chat.read(room)[0])
         rc, out, err = run(dispatches.cmd_dispatch, [
-            "hold", sent["id"], "read clean", "--source-clean", self.b,
+            "hold", sent["id"], "read clean; fab Ran 5 tests OK", "--source-clean", self.b,
             "--meld", room])
         self.assertEqual(rc, 0, err)
         self.assertIn("meld %s — AGREED" % room, out)
@@ -916,6 +934,7 @@ class PairLifecycleWalkTest(_PairDoorBase):
     after it reborn under the same name."""
 
     def test_the_room_lives_as_long_as_the_chain(self):  # noqa: VACUOUS_ASSERTION — every stage asserts a positive value on the room or row it moves; the empty other-room list is falsifier (b)
+        self.numbered_task(7100)
         self.lane = "pair-meld-per-task-7100"
         rc, _out, err, one = self.send(None, self.a)           # first
         self.assertEqual(rc, 0, err)
@@ -943,7 +962,7 @@ class PairLifecycleWalkTest(_PairDoorBase):
                       room=room, who=who, sign=False)
         self.holder = "seat-c"
         rc, out, err = run(dispatches.cmd_dispatch, [           # the row
-            "hold", four["id"], "read clean", "--source-clean", self.c,
+            "hold", four["id"], "read clean; fab Ran 5 tests OK", "--source-clean", self.c,
             "--meld", room])
         self.assertEqual(rc, 0, err)
         self.assertEqual(dispatches.snapshot()[0][four["id"]]["meld_outcome"],
@@ -1120,7 +1139,7 @@ class RulingSpiralWindowTest(tss.SpiralBase):
         self.assertIn("review spiral", block or "")
 
     def test_R2_an_exchange_for_another_chain_in_the_task_room_is_not_mine(self):  # noqa: VACUOUS_ASSERTION — the other chain's positive room result controls the same call before this chain's absence is asserted
-        room = "meld-0-pair-helm-task-3112"
+        room = "helm-3112"
         other = "d0" * 16
         other_row = row(rid=other, root=other,
                         lane="task-3112 inject (chain %s)" % CHAIN[:12],
@@ -1166,6 +1185,7 @@ class RulingExactRoundTest(_PairDoorBase):
         return meld.latest_seed(chat.read(room)[0])[0]
 
     def test_h_an_AGREED_from_round_N_does_not_exempt_round_N_plus_1(self):
+        self.numbered_task(7300)
         self.lane = "pair-meld-per-task-7300"
         rc, _out, err, one = self.send(None, self.b)
         self.assertEqual(rc, 0, err)
@@ -1192,7 +1212,7 @@ class RulingExactRoundTest(_PairDoorBase):
         # through the real hold door, a round cited by its epoch
         self.agree(room, second, self.b)
         rc, _out, err = run(dispatches.cmd_dispatch, [
-            "hold", two["id"], "read clean", "--source-clean", self.b,
+            "hold", two["id"], "read clean; fab Ran 5 tests OK", "--source-clean", self.b,
             "--meld", "%s@%d" % (room, second)])
         self.assertEqual(rc, 0, err)
         held = dispatches.snapshot()[0][two["id"]]
@@ -1256,6 +1276,7 @@ class RulingExactRoundTest(_PairDoorBase):
     def test_h_a_pair_rounds_AGREED_does_not_exempt_the_next_send_at_the_door(self):
         """Round two converged live AND was recorded AGREED on row two; the
         door deciding round three is not exempted by either."""
+        self.numbered_task(7301)
         self.lane = "pair-meld-per-task-7301"
         rc, _out, err, one = self.send(None, self.a)
         self.assertEqual(rc, 0, err)

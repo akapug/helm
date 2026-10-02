@@ -1,0 +1,1 @@
+storage-matrix [--measure] [--json] — the owner-facing cross-box storage matrix: explicit bounded measurement writes one durable snapshot; bare reads never probe

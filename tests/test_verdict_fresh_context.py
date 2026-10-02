@@ -62,7 +62,7 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from helm import (compose_contract, dispatches, landreq, pk,  # noqa: E402
-                  review_door, rowworld, runrecord, seats, seats_join)
+                  review_door, rowworld, runrecord, seats, seats_join, tasks)
 # The module, never its TestCase: tests/test_suite_collection.py says why.
 from tests import test_landreq as _landreq  # noqa: E402
 from tests._satellite_resolution import ledger_sources  # noqa: E402
@@ -103,7 +103,7 @@ RUN_WORDS = re.compile(r"(?i)fresh-context|reviewer[-_]run|runrecord"
 #: entry names a MODULE and is read whole, with every satellite it declares:
 #: see `surface_sources`.
 SURFACES = ("helm/dispatches.py", "helm/runrecord.py", "helm/review_door.py",
-            "helm/cli_help.py", "helm/obligation.py", "docs/VERBS.md",
+            "helm/help", "helm/obligation.py", "docs/VERBS.md",
             "agents/claudecode/skills/build/SKILL.md",
             "agents/claudecode/skills/reviewer-implements-own-findings/"
             "SKILL.md")
@@ -120,8 +120,18 @@ def surface_sources(root, rel):
     if rel.startswith("helm/") and rel.endswith(".py"):
         return ledger_sources(importlib.import_module(
             rel[:-len(".py")].replace("/", ".")))
-    with open(os.path.join(root, rel), encoding="utf-8") as fh:
-        return [(os.path.join(root, rel), fh.read())]
+    full = os.path.join(root, rel)
+    if os.path.isdir(full):
+        # The verb help is one file per verb under helm/help (task/3918):
+        # the directory is the surface, every fragment in it read whole.
+        out = []
+        for name in sorted(os.listdir(full)):
+            if name.endswith(".txt"):
+                with open(os.path.join(full, name), encoding="utf-8") as fh:
+                    out.append((os.path.join(full, name), fh.read()))
+        return out
+    with open(full, encoding="utf-8") as fh:
+        return [(full, fh.read())]
 
 
 def run_paragraphs(text):
@@ -513,6 +523,49 @@ class DoorClassifierTest(unittest.TestCase):
         self.assertEqual(review_door.irreversible_hits("send the payment"), [])
         self.assertEqual(review_door.irreversible_hits(
             "send the payment", review_door.DOOR_PHRASES), ["payment"])
+
+
+class ALandedLaneKeepsItsRangeTest(unittest.TestCase):
+    """task/4223: a lane that landed before its review is read after the
+    land. Its tip is then on trunk, so trunk gives it no range; the merge
+    that landed it does, off its first parent, and the read sees the same
+    paths and doors it would have seen before the land."""
+
+    def setUp(self):
+        tmp = tempfile.mkdtemp(prefix="helm-test-landed-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.repo = os.path.join(tmp, "repo")
+        os.makedirs(self.repo)
+        _git(self.repo, "init", "-q")
+        _git(self.repo, "config", "user.email", "test@example.com")
+        _git(self.repo, "config", "user.name", "Test")
+        _commit(self.repo, {"README.md": "fixture\n"}, "base")
+        self.cut = _commit(self.repo, {"notes.txt": "one\n"}, "trunk moves")
+
+    def landed(self, name, files):
+        """A lane cut from trunk, trunk moved on, then a train merge."""
+        tip = _commit(self.repo, files, name, "l-" + name)
+        _commit(self.repo, {"other.txt": name + "\n"}, "trunk moves on")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m",
+             "train1: merge lane %s" % name, tip)
+        return tip
+
+    def doors(self, tip):
+        return review_door.lane_doors({"id": "f" * 16, "lane": "lane/plant",
+                                       "tip": tip, "repo_root": self.repo})
+
+    def test_a_merged_lane_reads_its_own_range_off_the_landed_merge(self):
+        tip = self.landed("plain", {"docs/plain.md": "words\n"})
+        got = self.doors(tip)
+        self.assertEqual((got["doors"], got["paths"], got["base"]),
+                         ([], ["docs/plain.md"], self.cut))
+        door, path, text = DOOR_PLANTS[1]
+        got = self.doors(self.landed(door, {path: text}))
+        self.assertEqual({c for c, _w in got["doors"]}, {door})
+        # CONTROL: a trunk commit no merge landed still has no base.
+        got = self.doors(self.cut)
+        self.assertEqual([c for c, _w in got["doors"]], ["unknown"])
+        self.assertIn("no merge on", got["doors"][0][1])
 
 
 class RunRecordTest(unittest.TestCase):
@@ -1058,8 +1111,11 @@ class FreshOpusVerdictTest(_landreq.LandReqBase):
     def row(self, ref=None, lane="lane/fresh"):
         """A review row sent by this process, with the add's refusal
         named when there is one."""
+        work, why = tasks.add("fresh-context reviewed work", "integrator",
+                              project="helm-test", force_new=True)
+        self.assertIsNone(why, why)
         row, why = dispatches.add(RECIPIENT, lane, ref=ref or self.side,
-                                  repo=self.repo, kind="review",
+                                  repo=self.repo, kind="review", task=work["id"],
                                   new_work=True, notify=False, _reason=True)
         self.assertIsNotNone(row, why)
         return row
@@ -1106,6 +1162,48 @@ class FreshOpusVerdictTest(_landreq.LandReqBase):
         self.assertEqual(self.reads(row["id"])[-1]["independence"],
                          "fresh-context")
 
+    def test_an_OPUS_author_is_never_refused_as_the_same_model_before_the_run_is_judged(self):  # noqa: VACUOUS_ASSERTION — each spelling's refusal is asserted by its words and the tip's committer time, then the same row asserted to RECORD the run begun after the tip
+        """task/3855, measured: `verdict --reviewer-model opus
+        --author-model opus` came back "IS the author's model: ... not an
+        independent review", so the seat read the fresh-context arm as
+        closed and the door read went to Fable. The arm ran; its bound came
+        after that sentence. An Opus reader is judged by its run alone, so
+        the refusal leads with the bound that failed, names when the tip was
+        committed, and never says the read is not independent."""
+        tip = _commit(self.repo, {"g": "the opus author's lane\n"}, "cure",
+                      "opus-lane", self.a)
+        committed = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(
+            int(_git(self.repo, "show", "-s", "--format=%ct", tip))))
+        # ONE RUN PER ROW: a recorded run id belongs to its first row.
+        for author, run in (("opus", AGENT), (OPUS, "a" + "e" * 16)):
+            with self.subTest(author=author):
+                row = self.row(ref=tip, lane="lane/opus-%d" % len(author))
+                shutil.rmtree(self.root)
+                os.makedirs(self.root)
+                plant_agent(self.root, READER_SESSION, agent=run, tip=tip,
+                            at=before_commit(self.repo, tip))
+                out, err = dispatches.mark_verdict(
+                    row["id"], tip, "read clean", polarity="concur",
+                    basis="measured", bind_author=True, reviewer_model="opus",
+                    reviewer_run=run, author_model=author)
+                self.assertIsNone(out)
+                self.assertTrue(str(err).startswith(
+                    "opus is an Opus model, so helm judges it as a "
+                    "fresh-context run"), err)
+                self.assertIn("before the reviewed tip %s was committed at %s"
+                              % (tip[:12], committed), str(err))
+                self.assertNotIn("not an independent review", str(err))
+                self.assertNotIn("IS the author's model", str(err))
+                self.assertEqual(self.reads(row["id"]), [])
+                shutil.rmtree(self.root)
+                os.makedirs(self.root)
+                plant_agent(self.root, READER_SESSION, agent=run, tip=tip)
+                out, err = dispatches.mark_verdict(
+                    row["id"], tip, "read clean", polarity="concur",
+                    basis="measured", bind_author=True, reviewer_model="opus",
+                    reviewer_run=run, author_model=author)
+                self.assert_recorded(row, out, err, run=run)
+
     def test_lr_show_prints_the_model_and_the_fresh_context_run(self):  # noqa: VACUOUS_ASSERTION — rc 0 on both real CLI entry points, and both outputs asserted to carry the exact fresh-context line
         """(d): through the real CLI, and read back through `lr show`."""
         plant_agent(self.root, READER_SESSION, tip=self.side)
@@ -1115,7 +1213,7 @@ class FreshOpusVerdictTest(_landreq.LandReqBase):
             rc = dispatches.cmd_dispatch(
                 ["verdict", row["id"], row["tip"], "--concur", "--measured",
                  "--reviewer-model", "opus", "--reviewer-run", AGENT,
-                 "--author-model", OPUS, "read", "clean"])
+                 "--author-model", OPUS, "read", "clean;", "fab", "Ran", "5", "tests", "OK"])
         self.assertEqual(rc, 0, out.getvalue() + err.getvalue())
         shown = io.StringIO()
         with contextlib.redirect_stdout(shown), \
@@ -1152,7 +1250,7 @@ class FreshOpusVerdictTest(_landreq.LandReqBase):
             rc = dispatches.cmd_dispatch(
                 ["verdict", row["id"], row["tip"], "--concur", "--measured",
                  "--reviewer-model", "opus", "--reviewer-run", AGENT,
-                 "--author-model", OPUS, "read", "clean"])
+                 "--author-model", OPUS, "read", "clean;", "fab", "Ran", "5", "tests", "OK"])
         self.assertEqual(rc, 0, said.getvalue() + err.getvalue())
         state = dispatches.snapshot()[0][row["id"]]
         self.assertEqual((state["status"], state["hold_actor"],
@@ -1166,6 +1264,30 @@ class FreshOpusVerdictTest(_landreq.LandReqBase):
         self.assertEqual(landreq.source_clean_car(lr), (self.side, None))
         self.assertIsNone(state.get("polarity"),
                           "a held read mints no APPROVE: the land gate does")
+
+    def test_ONE_VERB_a_fresh_read_with_no_fab_receipt_holds_nothing(self):  # noqa: VACUOUS_ASSERTION — the same verb on the same fixture holds the row when the read's evidence carries a Ran line (the test above), so OPEN here is the missing receipt
+        """task/4103: the holder's own fresh-context read is a receipt source
+        only when that read's evidence carries one. A clean read whose
+        evidence names no fab run is recorded, and the hold it would carry
+        is refused by the receipt rule, so any fresh read cannot stand in
+        for the run the hold claims."""
+        row = self.row()
+        plant_agent(self.root, RECORDER_SESSION, tip=self.side)
+        said, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(said), contextlib.redirect_stderr(err):
+            rc = dispatches.cmd_dispatch(
+                ["verdict", row["id"], row["tip"], "--concur", "--measured",
+                 "--reviewer-model", "opus", "--reviewer-run", AGENT,
+                 "--author-model", OPUS, "read", "clean"])
+        self.assertEqual(rc, 0, said.getvalue() + err.getvalue())
+        self.assertIn("holds nothing", err.getvalue())
+        self.assertIn("no fab receipt", err.getvalue())
+        state = dispatches.snapshot()[0][row["id"]]
+        self.assertEqual(state["status"], "open")
+        self.assertNotIn("source_clean_tip", state)
+        self.assertEqual([(r["independence"], r["polarity"])
+                          for r in state["advisory_reads"]],
+                         [("fresh-context", "concur")])
 
     def test_ONE_VERB_a_fresh_FIX_holds_nothing(self):  # noqa: VACUOUS_ASSERTION — rc 0 and the row is asserted OPEN by value with the read recorded
         """Only a clean read is a source-clean claim: a fresh-context FIX is
@@ -1383,6 +1505,175 @@ class FreshOpusVerdictTest(_landreq.LandReqBase):
         self.assertIn("base cannot be told", str(err))
         self.assertEqual(self.reads(row["id"]), [])
 
+    def merge_lane(self, name):
+        """A lane whose tip is a MERGE of trunk into it: `side` (it writes
+        `g`), then trunk merged in, which brings b and c's lines of `state`.
+        Returns the merge commit."""
+        head = _git(self.repo, "symbolic-ref", "--short", "HEAD")
+        _git(self.repo, "checkout", "-q", "-b", name, self.side)
+        try:
+            _git(self.repo, "merge", "-q", "--no-ff", "-m", "merge trunk",
+                 self.main)
+            return _git(self.repo, "rev-parse", "HEAD")
+        finally:
+            _git(self.repo, "checkout", "-q", head)
+
+    def test_a_MERGE_tip_has_readable_changed_files(self):  # noqa: VACUOUS_ASSERTION — the paths are asserted EQUAL to the exact pair, and no door is asserted unknown
+        """task/4041: a merge commit's changed files are read against its
+        FIRST parent, beside the lane's own commits, so the paths hold the
+        lane's file and every file the merge brought in from trunk."""
+        tip = self.merge_lane("merge-paths")
+        self.assertEqual(len(_git(self.repo, "rev-list", "--parents", "-n",
+                                  "1", tip).split()), 3)
+        got = review_door.lane_doors({"id": "f" * 16, "lane": "lane/m",
+                                      "tip": tip, "repo_root": self.repo})
+        self.assertEqual(got["paths"], ["g", "state"])
+        self.assertNotIn("unknown", {c for c, _e in got["doors"]},
+                         got["doors"])
+
+    def test_a_fresh_read_of_a_MERGE_tip_is_recorded(self):  # noqa: VACUOUS_ASSERTION — assert_recorded asserts err None AND exactly one read whose run, independence and tip are asserted EQUAL
+        """task/4041, measured on two release gates: a fresh-context run's
+        read of a lane whose tip is a merge commit was refused, "(b) the
+        lane's changed files cannot be read (the per-commit diff ... cannot
+        be read (a merge ...". A run that made no edit is recorded."""
+        tip = self.merge_lane("merge-clean")
+        row = self.row(ref=tip, lane="lane/merge-clean")
+        plant_agent(self.root, READER_SESSION, tip=tip)
+        out, err = self.record(row)
+        self.assert_recorded(row, out, err)
+
+    def test_a_run_that_edited_a_file_the_MERGE_brought_in_is_refused(self):  # noqa: VACUOUS_ASSERTION — two fixed files, each refusal asserted present, positively, and the ledger asserted empty
+        """The no-write proof covers every file the lane changed, the trunk
+        side of its merge included: `state` came in only through the merge,
+        `g` only through the lane's own commit."""
+        tip = self.merge_lane("merge-wrote")
+        row = self.row(ref=tip, lane="lane/merge-wrote")
+        for path in ("state", "g"):
+            with self.subTest(path=path):
+                shutil.rmtree(self.root)
+                os.makedirs(self.root)
+                plant_agent(self.root, READER_SESSION, tip=tip, tools=[
+                    ("Edit", {"file_path": os.path.join(self.repo, path)})])
+                out, err = self.record(row)
+                self.assertIsNone(out)
+                self.assertIn("made Edit to the lane's own files", str(err))
+                self.assertEqual(self.reads(row["id"]), [])
+
+    def test_an_unreadable_merge_diff_still_FAILS_CLOSED(self):  # noqa: VACUOUS_ASSERTION — the reader's None is asserted, and the lane's paths asserted empty with an unknown door
+        """Fail closed: when git refuses the merge's first-parent diff, the
+        lane's changed files are unknown, never the lane's own commits
+        alone."""
+        tip = self.merge_lane("merge-refused")
+        from helm import vcs
+        real = vcs.backend(self.repo).run
+
+        def run(repo, *args, **kw):
+            if args[0] == "diff" and tip in args:
+                return 128, b"", b"fatal: refused"
+            return real(repo, *args, **kw)
+        with mock.patch.object(type(vcs.backend(self.repo)), "run",
+                               lambda _self, repo, *a, **k: run(repo, *a,
+                                                                **k)):
+            base = _git(self.repo, "merge-base", self.main, tip)
+            self.assertIsNone(review_door.lane_diff(self.repo, base, tip))
+            got = review_door.lane_doors({"id": "f" * 16, "lane": "lane/m",
+                                          "tip": tip, "repo_root": self.repo})
+        self.assertEqual(got["paths"], [])
+        self.assertIn("unknown", {c for c, _e in got["doors"]})
+
+    def ours_merge_lane(self, name):
+        """A lane whose tip merges trunk with `-s ours`: trunk's newest
+        commit changes helm/actsteer.py, a guard DOOR_OWNER the lane never
+        touched, and the merge keeps the lane's tree. So the merge brings
+        nothing against its first parent, and the tip still REVERTS that
+        file against its base (trunk). Returns the merge commit."""
+        _commit(self.repo, {"helm/actsteer.py": "DENY = ()\n"},
+                "trunk guard")
+        head = _git(self.repo, "symbolic-ref", "--short", "HEAD")
+        _git(self.repo, "checkout", "-q", "-b", name, self.side)
+        try:
+            _git(self.repo, "merge", "-q", "-s", "ours", "-m",
+                 "merge trunk, ours", self.main)
+            return _git(self.repo, "rev-parse", "HEAD")
+        finally:
+            _git(self.repo, "checkout", "-q", head)
+
+    def test_an_OURS_merge_that_reverts_a_trunk_door_file_is_a_door(self):  # noqa: VACUOUS_ASSERTION — the reverted file is asserted IN the paths and its guard door asserted present by exact evidence
+        """task/4041, worse than main before the cure: the per-commit read
+        of an `-s ours` merge is empty against its first parent, so
+        helm/actsteer.py, which the tip changes against base, dropped out of
+        the paths and the door arms; main answered `unknown`. The net diff
+        of base..tip is unioned in, so it is read."""
+        tip = self.ours_merge_lane("ours-paths")
+        base = _git(self.repo, "merge-base", self.main, tip)
+        self.assertIn("helm/actsteer.py", _git(
+            self.repo, "diff", "--name-only", base, tip).split())
+        got = review_door.lane_doors({"id": "f" * 16, "lane": "lane/m",
+                                      "tip": tip, "repo_root": self.repo})
+        self.assertIn("helm/actsteer.py", got["paths"])
+        self.assertIn("g", got["paths"])
+        self.assertIn(("guard", "helm/actsteer.py is a guard door owner"),
+                      got["doors"])
+
+    def test_a_run_that_edited_the_file_an_OURS_merge_reverts_is_refused(self):  # noqa: VACUOUS_ASSERTION — the refusal is asserted present and the ledger empty, then the positive control asserts a clean run on the same lane IS recorded
+        """The no-write proof covers the file the `-s ours` merge reverts:
+        a run that Edited helm/actsteer.py is refused, and a run that made
+        no edit on the same lane is recorded (the positive control)."""
+        tip = self.ours_merge_lane("ours-wrote")
+        row = self.row(ref=tip, lane="lane/ours-wrote")
+        plant_agent(self.root, READER_SESSION, tip=tip, tools=[
+            ("Edit", {"file_path": os.path.join(self.repo,
+                                                "helm/actsteer.py")})])
+        out, err = self.record(row)
+        self.assertIsNone(out)
+        self.assertIn("made Edit to the lane's own files", str(err))
+        self.assertEqual(self.reads(row["id"]), [])
+        shutil.rmtree(self.root)
+        os.makedirs(self.root)
+        plant_agent(self.root, READER_SESSION, tip=tip)
+        out, err = self.record(row)
+        self.assert_recorded(row, out, err)
+
+    def test_an_unreadable_NET_diff_of_a_merge_range_FAILS_CLOSED(self):  # noqa: VACUOUS_ASSERTION — the reader's None is asserted, and the lane's paths asserted empty with an unknown door
+        """Fail closed: when git refuses the net diff of base..tip, the
+        lane's changed files are unknown, never the per-commit records
+        alone (which miss what an `-s ours` merge reverts)."""
+        tip = self.ours_merge_lane("ours-refused")
+        base = _git(self.repo, "merge-base", self.main, tip)
+        from helm import vcs
+        real = vcs.backend(self.repo).run
+
+        def run(repo, *args, **kw):
+            if args[0] == "diff" and base in args and tip in args:
+                return 128, b"", b"fatal: refused"
+            return real(repo, *args, **kw)
+        with mock.patch.object(type(vcs.backend(self.repo)), "run",
+                               lambda _self, repo, *a, **k: run(repo, *a,
+                                                                **k)):
+            self.assertIsNone(review_door.lane_diff(self.repo, base, tip))
+            got = review_door.lane_doors({"id": "f" * 16, "lane": "lane/m",
+                                          "tip": tip, "repo_root": self.repo})
+        self.assertEqual(got["paths"], [])
+        self.assertIn("unknown", {c for c, _e in got["doors"]})
+        self.assertIsNotNone(review_door.lane_diff(self.repo, base, tip))
+
+    def test_a_ROOT_commit_merged_into_the_range_FAILS_CLOSED(self):  # noqa: VACUOUS_ASSERTION — the reader's None is asserted, and the lane's paths asserted empty with an unknown door
+        """Fail closed: a parentless commit merged into the lane has no
+        first parent to read against, so the lane's changed files are
+        unknown."""
+        root = _git(self.repo, "commit-tree", self.a + "^{tree}", "-m",
+                    "root")
+        tip = _git(self.repo, "commit-tree", self.side + "^{tree}", "-p",
+                   self.side, "-p", root, "-m", "merge an unrelated root")
+        base = _git(self.repo, "merge-base", self.main, tip)
+        self.assertIn(root, _git(self.repo, "rev-list", "--max-parents=0",
+                                 base + ".." + tip).split())
+        self.assertIsNone(review_door.lane_diff(self.repo, base, tip))
+        got = review_door.lane_doors({"id": "f" * 16, "lane": "lane/m",
+                                      "tip": tip, "repo_root": self.repo})
+        self.assertEqual(got["paths"], [])
+        self.assertIn("unknown", {c for c, _e in got["doors"]})
+
     def test_GEMINI_and_LOCAL_models_stay_input(self):  # noqa: VACUOUS_ASSERTION — MODELS is a fixed non-empty tuple; each refusal is asserted present, positively, and never the fresh-context arm's; the ledger asserted empty
         """MUST-MISS: the arm is Opus's alone. A gemini or a local model
         reading its own family's work is refused as before, and the fresh-
@@ -1514,6 +1805,36 @@ class FreshOpusVerdictTest(_landreq.LandReqBase):
         self.assertIsNone(err, err)
         self.assertEqual(self.reads(row["id"])[-1]["independence"],
                          "fresh-context")
+
+    def test_a_recorded_FIX_read_refuses_a_source_clean_hold_at_its_tip(self):  # noqa: VACUOUS_ASSERTION — the control row holds through the same door with the same reason first, and the refused row's status, reads and hold are read back from the fold
+        """task/4103, measured: a seat held a record-only row source-clean
+        after the integrator's fresh read recorded a FIX on it (a pager that
+        never paged). A read at the held tip that found something refuses
+        the hold by its verdict's name, whatever the reason carries."""
+        reason = "SOURCE-CLEAN: read clean; fab Ran 63 tests in 4.2s OK"
+        control = self.row(lane="lane/fresh-fix-control")
+        with mock.patch.object(dispatches, "_acting_author",
+                               return_value=(RECIPIENT, None)):
+            out, why = dispatches.mark_hold(control["id"], reason,
+                                            source_clean_tip=self.side)
+        self.assertIsNone(why, why)
+        self.assertEqual(out["status"], "held")
+        plant_agent(self.root, READER_SESSION, tip=self.side)
+        row = self.row()
+        _out, err = self.record(row, polarity="fix")
+        self.assertIsNone(err, err)
+        self.assertEqual(self.reads(row["id"])[-1]["polarity"], "fix")
+        with mock.patch.object(dispatches, "_acting_author",
+                               return_value=(RECIPIENT, None)):
+            out, why = dispatches.mark_hold(row["id"], reason,
+                                            source_clean_tip=self.side)
+        self.assertIsNone(out)
+        self.assertIn("FIX", str(why))
+        self.assertIn(self.side[:12], str(why))
+        current, unavailable = dispatches.snapshot()
+        self.assertFalse(unavailable)
+        self.assertEqual(current[row["id"]]["status"], "open")
+        self.assertNotIn("source_clean_tip", current[row["id"]])
 
     def test_a_run_spawned_by_the_RECIPIENTS_session_is_admitted(self):  # noqa: VACUOUS_ASSERTION — err is None AND the replayed read's recorder and independence are asserted equal to exact values
         """The ordinary route: the row's recipient records its own Opus run
@@ -1796,10 +2117,7 @@ class FreshOpusVerdictTest(_landreq.LandReqBase):
         self.git("merge", "--no-edit", "-q", "side")
         tip = _commit(self.repo, {"confirmed.txt": "confirmed\n"},
                       "confirmed", "advisory-confirming")
-        confirming, why = dispatches.add(
-            RECIPIENT, "lane/advisory-confirming", ref=tip, repo=self.repo,
-            kind="review", new_work=True, notify=False, _reason=True)
-        self.assertIsNotNone(confirming, why)
+        confirming = self.row(ref=tip, lane="lane/advisory-confirming")
         run = "a%016d" % 7
         plant_agent(self.root, READER_SESSION, agent=run, tip=tip)
         out, err = self.record(confirming, run=run)
@@ -1935,11 +2253,17 @@ class ReadingInstanceTest(_landreq.LandReqBase):
                                           "CLAUDE_CODE_SESSION_ID": session,
                                           "CLAUDE_SESSION_ID": session,
                                           "CODEX_SESSION_ID": session}):
+            root_task = {}
+            if parent is None:
+                work, why = tasks.add("reading instance work", sender,
+                                      project="helm-test", force_new=True)
+                self.assertIsNone(why, why)
+                root_task = {"task": work["id"]}
             row, why = dispatches.add(
                 recipient, lane, ref=tip, repo=self.repo, kind=kind,
                 notify=False, new_work=parent is None,
                 supersedes=parent["id"] if parent else None, force=True,
-                _reason=True)
+                _reason=True, **root_task)
         self.assertIsNone(why, why)
         return row
 
@@ -1985,7 +2309,7 @@ class ReadingInstanceTest(_landreq.LandReqBase):
                 mock.patch.dict(os.environ,
                                 {"CLAUDE_CODE_SESSION_ID": session}):
             return dispatches.mark_verdict(
-                row["id"], row["tip"], "read clean", polarity="concur",
+                row["id"], row["tip"], "read clean; fab Ran 5 tests OK", polarity="concur",
                 basis="measured", bind_author=True, reviewer_model="opus",
                 reviewer_run=run, author_model=OPUS)
 
@@ -2267,6 +2591,263 @@ class ReadingInstanceTest(_landreq.LandReqBase):
         self.assertEqual((got["session"], got["source"], got["kind"]),
                          (FRESH_SESSION, "startup", "interactive"))
         self.assertIsNone(sessionstart.session_start(FORK_SESSION))
+
+
+#: The lane-author hold door's escape, asked of the REAL planted run on the
+#: real repo (task/3887). The author is a recognised non-Claude family, so an
+#: Opus reader of its work is recorded `cross-family` — the LIVE shape (a
+#: source-clean hold on a deepseek-authored lane, its run verifying on disk,
+#: `reading_instance_is_fresh` True, `_fresh_instance_read` None).
+#: `_fresh_instance_read` filtered on the LABEL `fresh-context`, which only
+#: an Opus reader of a CLAUDE author gets, so a verified cross-family read
+#: was refused where the owner's premise (review-rules-prevent-self-
+#: rubber-stamping-not-hall-monitoring) says the INSTANCE decides, not the
+#: family.
+#:
+#: THE CURE IS A WRITE-TIME FACT, NEVER A READ-SIDE PROBE (the integrator's
+#: ruling, round 2): the VERDICT WRITER verifies the run once, when the read
+#: is recorded, and stamps `read_run_verified` on the read. Replay, the train
+#: planner and the post-land close read the ledger alone — a probe there
+#: would refuse after a land (the tip has no lane base) and flip closed rows
+#: back to held. The last arm pins that shape.
+CROSS_FAMILY_AUTHOR = "ds4-pro"
+
+
+class CrossFamilyAuthorEscapeTest(_landreq.LandReqBase):
+    """The author escape admits a VERIFIED independent read (task/3887): the
+    reading instance decides, not the label. Each arm drives the real
+    predicates `landreq._fresh_instance_read` and
+    `landreq.source_clean_author_error` — the one the hold door and the train
+    planner's `source_clean_car` both read."""
+
+    def setUp(self):
+        super().setUp()
+        self.root = os.path.join(self.tmp, "claude-projects")
+        os.makedirs(self.root)
+        patch = mock.patch.object(runrecord, "roots",
+                                  return_value=[self.root])
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.work, why = tasks.add("cross-family reviewed work", "integrator",
+                                   project="helm-test", force_new=True)
+        self.assertIsNone(why, why)
+
+    def row(self, ref=None):
+        """A review row whose SENDER wrote the lane, so the sender is a lane
+        author. A chain with no build row names every sender (task/3356), so
+        no build row is sent."""
+        row, why = dispatches.add(RECIPIENT, "lane/cross-family",
+                                  ref=ref or self.side,
+                                  repo=self.repo, kind="review", notify=False,
+                                  new_work=True, force=True, _reason=True,
+                                  task=self.work["id"])
+        self.assertIsNone(why, why)
+        return row
+
+    def read(self, row, run=AGENT, model=OPUS, polarity="concur", author=None):
+        """Record the model read through the real writer, on the real repo."""
+        _out, err = dispatches.mark_verdict(
+            row["id"], row["tip"], "read clean", polarity=polarity,
+            basis="measured", bind_author=True, reviewer_model=model,
+            reviewer_run=run, author_model=author or CROSS_FAMILY_AUTHOR)
+        self.assertIsNone(err, err)
+        return dispatches.snapshot()[0][row["id"]]["advisory_reads"][-1]
+
+    def test_the_verdict_writer_stamps_the_verified_run_on_the_read(self):
+        """THE CURE. The lane's author (its sender) records a read that is
+        another family's — so labelled `cross-family` — whose run verifies on
+        disk at the reviewed tip. The verdict writer verifies it ONCE and
+        stamps `read_run_verified`, and the author's hold is then admitted by
+        the read alone, exactly as an Opus reader's `fresh-context` read is."""
+        row = self.row()
+        plant_agent(self.root, READER_SESSION, model=OPUS, tip=self.side)
+        read = self.read(row, model=OPUS)
+        self.assertEqual(read["independence"], "cross-family",
+                         "fixture premise: a non-Claude author makes an Opus "
+                         "read cross-family, the live shape")
+        self.assertEqual(read.get("read_run_verified"),
+                         {"run": AGENT, "tip": self.side},
+                         "the writer must stamp the run it verified")
+        state = dispatches.snapshot()[0][row["id"]]
+        found = landreq._fresh_instance_read(state, "integrator", self.side)
+        self.assertIsNotNone(
+            found, "a verified cross-family read must be the author's escape")
+        self.assertEqual(found["polarity"], "concur")
+        self.assertIsNone(
+            landreq.source_clean_author_error(state, "integrator",
+                                              tip=self.side))
+
+    def test_a_cross_family_read_with_NO_verifiable_run_is_refused(self):  # noqa: VACUOUS_ASSERTION — the positive control on this same observable is
+    # test_the_verdict_writer_stamps_the_verified_run_on_the_read, which
+    # asserts _fresh_instance_read NON-None on a verified read; these assert
+    # it None one fact apart
+        """CONTROL: the same read whose run is not on disk holds nothing —
+        the label alone never admits an author, and no fact is stamped."""
+        row = self.row()
+        read = self.read(row, model=OPUS, run="a" + "9" * 16)
+        self.assertNotIn("read_run_verified", read)
+        state = dispatches.snapshot()[0][row["id"]]
+        self.assertIsNone(
+            landreq._fresh_instance_read(state, "integrator", self.side))
+        self.assertEqual(
+            getattr(landreq.source_clean_author_error(
+                state, "integrator", tip=self.side), "kind", None),
+            landreq.SourceCleanRefusal.LANE_AUTHOR)
+
+    def test_a_cross_family_read_of_ANOTHER_tip_is_refused(self):  # noqa: VACUOUS_ASSERTION — the positive control on this same observable is
+    # test_the_verdict_writer_stamps_the_verified_run_on_the_read; this asserts
+    # it None one fact apart
+        """CONTROL: a verified run that read other work is no clean read of
+        this tip."""
+        row = self.row()
+        plant_agent(self.root, READER_SESSION, model=OPUS, tip=TIP)
+        read = self.read(row, model=OPUS)
+        self.assertNotIn("read_run_verified", read)
+        state = dispatches.snapshot()[0][row["id"]]
+        self.assertIsNone(
+            landreq._fresh_instance_read(state, "integrator", self.side))
+
+    def test_a_cross_family_FIX_is_refused(self):  # noqa: VACUOUS_ASSERTION — the positive control on this same observable is
+    # test_the_verdict_writer_stamps_the_verified_run_on_the_read; this asserts
+    # it None one fact apart
+        """CONTROL: a read that FOUND something is not a clean read."""
+        row = self.row()
+        plant_agent(self.root, READER_SESSION, model=OPUS, tip=self.side)
+        self.read(row, model=OPUS, polarity="fix")
+        state = dispatches.snapshot()[0][row["id"]]
+        self.assertIsNone(
+            landreq._fresh_instance_read(state, "integrator", self.side))
+
+    def test_a_landed_tip_with_no_lane_base_stays_closed_on_cold_replay(self):
+        """THE SHAPE THE INTEGRATOR NAMED: a source-clean hold whose tip has
+        LANDED (so it has no lane base any more) must not lose its admission
+        on a COLD REPLAY. The stamp was recorded at write time, while the tip
+        still had a lane base; the replay reads it from the ledger and runs no
+        git or transcript probe — a read-side probe would refuse here (the
+        landed tip has no base) and flip the row back to held. The row's
+        sender wrote the lane (a chain with no build row), so it is a LANE
+        AUTHOR whose only admission is the verified read."""
+        row = self.row()                      # at self.side, off self.a
+        plant_agent(self.root, READER_SESSION, model=OPUS, tip=self.side)
+        read = self.read(row, model=OPUS)
+        self.assertEqual(read.get("read_run_verified"),
+                         {"run": AGENT, "tip": self.side},
+                         "fixture premise: the stamp is written while the tip "
+                         "still has a lane base")
+        # THE LAND: merge the side tip into main, so it is on trunk and has no
+        # lane base any more. A read-side probe would now refuse.
+        _git(self.repo, "checkout", "-q", self.main)
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "land", self.side)
+        _git(self.repo, "checkout", "-q", self.main)
+        # COLD REPLAY: a fresh fold from the ledger alone, no probe.
+        state = dispatches.snapshot()[0][row["id"]]
+        self.assertIsNotNone(
+            landreq._fresh_instance_read(state, "integrator", self.side),
+            "a cold replay must read the stamp, never re-probe a landed tip")
+        self.assertIsNone(
+            landreq.source_clean_author_error(state, "integrator",
+                                              tip=self.side))
+
+    def test_the_senders_hold_on_a_verified_read_is_owed_the_gate_and_survives_the_land(self):  # noqa: VACUOUS_ASSERTION — the hold is asserted HELD and stamped by value, its closing line is asserted EQUAL to the exact rests-on sentence, and after the land the cold replay asserts the row still HELD at that tip before the holder rung's None
+        """The SENDER (a lane author, no build row) holds source-clean on the
+        verified cross-family read. Every surface then says the hold rests on
+        that read and is owed the land gate — never that the row stays OWED,
+        which sends the integrator after a read the row already has. After
+        the tip LANDS, a cold replay still finds the hold and the close's own
+        holder rung (`source_clean_holder_error`, condition 1 of the
+        source-clean-landed close) admits it from the ledger alone."""
+        row = self.row()
+        plant_agent(self.root, READER_SESSION, model=OPUS, tip=self.side)
+        self.read(row, model=OPUS)
+        with mock.patch.object(dispatches, "_acting_author",
+                               return_value=("integrator", None)):
+            held, why = dispatches.mark_hold(
+                row["id"], "SOURCE-CLEAN: read clean; fab Ran 5 tests OK",
+                source_clean_tip=self.side)
+        self.assertIsNone(why, why)
+        state = dispatches.snapshot()[0][row["id"]]
+        self.assertEqual((held["status"], state["hold_actor"],
+                          state["source_clean_tip"]),
+                         ("held", "integrator", self.side))
+        self.assertEqual(
+            dispatches.advisory_read_lines(state)[-1],
+            "ADVISORY: the SOURCE-CLEAN hold at %s by @integrator rests on "
+            "the verified cross-family read above; what it owes now is the "
+            "integrator's land gate" % self.side[:12])
+        _git(self.repo, "checkout", "-q", self.main)
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "land", self.side)
+        current = dispatches.snapshot()[0]
+        state = current[row["id"]]
+        self.assertEqual((state["status"], state["source_clean_tip"]),
+                         ("held", self.side))
+        self.assertIsNone(landreq.source_clean_holder_error(state, current))
+
+    def test_the_hold_line_names_the_holder_as_the_door_does(self):  # noqa: VACUOUS_ASSERTION — SPELLINGS is a fixed non-empty tuple; each spelling asserts the door admits AND the closing line is the rests-on sentence; the other-seat control asserts the door refuses AND the line stays OWED
+        """ONE SEAT SPELLED TWO WAYS IS ONE SEAT ON EVERY SURFACE. The door
+        (`landreq._fresh_instance_read`) compares the holder with the read's
+        recorder through `landreq._same_seat`; the advisory line must ask the
+        same question, or it tells the integrator a hold the door admits
+        still leaves the row OWED."""
+        row = self.row()
+        plant_agent(self.root, READER_SESSION, model=OPUS, tip=self.side)
+        self.read(row, model=OPUS)
+        with mock.patch.object(dispatches, "_acting_author",
+                               return_value=("integrator", None)):
+            _held, why = dispatches.mark_hold(
+                row["id"], "SOURCE-CLEAN: read clean; fab Ran 5 tests OK",
+                source_clean_tip=self.side)
+        self.assertIsNone(why, why)
+        state = dispatches.snapshot()[0][row["id"]]
+        for spelling in ("Integrator", "INTEGRATOR", " integrator "):
+            with self.subTest(spelling=spelling):
+                held = dict(state, hold_actor=spelling)
+                self.assertIsNotNone(
+                    landreq._fresh_instance_read(held, spelling, self.side),
+                    "fixture premise: the door admits this spelling")
+                self.assertEqual(
+                    dispatches.advisory_read_lines(held)[-1],
+                    "ADVISORY: the SOURCE-CLEAN hold at %s by @%s rests on "
+                    "the verified cross-family read above; what it owes now "
+                    "is the integrator's land gate"
+                    % (self.side[:12], spelling))
+        other = dict(state, hold_actor="someone-else")
+        self.assertIsNone(
+            landreq._fresh_instance_read(other, "someone-else", self.side))
+        self.assertIn("stays OWED", dispatches.advisory_read_lines(other)[-1])
+
+    def test_the_hold_line_reads_the_held_tip_as_the_door_does(self):  # noqa: VACUOUS_ASSERTION — SPELLINGS is a fixed non-empty tuple; each spelling asserts the door admits AND the closing line is the rests-on sentence; the other-tip control asserts the door refuses AND the line stays OWED
+        """ONE TIP SPELLED TWO WAYS IS ONE TIP ON EVERY SURFACE. The door
+        (`landreq._fresh_instance_read`) lowers and strips the held tip and
+        the read's tip (`landreq._tip`) before it compares them; the advisory
+        line must read the held tip the same way, or it tells the integrator
+        a hold the door admits still leaves the row OWED."""
+        row = self.row()
+        plant_agent(self.root, READER_SESSION, model=OPUS, tip=self.side)
+        self.read(row, model=OPUS)
+        with mock.patch.object(dispatches, "_acting_author",
+                               return_value=("integrator", None)):
+            _held, why = dispatches.mark_hold(
+                row["id"], "SOURCE-CLEAN: read clean; fab Ran 5 tests OK",
+                source_clean_tip=self.side)
+        self.assertIsNone(why, why)
+        state = dispatches.snapshot()[0][row["id"]]
+        for spelling in (self.side.upper(), " %s " % self.side):
+            with self.subTest(spelling=spelling):
+                held = dict(state, source_clean_tip=spelling)
+                self.assertIsNotNone(
+                    landreq._fresh_instance_read(held, "integrator",
+                                                 spelling),
+                    "fixture premise: the door admits this spelling")
+                self.assertEqual(
+                    dispatches.advisory_read_lines(held)[-1],
+                    "ADVISORY: the SOURCE-CLEAN hold at %s by @integrator "
+                    "rests on the verified cross-family read above; what it "
+                    "owes now is the integrator's land gate" % self.side[:12])
+        elsewhere = "f" * len(self.side)
+        other = dict(state, source_clean_tip=elsewhere)
+        self.assertIsNone(
+            landreq._fresh_instance_read(other, "integrator", elsewhere))
+        self.assertIn("stays OWED", dispatches.advisory_read_lines(other)[-1])
 
 
 def setUpModule():

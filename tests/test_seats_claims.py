@@ -159,7 +159,7 @@ class HolderMoveExtractionTest(HolderRebindBase):
         import inspect
         from helm import seats, seats_claim_moves
         for name, signature in (
-                ("rebind_claim_holder", "(source, target, snap=None, restore=None)"),
+                ("rebind_claim_holder", "(source, target, snap=None, restore=None, only=None)"),
                 ("rollback_claim_holder", "(source, target, manifest)")):
             self.assertIs(getattr(seats, name), getattr(seats_claims, name))
             self.assertEqual(str(inspect.signature(getattr(seats_claims, name))), signature)
@@ -751,7 +751,14 @@ class ClaimsLockWaitIsBoundedTest(HolderRebindBase):
         self.renew_s = gate._GATE_LEGACY_RENEW_S
         self.period = self.renew_s * self.SCALE
         self.bound = seats_common.CLAIM_LOCK_WAIT_S * self.SCALE
-        self.timeout = 6 * self.period
+        # THE CEILING ON A WAIT IS NOT SCALED WITH THE BOUND. The defect is a
+        # wait with NO end, so any finite ceiling reports it as BLOCKED; what
+        # the ceiling must not do is catch a call that is merely slow.
+        # claims_list walks /proc once per call, and on a build host loaded by
+        # a whole-suite gate that walk alone ran past six scaled periods (3s)
+        # and was reported BLOCKED although it had taken the lock exactly
+        # once. The counts below, not this ceiling, prove each door's wait.
+        self.timeout = max(6 * self.period, 60)
         self.lock = claims_path() + ".lock"
         self.release_lease = self.claim(RES_A, ALICE, SID_A)
         self.refresh_lease = self.claim(self.RES_REFRESH, BOB, SID_B)

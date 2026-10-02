@@ -18,7 +18,9 @@ not a seat, and must not be reported as one.
 """
 import copy
 import inspect
+import json
 import os
+import shlex
 import shutil
 import tempfile
 import unittest
@@ -309,12 +311,14 @@ class FamiliesTest(unittest.TestCase):
         self.assertLess(grok["max_context"], grok["probed_context_length"])
         self.assertIsNone(grok.get("observed_context_floor"))
         self.assertIsNone(grok.get("owner_stated_window"))
-        # the one family left unpinned is ds4flash, whose route publishes no
-        # window: omission stays the honest value there, and nothing backs
-        # a pin
-        self.assertIsNone(seat.FAMILIES["ds4flash"].get("max_context"))
-        for key in seat.WINDOW_BACKINGS:
-            self.assertIsNone(seat.FAMILIES["ds4flash"].get(key), key)
+        # ds4flash rests on the same ONE grade as grok: its Go route's
+        # published window (models.dev, opencode-go), recorded as
+        # probed_context_length, with the pin under it and no other grade
+        flash = seat.FAMILIES["ds4flash"]  # noqa: SEAT_NAME — catalog FAMILY key, which is this arm's subject
+        self.assertEqual(flash.get("probed_context_length"), 1000000)
+        self.assertLess(flash["max_context"], flash["probed_context_length"])
+        self.assertIsNone(flash.get("observed_context_floor"))
+        self.assertIsNone(flash.get("owner_stated_window"))
 
     def test_an_owner_statement_is_its_own_grade_and_never_a_floor(self):
         """THE GRADE ADDED 2026-08-03, and the thing it must never become.
@@ -1278,8 +1282,10 @@ class EveryPinnedWindowIsItsRoutesPublishedValue(unittest.TestCase):
     far under the model's own window), recorded with its source in
     seat_catalog.PUBLISHED_ROUTE_WINDOWS, and the pin is that route window's
     INPUT ceiling by the codex law: the window less the output a seat
-    requests less Claude Code's reserve. Cursor alone departs from the law
-    (task/3616), and its arm shows that its worst request still fits.
+    requests less Claude Code's reserve. That law takes Claude Code's
+    reserve twice, because Claude Code takes it again from the window it is
+    taught. cursor (task/3616), grok and opus46 (task/3826) count it once,
+    and their arms show that each worst request still fits.
 
     THE NUMBERS ARE TRANSCRIBED, once, from the published listings, and each
     arm checks the catalog against the transcription AND against the
@@ -1300,6 +1306,7 @@ class EveryPinnedWindowIsItsRoutesPublishedValue(unittest.TestCase):
         ("grok", "grok-build-0.1"): 256000,  # noqa: SEAT_NAME — catalog FAMILY keys, which are this arm's subject
         ("opus46", "claude-opus-4-6-thinking"): 200000,  # noqa: SEAT_NAME — catalog FAMILY keys, which are this arm's subject
         ("gptoss", "gpt-oss-120b-medium"): 114000,  # noqa: SEAT_NAME — catalog FAMILY keys, which are this arm's subject
+        ("ds4flash", "deepseek-v4.1-flash"): 1000000,  # noqa: SEAT_NAME — catalog FAMILY keys, which are this arm's subject
         ("cursor", "grok-4.7-high"): 256000,  # noqa: SEAT_NAME — catalog FAMILY keys, which are this arm's subject
     }
 
@@ -1329,20 +1336,23 @@ class EveryPinnedWindowIsItsRoutesPublishedValue(unittest.TestCase):
                 self.assertTrue(record.get("route"), key)
                 self.assertTrue(record.get("read"), key)
 
-    def test_grok_gptoss_and_opus46_pin_their_routes_input_ceiling(self):
+    def test_grok_gptoss_and_opus46_record_their_routes_window(self):
         """The three families that pinned nothing. Each records its route's
         window as probed_context_length, the grade the no-guessed-window
-        guard bounds a pin by, and pins the codex-law ceiling under it."""
-        want = {"grok": (256000, 204000),  # noqa: SEAT_NAME — catalog FAMILY keys, which are this arm's subject
-                "opus46": (200000, 148000),  # noqa: SEAT_NAME — catalog FAMILY keys, which are this arm's subject
-                "gptoss": (114000, 62000)}  # noqa: SEAT_NAME — catalog FAMILY keys, which are this arm's subject
-        for family, (published, pinned) in want.items():
+        guard bounds a pin by, and pins a window under it. gptoss still pins
+        the codex-law ceiling; grok and opus46 count Claude Code's reserve
+        once (the arm below)."""
+        # (published window, pin, the codex-law ceiling under it)
+        want = {"grok": (256000, 237000, 204000),  # noqa: SEAT_NAME — catalog FAMILY keys, which are this arm's subject
+                "opus46": (200000, 173000, 148000),  # noqa: SEAT_NAME — catalog FAMILY keys, which are this arm's subject
+                "gptoss": (114000, 66000, 62000)}  # noqa: SEAT_NAME — catalog FAMILY keys, which are this arm's subject
+        for family, (published, pinned, law) in want.items():
             with self.subTest(family=family):
                 fam = seat.FAMILIES[family]
                 model = fam["model"]
                 self.assertEqual(fam.get("probed_context_length"), published)
                 self.assertEqual(fam.get("max_context"), pinned)
-                self.assertEqual(self._ceiling(family, model), pinned)
+                self.assertEqual(self._ceiling(family, model), law)
                 # the launch line teaches it, both knobs
                 line = seat.launch_line(family)
                 self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=%d " % pinned,
@@ -1389,20 +1399,37 @@ class EveryPinnedWindowIsItsRoutesPublishedValue(unittest.TestCase):
     #: measured once on a one-word request
     CURSOR_ESTIMATE_MARGIN = 10000
 
-    def _cursor_requests(self, window):
-        """(compaction point, {case: the largest request that reaches
-        Cursor}) for a cursor seat taught `window`, with Claude Code's own
-        rules applied once: its effective window is the taught one less
+    #: the largest growth of ANY seat's context between one request and
+    #: the next, MEASURED across the fleet's transcripts (task/3826):
+    #: qwenlocal 2026-09-25T23:55Z, 62,936 to 109,784 after one step of 88
+    #: parallel tool results. The measured maxima elsewhere sit under it:
+    #: ds4pro 38,261, grok 36,937, qwen27 32,536, gemini 26,963, opus46
+    #: 7,610. A family is held to this unless it measured its own.
+    FLEET_GROWTH = 46848
+    #: the first request of a FRESH session (system prompt, every tool
+    #: schema, the boot brief), MEASURED on each family's own transcript:
+    #: grok 59,249 (2026-09-25T16:12Z, after a /clear), opus46 55,037
+    #: (2026-09-18T22:01Z). Claude Code sends every tool schema to a proxy
+    #: base URL, so these families boot far above the lite local seats.
+    FRESH_BOOT = {"grok": 59249, "opus46": 55037}  # noqa: SEAT_NAME — catalog FAMILY keys, which are this arm's subject
+
+    def _worst_requests(self, family, window, growth):
+        """(compaction point, {case: the largest request that reaches the
+        route}) for a seat of `family` taught `window`, with Claude Code's
+        own rules applied once: its effective window is the taught one less
         min(output, 20000), it compacts at the launch line's 80% of that,
         and it sends nothing at or above effective less 3000. A request
-        reaching Cursor carries Cursor's own prompt too, and either the
-        output a seat requests or, for a compaction, the summary output
-        Claude Code reserves. pi reads the same window as its total."""
-        cursor = seat.FAMILIES["cursor"]  # noqa: SEAT_NAME — catalog FAMILY keys, which are this arm's subject
-        record = seat_catalog.PUBLISHED_ROUTE_WINDOWS[
-            ("cursor", "grok-4.7-high")]  # noqa: SEAT_NAME — catalog FAMILY keys, which are this arm's subject
-        prompt = record["route_prompt"]
-        output = cursor.get("max_output_tokens") or self.SEAT_OUTPUT
+        carries the route's own prompt too (Cursor's; none elsewhere), and
+        either the output a seat requests or, for a compaction, the summary
+        output Claude Code reserves. `growth` is the largest one-request
+        growth the compaction case allows for. pi reads the same window as
+        its total."""
+        fam = seat.FAMILIES[family]
+        record = seat_catalog.PUBLISHED_ROUTE_WINDOWS[(family,
+                                                      fam.get("upstream_model")
+                                                      or fam["model"])]
+        prompt = record.get("route_prompt", 0)
+        output = fam.get("max_output_tokens") or self.SEAT_OUTPUT
         reserve = min(output, self.CC_RESERVE)
         effective = window - reserve
         pct = int(seat_catalog.AUTOCOMPACT_PCT_OVERRIDE)
@@ -1412,8 +1439,184 @@ class EveryPinnedWindowIsItsRoutesPublishedValue(unittest.TestCase):
             "under compaction": trigger + prompt + output,
             "compaction failing, at the block": block - 1 + prompt + output,
             "a compaction after the largest growth":
-                trigger + self.CURSOR_GROWTH + prompt + reserve,
+                trigger + growth + prompt + reserve,
             "pi": window - self.PI_REQUEST_GAP + prompt}
+
+    def _cursor_requests(self, window):
+        """_worst_requests for cursor, with its own measured growth."""
+        return self._worst_requests("cursor", window, self.CURSOR_GROWTH)  # noqa: SEAT_NAME — catalog FAMILY keys, which are this arm's subject
+
+    def test_grok_and_opus46_count_claude_codes_margin_once(self):  # noqa: VACUOUS_ASSERTION — the loop runs over a literal two-entry table, and cursor's arm after it is unconditional
+        """task/3826. grok and opus46 pinned the codex law (route - output
+        - 20000), which takes Claude Code's reserve twice, as cursor's did
+        before task/3616. Each pin is now the largest thousand whose worst
+        requests all stay 10,000 under the route's published window, with
+        Claude Code's rules applied once and the fleet's largest measured
+        growth. The block
+        binds grok; the compaction after that growth binds opus46. Each
+        native compaction point clears the family's measured fresh boot."""
+        want = {"grok": (256000, 237000, 173600, {  # noqa: SEAT_NAME — catalog FAMILY keys, which are this arm's subject
+                    "under compaction": 205600,
+                    "compaction failing, at the block": 245999,
+                    "a compaction after the largest growth": 240448,
+                    "pi": 232904}),
+                "opus46": (200000, 173000, 122400, {  # noqa: SEAT_NAME — catalog FAMILY keys, which are this arm's subject
+                    "under compaction": 154400,
+                    "compaction failing, at the block": 181999,
+                    "a compaction after the largest growth": 189248,
+                    "pi": 168904})}
+        for family, (total, window, point, requests) in want.items():
+            with self.subTest(family=family):
+                fam = seat.FAMILIES[family]
+                model = fam["model"]
+                record = seat_catalog.PUBLISHED_ROUTE_WINDOWS[(family, model)]
+                self.assertEqual(record["context_length"], total)
+                self.assertEqual(fam["max_context"], window)
+                # the codex law it departs from sits under it
+                self.assertLess(self._ceiling(family, model), window)
+                trigger, worst = self._worst_requests(family, window,
+                                                      self.FLEET_GROWTH)
+                self.assertEqual(trigger, point)
+                self.assertEqual(worst, requests)
+                limit = total - self.CURSOR_ESTIMATE_MARGIN
+                for case, request in worst.items():
+                    with self.subTest(family=family, case=case):
+                        self.assertLessEqual(request, limit)
+                # the LARGEST such thousand: the next one breaks a case
+                self.assertGreater(max(self._worst_requests(
+                    family, window + 1000, self.FLEET_GROWTH)[1].values()),
+                    limit)
+                # a fresh session starts under the compaction point
+                self.assertGreater(trigger, self.FRESH_BOOT[family])
+                # the launch line teaches it, both knobs, and the watchdog
+                # gauges the same number
+                line = seat.launch_line(family)
+                self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=%d " % window,
+                              line)
+                self.assertIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW=%d " % window,
+                              line)
+                self.assertEqual(autocompact._window(family),
+                                 (window, "FAMILIES.max_context"))
+                self.assertEqual(seat._unbacked_window_reason({family: fam}),
+                                 "")
+        # cursor's pin passes the same rule under the fleet's growth too
+        cursor_limit = 256000 - self.CURSOR_ESTIMATE_MARGIN
+        self.assertLessEqual(max(self._worst_requests(
+            "cursor", seat.FAMILIES["cursor"]["max_context"],  # noqa: SEAT_NAME — catalog FAMILY keys, which are this arm's subject
+            self.FLEET_GROWTH)[1].values()), cursor_limit)
+
+    #: gptoss cannot hold a full-tool boot under its 114k route, so it
+    #: boots with cursor's tool denials (context_denied_tools). Its boot
+    #: is INFERRED from cursor's measured 13,700-20,800 range (task/3826):
+    #: the upper bound is what its trigger must clear.
+    INFERRED_LEAN_BOOT = 20800
+
+    def test_gptoss_counts_claude_codes_margin_once_and_boots_lean(self):
+        """task/3826. gptoss pinned the codex law (114000 - 32000 - 20000 =
+        62000), which took Claude Code's reserve twice and set a 33,600
+        trigger and 39,000 block point under a measured full-tool boot of
+        54-59k, so the seat blocked right after boot. 66000 is the largest
+        thousand whose 80% compaction point (36,800) after the fleet's
+        largest measured growth (46,848) stays 10,000 under the route's
+        114,000 published window (effective 46,000, worst request 103,648).
+        With Claude Code's 13,000 gap applied, its native trigger is 33,000.
+        To clear that trigger, gptoss denies the tools it never calls
+        (LOCAL_UNUSED_TOOLS + Workflow + ListAgents, as cursor does),
+        so its fresh boot sits within cursor's measured 13,700-20,800 lean
+        range and clears the 33,000 compaction point."""
+        family = "gptoss"  # noqa: SEAT_NAME — catalog FAMILY keys, which are this arm's subject
+        fam = seat.FAMILIES[family]
+        model = fam["model"]
+        record = seat_catalog.PUBLISHED_ROUTE_WINDOWS[(family, model)]
+        total = record["context_length"]
+        self.assertEqual(total, 114000)
+        window = fam["max_context"]
+        self.assertEqual(window, 66000)
+        # the codex law it departs from sits under it
+        self.assertLess(self._ceiling(family, model), window)
+        trigger, worst = self._worst_requests(family, window,
+                                              self.FLEET_GROWTH)
+        self.assertEqual(trigger, 33000)
+        self.assertEqual(worst, {
+            "under compaction": 65000,
+            "compaction failing, at the block": 74999,
+            "a compaction after the largest growth": 99848,
+            "pi": 61904})
+        limit = total - self.CURSOR_ESTIMATE_MARGIN
+        for case, request in worst.items():
+            with self.subTest(family=family, case=case):
+                self.assertLessEqual(request, limit)
+        # the 80% rule without the 13k gap binds 66000 as the largest thousand:
+        eff = window - min(fam.get("max_output_tokens", self.SEAT_OUTPUT),
+                           self.CC_RESERVE)
+        pct = int(seat_catalog.AUTOCOMPACT_PCT_OVERRIDE)
+        pct_trig = eff * pct // 100
+        self.assertEqual(pct_trig, 36800)
+        self.assertLessEqual(
+            pct_trig + self.FLEET_GROWTH + min(
+                fam.get("max_output_tokens", self.SEAT_OUTPUT),
+                self.CC_RESERVE), limit)
+        eff_next = (window + 1000) - min(
+            fam.get("max_output_tokens", self.SEAT_OUTPUT), self.CC_RESERVE)
+        pct_trig_next = eff_next * pct // 100
+        self.assertGreater(
+            pct_trig_next + self.FLEET_GROWTH + min(
+                fam.get("max_output_tokens", self.SEAT_OUTPUT),
+                self.CC_RESERVE), limit)
+        # a fresh session starts under the compaction point (inferred lean boot)
+        self.assertGreater(trigger, self.INFERRED_LEAN_BOOT)
+        # tool denials match cursor lean set and carries no workflow cap
+        want_denied = (seat_catalog.LOCAL_UNUSED_TOOLS +
+                       (seat_catalog.WORKFLOW_TOOL, "ListAgents"))
+        self.assertEqual(fam.get("context_denied_tools"), want_denied)
+        self.assertTrue(seat_catalog.context_lean(family))
+        self.assertEqual(seat_catalog.workflow_cap_env(family), ())
+        # the launch line teaches it, both knobs, and the watchdog gauges it
+        line = seat.launch_line(family)
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=%d " % window, line)
+        self.assertIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW=%d " % window, line)
+        for tool in want_denied:
+            self.assertIn(tool, line)
+        self.assertEqual(autocompact._window(family),
+                         (window, "FAMILIES.max_context"))
+        self.assertEqual(seat._unbacked_window_reason({family: fam}), "")
+
+    def test_all_catalog_families_windows_are_pinned_and_unchanged(self):  # noqa: VACUOUS_ASSERTION — asserts exact equality against literal dictionary of all 14 families
+        """Pin the full table of max_context across all families to prevent
+        accidental drift while adjusting individual families (task/3826)."""
+        want = {
+            "bonsai": (229376, 262144),
+            "codex": (220000, None),
+            "cursor": (225000, 256000),
+            "dots3": (463616, 512000),
+            "ds4flash": (948000, 1000000),
+            "ds4pro": (1000000, 1048576),
+            "gemini": (1000000, None),
+            "gptoss": (66000, 114000),
+            "grok": (237000, 256000),
+            "kimi": (1000000, 1048576),
+            "openrouter": (168000, 512000),
+            "opus46": (173000, 200000),
+            "qwen27": (180992, 212992),
+            "qwenlocal": (212992, 262144),
+        }
+        got = {f: (data.get("max_context"), data.get("probed_context_length"))
+               for f, data in seat.FAMILIES.items()}
+        self.assertEqual(got, want)
+
+    def test_dots3_teaches_a_window_that_leaves_the_compaction_floor(self):
+        """task/3196. dots3 is not served from the operator's box, so the
+        local-family guard does not cover it. The taught window still leaves
+        the output cap and LOCAL_COMPACTION_MARGIN free in the vendor slot.
+        The probe stays the vendor's 512000."""
+        fam = seat.FAMILIES["dots3"]  # noqa: SEAT_NAME — catalog FAMILY key, which is this arm's subject
+        self.assertFalse(seat_catalog.own_box(fam))
+        self.assertEqual(fam["probed_context_length"], 512000)
+        self.assertEqual(fam["max_output_tokens"], 32000)
+        self.assertEqual(
+            fam["max_context"],
+            fam["probed_context_length"] - fam["max_output_tokens"]
+            - seat_catalog.LOCAL_COMPACTION_MARGIN)
 
     def test_cursor_counts_claude_codes_margin_once_and_keeps_10000_for_estimate_error(self):
         """task/3616. Cursor's window is not an OpenRouter or router-for-me
@@ -1468,39 +1671,129 @@ class EveryPinnedWindowIsItsRoutesPublishedValue(unittest.TestCase):
         self.assertEqual(self._cursor_requests(law)[0], 137600)
         self.assertEqual((self._cursor_requests(law)[0] - self.CURSOR_FLOOR,
                           trigger - self.CURSOR_FLOOR), (40317, 66717))
-        # the launch line teaches the family's context_budget (task/3652:
-        # Cursor's own count of the history runs 3-6x the bridge's estimate;
-        # 88k is the watchdog threshold, native compaction near 72k after
-        # its output reserve), both knobs, and the watchdog gauges the same
-        # number; max_context above stays the window's ceiling
-        taught = cursor["context_budget"]
-        self.assertEqual(taught, 110000)
-        self.assertLess(taught, window)
+        # the launch line teaches this window itself, both knobs, and the
+        # watchdog gauges the same number: no context_budget narrows it
+        # (task/3816; the 110000 one rested on Cursor's run-start replay
+        # count, which the bridge's kept conversation removes, task/3817)
+        self.assertIsNone(cursor.get("context_budget"))
+        taught = seat_catalog.launch_window(cursor)
+        self.assertEqual(taught, window)
         line = seat.launch_line("cursor")  # noqa: SEAT_NAME — catalog FAMILY keys, which are this arm's subject
         self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=%d " % taught, line)
         self.assertIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW=%d " % taught, line)
         self.assertEqual(autocompact._window("cursor"),  # noqa: SEAT_NAME — catalog FAMILY keys, which are this arm's subject
-                         (taught, "FAMILIES.context_budget"))
+                         (taught, "FAMILIES.max_context"))
         # and the no-guessed-window guard still admits it under its reading
         self.assertEqual(seat._unbacked_window_reason({"cursor": cursor}), "")  # noqa: SEAT_NAME — catalog FAMILY keys, which are this arm's subject
 
-    def test_ds4flash_alone_stays_unpinned_and_unrecorded(self):
-        """Its OpenCode Go route publishes no window and the family is not
-        activatable, so nothing is taught one: no pin, no backing grade, no
-        record, and the watchdog reads Claude Code's own default."""
-        fam = seat.FAMILIES["ds4flash"]  # noqa: SEAT_NAME — catalog FAMILY keys, which are this arm's subject
-        self.assertTrue(fam.get("activation_refusal"))
-        self.assertIsNone(fam.get("max_context"))
+    def test_ds4flash_pins_its_go_routes_published_input_ceiling(self):
+        """OpenCode publishes its Go route's window for deepseek-v4.1-flash
+        (models.dev, opencode-go: 1000000 total), so the family records it as
+        probed_context_length and pins the codex-law input ceiling under it,
+        before its first seat is taught anything."""
+        family = "ds4flash"  # noqa: SEAT_NAME — catalog FAMILY key, which is this arm's subject
+        fam = seat.FAMILIES[family]
+        self.assertNotIn("activation_refusal", fam)
+        self.assertEqual(fam.get("probed_context_length"), 1000000)
+        self.assertEqual(fam.get("max_context"), 948000)
+        self.assertEqual(self._ceiling(family, "deepseek-v4.1-flash"), 948000)
+        self.assertEqual(autocompact._window(family),
+                         (948000, "FAMILIES.max_context"))
         recorded = sorted({k[0] for k in seat_catalog.PUBLISHED_ROUTE_WINDOWS})
-        self.assertEqual(recorded, ["codex", "cursor", "gptoss", "grok",
-                                    "opus46"])  # noqa: SEAT_NAME — catalog FAMILY keys, which are this arm's subject
-        self.assertEqual(autocompact._window("ds4flash"),  # noqa: SEAT_NAME — catalog FAMILY keys, which are this arm's subject
-                         (autocompact.CC_ASSUMED_WINDOW, "cc-assumed-default"))
-        # CONTROL on the same census: every OTHER family pins a window, so
-        # "ds4flash alone" is a measurement and not a table that pins nobody
+        self.assertEqual(recorded, ["codex", "cursor", "ds4flash", "gptoss",
+                                    "grok", "opus46"])  # noqa: SEAT_NAME — catalog FAMILY keys, which are this arm's subject
+        # THE CENSUS: every family now pins a window, so an unpinned family
+        # is a planted fixture from here on and never the live table
         unpinned = sorted(f for f, entry in seat.FAMILIES.items()
                           if not entry.get("max_context"))
-        self.assertEqual(unpinned, ["ds4flash"])  # noqa: SEAT_NAME — catalog FAMILY keys, which are this arm's subject
+        self.assertEqual(unpinned, [])
+        self.assertEqual(seat._unbacked_window_reason(), "")
+
+
+class CursorLeavesTheToolsItNeverCalls(unittest.TestCase):
+    """Claude Code sends every tool schema on every request to a proxy base
+    URL, because it turns tool search off there, so every schema it never
+    calls is window it cannot work in (task/3803 measured 41.1k of tool
+    schemas at boot). The family's own `context_denied_tools` takes away the
+    tools it never calls: LOCAL_UNUSED_TOOLS, Workflow and ListAgents. The tools it calls stay. A denied Workflow carries no cap,
+    and the family reads `helm chat read` short like the other context-lean
+    families."""
+
+    FAMILY = "cursor"  # noqa: SEAT_NAME — the catalog FAMILY key under test
+    CONTROL = "codex"  # noqa: SEAT_NAME — a catalog FAMILY key that keeps a capped Workflow
+    GONE = seat_catalog.LOCAL_UNUSED_TOOLS + ("Workflow", "ListAgents")
+    KEPT = ("Bash", "Read", "Edit", "Write", "Monitor", "SendMessage",
+            "TaskStop", "Agent", "WebFetch")
+
+    @staticmethod
+    def _deny_argv(line):
+        """The --disallowedTools words of a launch line, as claude gets them."""
+        _head, sep, tail = line.partition(" claude --disallowedTools ")
+        denied, sep2, _rest = tail.partition(" --dangerously-skip-permissions")
+        return shlex.split(denied) if sep and sep2 else []
+
+    def test_cursor_denies_the_tools_it_never_calls_and_carries_no_workflow_cap(self):  # noqa: VACUOUS_ASSERTION — each absence follows a presence on the same observable: the control family's cap on its line and seeded env, and every GONE tool on cursor's deny argv and seeded deny
+        cap = seat_catalog.WORKFLOW_CAP_VAR
+        # the control: a proxy family that keeps Workflow carries the cap on
+        # both surfaces, so an absence below is the family's and not the
+        # reader's
+        control = seat.launch_line(self.CONTROL)
+        self.assertIn(" %s=%d " % (cap, seat_catalog.WORKFLOW_AGENT_CAP), control)
+        self.assertEqual(seat_catalog.workflow_cap_env(self.CONTROL),
+                         ((cap, str(seat_catalog.WORKFLOW_AGENT_CAP)),))
+        self.assertIn(cap, self._seeded(self.CONTROL).get("env", {}))
+        line = seat.launch_line(self.FAMILY)
+        argv = self._deny_argv(line)
+        self.assertEqual(argv, list(seat.denied_tools(self.FAMILY)))
+        seeded = self._seeded(self.FAMILY)
+        for tool in self.GONE:
+            self.assertIn(tool, argv)
+            self.assertIn(tool, seeded["permissions"]["deny"])
+        for tool in self.KEPT:
+            self.assertNotIn(tool, argv)
+            self.assertNotIn(tool, seeded["permissions"]["deny"])
+        # a denied Workflow carries no cap, on the line or in the settings a
+        # resume inherits, and no refresh retires the family's own deny
+        self.assertEqual(seat_catalog.workflow_cap_env(self.FAMILY), ())
+        self.assertNotIn(cap, line)
+        self.assertNotIn(cap, seeded.get("env", {}))
+        self.assertEqual(seat_catalog.retired_denies(self.FAMILY), ())
+        self.assertTrue(seat_catalog.context_lean(self.FAMILY))
+
+    def test_gptoss_denies_the_tools_it_never_calls_and_carries_no_workflow_cap(self):  # noqa: VACUOUS_ASSERTION — checks presence and absence on launch line and seeded permissions
+        """task/3826. gptoss shares cursor's tool denials so it boots lean."""
+        cap = seat_catalog.WORKFLOW_CAP_VAR
+        family = "gptoss"  # noqa: SEAT_NAME — the catalog FAMILY key under test
+        line = seat.launch_line(family)
+        argv = self._deny_argv(line)
+        self.assertEqual(argv, list(seat.denied_tools(family)))
+        seeded = self._seeded(family)
+        for tool in self.GONE:
+            self.assertIn(tool, argv)
+            self.assertIn(tool, seeded["permissions"]["deny"])
+        # WebSearch is unserved on gptoss, so it is in deny argv too
+        self.assertIn("WebSearch", argv)
+        for tool in ("Bash", "Read", "Edit", "Write", "Monitor", "SendMessage",
+                     "TaskStop", "Agent", "WebFetch"):
+            self.assertNotIn(tool, argv)
+            self.assertNotIn(tool, seeded["permissions"]["deny"])
+        self.assertEqual(seat_catalog.workflow_cap_env(family), ())
+        self.assertNotIn(cap, line)
+        self.assertNotIn(cap, seeded.get("env", {}))
+        self.assertEqual(seat_catalog.retired_denies(family), ())
+        self.assertTrue(seat_catalog.context_lean(family))
+
+    def _seeded(self, family):
+        """The settings.json the shipped seeder leaves for a seat of
+        `family`, from an empty deny list."""
+        d = tempfile.mkdtemp(prefix="helm-test-context-deny-")
+        self.addCleanup(shutil.rmtree, d, True)
+        p = os.path.join(d, "settings.json")
+        with open(p, "w") as fh:
+            fh.write('{"permissions":{"deny":[]}}')
+        seat._seed_seat_settings(d, family)
+        with open(p) as fh:
+            return json.load(fh)
 
 
 if __name__ == "__main__":

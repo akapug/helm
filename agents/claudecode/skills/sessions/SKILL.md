@@ -20,7 +20,7 @@ that makes it possible. This skill is the safe front door: `scripts/helm-session
 - **Dry-run first.** Every copy/convert defaults to a DRY-RUN — cv writes a preview under a scratch dir
   (`--out`), real storage untouched. You SEE the new session id, the resume command, and which context
   files carry, before committing. Pass `--apply` to write for real.
-- **Original untouched.** `cv port`/`cv convert` are COPIES (they mint a NEW session id), never moves.
+- **Original untouched.** `cv port` (and `cv convert` on cv 0.10) makes COPIES (a NEW session id), never moves.
   After `--apply` the wrapper ASSERTS the original still exists with an unchanged cwd — a loud abort if not.
 - **Verify before resume.** After `--apply` it confirms the new session resolves, then prints the resume
   command. You never resume a session that didn't actually land.
@@ -78,7 +78,7 @@ git **worktree** used as both `--cwd` and `CLAUDE_PROJECT_DIR` (real project che
   and — unlike a raw emptiness check — survives re-resurrect into a permanent, reused home. After resume,
   have the expert quote its injected `=== MEMORY ===` block; it must be empty/its-own, never the shared buffer.
 - **Native-memory re-key gate** (exit 10): Claude Code keys its *native* memory (`<projects>/<slug>/memory/`)
-  off the slug dir the transcript lives in — NOT `CLAUDE_PROJECT_DIR`. `cv port --to-dir <worktree>` writes the
+  off the slug dir the transcript lives in — NOT `CLAUDE_PROJECT_DIR`. `cv port --cwd <worktree>` (`--to-dir` on cv 0.10) writes the
   ported transcript into the *worktree's* slug dir, so native memory follows the worktree BY CONSTRUCTION;
   `resurrect` asserts the ported transcript actually landed in the worktree slug and fails loud otherwise.
   Runs in both paths (dry-run checks the scratch slug dir cv wrote under `--out`; `--apply` checks the real
@@ -112,6 +112,6 @@ claim it on helm seat-home sessions; that gap is real and open.
 
 - `--apply` writes to real cv storage. Always dry-run first and read the preview.
 - This copies sessions; it never deletes. To retire a source session, do that deliberately and separately.
-- Not for reading/searching a session's CONTENT — that's `cv search` and `cv show <id> --find TERM`.
-- Cross-harness `convert` is best-effort on format fidelity; verify the ported session opens in the target
+- Not for reading/searching a session's CONTENT — that's `cv search` and `helm transcript <id> --find TERM`.
+- A cross-harness port (`cv port --harness`; `cv convert` on cv 0.10) is best-effort on format fidelity; verify the ported session opens in the target
   harness before relying on it (the verify rail checks existence, not semantic fidelity).

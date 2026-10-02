@@ -1,0 +1,1 @@
+sessions [<project>] — every local claude + codex session (the two transcript formats the catalog indexes; opencode/pi sessions reach `helm projects` but produce no rows here); resume in one paste

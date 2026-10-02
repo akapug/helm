@@ -251,6 +251,110 @@ class WhoByArrivalTest(ArrivalBase):
         self.assertLessEqual(sum(len(l) for l in lines), inject.WHO_CAP)
 
 
+    # WHO HAS TWO AUDIENCES (task/4071): the owner's own
+    # guidance (decision cards, human-only gates) reaches the seats he talks
+    # to; a worker that hears only its lead gets the operator line and the
+    # profile's longtail_guidance, never the lead-only rules a brief typed
+    # in by its lead would otherwise carry on every typed turn.
+    LEAD_ONLY = "a decision for him is a work-queue card plus a push"
+    LONGTAIL = "if he talks to you directly, answer short; else agent-to-agent"
+
+    def plant_audiences(self, seat, leads=frozenset({"seat-a"})):
+        from helm import teams, whoami
+        p = mock.patch.object(whoami, "load_profile", return_value={
+            "technical_level": "non-technical operator",
+            "guidance": ["headline first", self.LEAD_ONLY],
+            "longtail_guidance": [self.LONGTAIL]})
+        p.start()
+        self.addCleanup(p.stop)
+        if seat:
+            # InjectBase.tearDown restores the key (it is in ENV_KEYS); a
+            # cleanup here would run after it and drop the caller's value
+            os.environ["HELM_CHAT_NAME"] = seat
+        got = mock.patch.object(
+            teams, "settled_role",
+            side_effect=lambda name: "lead" if name in leads else "reviewer")
+        self.leads = got.start()
+        self.addCleanup(got.stop)
+
+    def who(self, sections):
+        return [l for l in sections["pinned"] if l.startswith("WHO")]
+
+    def test_a_worker_seat_typed_turn_gets_the_longtail_line_not_the_owner_rules(self):
+        self.plant_audiences("seat-b")
+        lines = self.who(inject.gather("brief from your lead", session="s-w"))
+        self.assertTrue(lines)                                # control
+        self.assertTrue(any("non-technical operator" in l for l in lines))
+        self.assertTrue(any(self.LONGTAIL in l for l in lines))
+        self.assertFalse(any(self.LEAD_ONLY in l for l in lines), lines)
+        self.assertFalse(any("headline first" in l for l in lines), lines)
+
+    def test_a_lead_seat_typed_turn_gets_the_full_owner_guidance(self):
+        self.plant_audiences("seat-a")
+        lines = self.who(inject.gather("what is the fleet doing", session="s-l"))
+        self.assertTrue(any(self.LEAD_ONLY in l for l in lines), lines)
+        self.assertFalse(any(self.LONGTAIL in l for l in lines), lines)
+
+    def test_an_unnamed_pane_is_the_owners_own_and_reads_no_roster(self):
+        self.plant_audiences(None)
+        lines = self.who(inject.gather("hello", session="s-u"))
+        self.assertTrue(any(self.LEAD_ONLY in l for l in lines), lines)
+        self.leads.assert_not_called()
+        with mock.patch.dict(os.environ, {"HELM_CHAT_NAME": "seat-b"}):
+            # control: a named seat reads the roster
+            self.assertTrue(self.who(inject.gather("hello", session="s-u2")))
+        self.assertTrue(self.leads.called)
+
+    def test_a_worker_wake_still_carries_no_who(self):
+        self.plant_audiences("seat-b")
+        wake = inject.gather(N.wake("ready for your verdict"), session="s-ww")
+        self.assertEqual(self.who(wake), [])
+        typed = inject.gather("now the brief", session="s-ww")
+        self.assertTrue(self.who(typed))                      # control
+
+    def test_a_worker_holding_its_line_is_not_re_read_or_re_sent(self):
+        self.plant_audiences("seat-b")
+        self.assertTrue(self.who(inject.gather("brief one", session="s-h")))
+        self.assertTrue(self.leads.called)                    # control
+        self.leads.reset_mock()
+        again = inject.gather("brief two", session="s-h")
+        self.assertEqual(self.who(again), [])
+        self.leads.assert_not_called()
+
+    def test_an_unreadable_team_reads_owner_never_a_withheld_digest(self):
+        self.plant_audiences("seat-b")
+        self.leads.side_effect = RuntimeError("roster unreadable")
+        lines = self.who(inject.gather("brief", session="s-x"))
+        self.assertTrue(any(self.LEAD_ONLY in l for l in lines), lines)
+
+    def test_an_empty_profile_never_pays_the_role_read(self):  # noqa: VACUOUS_ASSERTION — the same role-read mock is asserted CALLED on the profile-bearing turn first, and the digest non-empty there
+        """Door follow-on: a profile-less install never sets seen['who'], so
+        a role read there would be paid on every typed turn and thrown away."""
+        from helm import whoami
+        self.plant_audiences("seat-b")
+        self.assertTrue(self.who(inject.gather("brief", session="s-e0")))
+        self.assertTrue(self.leads.called)                    # control
+        self.leads.reset_mock()
+        with mock.patch.object(whoami, "load_profile", return_value={
+                "technical_level": "", "guidance": [],
+                "longtail_guidance": []}), \
+                mock.patch.object(sys.modules["helm.inject._whisper"],
+                                  "_who_audience") as aud:
+            self.assertEqual(self.who(inject.gather("brief", session="s-e")), [])
+        aud.assert_not_called()
+        self.leads.assert_not_called()
+
+    def test_both_variants_fit_who_cap(self):
+        self.plant_audiences("seat-b")
+        self.assertEqual(inject.WHO_AUDIENCES,
+                         (inject.WHO_OWNER, inject.WHO_LONGTAIL))
+        owner = inject._who_lines(inject.WHO_OWNER)
+        longtail = inject._who_lines(inject.WHO_LONGTAIL)
+        self.assertNotEqual(owner, longtail)
+        self.assertLessEqual(sum(len(l) for l in owner), inject.WHO_CAP)
+        self.assertLessEqual(sum(len(l) for l in longtail), inject.WHO_CAP)
+
+
 class LedgerFieldsTest(ArrivalBase):
 
     def test_every_row_carries_arrival_timed_out_and_fast_path(self):

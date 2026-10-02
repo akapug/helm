@@ -2678,7 +2678,12 @@ class DescendantFixture(unittest.TestCase):
         os.environ["HELM_CHAT_NAME"] = "descendants"
         require_supervisor()
         started = time.monotonic()
-        row, err = gate.run(repo=self.repo, timeout=0.5)
+        # THE TIMEOUT HAS TO OUTLAST THE FIXTURE'S OWN START. It writes the
+        # descendant's pid only after an interpreter, unittest and a Popen
+        # have run, and at 0.5 s a loaded host killed it before the write:
+        # the arm then had no descendant to judge. 3 s still sits far below
+        # the fixture's 60 s sleep, so the timeout branch is what ends it.
+        row, err = gate.run(repo=self.repo, timeout=3)
         self.assertIsNone(err, err)
         _assert_gate_status(self, row, "UNKNOWN")
         # A HANG BACKSTOP, NOT THE JUDGEMENT. At 3s this arm FAILED at
@@ -2699,6 +2704,14 @@ class DescendantFixture(unittest.TestCase):
         # that ran them. Contention made the defect visible; it was never
         # what made it true.
         self.assertLess(time.monotonic() - started, 20)
+        # THE FIXTURE MUST HAVE REACHED ITS WRITE, AND NO WAIT HERE CAN MAKE IT.
+        # gate.run returns only after the cgroup is empty, so a file absent
+        # now is never written: the suite was killed before it got there.
+        # That is a precondition the arm failed to set up, not the defect it
+        # is for, so it is named as such instead of read as FileNotFoundError.
+        self.assertTrue(os.path.exists(descendant_path),
+                        "the fixture never reached its write before the "
+                        "gate stopped it; the descendant arm measured nothing")
         with open(descendant_path) as f:
             descendant_pid, descendant_start = map(int, f.read().split())
         self.wait_for(lambda: not seats._is_pid_alive(
@@ -2727,7 +2740,12 @@ class DetachedDescendantFixture(unittest.TestCase):
         os.environ["HELM_CHAT_NAME"] = "detached-descendant"
         require_supervisor()
         started = time.monotonic()
-        row, err = gate.run(repo=self.repo, timeout=0.5)
+        # THE TIMEOUT HAS TO OUTLAST THE FIXTURE'S OWN START. It writes the
+        # descendant's pid only after an interpreter, unittest and a Popen
+        # have run, and at 0.5 s a loaded host killed it before the write:
+        # the arm then had no descendant to judge. 3 s still sits far below
+        # the fixture's 60 s sleep, so the timeout branch is what ends it.
+        row, err = gate.run(repo=self.repo, timeout=3)
         self.assertIsNone(err, err)
         _assert_gate_status(self, row, "UNKNOWN")
         # A HANG BACKSTOP, NOT THE JUDGEMENT. At 3s this arm FAILED at
@@ -2748,6 +2766,14 @@ class DetachedDescendantFixture(unittest.TestCase):
         # that ran them. Contention made the defect visible; it was never
         # what made it true.
         self.assertLess(time.monotonic() - started, 20)
+        # THE FIXTURE MUST HAVE REACHED ITS WRITE, AND NO WAIT HERE CAN MAKE IT.
+        # gate.run returns only after the cgroup is empty, so a file absent
+        # now is never written: the suite was killed before it got there.
+        # That is a precondition the arm failed to set up, not the defect it
+        # is for, so it is named as such instead of read as FileNotFoundError.
+        self.assertTrue(os.path.exists(descendant_path),
+                        "the fixture never reached its write before the "
+                        "gate stopped it; the descendant arm measured nothing")
         with open(descendant_path) as f:
             descendant_pid, descendant_start = map(int, f.read().split())
         self.wait_for(lambda: not seats._is_pid_alive(
@@ -2794,6 +2820,14 @@ class CompletedDetachedFixture(unittest.TestCase):
         # that ran them. Contention made the defect visible; it was never
         # what made it true.
         self.assertLess(time.monotonic() - started, 20)
+        # THE FIXTURE MUST HAVE REACHED ITS WRITE, AND NO WAIT HERE CAN MAKE IT.
+        # gate.run returns only after the cgroup is empty, so a file absent
+        # now is never written: the suite was killed before it got there.
+        # That is a precondition the arm failed to set up, not the defect it
+        # is for, so it is named as such instead of read as FileNotFoundError.
+        self.assertTrue(os.path.exists(descendant_path),
+                        "the fixture never reached its write before the "
+                        "gate stopped it; the descendant arm measured nothing")
         with open(descendant_path) as f:
             descendant_pid, descendant_start = map(int, f.read().split())
         self.wait_for(lambda: not seats._is_pid_alive(

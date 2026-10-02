@@ -366,10 +366,10 @@ def rollback_claim_sessions(seat, old_session, new_session, resources):
     for resource in rolled:
         _unlink_delegation_activity(resource)
     return len(rolled)
-def rebind_claim_holder(source, target, snap=None, restore=None):
+def rebind_claim_holder(source, target, snap=None, restore=None, only=None):
     """Transfer lease holders; retain this public and patchable claims door."""
     from . import seats_claim_moves
-    return seats_claim_moves.rebind_claim_holder(source, target, snap=snap, restore=restore)
+    return seats_claim_moves.rebind_claim_holder(source, target, snap, restore, only)
 
 
 def rollback_claim_holder(source, target, manifest):

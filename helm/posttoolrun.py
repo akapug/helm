@@ -126,9 +126,13 @@ class _Event:
         except Exception:
             pass
 
-    def prepare(self, session):
-        from . import toolwhisper
-        self.candidate = toolwhisper.prepare_for_pair(session)
+    def prepare(self, session, seat=None, payload=None):
+        # An edit rule outranks the owed-row line (stop_early), which waits
+        # for the next quiet boundary; it is computed only when no rule fired.
+        from . import actors, stop_early, toolwhisper
+        self.candidate = toolwhisper.prepare_for_pair(session) \
+            or stop_early.prepare(session, seat, actors.sidechain_agent(
+                payload) if isinstance(payload, dict) else None)
 
     def emit(self, line=None, whisper=True):
         if self.attempted:

@@ -88,6 +88,16 @@ def _rows():
             "windows_left": w.get("windows_left"),
             "windows_per_week": w.get("windows_per_week"),
             "verdict": w.get("verdict") or "",
+            # WHICH COPY THE ACCOUNT WAS READ THROUGH, AND THE HOME'S OWN
+            # FACT (task/2283): a row reads its ACCOUNT through a live copy
+            # (a helm home, Orca's copy, or Orca's own measurement), and a
+            # home whose own copy is dead says so beside it. A swap target is
+            # a home a seat can start in, so neither an Orca-only account nor
+            # a dead home is one.
+            "source": st.get("source") or a.get("source") or "",
+            "home_state": st.get("home_state") or "",
+            "home_note": st.get("home_note") or "",
+            "usable": a.get("usable", True),
         })
     return out
 
@@ -186,8 +196,13 @@ def cmd_creds(args):
         # is never overwritten. Otherwise the provider's status fills a cell that
         # was empty for exactly the rows a reader is squinting at.
         why = r["verdict"] or r["status"]
-        if r["note"]:
-            notes.setdefault(r["note"], []).append(r["account"])
+        if r.get("source") == "orca-reading":
+            why += " (Orca's own reading)"
+        if r.get("home_state"):
+            why = "home %s; account %s" % (r["home_state"], why)
+        for text in (r["note"], r.get("home_note")):
+            if text:
+                notes.setdefault(text, []).append(r["account"])
         print("  %-9s %-30s %-9s %-9s %-*s %-9s %-14s %s" % (
             r["provider"], r["account"][:30], (r["tier"] or "-")[:9],
             _pct(r["headroom"]), _state_w(), _state_cell(r["state"]),
@@ -289,6 +304,7 @@ def cmd_swap(args):
         fam = "anthropic" if provider == "claude" else provider
         rows = [r for r in _rows() if r["provider"] == fam
                 and r["account"] != match.get("identity")
+                and r.get("usable", True) and not r.get("home_state")
                 and (r["headroom"] is None or r["headroom"] > 0.1)]
     except ProviderError:
         rows = []

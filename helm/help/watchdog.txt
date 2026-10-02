@@ -1,0 +1,1 @@
+watchdog [--json] [--quiet] — scan proxy seat error logs for the context-window WEDGE signature and raise a loud a2a alert ONCE per wedge (re-fires only if the count climbs; a recovered seat re-arms), so a human can /clear + relaunch. Run it periodically (Monitor/cron) as the live backstop; --quiet detects without posting, --json is the machine form

@@ -166,8 +166,8 @@ of that skill.
 ## 7. Re-grounding a confused (not dead) seat
 
 `cv pack "<task>"` compiles a context bundle from the whole session corpus;
-`cv show <id> --find TERM` reads what a prior seat knew (see the `sessions`
-skill). Pane-level control (read/wait/send keystrokes, spawn in worktrees)
+`helm transcript <id> --find TERM` reads what a prior seat knew (see the
+`sessions` skill). Pane-level control (read/wait/send keystrokes, spawn in worktrees)
 is orca's: use the `orca-cli` skill primitives — don't reinvent PTY plumbing.
 
 ## 8. Seats ALIVE but INVISIBLE — the daemon-orphan case

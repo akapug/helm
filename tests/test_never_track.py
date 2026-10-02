@@ -51,6 +51,8 @@ the enforcement-timing leg. tests/test_never_track_hook.py proves the hook
 end-to-end.
 """
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -632,14 +634,236 @@ class LocalNeverTrackTest(unittest.TestCase):
         with open(self.listfile, "w", encoding="utf-8") as f:
             f.write("local/private-skill/\n")
         with self.env(self.listfile):
-            listed, _notes = nevertrack.scan_staged(repo)
+            listed, _notes, _ = nevertrack.scan_staged(repo)
         with self.env(self.absent):
-            unlisted, _notes = nevertrack.scan_staged(repo)
+            unlisted, _notes, _ = nevertrack.scan_staged(repo)
         hits = [v for v in listed if "never-track path 'local/private-skill/'" in v]
         self.assertEqual(len(hits), 1, listed)
         self.assertIn(self.listfile, hits[0], "the refusal names the local list")
         self.assertEqual([v for v in unlisted if "never-track path" in v], [],
                          "control: the same staged file passes with no local list")
+
+class CorrectedCommandIsBuiltFromStructuredPaths(unittest.TestCase):
+    """The one line every refusal ends with is run verbatim by the operator,
+    so it must name each offending path LITERALLY and be built from the
+    guard's own structured path data, not re-parsed from the violation prose.
+
+    THE PROPERTY THIS HOLDS: `scan_staged` returns the offending paths as a
+    list and `main` builds the corrected line from that list. A path is a
+    single, unbroken token. If instead the line were assembled by splitting the
+    violation prose on ' — ' and ',', a path that CONTAINS one of those two
+    delimiters would be torn in two — `local/with — dash.txt` into
+    `local/with` + `dash.txt`, and `local/a,comma.txt` into `local/a` +
+    `comma.txt` — both naming non-existent paths and leaving the real one
+    staged. The cure: each path is a git literal pathspec `:(top,literal)<path>`
+    (so a glob char or a leading '-' cannot match other files or be read as
+    an option, and the root-relative path names the same file from any
+    subdirectory), emitted after a `--`, in first-appearance order, distinct.
+    """
+    # Every violating path sits under the `local/` never-track prefix, so the
+    # path leg of the scan fires without planting any private needle content.
+    # The plain, comma, em-dash, dash and glob names each exercise a distinct
+    # failure mode the corrected command must survive.
+    VIOLATING = ("local/a,comma.txt",
+                 "local/with — dash.txt",
+                 "local/-x.txt",
+                 "local/a*b.txt",
+                 "local/plain.txt")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-ntk-corrected-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.root = os.path.join(self.tmp, "repo")
+        os.makedirs(self.root)
+        def git(*a):
+            return subprocess.run(("git", "-C", self.root) + a, capture_output=True,
+                                  text=True, timeout=60)
+        git("init", "-q", "-b", "main")
+        git("config", "user.email", "t@example.invalid")
+        git("config", "user.name", "t")
+        with open(os.path.join(self.root, "seed.txt"), "w") as f:
+            f.write("seed\n")
+        git("add", "seed.txt")
+        git("commit", "-qm", "seed")
+        for rel in self.VIOLATING:
+            os.makedirs(os.path.join(self.root, "local"), exist_ok=True)
+            with open(os.path.join(self.root, rel), "w") as f:
+                f.write("plain\n")
+            self.assertEqual(git("add", rel).returncode, 0,
+                             "could not stage %r" % rel)
+        self.listfile = os.path.join(self.tmp, "never-track.txt")
+        # No private needles: a real empty file, so the content/path-needle
+        # leg is a documented no-op and only the never-track path leg fires.
+        self.needles = os.path.join(self.tmp, "needles.txt")
+        open(self.needles, "w").close()
+
+    def staged(self):
+        p = subprocess.run(("git", "-C", self.root, "diff", "--cached",
+                            "--name-only"),
+                           capture_output=True, text=True, timeout=60)
+        return sorted(l for l in p.stdout.splitlines() if l)
+
+    def refusal(self):
+        with open(self.listfile, "w", encoding="utf-8") as f:
+            f.write("local/\n")
+        env = dict(os.environ)
+        env["HELM_NEVER_TRACK_LOCAL"] = self.listfile
+        env["HELM_PRIVATE_NEEDLES"] = self.needles
+        p = subprocess.run([sys.executable, nevertrack.__file__, "--staged"],
+                           cwd=self.root, capture_output=True, text=True,
+                           timeout=60, env=env)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        return p.stderr
+
+    def corrected_line(self):
+        """The exact `corrected:` line the guard printed, stripped."""
+        stderr = self.refusal()
+        m = re.search(r"^corrected:\s*(git restore --staged\s+.+)$",
+                     stderr, re.MULTILINE)
+        self.assertIsNotNone(m,
+                             "no corrected: line in refusal:\n%s" % stderr[:600])
+        return m.group(1).strip()
+
+    def test_comma_and_emdash_paths_survive_whole(self):
+        """A path containing ',' and one containing ' — ' each appear WHOLE in
+        the corrected line — never split on a delimiter. Splitting the
+        violation prose on those two characters would tear apart a path that
+        CONTAINS one, so the test asserts the whole path is emitted instead."""
+        line = self.corrected_line()
+        for raw in ("local/a,comma.txt", "local/with — dash.txt"):
+            self.assertIn(":(top,literal)" + raw, line,
+                          "%r was split apart by prose re-parse: %s"
+                          % (raw, line))
+        # the OLD bug: 'local/a,comma.txt' re-parsed on ',' -> 'local/a' +
+        # 'comma.txt'; 'local/with — dash.txt' re-parsed on ' — ' ->
+        # 'local/with'. Neither whole form is present in that output.
+
+    def test_dash_and_glob_paths_appear_as_literal_pathspecs(self):
+        """A leading '-' path and a glob-bearing path are emitted as literal
+        pathspecs after '--', so neither is read as an option or glob-matched
+        to other files."""
+        line = self.corrected_line()
+        self.assertIn("git restore --staged --", line,
+                      "corrected line lacks the '--' option terminator: %s" % line)
+        self.assertIn(":(top,literal)local/-x.txt", line,
+                      "leading-dash path not a literal pathspec: %s" % line)
+        self.assertIn(":(top,literal)local/a*b.txt", line,
+                      "glob path not a literal pathspec: %s" % line)
+        # the literal prefix is what keeps a*b.txt from un-staging a12.txt et al.
+
+    def test_plain_path_control_stays_quoted_and_unstages(self):
+        """Control: every violating path is still emitted and quoted, and the
+        emitted command actually un-stages all of them against this very repo."""
+        line = self.corrected_line()
+        self.assertIn(":(top,literal)local/plain.txt", line, line)
+        toks = shlex.split(line)
+        self.assertEqual(toks[:4], ["git", "restore", "--staged", "--"], toks)
+        # one literal pathspec per violating path, each exactly once: a set,
+        # so the order of git's diff output cannot make the test flake. A
+        # prose re-parse would emit the split pieces ('local/a', 'comma.txt',
+        # 'local/with'), which are NOT in this set — so this is RED on the
+        # old code and GREEN on the cure.
+        got = set(toks[4:])
+        want = set(":(top,literal)" + p for p in self.VIOLATING)
+        self.assertEqual(got, want, line)
+        p = subprocess.run(toks, cwd=self.root, capture_output=True, text=True,
+                           timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.staged(), [], "corrected command left a file staged")
+
+
+class CorrectedCommandUnstagesExactlyThosePaths(unittest.TestCase):
+    """The corrected line, split by shlex and run by git, un-stages EXACTLY the
+    offending paths: no other staged file, from the work-tree root or from a
+    subdirectory, and whatever the names carry.
+
+    The glob names are listed one by one in the never-track file, and a staged
+    DECOY sits beside each that the name would match as a git glob
+    (`glob/a*b.txt` matches `glob/a12b.txt`, `glob/[x].txt` matches
+    `glob/x.txt`). The decoys are not violations, so they must stay staged: a
+    pathspec without `literal` un-stages them too. The `odd/` names carry a
+    space, both quote characters, a command substitution, a leading '-' and a
+    newline; each must reach git as one argument and no shell may run any of
+    it. The guard writes paths relative to the work-tree root and the operator
+    runs the line from wherever their shell is, so the same line is also run
+    from a subdirectory: a pathspec without `top` resolves against that
+    subdirectory there and names nothing."""
+    VIOLATING = ("glob/a*b.txt", "glob/[x].txt", "odd/sp ace.txt",
+                 "odd/q'uo\"te.txt", "odd/$(touch PWNED).txt", "odd/-lead.txt",
+                 "odd/new\nline.txt")
+    DECOYS = ("glob/a12b.txt", "glob/x.txt")
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-ntk-exact-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.root = os.path.join(self.tmp, "repo")
+        os.makedirs(os.path.join(self.root, "deep", "er"))
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.email", "t@example.invalid")
+        self.git("config", "user.name", "t")
+        with open(os.path.join(self.root, "deep", "er", "seed.txt"), "w") as f:
+            f.write("seed\n")
+        self.git("add", "deep")
+        self.git("commit", "-qm", "seed")
+        for rel in self.VIOLATING + self.DECOYS:
+            os.makedirs(os.path.dirname(os.path.join(self.root, rel)),
+                        exist_ok=True)
+            with open(os.path.join(self.root, rel), "w") as f:
+                f.write("plain\n")
+        self.listfile = os.path.join(self.tmp, "never-track.txt")
+        with open(self.listfile, "w", encoding="utf-8") as f:
+            f.write("odd/\nglob/a*b.txt\nglob/[x].txt\n")
+        self.needles = os.path.join(self.tmp, "needles.txt")
+        open(self.needles, "w").close()
+
+    def git(self, *a, cwd=None):
+        return subprocess.run(("git",) + a, cwd=cwd or self.root,
+                              capture_output=True, text=True, timeout=60)
+
+    def stage_all(self):
+        for rel in self.VIOLATING + self.DECOYS:
+            self.assertEqual(self.git("add", "--", ":(literal)" + rel)
+                             .returncode, 0, "could not stage %r" % rel)
+
+    def staged(self):
+        out = self.git("diff", "--cached", "--name-only", "-z").stdout
+        return sorted(p for p in out.split("\0") if p)
+
+    def corrected_tokens(self):
+        """The corrected command as shlex reads it. It is the LAST thing the
+        refusal writes, and a quoted newline name spans two lines, so it is
+        everything after the prefix rather than one regex line."""
+        env = dict(os.environ, HELM_NEVER_TRACK_LOCAL=self.listfile,
+                   HELM_PRIVATE_NEEDLES=self.needles)
+        p = subprocess.run([sys.executable, nevertrack.__file__, "--staged"],
+                           cwd=self.root, capture_output=True, text=True,
+                           timeout=60, env=env)
+        self.assertEqual(p.returncode, 1, p.stderr)
+        self.assertIn(nevertrack.CORRECTED, p.stderr, p.stderr[-600:])
+        line = p.stderr.split(nevertrack.CORRECTED, 1)[1]
+        self.assertTrue(line.endswith("\n"), line)
+        toks = shlex.split(line[:-1])
+        self.assertEqual(toks[:4], ["git", "restore", "--staged", "--"], toks)
+        self.assertEqual(len(toks) - 4, len(self.VIOLATING), toks)
+        return toks
+
+    def assert_unstages_exactly_the_violations(self, cwd):
+        self.stage_all()
+        toks = self.corrected_tokens()
+        p = self.git(*toks[1:], cwd=cwd)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(self.staged(), sorted(self.DECOYS),
+                         "the corrected line must un-stage every violating "
+                         "path and no decoy")
+        self.assertFalse(os.path.exists(os.path.join(cwd, "PWNED")))
+        self.assertFalse(os.path.exists(os.path.join(self.root, "PWNED")))
+
+    def test_from_the_work_tree_root(self):
+        self.assert_unstages_exactly_the_violations(self.root)
+
+    def test_from_a_subdirectory(self):
+        self.assert_unstages_exactly_the_violations(
+            os.path.join(self.root, "deep", "er"))
 
 
 if __name__ == "__main__":

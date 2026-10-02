@@ -18,7 +18,7 @@ import re
 import sys
 import time
 
-from . import chat, home, hookrun, machine_senders, pk
+from . import chat, home, hookrun, machine_senders, needs_act, pk
 from .seats_common import (MAX_BYTES, ROOM_SCAN_CAP, SCAN_CAP, _canonical_recipient,
                            _clip, _flocked, _scrub, _seat_key, _seat_label,
                            _CanonicalRecipient, alias_keys, dm_lane, own_name,
@@ -30,7 +30,7 @@ from .seats_common import (MAX_BYTES, ROOM_SCAN_CAP, SCAN_CAP, _canonical_recipi
 from .seats_identity import (_delivery_guard, _reaction_wake_body,
                              _same_reaction_target, _warn_disagreement,
                              _warn_once, acting_seat, deliverable,
-                             boundary_scope, seat_scope)
+                             boundary_scope, seat_names, seat_scope)
 from .seats_roster import (nonpane_session, roster_checked, seat_for_session,
                            touch_seen, write_roster)
 from .seats_runtime import runtime_for_session
@@ -297,6 +297,8 @@ def _init_cursor(room, seat, session=None, at_start=False,
         if session:
             updates.update({path: dict(row) for path in base_pair})
         return False if not _commit_cursor_updates(updates) else False
+
+
 def _say(report, outcome, detail):
     """Record one room read's coverage, when the caller asked for it."""
     if isinstance(report, dict):
@@ -413,7 +415,7 @@ def _tail(room, cur, report=None):
 # every consumer of the rotation reaches for exactly these three names.
 # Re-exported so no existing import path changed.
 from .seats_roomscan import (_fair_room_slice,  # noqa: F401,E402
-                             _give_back, _scan_rooms, scan_path)
+                             ABSENT, _give_back, _scan_rooms, scan_path)
 def _room_dirty(room, seat, session=None, beacon=False):
     """Lock-free precheck: could `room` hold rows past this consumer cursor?
     A missing cursor is dirty (a room this seat has never looked
@@ -525,6 +527,8 @@ def _deliver_unpaused(session=None, room="main", seat=None, emit=None, cwd=None,
         write_roster(seat, session=session,
                      identity=not nonpane_session(session))
     beacon = channel == "beacon"
+    # needs_act reads the alias list the mention rule does, ONCE per pass.
+    _names = seat_names(seat, sc)
     had_delivery = _cursor(room, seat, session) is not None
     if not had_delivery or _cursor(room, seat, session, beacon=True) is None:
         at_start = backfill or (not had_delivery
@@ -554,13 +558,27 @@ def _deliver_unpaused(session=None, room="main", seat=None, emit=None, cwd=None,
             token = _occurrence(dev, ino, start)
             if candidate is None:
                 return False, False, False, token
+            if token in done:
+                return False, False, True, token
             if beacon:
-                suppressed = token in done
-                if suppressed:
-                    return False, False, True, token
                 wakes = deliverable(candidate, seat, room, sc, ambient, True)
                 normal = deliverable(candidate, seat, room, sc, True, False)
-                hold = normal and not wakes and (pk.slug(room) in sc["mute"]
+                # task/4019 slice A (owner "p0+++"): a row the beacon would
+                # have woken on that needs NO ACT from this seat (a stale-bot
+                # all-keep sweep, a row addressed to other seats: deliverable's
+                # wake tier already refuses the latter, so ask the same tier
+                # without it) is HELD for the hook, the hold a muted room's
+                # row gets: the token lands in `held`, and the next tool
+                # boundary delivers it. Unclassifiable is ACT
+                # (helm/needs_act.py), so the hold never silences a row the
+                # classifier cannot read, and a row it holds is never dropped.
+                fyi = normal and not needs_act.needs_act(candidate, _names) \
+                    and (wakes or deliverable(
+                        candidate, seat, room, sc, ambient, False))
+                if fyi:
+                    wakes = False
+                hold = normal and not wakes and (fyi
+                                                 or pk.slug(room) in sc["mute"]
                                                  or machine_senders.owner_rail(candidate))
                 return wakes, hold, False, token
             already_woke = same_wake_file and end <= wake_cur.get("off", 0) \
@@ -596,7 +614,13 @@ def _deliver_unpaused(session=None, room="main", seat=None, emit=None, cwd=None,
                     wake = dict(target)
                     wake["active"] = bool(target.get("active") or
                                           wake_cur.get("active"))
-                    done.clear()
+                    # A recv may have seen a later pair YIELD without moving
+                    # this cursor past earlier rows. Retain that sparse done
+                    # token until the boundary actually crosses its offset.
+                    done.difference_update(token for token in tuple(done)
+                                           if (parts := _occurrence_parts(token))
+                                           and parts[:2] == (target["dev"], target["ino"])
+                                           and parts[2] < target["off"])
             for field, values in (("held", held), ("done", done)):
                 if values:
                     wake[field] = sorted(values)
@@ -660,7 +684,7 @@ def _deliver_unpaused(session=None, room="main", seat=None, emit=None, cwd=None,
             else:
                 line = "[helm chat%s → %s @%s] %s: %s" % (
                     where, seat, row_ts, chat._dsan(row.get("from") or "?"),
-                    _clip(_scrub(row.get("text") or "")))
+                    _clip(_scrub(needs_act.lead_mention(row.get("text") or "", _names))))
         except Exception as exc:
             cross(crossed)
             target = _cursor_state((dev, ino, cursor_end, cursor_rid),
@@ -717,7 +741,8 @@ def _deliver_unpaused(session=None, room="main", seat=None, emit=None, cwd=None,
         return line
 def deliver_any(session=None, seat=None, emit=None, cwd=None, room="main",
                 ambient=True, channel=None, sink_usable=None,
-                announce_only=False, render=None, project_only=False):
+                announce_only=False, render=None, project_only=False,
+                quiet=None):
     """The MULTI-ROOM boundary nudge (slice 5 — what the PostToolUse hook and
     the beacon actually call): one delivery event per boundary from the first
     room that has one — the primary room first, then the rest of _scan_rooms'
@@ -730,7 +755,16 @@ def deliver_any(session=None, seat=None, emit=None, cwd=None, room="main",
     floods. Scanning a clean room advances only that room's cursor; a hit STOPS
     the scan and hands the hit room and every later one back unread, so they
     lead the next boundary (one nudge per boundary). Exceptions propagate as
-    deliver's do (H7); callers wrap fail-open."""
+    deliver's do (H7); callers wrap fail-open.
+
+    `quiet` is the caller's `seats_roomscan.QuietRooms` (task/3848). With it
+    the pass takes its room listing from the shared one instead of the
+    directory, never hands out a room whose log is gone, and -- for a
+    consumer that remembers across passes, the beacon waiter -- returns
+    before the roster read and the scan when every room is still at the stamp
+    a previous pass proved it quiet at. Presence is stamped first either
+    way: a consumer with nothing to read is still present. None is the pass
+    every caller made before."""
     # DISPUTE SPEAKS FIRST, then admission — see deliver for why the order is
     # load-bearing. Either way: no beat, no consume; the beat must stop HERE
     # too or the dispute reads as presence.
@@ -764,13 +798,28 @@ def deliver_any(session=None, seat=None, emit=None, cwd=None, room="main",
     # this pass's ability to spend rows.
     if sink_usable is False:
         return None
+    names = snap = None
+    if quiet is not None:
+        try:
+            names = quiet.room_names()
+        except OSError:
+            names = None        # the scan lists for itself, and says so
+        else:
+            snap = quiet.snapshot(names, seat, room)
+            if quiet.quiet(snap):
+                return None     # every room still where a pass proved it
+            # A LOG THAT IS GONE IS NOT HANDED OUT. The shared listing can
+            # name a room retired since it was made, and handing that room
+            # to a pass mints a fresh cursor pair for a log that is not there.
+            names = [n for n in names if snap.get(n) != ABSENT]
     sc = boundary_scope(seat, room, project_only)  # ONE roster read
     primary = (cursor_path(room, seat, session), cursor_path(room, seat))
     tracked = sc["tracked"] or any(
         _cursor_transaction_pending(path) for path in primary) \
         or (_cursor(room, seat, session) or _cursor(room, seat)) is not None
     rooms = _scan_rooms(room, seat=seat, scope=sc, session=session,  # lent:
-                        scan_lane="deliver", lent=(lent := {}))  # handed back
+                        scan_lane="deliver", lent=(lent := {}),  # handed back
+                        names=names, proven=quiet.clean if snap else None)
     for i, r in enumerate(rooms):
         if not _room_dirty(r, seat, session, beacon=channel == "beacon"):
             continue
@@ -784,7 +833,13 @@ def deliver_any(session=None, seat=None, emit=None, cwd=None, room="main",
                        announce_only=announce_only)  # the beacon alone narrows ambient
         if line:
             _give_back(rooms[i:], seat, session, "deliver", lent, hit=r)
+            if quiet is not None:
+                quiet.forget(r)
             return line
+    if snap is not None:
+        beacon = channel == "beacon"
+        quiet.settle(snap, lambda r: _room_dirty(r, seat, session,
+                                                 beacon=beacon), looked=rooms)
     return None
 def _resolve_against(to, r):
     """Resolve `to` without reacquiring the roster `r` the caller already read.

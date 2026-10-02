@@ -53,6 +53,19 @@ def _exiting_child(code=0, sleep=0.0):
     return pid
 
 
+def _until_exited(*pids):
+    """Block until each pid has EXITED, and leave its status to be reaped.
+
+    THE ARMS ASSERT ON ZOMBIES, so a zombie is the precondition, and a fixed
+    sleep only asks whether the box was fast enough to make one in time: on a
+    loaded host it was not, the reaper correctly found nothing to take, and
+    the arm read that as the defect. WNOWAIT waits for the exit and leaves the
+    status in place, so the reaper under test is still the one that takes it.
+    """
+    for pid in pids:
+        os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT)
+
+
 class TheForkHarnessCanActuallyFail(unittest.TestCase):
     """The control for every arm in this file, and it is not a formality.
 
@@ -91,10 +104,16 @@ class TheReaperReportsTheOwnedChildRatherThanEatingIt(unittest.TestCase):
         normal outcome; the remaining orphans are drained in the same pass,
         because leaving them is the whole defect."""
         def body():
-            import time
             owned = _exiting_child(code=7)
             orphan = _exiting_child(code=0)
-            time.sleep(0.2)
+            # BOTH CHILDREN HAVE EXITED BEFORE THE ONE CALL (task/4151). The
+            # claim is that ONE pass returns the owned status and drains the
+            # rest, and that needs both to be zombies first. A fixed 0.2 s
+            # asked whether the box was fast; polling the reaper until it
+            # answered could return on the owned child while the orphan was
+            # still running, and then fail the drain. WNOWAIT waits for each
+            # exit and leaves the status for the reaper to take.
+            _until_exited(owned, orphan)
             status = owner._reap_adopted(owned=owned)
             assert status is not None, "the owned status was eaten, not returned"
             assert os.WIFEXITED(status), status
@@ -112,10 +131,9 @@ class TheReaperReportsTheOwnedChildRatherThanEatingIt(unittest.TestCase):
         that returned a status unconditionally would end the wait loop on its
         first pass and report a fabricated exit for a live harness."""
         def body():
-            import time
             owned = _exiting_child(code=0, sleep=5)
             orphan = _exiting_child(code=0)
-            time.sleep(0.2)
+            _until_exited(orphan)          # the owned child is still running
             status = owner._reap_adopted(owned=owned)
             assert status is None, "reported an exit for a RUNNING child: %r" % status
             try:
@@ -166,9 +184,8 @@ class TheDrainIsBOUNDED(unittest.TestCase):
         REAL waitpid the drain still empties the table, because the kernel
         answers 'nothing left' long before the cap."""
         def body():
-            import time
             kids = [_exiting_child(code=0) for _ in range(8)]
-            time.sleep(0.25)
+            _until_exited(*kids)
             owner._reap_adopted()
             for pid in kids:
                 try:
@@ -190,10 +207,9 @@ class TheSteadyStateLoopReapsWhatItAdopts(unittest.TestCase):
         status is reported unchanged. Both halves are asserted: reaping the
         orphan must not cost the exit code the wrapper exists to reproduce."""
         def body():
-            import time
             harness = _exiting_child(code=3, sleep=0.35)
             orphan = _exiting_child(code=0)
-            time.sleep(0.1)
+            _until_exited(orphan)          # "an orphan already exited"
             status = owner._wait_owned_child(harness, os.getpgrp(),
                                              lambda: False)
             assert os.WIFEXITED(status), status

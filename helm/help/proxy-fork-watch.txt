@@ -1,0 +1,1 @@
+proxy-fork-watch [--json] [--post] [--force] [--install-timer] — run the durable CLIProxyAPI fork's upstream checker; read-only by default, one #helm line on first run or semantic change, daily user timer available

@@ -29,11 +29,11 @@ NO EXEMPTION FOR A SEAT HANDLE. A private name inside a seat handle
 that credits a project's seat names the project.
 
 THE RUNG (`--staged`). Every line the staged set ADDS under a public-bound
-path (`public_bound`: helm/, docs/, tests/, agents/, bin/, scripts/, and the
-top-level README and documentation files) is scanned, and a hit REFUSES the
-commit naming the path, the line and the list entry's number. The name itself
-is never printed, so a refusal pasted into a chat room does not repeat the
-leak. A new file, and a file renamed into a public-bound path from outside
+path (`public_bound`: helm/, docs/, tests/, agents/, bin/, scripts/, the
+change notes in changes/, and the top-level README and documentation files)
+is scanned, and a hit REFUSES the commit naming the path, the line and the
+list entry's number. The name itself is never printed, so a refusal pasted
+into a chat room does not repeat the leak. A new file, and a file renamed into a public-bound path from outside
 one, adds every line. A line moved between public-bound files is judged like
 any other added line: a private name is a leak wherever it lands, and the
 committer is already holding the line. Staged bytes are read by index OID
@@ -117,7 +117,10 @@ LABEL_TIMEOUT_S = 3.0
 #: line is not cut, it is not asked about.
 MAX_LINE = 400
 
-PUBLIC_DIRS = ("helm/", "docs/", "tests/", "agents/", "bin/", "scripts/")
+#: changes/ holds the change notes the release folds into CHANGELOG.md
+#: (changes/README.md), so they ship exactly as CHANGELOG.md does.
+PUBLIC_DIRS = ("helm/", "docs/", "tests/", "agents/", "bin/", "scripts/",
+               "changes/")
 _TOP_DOC_PREFIXES = ("README", "LICENSE", "CHANGELOG", "CONTRIBUTING",
                      "SECURITY", "AGENTS")
 _DOC_EXT = (".md", ".rst", ".txt")

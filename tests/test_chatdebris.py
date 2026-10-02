@@ -401,6 +401,28 @@ class RetireRoomsTest(DebrisBase):
         self.assertTrue(os.path.exists(lobby), "retired a non-meld room")
         self.assertFalse(os.path.exists(meld_path), "must-hit")
 
+    def test_a_task_pair_meld_retires_like_any_meld(self):
+        """A task's pair meld is named `<scope>-<N>` (helm-3742), with no
+        `meld-` prefix. Idle, it leaves the bus like every meld; an idle
+        project room beside it stays."""
+        from helm import chatdebris
+        task, snap, cursors = self.meld_room("helm-3742")
+        chat.post("an old project room", room="helm", who="alice")
+        project = chat.room_path("helm")
+        t = time.time() - OLD
+        os.utime(project, (t, t))
+        self.assertEqual([r for r, _ in chatdebris.retirable_rooms()],
+                         ["helm-3742"])
+        # CONTROL: the project room is refused by name
+        self.assertEqual(chatdebris.retire_room("helm"),
+                         (None, "not a meld room"))
+        rc, out, err = self.retire("--apply")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("retired  helm-3742", out)
+        for p in [task, snap] + cursors:
+            self.assertFalse(os.path.exists(p), p)
+        self.assertTrue(os.path.exists(project), "retired a project room")
+
     def test_a_post_after_the_scan_keeps_the_room(self):
         """Idleness is re-proven under the room lock: the listing and the
         retirement are two moments, and a post can land between them."""

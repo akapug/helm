@@ -120,7 +120,8 @@ class RoutesTableTest(unittest.TestCase):
         self.assertIsNone(M.BY_ID["act.land.compose"].detector)
         for r in M.ROUTES:
             with self.subTest(route=r.id):
-                self.assertTrue(r.status == M.LIVE or r.status.startswith("planned"))
+                self.assertTrue(r.status in (M.LIVE, M.SHADOW)
+                                or r.status.startswith("planned"))
                 # The name says ARRIVAL rows: a live row of another family is
                 # detected by its own hook code, which its form names.
                 if r.status == M.LIVE and r.family == "arrival":

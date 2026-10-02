@@ -1,0 +1,1 @@
+sweep [--apply] [--project P] — lineage-driven supersession sweep of the adopted store (dry-run default)

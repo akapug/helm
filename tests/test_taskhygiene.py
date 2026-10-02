@@ -169,6 +169,21 @@ class ParseTrainTest(unittest.TestCase):
                 self.assertEqual((got["task"], got["basis"]), (task, basis))
                 self.assertFalse(got["partial"])
 
+    def test_a_recomposed_train_is_read_like_any_train(self):
+        """task/4119: a recomposed train takes a letter after its number
+        (train555b). Its merge is a land like any other: its own task is
+        RECORDED, a lane named task-N infers it, and the train keeps its
+        lettered name."""
+        got = taskhygiene.parse_train(
+            "train555b: merge lane x at abc1234 (task/12: the thing, P1)")
+        self.assertEqual((got["train"], got["task"], got["basis"]),
+                         ("train555b", "task/12", taskhygiene.RECORDED))
+        got = taskhygiene.parse_train("train536b: merge lane task-3585-board")
+        self.assertEqual((got["train"], got["task"], got["basis"]),
+                         ("train536b", "task/3585", taskhygiene.INFERRED))
+        self.assertIsNone(taskhygiene.parse_train(
+            "trainee: merge lane x (task/12)"))
+
 
 class LandedLinkTest(HygieneBase):
     """A train naming the whole task links it and, after the quiet window,
@@ -855,6 +870,158 @@ class LandSafetyTest(HygieneBase):
         self.assertEqual(self.kinds(rep, tid), [])
         self.assertEqual(self.receipts(tid), [])
         self.assertEqual(rep["candidates"], [])
+
+
+class LandedCandidateTest(HygieneBase):
+    """task/3746 D5: a task whose lane landed and that is still open is a
+    close candidate from the land itself, with its LAND and whether the lane
+    carried the whole ask."""
+
+    def candidates(self, now):
+        with mock.patch("time.time", return_value=now):
+            cands, _unavailable = taskhygiene.close_candidates(
+                now=now, path=self.path, repo=self.repo, trunk="main",
+                dispatch_path=self.dispatch_path)
+        return {c["id"]: c for c in cands}
+
+    def asked(self, tid, at, label="LAND 537", whole=False, kids=()):
+        from helm import landtask
+        land = {"task": tid, "lane": "lane-x", "tip": "1" * 40,
+                "label": label, "sha": "5e" * 20}
+        text = landtask.stays_open(land, list(kids)) if whole \
+            else landtask.question(land)
+        return self.note(tid, text, at, by="auto-land")
+
+    def test_a_whole_train_land_is_a_candidate_before_any_sweep_applies(self):  # noqa: VACUOUS_ASSERTION — the candidate's land fields are asserted exactly; no receipt is the point
+        """THE MEASURED MISS: `helm task close-candidates` found 0 rows while
+        seven open rows' lanes had landed their whole ask. A row was a
+        candidate only once `helm stale sweep --apply` had written its
+        LANDED receipt, and the scheduled sweep runs dry, so no receipt was
+        ever written. The land on trunk is the fact; the receipt records it."""
+        tid = self.file("coach reads the lesson from stdin")["id"]
+        sha = self.commit("train279: merge lane coach-help-says-stdin (%s): "
+                          "'helm coach --help' says the lesson may come on "
+                          "stdin" % tid, T0 + DAY)
+        from helm import autoland
+        self.assertTrue(autoland.record_land(self.repo, 527, sha,
+                                             train="train279"))
+        cands = self.candidates(T0 + 2 * DAY)
+        self.assertEqual(sorted(cands), [tid])
+        self.assertEqual((cands[tid]["sha"], cands[tid]["train"],
+                          cands[tid]["land"], cands[tid]["whole"]),
+                         (sha[:12], "train279", "LAND 527", None))
+        self.assertEqual(self.receipts(tid), [])
+
+    def test_a_land_step_question_is_a_candidate_with_its_land(self):
+        tid = self.file("a part-landed ask")["id"]
+        self.asked(tid, T0 + DAY)
+        cands = self.candidates(T0 + 2 * DAY)
+        self.assertEqual(sorted(cands), [tid])
+        cand = cands[tid]
+        self.assertEqual((cand["land"], cand["whole"], cand["sha"]),
+                         ("LAND 537", False, ("5e" * 20)[:12]))
+
+    def test_a_whole_land_over_open_sub_tasks_is_a_candidate_marked_whole(
+            self):
+        tid = self.file("a whole-landed ask")["id"]
+        kid = self.file("the part still open", continues=tid)["id"]
+        self.asked(tid, T0 + DAY, whole=True, kids=[kid])
+        cand = self.candidates(T0 + 2 * DAY)[tid]
+        self.assertEqual((cand["land"], cand["whole"]), ("LAND 537", True))
+        self.assertIn(kid, " ".join(cand["blockers"]))
+
+    def test_the_land_step_s_comment_is_not_motion(self):
+        """The step's comment is written after the land, by the machine: it
+        never holds the holder's confirm ask as motion after the land."""
+        p0 = self.file("burning landed", priority="P0")["id"]
+        self.commit("train6: merge lane b at 6666666ffff (%s, all)" % p0,
+                    T0 + DAY)
+        self.asked(p0, T0 + DAY + 60)
+        self.run_sweep(T0 + DAY + 120, apply=True, notify=lambda *a: True)
+        rep = self.run_sweep(T0 + 5 * DAY, notify=lambda *a: True)
+        self.assertIn((taskhygiene.CONFIRM_ASK, p0), self.kinds(rep))
+
+
+class OpenSubTasksHoldTest(HygieneBase):
+    """task/3746 D6: an open sub-task at ANY depth holds a candidate
+    (`tasks.story_facts`), and `confirm-close` refuses over open sub-tasks
+    as `helm task close` does, unless they are said to stay."""
+
+    def landed_parent(self):
+        parent = self.file("the landed parent")["id"]
+        self.commit("train3: merge lane parent at 3333333cccc (%s, all)"
+                    % parent, T0 + DAY)
+        return parent
+
+    def test_an_open_grandchild_holds_the_candidate(self):
+        parent = self.landed_parent()
+        kid = self.file("a closed part", continues=parent)["id"]
+        grand = self.file("its open part", continues=kid)["id"]
+        tasks.close(kid, "done, its own part stays",
+                    open_children=tasks.OPEN_CHILDREN_STAY, path=self.path)
+        rep = self.run_sweep(T0 + 2 * DAY, apply=True)
+        cand = [c for c in rep["candidates"] if c["id"] == parent][0]
+        self.assertIn("open children %s" % grand, " ".join(cand["blockers"]))
+
+    def test_confirm_close_refuses_over_open_sub_tasks_unless_they_stay(self):
+        parent = self.landed_parent()
+        kid = self.file("the open remainder", continues=parent)["id"]
+        self.run_sweep(T0 + 2 * DAY, apply=True)
+        none, why = taskhygiene.confirm_close(parent, "seat-a",
+                                              path=self.path)
+        self.assertIsNone(none)
+        self.assertIn(kid, why)
+        self.assertIn("would leave them under a closed parent", why)
+        self.assertEqual(self.row(parent)["status"], "open")
+        row, err = taskhygiene.confirm_close(
+            parent, "seat-a", path=self.path,
+            open_children=tasks.OPEN_CHILDREN_STAY)
+        self.assertIsNone(err, err)
+        self.assertEqual((row["status"], row["open_children_at_close"]),
+                         ("closed", [kid]))
+
+
+class ConfirmCloseCliTest(CliBase):
+    """`helm task confirm-close <id> [--open-children-stay]` (D6) and the
+    candidate list's LAND and whole words (D5)."""
+
+    def test_confirm_close_takes_the_story_flag_and_the_list_says_the_land(
+            self):
+        from helm import landtask
+        row, err = tasks.add("landed row", "seat-a", force_new=True)
+        self.assertIsNone(err, err)
+        tid = row["id"]
+        kid, err = tasks.add("its remainder", "seat-a", force_new=True,
+                             continues=tid)
+        self.assertIsNone(err, err)
+        land = {"task": tid, "lane": "lane-x", "tip": "1" * 40,
+                "label": "LAND 537", "sha": "5e" * 20}
+        tasks.comment(tid, landtask.question(land), by="auto-land")
+        commits = [{"sha": "a" * 40, "ct": time.time() - 60,
+                    "subject": "", "named": {tid},
+                    "train": {"train": "train7", "lane": "l-1", "tip": None,
+                              "task": tid, "partial": False}}]
+        with mock.patch.object(taskhygiene, "trunk_commits",
+                               return_value=(commits, None)), \
+                mock.patch.object(taskhygiene, "dispatch_motion",
+                                  return_value=({}, None)), \
+                mock.patch.object(taskhygiene, "lane_commits",
+                                  return_value=({}, None)):
+            taskhygiene.sweep(apply=True)
+            rc, out, _err = self.cli("close-candidates")
+            self.assertEqual(rc, 0)
+            self.assertIn("LAND 537", out)
+            self.assertIn("part", out)
+            rc, _out, err = self.cli("confirm-close", tid)
+            self.assertEqual(rc, 2)
+            self.assertIn(kid["id"], err)
+            self.assertIn(tasks.OPEN_CHILDREN_FLAG, err)
+            rc, out, err = self.cli("confirm-close", tid,
+                                    tasks.OPEN_CHILDREN_FLAG)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(tasks.get(tid)["status"], "closed")
+        self.assertEqual(tasks.get(tid)["open_children_at_close"],
+                         [kid["id"]])
 
 
 if __name__ == "__main__":

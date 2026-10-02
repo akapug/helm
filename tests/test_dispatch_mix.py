@@ -450,8 +450,8 @@ class BaseValidatesKindTest(MixBase):
              mock.patch.object(D, "_resolve_tip", return_value=("a" * 40, None)), \
              mock.patch.object(S, "resolve_recipient",
                                return_value=("kimi", None)):
-            row, err = D._base("kimi", "lane", "HEAD", None, 600, None,
-                               kind="buld")
+            row, err, _advisory = D._base3("kimi", "lane", "HEAD", None, 600,
+                                           None, kind="buld")
         self.assertIsNone(row, "a typo'd kind reached the ledger")
         self.assertIn("build|review", err)
 
@@ -463,8 +463,9 @@ class BaseValidatesKindTest(MixBase):
              mock.patch.object(D, "_resolve_tip", return_value=("a" * 40, None)), \
              mock.patch.object(S, "resolve_recipient",
                                return_value=("kimi", None)):
-            row, err = D._base("kimi", "lane", "HEAD", None, 600, None,
-                               kind=" BUILD ", new_work=True)
+            row, err, _advisory = D._base3("kimi", "lane", "HEAD", None, 600,
+                                           None, kind=" BUILD ",
+                                           new_work=True)
         self.assertIsNone(err)
         self.assertEqual(row["kind"], "build")
 

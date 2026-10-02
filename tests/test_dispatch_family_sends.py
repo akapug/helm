@@ -81,6 +81,8 @@ class FamilySendCountTest(td.DispatchBase):
                 "repo": self.repo, "kind": "review", "new_work": True,
                 "notify": False, "_reason": True}
         args.update(kwargs)
+        if args["kind"] == "review" and args.get("new_work"):
+            args.setdefault("task", self.review_task["id"])
         return dispatches.add(recipient, **args)
 
     def admit(self, recipient, **kwargs):
@@ -96,7 +98,8 @@ class FamilySendCountTest(td.DispatchBase):
                    ["send", recipient, "family-send-%d" % self._lane,
                     "read the delta at this tip and cure what you find",
                     "--ref", self.a, "--kind", "review", "--new-work",
-                    "--repo", self.repo, *flags])
+                    "--task", self.review_task["id"], "--part", "--repo", self.repo,
+                    *flags])
 
     def counts(self, row):
         return [n for n in row.get(NOTES, ()) if COUNT in n]

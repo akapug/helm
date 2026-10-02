@@ -28,7 +28,7 @@ import time
 import unittest
 from unittest import mock
 
-from helm import cli, dispatches, eventledger, gate, home, pk, seats
+from helm import cli, dispatches, eventledger, gate, home, pk, seats, tasks
 from tests._gate_receipt import serial_process
 
 ENV_KEYS = ("HELM_HOME", "HELM_ADOPTED_DIR", "HELM_CHAT_DIR", "HELM_CHAT_NODE_URL",
@@ -83,6 +83,10 @@ class ChainBase(unittest.TestCase):
         self.a = self.commit("a")
         self.b = self.commit("b")
         self.c = self.commit("c")
+        self.review_task, why = tasks.add(
+            "fixture reviewed work", "integrator", project="helm",
+            force_new=True)
+        self.assertIsNone(why, why)
 
         # THE ROSTER STAYS EMPTY HERE, DELIBERATELY. Do not add
         # `seats.write_roster(...)` to this setUp: an empty roster is UNKNOWN,
@@ -120,8 +124,10 @@ class ChainBase(unittest.TestCase):
     def root(self, lane="lane-a", **kw):
         """One row that roots its own chain."""
         kw.setdefault("ref", self.a)
+        kw.setdefault("task", self.review_task["id"])
+        kind = kw.pop("kind", "review")
         row, why = dispatches.add("codex-3", lane, repo=self.repo,
-                                  kind="review", notify=False, new_work=True,
+                                  kind=kind, notify=False, new_work=True,
                                   _reason=True, **kw)
         self.assertIsNone(why)
         return row
@@ -211,7 +217,7 @@ class RequiredFieldTest(ChainBase):
         rc, out, err = run(dispatches.cmd_dispatch,
                            ["add", "codex-3", "lane-a", "--ref", self.a,
                             "--kind", "review", "--repo", self.repo,
-                            "--new-work"])
+                            "--new-work", "--task", self.review_task["id"], "--part"])
         self.assertEqual(rc, 0, err)
         self.assertIn("NEW WORK", out)
         rid = next(iter(dispatches.rows()))
@@ -316,9 +322,10 @@ class LifecycleWalkTest(ChainBase):
         """Two rows match the prefix, so mutating either would be a guess."""
         made = []
         for i in range(2):
-            row = dispatches._base("codex-3", "lane-%d" % i, self.a, None, 600,
+            row = dispatches._base3("seat-a", "lane-%d" % i, self.a, None, 600,
                                    self.repo, kind="review", new_work=True,
-                                   rid="ab" + "%030x" % i)[0]
+                                   task=self.review_task["id"],
+                                   rid="ab" + "%030x" % i)[0]  # (row, err, advisory)
             out, why, _existed = dispatches._append_dispatch(row)
             self.assertIsNone(why)
             made.append(out)
@@ -491,7 +498,8 @@ class DuplicateSuccessorWarningTest(ChainBase):
         first = self.root(lane="shared-label")
         dup, open_warning = dispatches.add(
             "seat-a", "shared-label", repo=self.repo, ref=self.b,
-            kind="review", notify=False, new_work=True, _reason=True)
+            kind="review", notify=False, new_work=True,
+            task=self.review_task["id"], _reason=True)
         self.assertIsNone(dup)
         self.assertIn("%s (OPEN)" % first["id"][:12], open_warning)
         self.assertNotIn("dispatch list --held", open_warning)
@@ -502,7 +510,8 @@ class DuplicateSuccessorWarningTest(ChainBase):
         self.assertEqual(held["status"], "held")
         dup, held_warning = dispatches.add(
             "seat-a", "shared-label", repo=self.repo, ref=self.b,
-            kind="review", notify=False, new_work=True, _reason=True)
+            kind="review", notify=False, new_work=True,
+            task=self.review_task["id"], _reason=True)
         self.assertIsNone(dup)
         self.assertIn("%s (HELD)" % first["id"][:12], held_warning)
         self.assertNotIn("%s (OPEN)" % first["id"][:12], held_warning)
@@ -597,7 +606,8 @@ class DuplicateSuccessorWarningTest(ChainBase):
                                return_value=({}, "PermissionError: denied")):
             row, why = dispatches.add(
                 "codex-3", "lane-a", ref=self.a, repo=self.repo,
-                kind="review", notify=False, new_work=True, _reason=True)
+                kind="review", notify=False, new_work=True,
+                task=self.review_task["id"], _reason=True)
         self.assertIsNone(row)
         self.assertIn("duplicate-mint check UNKNOWN", why)
         self.assertIn("NOT recorded", why)
@@ -634,14 +644,16 @@ class DuplicateSuccessorWarningTest(ChainBase):
         rc, out, err = run(
             dispatches.cmd_dispatch,
             ["add", "codex-3", "shared-label", "--ref", self.b,
-             "--kind", "review", "--repo", self.repo, "--new-work"])
+             "--kind", "review", "--repo", self.repo, "--new-work",
+             "--task", self.review_task["id"], "--part"])
         self.assertEqual(rc, 1, err)
         self.assertIn("born-wrong", err)
         # --force wins
         rc2, out2, err2 = run(
             dispatches.cmd_dispatch,
             ["add", "codex-3", "shared-label", "--ref", self.b,
-             "--kind", "review", "--repo", self.repo, "--new-work", "--force",
+             "--kind", "review", "--repo", self.repo, "--new-work",
+             "--task", self.review_task["id"], "--part", "--force",
              "--reason", "a deliberate same-lane label"])
         self.assertEqual(rc2, 0, err2)
         self.assertIn("born-wrong", err2)
@@ -811,7 +823,8 @@ class SpiralCountsTheChainTest(ChainBase):
         row, why = dispatches.add(
             "codex-3", lane, ref=ref, repo=self.repo, kind="review",
             notify=False, _reason=True, new_work=supersedes is None,
-            supersedes=supersedes, force=force)
+            supersedes=supersedes, force=force,
+            task=self.review_task["id"] if supersedes is None else None)
         self.assertIsNone(why)
         return row
 
@@ -952,7 +965,8 @@ class DischargeWalksTheChainTest(ChainBase):
     def contrary(self):
         row, why, _sent = dispatches.send(
             "codex-3", "feature-r1", "review r1", self.a, repo=self.repo,
-            kind="review", key="r1", sign=False, new_work=True)
+            kind="review", key="r1", sign=False, new_work=True,
+            task=self.review_task["id"])
         self.assertIsNone(why)
         dispatches.mark_verdict(row["id"], self.a, "findings", polarity="fix")
         return row
@@ -961,7 +975,8 @@ class DischargeWalksTheChainTest(ChainBase):
         row, why, _sent = dispatches.send(
             "codex-3", lane, "review " + lane, tip, repo=self.repo,
             kind="review", key="key-" + lane, sign=False,
-            new_work=supersedes is None, supersedes=supersedes)
+            new_work=supersedes is None, supersedes=supersedes,
+            task=self.review_task["id"] if supersedes is None else None)
         self.assertIsNone(why)
         # A BOUND approve, minted for real. The old fixture wrote an ungated
         # approve and IGNORED mark_verdict's return — when the writer began

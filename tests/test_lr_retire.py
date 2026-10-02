@@ -38,7 +38,7 @@ import time
 import unittest
 from unittest import mock
 
-from helm import beacons, dispatches, eventledger, home, landreq, seats
+from helm import beacons, dispatches, eventledger, home, landreq, seats, tasks
 from helm import seats_report
 # The module, never its TestCase: tests/test_suite_collection.py says why.
 from tests import test_landreq as _landreq
@@ -319,9 +319,12 @@ _REAL_EVENT_SHAPES = (
       "reason": "SOURCE-CLEAN: read clean", "owner_gated": False,
       "source_clean_tip": "b" * 40, "hold_actor": "holding-seat"}),
 
-    ("a release records no hand at all", None,
+    ("a release records its releasing hand the way a hold records its "
+     "holder (task/4149): the acting seat, or a programmatic mover's fixed "
+     "name, so a deliberate release never reads as an unattributed one",
+     "releasing-seat",
      {"v": 3, "event": "release", "seq": 2, "id": "5e" * 16, "ts": None,
-      "reason": "gate cleared"}),
+      "reason": "gate cleared", "release_actor": "releasing-seat"}),
 
     ("a delivery marker records no hand at all", None,
      {"v": 3, "event": "delivered", "seq": 1, "id": "6f" * 16, "ts": None,
@@ -336,6 +339,14 @@ _REAL_EVENT_SHAPES = (
      {"v": 3, "event": "retip", "seq": 2, "id": "0d" * 16, "ts": None,
       "tip": "b" * 40, "ref": "refs/heads/lane/fixture", "old_tip": "d" * 40,
       "reason": "rebased", "identity": "verified"}),
+
+    ("A CHAIN-TASK ATTACH CREDITS THE SEAT THE DOOR ADMITTED (task/4000) — "
+     "the chain's author or the integrator, resolved by the writer from the "
+     "declared identity and recorded in `attached_by`; `attach_role` is the "
+     "door that admitted them, never a second hand", "attaching-seat",
+     {"v": 3, "event": "chain-task", "seq": 2, "id": "1e" * 16, "ts": None,
+      "task": "task/4000", "attached_by": "attaching-seat",
+      "attach_role": "integrator"}),
 )
 
 
@@ -513,14 +524,26 @@ class RetireBase(_landreq.LandReqBase):
     # ------------------------------------------------------------------
     def open_row(self, author="ghost-author", reviewer="ghost-reviewer",
                  lane="lane/retire", ref=None, **kw):
-        """One OPEN dispatch with an exact author and reviewer."""
+        """One OPEN dispatch with an exact author and reviewer.
+
+        New review roots serve a real task in this test's scratch HELM_HOME.
+        An explicit task=None keeps legacy/taskless refusal controls intact;
+        successors carry the task from their parent.
+        """
         kw.setdefault("new_work", "supersedes" not in kw)
+        if kw["new_work"] and "task" not in kw:
+            if not hasattr(self, "review_task"):
+                self.review_task, why = tasks.add(
+                    "retirement fixture reviewed work", "integrator",
+                    project="helm-test", force_new=True)
+                self.assertIsNone(why, why)
+            kw["task"] = self.review_task["id"]
         prior = os.environ.get("HELM_CHAT_NAME")
         os.environ["HELM_CHAT_NAME"] = author
         try:
             row = dispatches.add(reviewer, lane, ref=ref or self.side,
-                                 repo=self.repo, kind="review", notify=False,
-                                 **kw)
+                                 repo=kw.pop("repo", self.repo), kind="review",
+                                 notify=False, **kw)
         finally:
             if prior is None:
                 os.environ.pop("HELM_CHAT_NAME", None)
@@ -2786,18 +2809,8 @@ class ARetiredRowLeavesTheHeldListingTest(RetireBase):
         verdict), while repo-unreadable asks only about the row's repository
         binding and so is indifferent to the status word.
         """
-        prior = os.environ.get("HELM_CHAT_NAME")
-        os.environ["HELM_CHAT_NAME"] = "deleted-author"
-        try:
-            row = dispatches.add("ghost-reviewer", lane, ref=self.side,
-                                 repo=repo or self.repo, kind="review",
-                                 notify=False, new_work=True)
-        finally:
-            if prior is None:
-                os.environ.pop("HELM_CHAT_NAME", None)
-            else:
-                os.environ["HELM_CHAT_NAME"] = prior
-        self.assertIsNotNone(row)
+        row = self.open_row(author="deleted-author", reviewer="ghost-reviewer",
+                            lane=lane, repo=repo or self.repo)
         out, why = dispatches.mark_hold(row["id"], reason)
         self.assertIsNone(why, why)
         self.assertEqual(str(out.get("status") or "").strip().lower(), "held",
@@ -3057,6 +3070,11 @@ _ALLOW_RETIRED_OPT_INS = {
     # it returns rows to print and mutates nothing.
     "live_successors": "READ (lr show of a cancelled id finds the row that "
                        "continues it; mutates nothing)",
+    # The lead-context door walks a send's --supersedes chain to prove the
+    # row is a hand-back to its own sender (task/4039); an ancestor may be
+    # retired, and the walk only reads it.
+    "_hands_back": "READ (proves a hand-back along the supersedes chain; "
+                   "mutates nothing)",
     # DIAGNOSIS — exactly ONE, and it is an EARNED PROPERTY rather than a
     # kind label: `_resolve_row_for_diagnosis` consumes a retired row into
     # (None, specific terminal refusal), so no caller can receive that row as
@@ -3256,6 +3274,16 @@ _WRITERS_NOT_TRANSPLANTABLE = {
                 "_ACTIVE_ONLY_EVENTS so a compat replay after a retirement is "
                 "inert, but no production path emits one, "
                 "so there is nothing to capture.",
+    "diff-applied": "its writer (`mark_applied`, task/3937) admits only a "
+                    "VERDICTED MELD-DIFF FIX row carrying a typed diff "
+                    "handoff, and a cure commit whose parent is that row's "
+                    "reviewed tip; the event binds that handoff's receipt "
+                    "digest. A twin built by open_row has no handoff to "
+                    "measure, and an event captured elsewhere names a "
+                    "receipt the retired twin does not carry, so the "
+                    "reducer's own receipt check would leave it inert for a "
+                    "reason that is not retirement. Its inertness after a "
+                    "retirement is pinned in tests.test_diff_handoff.",
 }
 
 

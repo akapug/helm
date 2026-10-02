@@ -129,6 +129,7 @@ import getpass
 import os
 import re
 import sys
+import time
 
 from . import (dispatches, eventledger, gatewindow, home, landorder,
                landreq, pk, rowworld, vcs)
@@ -142,7 +143,7 @@ USAGE = ("usage: helm train [--repo PATH] [--trunk REF] [--name TRAIN] "
          "       helm train readmit <tip> --reason TEXT [--repo PATH]\n"
          "       helm train auto [--repo PATH] [--apply] [--status] "
          "[--pause [--reason TEXT] | --resume | --abandon [--force] "
-         "--reason TEXT]\n"
+         "[--drop ROW|LANE] --reason TEXT]\n"
          "       helm train veto <train> --reason TEXT [--repo PATH]")
 READMIT_USAGE = "usage: helm train readmit <tip> --reason TEXT [--repo PATH]"
 BOX = "compose"
@@ -200,6 +201,9 @@ UNVERIFIED = "READY-UNVERIFIED"
 # THE WORD A SOURCE-CLEAN CAR PRINTS in the READY word's column: no approve,
 # a finished read (task/3053 F3).
 SOURCE_CLEAN = "SOURCE-CLEAN"
+#: The train name `car_admission` plans under: a notice reads no train
+#: number from trunk, and no train is ever made under this name.
+NOTICE_NAME = "admission"
 
 
 # THE EJECTION STORE (see the module docstring): its file under the project's
@@ -216,6 +220,72 @@ _TIP_TOKEN = re.compile(r"\A[0-9a-f]{4,40}\Z")
 #: The one line `helm train` folds every NO HOLDER exclusion into (the
 #: author's ruling 6, round 4), and the verb that lists those rows.
 NO_HOLDER_LIST = "helm dispatch list --no-holder"
+
+# LAND FIRST, REVIEW AFTER (task/4223). A review row nobody has read for this
+# long rides the train at its dispatched tip without a review hold, when its
+# lane is no door. The whole-suite gate still runs, the row stays OPEN, and
+# its reader reads the landed merge: a FIX files a follow-on task, never a
+# revert. LAND_FIRST is the car's basis, LAND_FIRST_WORD its plan word, and
+# LAND_FIRST_MARK the words its merge body and its land line carry.
+LAND_FIRST_WAIT_S = 1800
+LAND_FIRST = "land-first"
+LAND_FIRST_WORD = "UNREAD"
+LAND_FIRST_MARK = "landed before review"
+# THE TIP WORD each car basis prints, and the words its merge body writes
+# before `tip` (`trainblame._CAR` reads them back).
+_TIP_WORD = {"source-clean": "held", LAND_FIRST: "unread"}
+_BODY_WORD = {"source-clean": "source-clean held",
+              LAND_FIRST: LAND_FIRST_MARK + ", unread"}
+
+
+def land_first_tip(lr, rows, now):
+    """The dispatched tip a review row rides at before its review, or None.
+
+    Only an OPEN review row qualifies, dispatched (or last re-tipped) at least
+    LAND_FIRST_WAIT_S ago, on which no reader recorded anything: no verdict
+    and no hold (the row is still open), no hold that was released, no
+    advisory read, no findings note, nothing retired. A stamp that cannot be
+    read or lies in the future is no age, so no car. Whether its lane is a
+    door, and whether its tip is its branch's and off trunk, are `plan`'s,
+    asked after the cheap ledger facts here."""
+    row = (rows or {}).get(str(lr.get("id") or ""))
+    if not isinstance(row, dict) or row.get("kind") != "review" \
+            or row.get("status") != "open" or lr.get("terminal") \
+            or landreq._retired_by(lr) or any(row.get(k) for k in (
+                "release_ts", "advisory_reads", "findings_notes")):
+        return None
+    hops = row.get("retips") or ()
+    at = landreq._epoch((hops[-1] if hops else row).get("ts"))
+    if at is None or not LAND_FIRST_WAIT_S <= now - at:
+        return None
+    tip = str(row.get("tip") or "")
+    return tip if _TIP.fullmatch(tip) and tip == lr.get("pinned_tip") \
+        else None
+
+
+def _land_first_reason(lr):
+    """The clause beside a land-first car's word: what rides, and what its
+    row owes after the land."""
+    return ("no reader in %d min and no door: %s; the row stays open for "
+            "its reader %s's post-land read, and a FIX files a follow-on "
+            "task, never a revert" % (LAND_FIRST_WAIT_S // 60,
+                                      LAND_FIRST_MARK,
+                                      lr.get("reviewer") or "?"))
+
+
+def _land_first_doors(lr):
+    """Every door class of a land-first car's lane, ["unknown"] when its
+    doors cannot be read: `review_door.lane_doors` is the authority."""
+    from . import review_door
+    rows, _verdicts, err = landreq._ledger_fold()
+    row = (rows or {}).get(str(lr.get("id") or ""))
+    if err or not isinstance(row, dict):
+        return ["unknown"]
+    try:
+        return sorted({c for c, _e in review_door.lane_doors(row, rows)
+                       ["doors"]})
+    except Exception:  # noqa: BLE001 — unread doors could include a door
+        return ["unknown"]
 
 
 def _source_clean_reason(lr):
@@ -441,26 +511,35 @@ def readmit(root, token, reason, by):
 
 def ejection_reason(record):
     """The EXCLUDED line's clause for a car whose tip was ejected: from its
-    red gate, or from its train's red pre-gate audits (`audits`, the log
-    `trainblame.audit_red` read), which no gate names."""
+    red gate, from its train's red pre-gate audits (`audits`, the log
+    `trainblame.audit_red` read), or from a hand `--drop` whose `reason`
+    names why that car was kept out."""
     tests = [str(t) for t in record.get("tests") or ()]
     tip = _short(record.get("tip"))
+    if record.get("audits"):
+        where = "its pre-gate audits"
+    elif record.get("gate"):
+        where = "gate:%s" % record["gate"]
+    elif record.get("reason"):
+        where = "abandoned (%s)" % record["reason"]
+    else:
+        where = "gate:%s" % (record.get("gate") or "?")
     return ("ejected from %s (%s) at %s: %s%s; re-tip the lane or "
             "readmit this tip: `helm train readmit %s --reason ...`"
-            % (record.get("train") or "?", "its pre-gate audits"
-               if record.get("audits") else
-               "gate:%s" % (record.get("gate") or "?"), tip,
+            % (record.get("train") or "?", where, tip,
                tests[0] if tests else "no failing test recorded",
                " (+%d more)" % (len(tests) - 1) if len(tests) > 1 else "",
                tip))
 
 
-def approve_ready(lrs, identity):
+def approve_ready(lrs, identity, now=None):
     """(cars, excluded) for one project, cars in MERGE ORDER.
 
     A car is a LIVE row the projection calls READY, bound to this repository,
     with a reviewed tip — or a HELD source-clean row that
-    `landreq.source_clean_car` admits, at its held tip (`basis` names which).
+    `landreq.source_clean_car` admits, at its held tip — or an open review
+    row nobody has read for LAND_FIRST_WAIT_S (`land_first_tip`), at its
+    dispatched tip (`basis` names which).
     A row bound to ANOTHER repository is not this window's business and is
     not listed. A READY row with no binding at all is listed as excluded,
     because nothing places it here and merging it would make that claim for
@@ -482,7 +561,8 @@ def approve_ready(lrs, identity):
     instant its hold was recorded. A row whose entry instant is unknown sorts
     last; the row id breaks ties so two runs agree.
     """
-    cars, excluded = [], []
+    cars, excluded, rows = [], [], None
+    now = time.time() if now is None else now
     for lr in (lrs or {}).values():
         bound = lr.get("repo_id")
         if bound and bound != identity:
@@ -504,6 +584,16 @@ def approve_ready(lrs, identity):
                 cars.append(car)
             continue
         if not landreq.live_ready(lr):
+            if bound:
+                if rows is None:
+                    # AN UNREAD LEDGER IS NO CAR: nothing shows the row unread.
+                    fold, _verdicts, err = landreq._ledger_fold()
+                    rows = {} if err else fold or {}
+                tip = land_first_tip(lr, rows, now)
+                if tip:
+                    cars.append({"id": lr["id"], "lane": lr.get("lane") or "?",
+                                 "tip": tip, "entered": lr.get("entered_ts"),
+                                 "lr": lr, "basis": LAND_FIRST})
             continue
         car = {"id": lr.get("id") or "?", "lane": lr.get("lane") or "?",
                "tip": lr.get("reviewed_tip") or "",
@@ -631,12 +721,37 @@ def parse_max_behind(raw):
     return n, None
 
 
-def plan(repo, trunk=None, name=None, project=None, max_behind=MAX_BEHIND):
+def _bound_branch_tip(be, root, lr):
+    """(sha, why). The tip of the branch this row bound at dispatch.
+
+    The binding is ``ref_branch``, and only a ``refs/heads/`` ref is a
+    branch. A missing binding, a ref that is not a local branch, or a ref
+    git cannot read is UNKNOWN and the car does not ride. The lane label
+    is not a branch name, so it is not consulted (task/3991)."""
+    branch = (lr or {}).get("ref_branch")
+    if not isinstance(branch, str) or not branch.startswith("refs/heads/") \
+            or branch == "refs/heads/" or any(c.isspace() for c in branch):
+        return None, ("the row bound no local branch, so whether its hold "
+                      "is that branch's current tip is UNKNOWN and it is "
+                      "not composed")
+    rc, head, _err = be.text(
+        root, "rev-parse", "--verify", "-q", branch + "^{commit}", env=_env())
+    if rc != 0 or not head:
+        return None, ("branch %s is not readable, so whether this hold is "
+                      "its current tip is UNKNOWN and it is not composed"
+                      % branch)
+    return head, None
+
+
+def plan(repo, trunk=None, name=None, project=None, max_behind=MAX_BEHIND,
+         observe=True):
     """(plan, refusal) — everything this window would do, measured, with
     nothing minted or merged. The one write is the trunk authority's own
     bounded fetch of the declared ref (`trunk_authority`), the same one a
     build dispatch makes. `project` is the listing seam; its default is the real
-    projection. `max_behind` is the drift cap (see the module docstring)."""
+    projection. `max_behind` is the drift cap (see the module docstring).
+    `observe` False skips that fetch, and the plan's `authority` is None:
+    only `car_admission` passes it, and it never renders or applies a plan."""
     root = _lanes.find_root(repo)
     if not root:
         return None, "%s is not inside a git repository" % repo
@@ -649,7 +764,7 @@ def plan(repo, trunk=None, name=None, project=None, max_behind=MAX_BEHIND):
                             ref + "^{commit}", env=_env())
     if rc != 0 or not sha:
         return None, "trunk %s does not resolve in %s" % (ref, root)
-    authority = trunk_authority(root, identity)
+    authority = trunk_authority(root, identity) if observe else None
     ejected, ejections_unknown = read_ejections(root)
     lrs, unavailable = (project or landreq.project)()
     if unavailable:
@@ -660,9 +775,12 @@ def plan(repo, trunk=None, name=None, project=None, max_behind=MAX_BEHIND):
     for car in ready:
         tip = car["tip"]
         clean = car.get("basis") == "source-clean"
+        first = car.get("basis") == LAND_FIRST
         # A SOURCE-CLEAN CAR HAS NO READY WORD TO READ: its admission is
         # `landreq.source_clean_car`, already asked, and its line says so.
-        word = SOURCE_CLEAN if clean else landreq.ready_word(car["lr"])
+        # Nor has a land-first car: nobody read it (`land_first_tip`).
+        word = SOURCE_CLEAN if clean else LAND_FIRST_WORD if first \
+            else landreq.ready_word(car["lr"])
         if word in DOOR_CAUTION:
             excluded.append(dict(car, why="is %s: %s. That is a door-caution "
                                           "rung of the READY word, and no "
@@ -671,7 +789,8 @@ def plan(repo, trunk=None, name=None, project=None, max_behind=MAX_BEHIND):
                                           "why" % (word, DOOR_CAUTION[word],
                                                    _short(car["id"]))))
             continue
-        reason = (_source_clean_reason(car["lr"]) if clean else None)
+        reason = (_source_clean_reason(car["lr"]) if clean else
+                  _land_first_reason(car["lr"]) if first else None)
         if word == UNVERIFIED:
             why, reason = _unverified(car["lr"])
             if why:
@@ -698,6 +817,10 @@ def plan(repo, trunk=None, name=None, project=None, max_behind=MAX_BEHIND):
                 "gate:<id> --apply` closes it on a verified whole-suite "
                 "receipt containing it; do not compose it"
                 % (_short(tip), ref, _short(sha))) if clean else
+                "unread tip %s is already on %s with no verdict: its "
+                "post-land read is owed by its reader %s; do not compose it"
+                % (_short(tip), ref, car["lr"].get("reviewer") or "?")
+                if first else
                 "reviewed tip %s is already on %s — close it, do not compose "
                 "it" % (_short(tip), ref)))
             continue
@@ -722,6 +845,30 @@ def plan(repo, trunk=None, name=None, project=None, max_behind=MAX_BEHIND):
                                  % (_short(tip), drift, ref, _short(sha),
                                     max_behind)))
             continue
+        # ONE CAR PER LANE. The car is the hold at the tip of the branch
+        # the row bound. An older hold on that same branch is superseded
+        # and is not composed (task/3991): merging both tips puts the
+        # pre-rebase hold on the train, and that hold conflicts with trunk.
+        branch_tip, branch_why = _bound_branch_tip(be, root, car.get("lr"))
+        if branch_why:
+            excluded.append(dict(car, why=branch_why))
+            continue
+        if tip != branch_tip:
+            excluded.append(dict(car, why=(
+                "superseded: branch %s's current tip is %s; this hold is %s "
+                "and is not composed"
+                % (car["lr"].get("ref_branch"), _short(branch_tip),
+                   _short(tip)))))
+            continue
+        # A DOOR WAITS FOR ITS READ: only a lane `review_door.lane_doors`
+        # finds no door in lands before review. Asked last, of the few cars
+        # left, because it reads the lane's diff.
+        doors = _land_first_doors(car["lr"]) if first else []
+        if doors:
+            excluded.append(dict(car, why=(
+                "is unread and a DOOR (%s): a door lands only after its "
+                "review" % ", ".join(doors))))
+            continue
         seen[tip] = car["id"]
         # UNKNOWN, never a guess, when the store cannot be read: the car
         # stays listed and `--apply` refuses (`compose`).
@@ -740,6 +887,49 @@ def plan(repo, trunk=None, name=None, project=None, max_behind=MAX_BEHIND):
             "train": name, "room": _lanes.lane_path(root,
                                                     os.path.join(BOX, name)),
             "cars": cars, "excluded": excluded}, None
+
+
+def car_admission(rid, project=None):
+    """(root, tip, why) — would `helm train auto` take land-request row `rid`
+    as a car now? THE PLANNER'S OWN ANSWER, never a second one: the row's
+    projection is handed to `plan` itself, on the repository the row is bound
+    to and with the default trunk and drift cap `helm train auto` plans with.
+    So every rung `plan` asks (`landreq.source_clean_car`, the door-caution
+    word, an ejected tip, a tip already on trunk, the drift cap, a superseded
+    branch tip) is asked here exactly as the train asks it.
+
+    A NOTICE IS NOT A PLAN, so two things are not done: no remote trunk
+    authority is observed (that bounded fetch guards `--apply`, and a hold
+    verb must not fetch), and no train name is read from trunk. The answer
+    stands on the local trunk snapshot.
+
+    `root` is None when the row's repository cannot be named. `tip` is the
+    car's tip when the planner admits it; `why` is the planner's own
+    exclusion otherwise. `project` is the listing seam, as for `plan`."""
+    lrs, unavailable = (project or (
+        lambda: landreq.project(selector=rid)))()
+    if unavailable:
+        return None, None, ("the land-request projection is unavailable: %s"
+                            % unavailable)
+    lr = next((r for r in (lrs or {}).values() if r.get("id") == rid), None)
+    if lr is None:
+        return None, None, ("the land-request projection carries no row %s"
+                            % _short(rid))
+    gitdir, why = landreq._close_repo(lr, None)
+    if why:
+        return None, None, why
+    root = gitdir[:-5] if gitdir.endswith("/.git") else gitdir
+    got, why = plan(root, name=NOTICE_NAME,
+                    project=lambda: ({rid: lr}, None), observe=False)
+    if why:
+        return root, None, why
+    for car in got["cars"]:
+        if car["id"] == rid:
+            return root, car["tip"], None
+    for car in got["excluded"]:
+        if car["id"] == rid:
+            return root, None, str(car["why"])
+    return root, None, "the planner does not list it as a car"
 
 
 def render(got):
@@ -764,8 +954,8 @@ def render(got):
     for i, car in enumerate(got["cars"], 1):
         lines.append("    %d. %s  lane %s  %s tip %s  %s%s  (%d behind)%s"
                      % (i, _short(car["id"]), car["lane"],
-                        "held" if car.get("basis") == "source-clean"
-                        else "reviewed", _short(car["tip"]),
+                        _TIP_WORD.get(car.get("basis"), "reviewed"),
+                        _short(car["tip"]),
                         car["word"], " — %s" % car["reason"]
                         if car.get("reason") else "", car["behind"],
                         "  ejection %s" % car["ejection"]
@@ -806,13 +996,15 @@ def _order_header(cars):
     """The merge-order line. Unchanged for a train of approve-ready rows; a
     train carrying source-clean cars counts both kinds, because an
     approve-ready count that included them would claim an approve nobody
-    wrote."""
+    wrote. A land-first car is counted as one too, for the same reason."""
     clean = sum(1 for car in cars if car.get("basis") == "source-clean")
-    if not clean:
+    first = sum(1 for car in cars if car.get("basis") == LAND_FIRST)
+    if not clean and not first:
         return "  merge order, %d approve-ready row%s:" % (
             len(cars), "" if len(cars) == 1 else "s")
-    return "  merge order, %d car%s (%d approve-ready, %d source-clean):" % (
-        len(cars), "" if len(cars) == 1 else "s", len(cars) - clean, clean)
+    return "  merge order, %d car%s (%d approve-ready, %d source-clean%s):" % (
+        len(cars), "" if len(cars) == 1 else "s", len(cars) - clean - first,
+        clean, ", %d %s" % (first, LAND_FIRST_MARK) if first else "")
 
 
 def _source_clean_loop(cars, out):
@@ -908,8 +1100,8 @@ def merge_car(be, room, car, train, identity=None):
     rc, out, err = be.text(
         room, *NO_RERERE, "merge", "--no-ff", "--no-edit", "--no-log",
         "-m", message, "-m", "land request %s, %s tip %s"
-        % (car["id"], "source-clean held" if car.get("basis") ==
-           "source-clean" else "reviewed", tip), tip, env=env,
+        % (car["id"], _BODY_WORD.get(car.get("basis"), "reviewed"), tip),
+        tip, env=env,
         timeout=MERGE_TIMEOUT_S)
     if rc == 0:
         rc, line, _err = be.text(room, "rev-list", "--parents", "-n", "1",

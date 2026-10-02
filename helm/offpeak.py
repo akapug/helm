@@ -348,6 +348,24 @@ def _config_providers(family, seat_name):
     return {name for name, _item in items if name}
 
 
+def default_routes(fam):
+    """The proxy providers a seat of this family carries when its config
+    cannot be read: the pool_default row's, since a mint writes ONE row and
+    that one unless told otherwise; every row when no default is named.
+
+    The pro family's pool holds the gated direct key (its default) beside the
+    flat Go subscription, and a seat carries one of them. Standing in with every row
+    would read an open Go route into a direct-key seat whose config is
+    unreadable, and spend the key at the peak price."""
+    rows = (fam or {}).get("pool_providers")
+    rows = rows if isinstance(rows, dict) else {}
+    default = rows.get((fam or {}).get("pool_default"))
+    picked = {(fam or {}).get("pool_default"): default} \
+        if isinstance(default, dict) else rows
+    return {row.get("proxy_provider") or name
+            for name, row in picked.items() if isinstance(row, dict)}
+
+
 def _all_closed(family, fam, at, seat_name=None, prove_clock=False):
     """The gates when EVERY route the seat can take is closed, else [].
 
@@ -355,17 +373,14 @@ def _all_closed(family, fam, at, seat_name=None, prove_clock=False):
     config carries: a seat whose config holds only the gated block has no
     open route at peak even if its family's pool declares another, and a
     seat carrying an open block beside the gated one is never held. With no
-    readable config the family's pool rows stand in."""
+    readable config the family's default route stands in (`default_routes`)."""
     fam = _family(family, fam)
     gates = gate(family, fam, at, prove_clock=prove_clock)
     if not gates:
         return []
     routes = _config_providers(family, seat_name) if seat_name else None
     if routes is None:
-        rows = fam.get("pool_providers")
-        routes = {row.get("proxy_provider") or name
-                  for name, row in (rows.items() if isinstance(rows, dict)
-                                    else ()) if isinstance(row, dict)}
+        routes = default_routes(fam)
     closed = {g["provider"] for g in gates if g["closed"]}
     if not routes or not routes <= closed:
         return []
@@ -432,8 +447,8 @@ def status_line(family, fam=None, at=None, present=None):
         if g.get("clock_error") else
         "CLOSED (peak guard)" if g["closed"] else "OPEN",
         iso(g["until"]) or "UNKNOWN") for g in gates]
-    only = present <= {g["provider"] for g in gates} if present is not None \
-        else len(gated_providers(fam)) == len(fam.get("pool_providers") or ())
+    only = (present if present is not None else default_routes(fam)) \
+        <= {g["provider"] for g in gates}
     return ("OFF-PEAK-ONLY: " if only else "off-peak route: ") + \
         "; ".join(parts)
 

@@ -1,0 +1,1 @@
+drain [--apply] — route raw memory intake to typed homes (dry-run default)

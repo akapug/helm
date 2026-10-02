@@ -41,7 +41,7 @@ import unittest
 from unittest import mock
 
 import tests._tmphome  # noqa: F401 — one tmp HELM_HOME per process
-from helm import dispatches, eventledger, landreq, registry
+from helm import dispatches, eventledger, landreq, registry, tasks
 from tests._tmphome import dispatch_home
 # The module, never its TestCase: tests/test_suite_collection.py says why.
 from tests import test_landreq as _landreq
@@ -91,11 +91,18 @@ class ProjectScopeBase(_landreq.LandReqBase):
             self.addCleanup(os.chdir, self._entry_cwd)
         os.chdir(where)
 
+    def review_task(self):
+        work, why = tasks.add("project-scope reviewed work", "integrator",
+                              project="helm-test", force_new=True)
+        self.assertIsNone(why, why)
+        return work["id"]
+
     def foreign_add(self, repo, lane, ref, deadline_s=60):
         """A row minted AS the foreign repository's own helm."""
         with dispatch_home(repo):
             row = dispatches.add("seat-a", lane, ref=ref, repo=repo,
                                  new_work=True, kind="review",
+                                 task=self.review_task(),
                                  deadline_s=deadline_s, notify=False)
         self.assertIsNotNone(row)
         return row
@@ -458,8 +465,8 @@ class CwdScopedCliListingsBase(ProjectScopeBase):
         dispatches._mark_delivered(home["id"], "post-h")
         foreign, why = dispatches.add(
             "seat-a", "lane/other-project-work", ref=self.c, repo=other,
-            new_work=True, kind="review", deadline_s=60, notify=False,
-            _reason=True)
+            new_work=True, kind="review", task=self.review_task(),
+            deadline_s=60, notify=False, _reason=True)
         self.assertIsNotNone(
             foreign, "the registered project's row was refused at the write "
             "door, so there is nothing for the listings to scope: %s" % (why,))
@@ -572,7 +579,8 @@ class CwdScopedCliListingsTest(CwdScopedCliListingsBase):
         # door rather than the project narrowing.
         mine, why = dispatches.add("integrator", "lane/elsewhere", ref=self.c,
                                    repo=other, new_work=True, kind="review",
-                                   deadline_s=60, notify=False, _reason=True)
+                                   task=self.review_task(), deadline_s=60,
+                                   notify=False, _reason=True)
         self.assertIsNotNone(mine, "%s" % (why,))
         self.chdir(self.repo)
 
@@ -666,12 +674,14 @@ class CliScopeFollowsTheClassifierTest(CwdScopedCliListingsBase):
         home = self.dispatch(deadline_s=60)
         sib, why = dispatches.add("seat-a", "lane/sibling-work", ref=self.c,
                                   repo=sibling, new_work=True, kind="review",
-                                  deadline_s=60, notify=False, _reason=True)
+                                  task=self.review_task(), deadline_s=60,
+                                  notify=False, _reason=True)
         self.assertIsNotNone(sib, "the sibling repository's row was refused at "
                              "the write door: %s" % (why,))
         far, why = dispatches.add("seat-a", "lane/stranger-work", ref=self.c,
                                   repo=stranger, new_work=True, kind="review",
-                                  deadline_s=60, notify=False, _reason=True)
+                                  task=self.review_task(), deadline_s=60,
+                                  notify=False, _reason=True)
         self.assertIsNotNone(far, "%s" % (why,))
         return sibling, stranger, home, sib, far, self.legacy_row()
 
@@ -694,7 +704,8 @@ class CliScopeFollowsTheClassifierTest(CwdScopedCliListingsBase):
         self.pin_registry_scoped(dict(projects, goneproj=[unclaimed]))
         row, why = dispatches.add("seat-a", "lane/unclaimed-work", ref=self.c,
                                   repo=unclaimed, new_work=True, kind="review",
-                                  deadline_s=60, notify=False, _reason=True)
+                                  task=self.review_task(), deadline_s=60,
+                                  notify=False, _reason=True)
         self.assertIsNotNone(row, "the write door refused the row this arm's "
                              "sub-bucket is made of: %s" % (why,))
         self.assertEqual(row["repo_id"],
@@ -945,8 +956,8 @@ class CliScopeFollowsTheClassifierTest(CwdScopedCliListingsBase):
                                   "otherproj": [other]})
         foreign, why = dispatches.add(
             "seat-a", "lane/other-project-work", ref=self.c, repo=other,
-            new_work=True, kind="review", deadline_s=60, notify=False,
-            _reason=True)
+            new_work=True, kind="review", task=self.review_task(),
+            deadline_s=60, notify=False, _reason=True)
         self.assertIsNotNone(foreign, "%s" % (why,))
         rc, out, err = self.dispatch_cli(["list", "--json"])
         self.assertEqual(rc, 0, err)
@@ -1424,8 +1435,8 @@ class JsonDisclosureFollowsTheWITHHOLDINGTest(ProjectScopeBase):
         self.pin_registry({"homeproj": self.repo, "otherproj": other})
         foreign, why = dispatches.add(
             "seat-a", "lane/other-project-work", ref=self.c, repo=other,
-            new_work=True, kind="review", deadline_s=60, notify=False,
-            _reason=True)
+            new_work=True, kind="review", task=self.review_task(),
+            deadline_s=60, notify=False, _reason=True)
         self.assertIsNotNone(foreign, "%s" % (why,))
         dispatches._mark_delivered(foreign["id"], "post-f")
         rc, out, err = self.dispatch_cli(["list", "--json"])
@@ -1474,8 +1485,8 @@ class ScopeMarksNeverWriteTheFoldTest(ProjectScopeBase):
         dispatches._mark_delivered(home["id"], "post-h")
         foreign, why = dispatches.add(
             "seat-a", "lane/other-project-work", ref=self.c, repo=other,
-            new_work=True, kind="review", deadline_s=60, notify=False,
-            _reason=True)
+            new_work=True, kind="review", task=self.review_task(),
+            deadline_s=60, notify=False, _reason=True)
         self.assertIsNotNone(
             foreign, "the registered project's row was refused at the write "
             "door, so there is no foreign row to mark: %s" % (why,))

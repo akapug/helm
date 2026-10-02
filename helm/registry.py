@@ -2599,6 +2599,12 @@ def projections():
             rebuild="helm proxywatch --post  # the posting pass writes it "
                     "beside the codex runway; it reads the usage history "
                     "and makes no vendor call of its own"),
+        # THE CLAUDE POOL'S HORIZON (task/3871): AUTHORED, what the owner
+        # says the pool must last until; losing it paces to the next reset.
+        row("pace-horizon", "authored", "home",
+            ("_global/.state/pace-horizon.json",
+             "_global/.state/pace-horizon.json.*.tmp"),
+            source="the owner, through `helm burn horizon`"),
         # THE DECLARATIONS ARE AUTHORED, NOT DERIVED: the owner types a colour
         # and an expiry, nothing recomputes them, and losing the file loses
         # what he said rather than a cache.
@@ -2660,6 +2666,15 @@ def projections():
             source="git answers about immutable object ids (helm.gitfacts)",
             sources=(master,),
             rebuild="delete; every entry re-derives on the next read"),
+        # THE WORKTREE SWEEP'S KEEP VERDICTS (task/4061): one file per
+        # repository, NOT-landed answers keyed by lane tip, self-bounded to
+        # a day and 4096 entries (`work._gc.LandedMemo`). Its
+        # `pk.atomic_write` temp is the cache root's `scratch` row.
+        row("gc-landed", "projection", "cache", ("gc-landed-*.json",),
+            source="the landedness reads `helm work gc` and `helm worktree "
+                   "gc` make (helm.work._gc.LandedMemo)",
+            sources=(master,),
+            rebuild="delete; the next sweep asks git again"),
         row("store-cache", "projection", "cache", ("store-cache-*.json",),
             source="the typed store roots (stat-signature keyed)",
             sources=store_roots, rebuild="helm inject"),

@@ -1,0 +1,1 @@
+configs [list|show <path>|cascade <cwd> [--harness claude|codex|pi]|injection [--seat SEAT] [--session SID]|edit <path>|backups|restore <backup>] — every config across every home: list/show/cascade read; injection is the opt-in requested-vs-verified identity + versioned weight observation; edit takes new content on stdin through backup -> validate -> atomic write

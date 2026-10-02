@@ -2520,6 +2520,97 @@ class BeaconAmbientDefaultTest(SeatsBase):
         self.assertEqual(len(got), 1)
         self.assertIn("private word", got[0])
 
+    # task/4019 slice A, cures 1b and 1c on the WAKE path. Each FYI arm is
+    # red on the pre-cure tree; each falsifier twin drives the same beacon
+    # and must still wake.
+
+    def _home_with_peer(self, seat, session, room):
+        """`seat` homed in `room`, plus a JOINED peer the rows address."""
+        seats.join(session="s-peer-" + seat, seat="seat-b", cwd="/tmp/p",
+                   room="team-peer")
+        seats.join(session=session, seat=seat, cwd="/tmp/p", room=room)
+
+    def test_a_row_addressed_to_another_seat_is_off_the_wake_tier_only(self):
+        """The root cause, measured: the ambient home-room tier answered True
+        on the wake tier for rows stamped addressees:[other]. It now falls
+        through on beacon=True and stays on the boundary tier (never dropped).
+        A row with no stamp keeps the full-surface tier on both."""
+        self._home_with_peer("xen", "s-x", "team-x")
+        row = chat.post("@seat-b 9a5c2ff9: meld-diff-applied-3937",
+                        who="bob", room="team-x")
+        self.assertEqual([a["membership"] for a in row["addressees"]],
+                         ["JOINED"])
+        self.assertFalse(seats_identity.deliverable(
+            row, "xen", room="team-x", ambient=True, beacon=True))
+        self.assertTrue(seats_identity.deliverable(
+            row, "xen", room="team-x", ambient=True, beacon=False))
+        plain = chat.post("plain team chatter, no address",
+                          who="bob", room="team-x")
+        self.assertTrue(seats_identity.deliverable(
+            plain, "xen", room="team-x", ambient=True, beacon=True))
+
+    def test_an_ambient_beacon_never_wakes_on_a_row_for_another_seat(self):
+        """The one-shot wait runs ambient: it woke every home-room member on a
+        row for seat-b. It now holds it, and the boundary delivers it."""
+        self._home_with_peer("xen", "s-x2", "team-x")
+        chat.post("@seat-b 9a5c2ff9: meld-diff-applied-3937",
+                  who="bob", room="team-x")
+        self.assertEqual(self.beacon("xen", "s-x2", ambient=True), [])
+        held = seats.deliver_any(session="s-x2", seat="xen")
+        self.assertIsNotNone(held)
+        self.assertIn("meld-diff-applied-3937", held)
+
+    def test_act_rows_in_the_home_room_still_wake_the_ambient_beacon(self):
+        """Falsifiers on the same path: a row naming this seat, an owner row,
+        a deadline row, a failure row, an unresolvable addressee and an @all
+        each still wake, even when the row also names another seat."""
+        texts = (("@xen please review the branch", "bob", None),
+                 ("@seat-b hold all lands", "daria", "web"),
+                 ("@seat-b the deadline is 17:00", "bob", None),
+                 ("@seat-b the gate FAILED on 3926", "bob", None),
+                 ("@nobody-joined-by-this-name take it", "bob", None),
+                 ("@all and @seat-b: standup", "bob", None))
+        for i, (text, who, origin) in enumerate(texts):
+            room, session = "team-f%d" % i, "s-f%d" % i
+            self._home_with_peer("fen%d" % i, session, room)
+            chat.post(text, who=who, room=room, origin=origin)
+            got = self.beacon("fen%d" % i, session, ambient=True)
+            self.assertEqual(len(got), 1, text)
+            self.assertIn(text.split()[-1], got[0])
+
+    def test_an_all_keep_stalebot_sweep_never_wakes_the_beacon(self):
+        """Cure 1c: one keep-only sweep woke ~10 seats in 3 minutes. It is
+        held for the hook; the row is NOT dropped — deliver_any returns it."""
+        seats.join(session="s-sk", seat="sal", cwd="/tmp/p", room="team-s")
+        chat.post("@sal [stale-bot] 2 aged or cure-awaiting row(s) on your "
+                  "name — PROPOSED dispositions below.\n"
+                  "1. abc123 (task, untouched 4d) PROPOSED still-live-keep: "
+                  "live\n2. def456 (dispatch, past its 3600s deadline) "
+                  "PROPOSED still-live-keep: live",
+                  who="stale-bot", room="elsewhere")
+        self.assertEqual(self.beacon("sal", "s-sk"), [])
+        held = seats.deliver_any(session="s-sk", seat="sal")
+        self.assertIsNotNone(held)
+        self.assertIn("still-live-keep", held)
+
+    def test_a_sweep_proposing_a_terminal_still_wakes(self):
+        """Falsifier: only an ALL-KEEP sweep is FYI. A proposed supersede,
+        and a capped sweep whose unshown rows are unknown, still wake."""
+        for seat, text in (
+                ("sam", "@sam [stale-bot] 2 aged row(s)\n"
+                        "1. abc123 (task, aged) PROPOSED still-live-keep: ok\n"
+                        "2. def456 (task, aged) PROPOSED supersede-candidate: "
+                        "on trunk"),
+                ("sid", "@sid [stale-bot] 14 aged row(s)\n"
+                        "1. abc123 (task, aged) PROPOSED still-live-keep: ok\n"
+                        "… +13 more row(s) on your name NOT shown here")):
+            seats.join(session="s-" + seat, seat=seat, cwd="/tmp/p",
+                       room="team-" + seat)
+            chat.post(text, who="stale-bot", room="elsewhere")
+            got = self.beacon(seat, "s-" + seat)
+            self.assertEqual(len(got), 1, text)
+            self.assertIn("stale-bot", got[0])
+
     def test_at_all_wakes_the_default_beacon_in_the_home_room(self):
         """ambient=False must fall THROUGH to the @all rule, not swallow the
         home room whole — a home-room @all broadcast still wakes."""
@@ -10450,11 +10541,10 @@ class CanonicalKeyResolverTest(SeatsBase):
         self.addCleanup(held.stop)
         seats.write_roster("kimi", session=self.LIVE, cwd=self.tmp)
         mine = "M" * 32                      # a fresh sid, rostered nowhere
-        self.addCleanup(os.environ.pop, "HELM_CHAT_NAME", None)
         # UNCONDITIONAL FIRST. The exact spelling disputed before this lane
         # too, so it proves the fixture actually reaches the guard; an empty
         # loop below would otherwise pass in silence.
-        os.environ["HELM_CHAT_NAME"] = "kimi"
+        os.environ["HELM_CHAT_NAME"] = "kimi"   # SeatsBase.tearDown restores it
         self.assertEqual(seats_identity.identity_disagreement(mine),
                          ("kimi", "kimi"))
         for spelling in ("Kimi", "KIMI"):
@@ -10470,8 +10560,7 @@ class CanonicalKeyResolverTest(SeatsBase):
         """The other pole. A guard cured by making it fire on everything is
         not cured, and every arm above asserts a dispute."""
         seats.write_roster("kimi", session=self.LIVE, cwd=self.tmp)
-        os.environ["HELM_CHAT_NAME"] = "stranger"
-        self.addCleanup(os.environ.pop, "HELM_CHAT_NAME", None)
+        os.environ["HELM_CHAT_NAME"] = "stranger"   # SeatsBase.tearDown restores it
         self.assertIsNone(seats_identity.identity_disagreement("M" * 32))
 
     def test_a_joined_seat_is_TRACKED_under_a_case_variant(self):

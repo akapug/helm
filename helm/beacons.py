@@ -189,6 +189,9 @@ MISROUTED = "MISROUTED"
 # for about 30 seconds every half hour. It is outside the alarm class, the
 # re-arm nudge never types into it, and it becomes DEAF once the grace ends.
 WAKING = "WAKING"
+# BUSY is a pane whose current session has made bounded recent progress even
+# though its beacon lapsed. It does NOT prove a wake path, only ongoing work.
+BUSY = "BUSY"
 # RESTING is not a softer DEAF either, and it is the one verdict that is an
 # INTENT rather than a measurement (task/3280). The owner paused the seat
 # (`helm seat rest`, helm/seat_rest.py): its beacon is off on purpose and only
@@ -563,7 +566,7 @@ def sink_state(pid, proc_dir=None):
     return sink_probe(pid, proc_dir)[0]
 
 
-def sink_usable_for(dest, follower=True):
+def sink_usable_for(dest, follower=True, exit_wakes=False):
     """False when this DESTINATION is PROVEN to reach no reader, else None.
 
     `follower` says whether the consumer keeps running after it writes. Only
@@ -587,6 +590,11 @@ def sink_usable_for(dest, follower=True):
     forever against rows that stay PENDING. It excuses a regular FILE only --
     /dev/null is non-waking by construction and nobody captures to it in order
     to read it later.
+
+    `exit_wakes` says the consumer's EXIT is the wake (`--once`, `waking_sink`):
+    armed as a background task, its regular-file stdout is read by the
+    harness when it exits, so that file is admissible as the override makes
+    it. /dev/null stays refuted.
 
     -> False only where the destination is PROVEN to reach nobody. Everything
     else, including an object with no `fileno` and any read this cannot make,
@@ -626,7 +634,7 @@ def sink_usable_for(dest, follower=True):
     if state != SINK_REFUTES:
         return None
     if token and stat.S_ISREG(token[0]) \
-            and os.environ.get(FILE_SINK_OK) == "1":
+            and (exit_wakes or os.environ.get(FILE_SINK_OK) == "1"):
         return None
     return False
 
@@ -1130,6 +1138,8 @@ def waiter_spec(pid, proc_dir=None, argv=None, env=None, row=None):
               "ambient": "--ambient" in sub, "timeout": timeout}
     if "--per-row" in sub:           # the doorbell (the default) sets no key
         stable["per_row"] = True
+    if "--once" in sub:              # a waiter that exits after one ring
+        stable["once"] = True
     if not room and isinstance(saved, dict) \
             and all(saved.get(k) == v for k, v in stable.items()):
         room = saved.get("room")
@@ -1145,19 +1155,38 @@ def waiter_spec(pid, proc_dir=None, argv=None, env=None, row=None):
 
 
 def requested_waiter_spec(room="main", any_row=False, ambient=False,
-                          timeout=None, per_row=False):
+                          timeout=None, per_row=False, once=False):
     """Canonical behavior value for a CLI waiter before it mutates anything.
 
     `--per-row` changes what the waiter emits (one line per row instead of the
     doorbell's one ring per burst), so it is part of the behavior an incumbent
-    must share. The key exists only when it is set, so a doorbell waiter's
-    value, and every registry row written before the flag existed, are
-    unchanged."""
+    must share. `--once` changes how long it waits (it exits after its first
+    ring), so it is part of that behavior too. Each key exists only when it
+    is set, so a doorbell waiter's value, and every registry row written
+    before the flag existed, are unchanged."""
     spec = {"follow": True, "room": room or "main", "any": bool(any_row),
             "ambient": bool(ambient), "timeout": timeout}
     if per_row:
         spec["per_row"] = True
+    if once:
+        spec["once"] = True
     return spec
+
+
+def waking_sink(spec, sink, sink_id):
+    """`sink` as a wake path for a waiter whose behavior is `spec`.
+
+    A ONE-SHOT'S EXIT IS ITS WAKE. A `--follow` waiter writes a line and keeps
+    running, so a regular file on its stdout is read by nobody until the
+    waiter dies, which is why `sink_probe` refutes it. A `--once` waiter
+    exits after its one ring, and armed as a background task its stdout IS
+    that task's output file, which the harness reads when the task exits and
+    hands to the agent as a new turn. So for a one-shot a REGULAR FILE is
+    admissible. /dev/null is still refuted: nothing reads it at any time."""
+    if sink == SINK_REFUTES and isinstance(spec, dict) and spec.get("once") \
+            and sink_id and stat.S_ISREG(sink_id[0]):
+        return SINK_ADMISSIBLE
+    return sink
 
 
 def waiter_seat(pid, proc_dir=None, argv=None, env=None):
@@ -1969,6 +1998,36 @@ def release(seat, pid=None):
     return removed
 
 
+def mark_ended(seat, pid=None, now=None):
+    """Stamp this beacon's row as a ONE-SHOT that delivered its wake and
+    exited, in place of dropping it (`release`).
+
+    THE ROW IS THE ONLY EVIDENCE THE SEAT IS RE-ARMING. A `--once` waiter
+    exits after its one ring, and the seat re-arms inside the turn that ring
+    starts. Between the two no waiter is live, and a census that found no row
+    would read the seat DEAF and type a resume turn into a pane that is
+    already awake. The stamp lets `seat_census` read the gap as WAKING for
+    REARM_GRACE_S after `ended` (`once_age`), the same grace a Monitor lease
+    gets; after it the row is pruned like every other dead row.
+    -> True when a row for this pid was stamped."""
+    if not valid_seat(seat):
+        return False
+    pid = int(pid or os.getpid())
+    at = float(now if now is not None else time.time())
+    stamped = False
+    for row in entries(seat):
+        if row["pid"] != pid:
+            continue
+        path = row.pop("_path")
+        row.update(ended=at, ended_how="once")
+        try:
+            pk.write_json(path, row)
+            stamped = True
+        except OSError:
+            pass                             # a registry miss never stops a beacon
+    return stamped
+
+
 def prune(row):
     try:
         os.unlink(row.get("_path") or _entry_path(row["seat"], row["pid"]))
@@ -2146,8 +2205,9 @@ def _one_live_incumbent(seat, session, keep_pid=None, proc_dir=None,
         sink, sink_id = sink_probe(pid, proc_dir)
         if not is_waiter(pid, proc_dir) or proc_starttime(pid, proc_dir) != start:
             return None
-        owned.append((state, row, start, waiter_spec(pid, proc_dir, row=row),
-                      sink, sink_id))
+        spec = waiter_spec(pid, proc_dir, row=row)
+        owned.append((state, row, start, spec,
+                      waking_sink(spec, sink, sink_id), sink_id))
     if len(owned) != 1:
         return None
     state, row, start, incumbent, sink, sink_id = owned[0]
@@ -2768,7 +2828,7 @@ def classify(pid, seat=None, row=None, live=None, proc_dir=None, records=None):
 
 
 def _verdict(live_, unknown, unlistable, agent, agent_why, undrained=None,
-             sidechain=False, expired=()):
+             sidechain=False, expired=(), busy=None):
     """(verdict, why) — the seat ladder, in one place so the verdicts cannot
     drift apart across two call sites.
 
@@ -2781,18 +2841,18 @@ def _verdict(live_, unknown, unlistable, agent, agent_why, undrained=None,
     covered, occupied seat with rows older than the grace was not woken by
     them, whatever every process-shaped instrument says.
 
-    IT REFINES COVERED AND NOTHING ELSE. A seat with no live beacon is DEAF
-    whether or not rows are waiting — that verdict is already the stronger
-    claim — and an unclassifiable seat stays UNPROVEN rather than acquiring a
-    verdict from a fact that cannot be attributed to it.
+    An undrained row refines COVERED and nothing else. A seat with no live
+    beacon is DEAF unless its own RUNNING pane made a bounded recent call in
+    the current session: BUSY proves ongoing work, not a working wake path.
+    An unclassifiable seat remains UNPROVEN.
 
     `expired` is the other refinement, and it refines DEAF only (task/3055):
     the beacons `seat_census` kept because they ended at their lease deadline
     inside the re-arm grace. With no live and no unknown beacon, at least one
     expired row and a pane that DECLARES this seat (`agent` True — the same
     independent evidence VACANT rests on, so a dead session cannot read
-    WAKING), the seat is re-arming, not deaf. Every other combination falls
-    through to DEAF unchanged."""
+    WAKING), the seat is re-arming, not deaf. Outside grace, only recent
+    same-session RUNNING work can yield BUSY; otherwise it is DEAF."""
     if unlistable:
         return UNPROVEN, "the process table could not be listed"
     if live_:
@@ -2824,19 +2884,25 @@ def _verdict(live_, unknown, unlistable, agent, agent_why, undrained=None,
     if expired and agent is True:
         # THE NEWEST EXPIRY SPEAKS: it is the one the seat is re-arming after,
         # and it is the one whose grace ends last.
-        past = min(float(b.get("lease_past") or 0.0) for b in expired)
+        newest = min(expired, key=lambda b: float(b.get("lease_past") or 0.0))
+        past = float(newest.get("lease_past") or 0.0)
+        how = ("one-shot beacon delivered its wake and exited %s ago"
+               % _age_s(max(0.0, past)) if newest.get("once") else
+               "beacon expired %s ago (%d-minute lease)"
+               % (_age_s(max(0.0, past)), BEACON_TIMEOUT_MS // 60000))
         return WAKING, (
-            "beacon expired %s ago (%d-minute lease); %s; re-arm expected "
-            "within %s" % (_age_s(max(0.0, past)), BEACON_TIMEOUT_MS // 60000,
-                           agent_why or "a pane declares this seat",
-                           _age_s(max(0.0, REARM_GRACE_S - past))))
+            "%s; %s; re-arm expected within %s"
+            % (how, agent_why or "a pane declares this seat",
+               _age_s(max(0.0, REARM_GRACE_S - past))))
+    if busy and agent is True:
+        return BUSY, "%s; no live beacon, so it will need re-arming after this turn" % busy
     return DEAF, "no live beacon: helm cannot wake it"
 
 
 def _rested(seat, verdict, why):
     """(verdict, why) with the owner's rest applied: a seat helm cannot wake
     because the OWNER paused it reads RESTING, not DEAF (see RESTING)."""
-    if verdict not in (COVERED, DEAF, WAKING, DEAF_IN_EFFECT):
+    if verdict not in (COVERED, DEAF, WAKING, BUSY, DEAF_IN_EFFECT):
         return verdict, why
     from . import seat_rest
     rec, err = seat_rest.read(seat)
@@ -3234,6 +3300,25 @@ def lease_age(row, now=None):
     return None
 
 
+def once_age(row, now=None):
+    """Seconds since this registry row's ONE-SHOT delivered its wake and
+    exited (`mark_ended`), while that is inside REARM_GRACE_S, else None.
+
+    A one-shot's exit is not a fault: it is the wake, and the seat re-arms in
+    the turn it starts. Like `lease_age`, only a caller that has already
+    PROVEN the pid GONE may use this; a row with no stamp, or an `arming`
+    marker, never qualifies."""
+    if not isinstance(row, dict) or row.get("phase") == "arming" \
+            or row.get("ended_how") != "once":
+        return None
+    try:
+        ended = float(row.get("ended"))
+    except (TypeError, ValueError):
+        return None
+    past = (time.time() if now is None else float(now)) - ended
+    return past if -EXPIRY_SKEW_S <= past <= REARM_GRACE_S else None
+
+
 def seat_census(seat, live=None, proc_dir=None, records=None, agents=_UNPROBED,
                 waited=None, undrained_unreadable=None,
                 undrained_evidence=None, homes=None, now=None):
@@ -3261,13 +3346,19 @@ def seat_census(seat, live=None, proc_dir=None, records=None, agents=_UNPROBED,
         if not gone:
             continue
         past = lease_age(row, now)
+        once = past is None and once_age(row, now) is not None
+        if once:
+            past = once_age(row, now)
         if past is None:
             prune(row)
             continue
-        gone[0].update(state=EXPIRED, lease_past=past,
-                       why="pid %s ended at its %d-minute lease deadline "
-                           "%s ago" % (row["pid"], BEACON_TIMEOUT_MS // 60000,
-                                       _age_s(max(0.0, past))))
+        gone[0].update(state=EXPIRED, lease_past=past, once=once,
+                       why=("pid %s delivered its one-shot wake and exited %s "
+                            "ago" % (row["pid"], _age_s(max(0.0, past))))
+                       if once else
+                       "pid %s ended at its %d-minute lease deadline "
+                       "%s ago" % (row["pid"], BEACON_TIMEOUT_MS // 60000,
+                                   _age_s(max(0.0, past))))
         expired.append(gone[0])
     beacons = [b for b in beacons if b["state"] not in (GONE, EXPIRED)]
     live_ = [b for b in beacons if b["state"] == LIVE]
@@ -3293,9 +3384,17 @@ def seat_census(seat, live=None, proc_dir=None, records=None, agents=_UNPROBED,
             unstamped += origin_unstamped(row)
             owner_reasons.append(owner_why or "unattributed, no reason given")
     sidechain = bool(live_) and all(o == OWNER_SUBAGENT for o in owners)
+    busy = None
+    if not live_ and not unknown and not unlistable and agent is True \
+            and not expired:
+        try:
+            from . import beacon_busy
+            busy = beacon_busy.proof(seat, time.time() if now is None else now)
+        except Exception:                     # noqa: BLE001 — uncertainty is DEAF
+            pass
     verdict, why = _rested(seat, *_verdict(
         live_, unknown, unlistable, agent, agent_why, undrained=waited,
-        sidechain=sidechain, expired=expired))
+        sidechain=sidechain, expired=expired, busy=busy))
     return {"seat": seat, "verdict": verdict, "why": why, "agent": agent,
             "owners": owners, "unattributed": unattributed,
             "unstamped": unstamped, "owner_reasons": owner_reasons,
@@ -3542,6 +3641,7 @@ def census(seats=None, proc_dir=None):
         "agent_probe": agents is not None,
         "covered": [r for r in rows if r["verdict"] == COVERED],
         "waking": [r for r in rows if r["verdict"] == WAKING],
+        "busy": [r for r in rows if r["verdict"] == BUSY],
         "deaf": [r for r in rows if r["verdict"] == DEAF],
         "deaf_in_effect": [r for r in rows if r["verdict"] == DEAF_IN_EFFECT],
         "resting": [r for r in rows if r["verdict"] == RESTING],
@@ -3585,9 +3685,8 @@ def census(seats=None, proc_dir=None):
 #   alarm    did this pass find NO PROVEN WAKE PATH? (`unreachable`)
 #   alerted  the last state successfully POSTED to chat (human-readable)
 #   alarmed  the alarm value the last successful CHAT post carried — the latch
-#   pushed   the alarm value the last successful PHONE push carried — the
-#            SECOND latch, because a dead phone must not re-post to a healthy
-#            room nor the reverse (proxywatch's per-channel outbox law)
+#   (the fleet-down episode is not on any seat's row: the office weather
+#   keeps it in its own record, task/3939)
 #   why      the census's own reason line
 #
 # NOT A SECOND SOURCE OF TRUTH, by construction: presence stays the seen-file
@@ -3685,15 +3784,44 @@ def _roster_readable():
     return True, None
 
 
-def attend(rep, now=None):
+def attended_path(roster):
+    """Where `attend` keeps the census it ATTENDED: beside the register."""
+    return roster + ".census.json"
+
+
+def attended(rep, now):
+    """The census `attend` judged, as `beacon_phone.qualify` reads it: each
+    row's seat, its verdict after attendance's hold, and whether its beacon
+    is live (`unreachable` reads both), with the two probe flags and `at`,
+    the instant the register's rows were stamped with."""
+    return {"at": now, "live_probe": bool(rep.get("live_probe")),
+            "agent_probe": bool(rep.get("agent_probe")),
+            "seats": [{"seat": row.get("seat"), "verdict": row.get("verdict"),
+                       "live": bool(row.get("live"))}
+                      for row in rep.get("seats") or ()
+                      if isinstance(row, dict)]}
+
+
+def attend(rep, now=None, fleet=False):
     """Write one census's verdicts under the escalation then roster locks.
     Returns {"written": [seats], "transitions": [(seat, att, prior)],
-    "error": None | reason} — a transition is a DEAF EDGE (a seat entering or
-    leaving DEAF relative to the last state successfully posted), detected
-    here because the latch lives on the row being written."""
+    "error": None | reason, "census": None | reason} — a transition is a DEAF
+    EDGE (a seat entering or leaving DEAF relative to the last state
+    successfully posted), detected here because the latch lives on the row
+    being written.
+
+    ONE OBSERVATION, ONE OWNER (task/3939). With `fleet` (a whole-roll pass,
+    the timer's), the census as ATTENDED (after an unproven recovery is held
+    at DEAF-IN-EFFECT and rebucketed) is written beside the register
+    (`attended_path`), under the same roster lock and stamped with the same
+    `at`, so `beacon_phone.fleet` judges exactly the observation the register
+    records. The office weather never takes a census of its own: a second
+    census at another instant disagrees with the register on every held or
+    flapping seat. "census" names why that write failed; it never fails the
+    pass."""
     from . import chat, seats as seats_mod
     now = float(now if now is not None else time.time())
-    out = {"written": [], "transitions": [], "error": None}
+    out = {"written": [], "transitions": [], "error": None, "census": None}
     try:
         chat._ensure_dir()
         # A CORRUPT ROSTER MUST NOT READ AS AN EMPTY FLEET. Checked BEFORE the
@@ -3793,8 +3921,7 @@ def attend(rep, now=None):
                                if state == DEAF_IN_EFFECT else None),
                            "alerted": prior.get("alerted"),
                            "alarmed": bool(prior.get("alarmed")),
-                           "pushed": bool(prior.get("pushed")),
-                           # CARRIED LIKE THE LATCHES, and for the same
+                           # CARRIED LIKE THE CHAT LATCH, and for the same
                            # reason: this row is rebuilt from scratch every
                            # pass, so an episode left out of it is an episode
                            # ERASED — and a pane repair whose record is wiped
@@ -3806,13 +3933,18 @@ def attend(rep, now=None):
                     row["attendance"] = att
                     r[seat] = row
                     out["written"].append(seat)
-                    # A transition is an edge on EITHER channel: the chat room
-                    # may already carry an alarm the phone never received, and
-                    # that seat must stay in the batch until BOTH have it.
-                    if alarm != att["alarmed"] or alarm != att["pushed"]:
+                    # Per-seat reachability has one delivery channel: #seats.
+                    # Fleet-down pages through the office weather (task/3939).
+                    if alarm != att["alarmed"]:
                         out["transitions"].append((seat, att, prior))
                 if out["written"]:
                     pk.write_json(path, r)
+                if fleet:
+                    try:
+                        pk.write_json(attended_path(path), attended(rep, now))
+                    except Exception as exc:  # noqa: BLE001 — named, and the
+                        out["census"] = "%s: %s" % (  # weather reads it stale
+                            exc.__class__.__name__, exc)
     except Exception as exc:                 # noqa: BLE001 — the caller turns
         out["error"] = "%s: %s" % (exc.__class__.__name__, exc)
     return out                               # this into exit 2, never a raise
@@ -3835,14 +3967,11 @@ def _settle_rearm(ep, state, now):
                 detail="the seat answers again: its beacon is live")
 
 
-def _ack_alerts(rows, chat_leg=False, push_leg=False):
-    """Advance the escalation latch of the channel that just DELIVERED.
-    Deliberately a SECOND write after delivery rather than part of `attend`'s:
-    a latch may only move once its own post landed, so a failed delivery
-    re-detects the same edge next pass (at-least-once, proxywatch's outbox law
-    in two fields). PER CHANNEL, because they fail independently — a dead phone
-    must not re-post to a healthy room, nor the reverse. Best-effort: a failed
-    ack merely re-posts an edge, it never loses one."""
+def _ack_alerts(rows, chat_leg=False):
+    """Advance the per-seat chat latch only after its room post delivered.
+
+    A failed chat ack merely re-posts the edge on the next pass; it never
+    loses one."""
     from . import chat, seats as seats_mod
     try:
         chat._ensure_dir()
@@ -3863,8 +3992,6 @@ def _ack_alerts(rows, chat_leg=False, push_leg=False):
                 if chat_leg:
                     cur["alerted"] = att["state"]
                     cur["alarmed"] = bool(att["alarm"])
-                if push_leg:
-                    cur["pushed"] = bool(att["alarm"])
                 hit = True
             if hit:
                 pk.write_json(seats_mod.roster_path(), r)
@@ -3936,6 +4063,7 @@ def _rebucket(rep, was, now_row):
             bucket.append(now_row)
 
     for key, verdict in (("covered", COVERED), ("waking", WAKING),
+                         ("busy", BUSY),
                          ("deaf", DEAF), ("resting", RESTING),
                          ("vacant", VACANT), ("unproven", UNPROVEN),
                          ("deaf_in_effect", DEAF_IN_EFFECT)):
@@ -4210,71 +4338,28 @@ def _alarm_line(seat, att):
             "it is down." % (label(seat), how_long, att.get("why") or "?"))
 
 
-PUSH_NAME_CAP = 6
+def escalate(transitions, rep, now=None, complete=False):
+    """Post per-seat reachability edges to #seats; never page fleet-down.
 
-
-def _push_body(rows):
-    """The PHONE body: one line, lock-screen shaped, seats named.
-
-    A push is read in one glance in the dark. It carries the count, the names
-    (capped — a seven-seat outage must not arrive as a wall of text) and
-    nothing else; the fleet room carries the full report for whoever is left
-    to read it."""
-    hit = [label(seat) for seat, att, _ in rows if att["alarm"]]
-    back = [label(seat) for seat, att, _ in rows if not att["alarm"]]
-    parts = []
-    for names, what in ((hit, "UNREACHABLE"), (back, "reachable again")):
-        if not names:
-            continue
-        shown = ", ".join(names[:PUSH_NAME_CAP])
-        if len(names) > PUSH_NAME_CAP:
-            shown += " +%d more" % (len(names) - PUSH_NAME_CAP)
-        parts.append("%d seat%s %s (%s)" % (len(names),
-                                            "s"[:len(names) != 1], what, shown))
-    body = "helm fleet: " + "; ".join(parts)
-    if hit:
-        return body + " — helm cannot wake them, and the fleet room cannot " \
-                      "tell you: its readers are the seats."
-    return body + "."
-
-
-def escalate(transitions, rep, now=None):
-    """Deliver the reachability edges on BOTH channels the owner has, and
-    return {"chat": bool, "push": bool, "alarms": int}.
-
-    THE ROOM IS NOT ENOUGH, and that is what the 2026-08-03 replay proved. The
-    fleet room is the right surface for the fleet: naming each seat and HOW
-    LONG it has been unreachable (anchored on its last proven answer, not on
-    when this pass happened to notice). But at 03:44 EVERY READER OF THAT ROOM
-    WAS ONE OF THE SEVEN SEATS THAT HAD JUST DIED, and the owner was asleep, so
-    a perfect alarm fired into an empty room and the outage still ran four
-    hours. An alarm about the fleet being unreachable must not depend on a
-    fleet member being reachable — so the same edge also goes to the owner's
-    phone through `notify.owner_push`, the channel he already reads and the
-    only helm surface that survives every seat on the box dying at once.
-
-    Change-latched PER CHANNEL: one post per edge per channel, each latched
-    only after its own delivery, so a failed push re-pushes without re-posting
-    (and vice versa).
+    Fleet-down has ONE page: the office weather turning stormy
+    (`officeweather._fleet` judges the census `attend` recorded by
+    `beacon_phone.qualify`, the one definition of fleet-down). So escalate
+    hands back a dormant `phone` leg and never pushes (task/3939).
+    A single seat's edge is for its steward in #seats, not the owner's phone.
+    When all room readers are down, room delivery alone cannot wake anyone;
+    the weather's fleet-down storm is the page for that.
 
     ONE ESCALATION AT A TIME, AND THE BATCH IS RE-PROVEN WHERE IT IS SPENT
     (a6d5d95f's remaining finding: "concurrent passes deliver same edge
     twice"). Before the shared outer lock, `attend` derived under only the
     roster lock while delivery ran outside its domain, so a second --post pass
     starting inside the first's attend-to-ack window re-derived the same edge
-    and the owner heard every alarm twice on both channels (measured on this
-    tree: 2 posts + 2 pushes for one edge). Serializing only deliveries would
-    not cure it — a stale batch would simply deliver after the lock freed — so
-    the batch must DIE at delivery time if its edge already landed: one lock
-    spans revalidate ->
-    deliver -> ack, and `attend` enters that SAME outer lock before committing
-    a newer verdict, so truth cannot change after the check but before the old
-    sentence leaves. Each row is re-checked against the roster's CURRENT latch.
-    A row whose latch already carries its alarm value was delivered by a
-    concurrent pass and collapses; a row whose delivery FAILED kept an
-    un-advanced latch and survives revalidation, so at-least-once still holds
-    per channel. A lock that cannot even be OPENED is refused, never raced
-    (the same fail-closed polarity as `attend`'s roster lock).
+    and delivered twice. The lock spans revalidate -> deliver -> ack; `attend`
+    enters that SAME outer lock before committing a newer verdict. Chat rows
+    are re-checked against the roster's CURRENT latch. A lock that cannot
+    even be OPENED is
+    refused, never raced (the same fail-closed polarity as `attend`'s roster
+    lock).
 
     AND THE LATCH IS ONLY HALF THE REVALIDATION — the opposite edge is the
     other half (an amendment to the bound review of the delivery-edge
@@ -4284,13 +4369,9 @@ def escalate(transitions, rep, now=None):
     delivers a statement about a world that no longer exists. Measured, in
     both polarities: pass A derives alarm=True; the seat RECOVERS; pass B
     writes covered/alarm=False and derives NO edge (the latches are still
-    false, so nothing is owed); A then passes latch
-    revalidation unchanged and posts DEAF SEAT alpha ... helm cannot wake it
-    onto a covered row, acking alarmed/pushed=True (observed: recovery
-    transitions 0, stale chat=1 push=1). The mirror is worse — a stale
-    RECOVERY batch delivered onto a row that has since gone DEAF again told
-    the owner's phone "helm fleet: 1 seat reachable again" while the seat was
-    down, and reset BOTH latches to false.
+    false, so nothing is owed); A then passes latch revalidation unchanged
+    and posts DEAF SEAT alpha onto a covered row. The mirror posts an obsolete
+    recovery onto a row that has since gone DEAF again. Neither is allowed.
 
     So a row must also still BE what it says: its current attendance is
     re-read and the row collapses unless the register still records the same
@@ -4305,17 +4386,14 @@ def escalate(transitions, rep, now=None):
     classified), so a row can hold its state and lose its alarm.
 
     Nothing is lost by collapsing: OWEDNESS IS A PROPERTY OF THE ROW, not of
-    the batch. `attend` re-derives an edge on every pass from (current alarm
-    vs alarmed) and (current alarm vs pushed), so a genuinely undelivered
-    edge is re-derived by the next census — while
-    a retried FAILED leg still survives, because a retry's row carries the
-    same (alarm, state) the register holds. An absent or unreadable
+    the batch. `attend` re-derives the chat edge from current alarm vs alarmed;
+    a failed post leaves its latch unadvanced for the next census. An absent
     attendance row cannot contradict anything and DELIVERS, the same
     duplicate-beats-a-drop polarity the latch read already takes."""
     out = {"chat": True, "push": True, "alarms": 0}
     # THE REPAIR LEG IS NOT A NOTIFICATION LEG, so it does not share this
-    # gate. `transitions` is the edge on the chat/phone LATCHES, and a seat
-    # that was already DEAF and alarmed on both channels moves to
+    # gate. `transitions` is the edge on the chat latch, and a seat
+    # that was already DEAF and alarmed in #seats moves to
     # DEAF-IN-EFFECT without producing one — which is precisely the seat that
     # has just acquired a repair nobody has attempted.
     die = [row for row in (rep or {}).get("deaf_in_effect") or ()]
@@ -4331,9 +4409,7 @@ def escalate(transitions, rep, now=None):
     # passes and the census reads it DEAF.
     mute = [row for row in (rep or {}).get("deaf") or ()
             if row.get("agent") is True]
-    if not transitions and not die and not mute:
-        return out
-    from . import chat, notify, seats as seats_mod
+    from . import seats as seats_mod
     now = float(now if now is not None else time.time())
     # The DERIVED count, which only the refusal path below ever returns (it
     # delivers nothing, so it reports the batch it was handed). Revalidation
@@ -4464,24 +4540,15 @@ def escalate(transitions, rep, now=None):
             _record_repairs(repaired, now)
         chat_rows = [t for t in fresh
                      if t[1]["alarm"] != _latch(t[0], "alarmed")]
-        push_rows = [t for t in fresh
-                     if t[1]["alarm"] != _latch(t[0], "pushed")]
-        # COUNT WHAT SURVIVES, not what was derived: `alarms` drives the
-        # operator's "this alarm reached the fleet room ONLY" note, and a
-        # collapsed row reached nothing. Counted from the batch (so the seat
-        # set is the caller's) but gated on the rows that are actually about
-        # to be delivered on at least one channel.
-        owed = {t[0] for t in chat_rows} | {t[0] for t in push_rows}
-        out["alarms"] = sum(1 for seat, att, _p in transitions
-                            if att["alarm"] and seat in owed)
-        return _deliver_legs(out, chat_rows, push_rows, rep, now)
+        # A seat alarm belongs to #seats; fleet-down is the office weather's,
+        # judged from a whole census, not from this transition batch.
+        out["alarms"] = sum(1 for _seat, att, _p in chat_rows if att["alarm"])
+        return _deliver_legs(out, chat_rows, rep, now, complete)
 
 
-def _deliver_legs(out, chat_rows, push_rows, rep, now):
-    """The two delivery legs, RUN UNDER escalate's lock (split out only so the
-    lock body stays readable — the lock is the caller's, and the ack must land
-    inside it or the revalidate-deliver-ack window reopens)."""
-    from . import chat, notify
+def _deliver_legs(out, chat_rows, rep, now, complete):
+    """Post per-seat chat under the escalation lock; the phone leg is dormant."""
+    from . import chat
     if chat_rows:
         lines = []
         for seat, att, prior in chat_rows:
@@ -4497,50 +4564,28 @@ def _deliver_legs(out, chat_rows, push_rows, rep, now):
                                 _age(prior.get("since") or now)))
         body = ("beacons: seat reachability CHANGED\n" + "\n".join(lines) + "\n"
                 + _summary(rep))
+        # #SEATS, @MENTIONING EACH SEAT'S PROJECT LEAD (task/3876). In #helm
+        # this row was a machine row addressed to nobody, so it woke nobody.
+        from . import seatevents
+        projects = seatevents.project_of([seat for seat, _a, _p in chat_rows])
+        lead, tail = seatevents.address(
+            [("project-seats", projects.get(seat))
+             for seat, _a, _p in chat_rows])
         try:
-            chat.post(body, who="beacons", room="helm")
+            chat.post(lead + body + tail, who="beacons", room=seatevents.ROOM)
         except Exception:                    # noqa: BLE001 — retried next pass
             out["chat"] = False
         else:
             _ack_alerts(chat_rows, chat_leg=True)
-    if push_rows:
-        # A LATCH RECORDS A PUSH THAT HAPPENED, AND AN OPT-OUT SENDS NOTHING.
-        # `owner_push` returns True for two different worlds — its docstring
-        # says so: "delivered, OR DELIBERATELY OPTED OUT (no topic: nothing to
-        # retry)". From notify's own invariants that is right; with no endpoint
-        # there is genuinely nothing to retry. But `pushed` means "the alarm
-        # value the last successful PHONE push carried", so latching on that
-        # True records a push that never left the machine.
-        #
-        # Read BEFORE the call, never after: a topic set mid-pass would
-        # otherwise latch an edge that predates the channel existing.
-        #
-        # The consequence was never "the phone goes silent forever" — the next
-        # EDGE still pushes. What was lost is the STANDING alarm at configure
-        # time: fleet goes down while the phone is off, the edge latches, the
-        # owner sets HELM_NTFY_TOPIC, and the phone says nothing about the
-        # fleet that is STILL down, because no new transition exists to carry
-        # it. Silence on exactly the state he turned the channel on to hear.
-        #
-        # This module already KNEW: `notify.configured()` is called ~240 lines
-        # below to tell the HUMAN the alarm reached the room only. That fixed
-        # the eyes and left the state machine believing the push happened.
-        # Same question, now asked where the latch is.
-        armed = notify.configured()
-        if notify.owner_push(_push_body(push_rows),
-                             title="helm fleet unreachable"
-                                   if any(t[1]["alarm"] for t in push_rows)
-                                   else "helm fleet",
-                             receipt=("beacons.notify_failed", "fleet")):
-            if armed:
-                _ack_alerts(push_rows, push_leg=True)
-            # else: nothing was sent, so nothing latches — the edge stays
-            # armed and re-pushes the moment a channel exists, which is
-            # exactly what this module already promises a FAILED push
-            # ("it stays armed and re-pushes next pass"). An opt-out sent
-            # strictly less than a failure and must not be treated better.
-        else:
-            out["push"] = False
+    # THE FLEET-DOWN PAGER WAS REMOVED HERE (task/3939): the weather owns the
+    # fleet-down page now; its `_fleet` reader judges the census `attend`
+    # recorded (`attended_path`) by `beacon_phone.qualify`. Nothing in beacons
+    # pages the owner about fleet-down. The `phone` key stays for the callers and tests that read it: the
+    # pager leg is dormant.
+    out["phone"] = {"phase": "dormant", "reason": "the weather pages fleet-down",
+                    "sent": False, "owed": False, "failed": False,
+                    "configured": False}
+    out["push"] = False
     return out
 
 
@@ -4774,13 +4819,13 @@ def _summary(rep):
     # never asked for it, has no WAKING seat to count.
     own = _ownership_of(rep)
     # RESTING JOINS IT (task/3280), read with `.get` like WAKING.
-    return ("helm beacons: %d seat%s, %d covered, %d WAKING, %d DEAF, "
+    return ("helm beacons: %d seat%s, %d covered, %d WAKING, %d BUSY, %d DEAF, "
             "%d DEAF-IN-EFFECT, %d RESTING, "
             "%d MISROUTED, %d VACANT, %d UNPROVEN, %d ghost waiter%s, "
             "%d beacon%s (%d surplus); %s" % (
                 len(rep["seats"]), "s"[:len(rep["seats"]) != 1],
                 len(rep["covered"]), len(rep.get("waking") or ()),
-                len(rep["deaf"]),
+                len(rep.get("busy") or ()), len(rep["deaf"]),
                 len(rep["deaf_in_effect"]), len(rep.get("resting") or ()),
                 len(own["misrouted"]),
                 len(rep["vacant"]),
@@ -4896,6 +4941,10 @@ def _print_census(rep):
               "lease deadline is the seat's check-in, and nothing is typed "
               "into it; it reads DEAF only if the grace passes with no "
               "re-arm." % (label(row["seat"]), row["why"]))
+    for row in rep.get("busy") or ():
+        print("  BUSY SEAT %s — %s. The pane is working but its beacon is "
+              "not armed; re-arm it after this turn." % (
+                  label(row["seat"]), row["why"]))
     for row in rep.get("resting") or ():
         print("  RESTING SEAT %s — %s. Not DEAF: the owner paused it, so no "
               "beacon is owed, nothing is typed into it and no work is "
@@ -4992,11 +5041,13 @@ def cmd_beacons(args):
     seat (no live beacon), a GHOST waiter (a beacon whose session is dead) and
     a VACANT seat (a live beacon with no agent home). The bare read signals
     nothing and writes nothing. --post (the timer's entry) additionally writes
-    each verdict onto its roster row (the attendance register) and delivers
-    reachability edges on BOTH channels, change-latched per channel: the fleet
-    room, and the owner's phone (HELM_NTFY_TOPIC) — because when the fleet is
-    unreachable, every reader of the fleet room is one of the unreachable
-    seats.
+    each verdict onto its roster row (the attendance register), records the
+    census it attended beside the register, and delivers per-seat
+    reachability edges to #seats. It never pages fleet-down itself: when the
+    whole fleet is unreachable every reader of the room may be one of its
+    unreachable seats, so fleet-down, judged on that recorded census, turns
+    the office weather stormy, and the weather is the only writer of the
+    fleet-down page (task/3939).
 
     AND --post ACTUATES, which this help did not say. The fourth verdict is
     DEAF-IN-EFFECT: a seat whose wake path is LIVE and whose turns are not
@@ -5010,7 +5061,10 @@ def cmd_beacons(args):
     written and nothing is typed, and that qualification is the whole of the
     promise: --json is a RENDERING choice, not a dry run, so `--json --post`
     attends, renders, escalates and can spawn the pane repair exactly as the
-    text form does.
+    text form does. A pane nudge is submitted or taken back, never left:
+    --post first clears any nudge line whose deliverer died before it
+    finished (one Ctrl+U, only into a composer holding exactly that line),
+    and it waits for the deliverers it forks before it exits.
 
     AND A DEAF SEAT WHOSE PANE DECLARES IT (HELM_CHAT_NAME) AND THAT OWES
     WORK (a pending addressed row, or owed dispatch work) gets the same
@@ -5065,7 +5119,7 @@ def cmd_beacons(args):
     # same breath, with the reassuring one on the screen (task/2463 finding 8).
     # The bare read is unchanged: it proposes nothing, so there is nothing to
     # reconcile against.
-    reg = attend(rep) if "--post" in args else None
+    reg = attend(rep, fleet=not seat) if "--post" in args else None
     if "--json" in args:
         print(json.dumps(rep, indent=2, default=str))
     else:
@@ -5076,6 +5130,10 @@ def cmd_beacons(args):
         print("helm beacons: register write failed (%s) — attendance not "
               "recorded" % reg["error"], file=sys.stderr)
         return 2
+    if reg.get("census"):
+        print("helm beacons: the attended census was not recorded (%s) — "
+              "the office weather reads fleet-down as unestablished until a "
+              "pass records one" % reg.get("census"), file=sys.stderr)
     # AN UNDELIVERED OWNER DECISION IS AN OWNER-REACHABILITY FAILURE, so this
     # watchdog owns its retry (a second review pass on task/232). A decision
     # card's carry rides the NEXT card's push, which leaves the LAST card ever
@@ -5095,7 +5153,45 @@ def cmd_beacons(args):
         print("helm beacons: decision-backlog flush skipped (%s)" % _e,
               file=sys.stderr)
     stalled = _prompt_stall_leg(seat)
-    sent = escalate(reg["transitions"], rep)
+    # A NUDGE IS SUBMITTED OR REMOVED, NEVER LEFT. The sweep runs BEFORE the
+    # repairs, so a line a dead deliverer left in a composer is gone before a
+    # fresh nudge's clean-composer pre-read reads it as someone's draft; the
+    # wait runs on every exit, so this pass's own deliverers finish before
+    # systemd tears down the unit they run in (`resumeturn.await_children`).
+    from . import resumeturn
+    _sweep_stranded_nudges()
+    try:
+        return _report_repairs(escalate(
+            reg["transitions"], rep, complete=not seat and
+            bool(rep.get("live_probe") and rep.get("agent_probe"))), rep, stalled)
+    finally:
+        left = resumeturn.await_children()
+        if left:
+            print("helm beacons: %d pane deliverer(s) still running after "
+                  "%ds — the next pass clears any line they leave"
+                  % (left, resumeturn.DELIVERER_S), file=sys.stderr)
+
+
+def _sweep_stranded_nudges():
+    """Clear every line a dead deliverer left in a composer, and say so."""
+    import sys
+    from . import resumeturn
+    try:
+        swept, err = resumeturn.sweep_stranded()
+    except Exception as exc:                 # noqa: BLE001 — never costs the pass
+        swept, err = [], "%s: %s" % (exc.__class__.__name__, exc)
+    if err:
+        print("helm beacons: stranded-nudge sweep skipped (%s)" % err,
+              file=sys.stderr)
+    for handle, state, detail in swept:
+        print("helm beacons: stranded nudge in pane %s — %s: %s"
+              % (handle, state, detail), file=sys.stderr)
+
+
+def _report_repairs(sent, rep, stalled):
+    """What the escalation and each pane repair did, printed under --post ->
+    the exit code."""
+    import sys
     if sent.get("refused"):
         # Named for what it IS: the fall-through would report "chat post
         # failed", and a refusal wearing a delivery-failure's words sends the
@@ -5143,19 +5239,6 @@ def cmd_beacons(args):
                   "(%s) — %s" % (label(seat), action,
                                  detail or "no reason given"),
                   file=sys.stderr)
-    if sent["alarms"]:
-        from . import notify
-        if not notify.configured():
-            # THE HALF-WORKING ALARM, named out loud on the surface a human is
-            # actually looking at. An opted-out push returns delivered, so the
-            # only way this reads as anything but success is to say it.
-            print("helm beacons: phone channel OFF (HELM_NTFY_TOPIC unset) — "
-                  "this alarm reached the fleet room ONLY, and the fleet room "
-                  "is read by the seats", file=sys.stderr)
-        elif not sent["push"]:
-            print("helm beacons: owner push FAILED — the fleet room has the "
-                  "edge, the phone does not; it stays armed and re-pushes "
-                  "next pass", file=sys.stderr)
     if not sent["chat"]:
         print("helm beacons: chat post failed — the edge stays unlatched "
               "and re-posts next pass", file=sys.stderr)

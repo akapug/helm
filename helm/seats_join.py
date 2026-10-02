@@ -38,6 +38,12 @@ from .seats_runtime import launch_runtime
 from .sessionstart import note_session_start
 from .seats_delivery import (_cursor, _init_cursor, _scan_rooms, cursor_path,
                              deliver_any)
+from .seats_roomscan import QuietRooms
+# THE BANNER RENDERER lives in seats_join_banner (this file passed its
+# 1000-line budget); `_OWNER_NAMES` declares the move for the retired-name
+# rung, and the name stays importable from here.
+from .seats_join_banner import join_banner  # noqa: F401
+_OWNER_NAMES = (("seats_join_banner", ("join_banner",)),)  # moved; bound here
 
 def join_cli(args, room, room_explicit, room_source):
     """`helm chat join` typed by hand — the NON-hook leg, beside the verb it
@@ -549,54 +555,15 @@ def owed_emitter(emit, session):
     return paying
 
 
-def join_banner(seat, display_room, scope, covered_pid=None):
-    """The SessionStart banner for one seat — the armed form when a live
-    waiter's pid is supplied, else the one that asks for the first action.
-
-    A PURE RENDERER AT ITS OWN DOOR, because this is the highest-frequency
-    message helm prints and a budget over it has to measure the artifact
-    rather than a reconstruction of it. `join` decides coverage; this decides
-    nothing and only writes words.
-
-    THE ARMED FORM IS THE SHORTER ONE, which it was not: 771 characters to say
-    that nothing is owed, four sentences of them re-arm caveats that matter
-    only later. It states the fact and stops; the caveats are in the guide it
-    already cites, which is where a seat that needs them is reading anyway.
-
-    THE MONITOR ARGV IS THE PAYLOAD of the other form and stays verbatim, and
-    so does the deferred-tool fallback, because a seat that cannot find the
-    tool cannot perform the act. What is not here is the rationale — why a
-    background shell cannot wake a PTY agent — which the guide carries whole.
-    The call grew by the description the Monitor tool requires (task/3435),
-    and the prose around it gave that width back: the fallback keeps its act
-    and drops its label, and the pointer says what the guide explains in
-    fewer words.
-
-    AND THE CITATION IT CARRIED WAS DEAD: it named premise
-    `native-wake-only-agent-armed`, the store holds
-    `native-wake-only-agent-armed-or-headless`, and `helm store get` on the
-    cited spelling returns nothing. A dangling id printed at every session
-    start is worse than no id — it teaches readers that helm's citations do
-    not resolve. The pointer is the guide now, and it is a path that exists."""
-    if covered_pid is not None:
-        return ("[helm chat] seat '%s' in room %s. Your beacon is already "
-                "armed for this session (waiter pid %s), so nothing is owed; "
-                "catch up with `helm chat read`. If it dies, or you are "
-                "addressed and do not wake, re-arm — see %s"
-                % (seat, display_room, covered_pid, GUIDE_PATH))
-    return ("[helm chat] seat '%s' in room %s — mentions, DMs and @all wake "
-            "you between tool calls%s. First action: arm your "
-            "beacon — %s; %s. No Monitor tool? ToolSearch(query: "
-            "\"select:Monitor\"). Why not a background shell: %s"
-            % (seat, display_room, scope, seats_advice.beacon_monitor(seat),
-               seats_advice.BEACON_EXPIRY_TERSE, GUIDE_PATH))
 
 
-def destination_usable(stream, follower=True):
+def destination_usable(stream, follower=True, exit_wakes=False):
     """False when `stream`'s bytes are PROVEN to reach no reader, else None.
 
     `follower=False` is a consumer that exits after its line: its exit flushes
     any filter it writes through, so only a follower asks who reads its pipe.
+    `exit_wakes` is a consumer whose exit is the wake (`--once`): a regular
+    file on its stdout is read when it exits (`beacons.waking_sink`).
 
     IDENTITY RESOLVES THE OBJECT; THE OBJECT DECIDES. Asking WHICH FUNCTION
     was passed is never authority here -- it cannot be, because the same
@@ -614,7 +581,8 @@ def destination_usable(stream, follower=True):
     which function; it was about which callers got measured at all."""
     dest = sys.stdout if stream in (_emit_line, print) else None
     from . import beacons
-    return beacons.sink_usable_for(dest, follower=follower)
+    return beacons.sink_usable_for(dest, follower=follower,
+                                   exit_wakes=exit_wakes)
 
 
 def _emit_line(line):
@@ -744,7 +712,8 @@ def _beacon_identity_refusal(session, cwd=None, ambient_seat=True,
 
 
 def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
-         emit=None, follow=False, session=None, ambient=None, doorbell=False):
+         emit=None, follow=False, session=None, ambient=None, doorbell=False,
+         once=False):
     """Block until the next word arrives; returns the line or None on
     timeout. Seat mode IS a delivery (advances the cursor via deliver's
     at-most-once path); --any watches the room without touching cursors.
@@ -786,7 +755,16 @@ def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
     doorbell=True (the CLI beacon's default; `--per-row` turns it off) keeps
     the drain above and replaces the per-row stream with ONE announce-only
     ring line per burst, so a resumed seat pulls its backlog instead of paying
-    a turn per row (helm.beacon_doorbell.waiter_bell)."""
+    a turn per row (helm.beacon_doorbell.waiter_bell).
+
+    once=True (`--once` beside the follow flag) is the ONE-SHOT BEACON: the
+    follow shape in every respect (mention-only, the wake cursor, the
+    doorbell) except that it returns the first line it emits. Its exit is
+    the wake, so a seat arms it as a background task or a Monitor and
+    re-arms it in the turn it starts; it costs no wake while nothing
+    addresses the seat, where a 30-minute Monitor costs one at every expiry.
+    A regular file is an admissible sink for it (`beacons.waking_sink`): the
+    harness reads a background task's output file when the task exits."""
     poll = chat.POLL_S if poll is None else poll
     if ambient is None:
         # THE BEACON SHAPE (--follow) defaults MENTION-ONLY; every other wait
@@ -812,7 +790,7 @@ def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
         # reads stdout, so the refusal must ride the same channel a wake would.
         _emit_line(refusal)
         return None
-    if follow and emit is None:
+    if follow and emit is None and not once:
         # A BEACON WHOSE STDOUT IS A REGULAR FILE CAN WAKE NOBODY. Armed as a
         # background shell task, stdout is that task's output FILE: every
         # wake-line lands in a sink no reader is woken by, while the beacon
@@ -897,13 +875,14 @@ def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
     # refuse, so `destination_usable` is asked at the moment a row would
     # be spent, beside the call that spends it.
     since = chat.read(room)[1] if any_row else None
-    bell = None
+    quiet = QuietRooms()        # one proof for the waiter's life (task/3848)
+    bell = idle = None
     if follow and not any_row:   # lambdas: both names resolve HERE per call
-        from .beacon_doorbell import waiter_bell
-        bell = waiter_bell(
-            seat, session, stream, doorbell, room=room, ambient=ambient,
-            deliver=lambda **kw: deliver_any(**kw),
-            usable=lambda: destination_usable(stream, follower=True))
+        from .beacon_idle import arm   # the doorbell, the quiet proof, the gate
+        bell, idle = arm(seat, session, stream, doorbell, room, ambient, quiet,
+                         lambda **kw: deliver_any(**kw),
+                         lambda: destination_usable(stream, follower=not once,
+                                                    exit_wakes=once))
     while True:
         if follow and _beacon_orphaned():
             # loud, then STOP: a beat from here would be a lie (see
@@ -916,7 +895,7 @@ def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
         if any_row:
             rows, total = chat.read(room, since)  # read() self-heals since>total
             if rows:
-                if not follow:
+                if not follow or once:
                     return chat._fmt(rows[0])
                 # Same firehose class as the seat drain below: >BEACON_DRAIN_CAP
                 # new rows in one poll would emit as a Monitor-event BURST →
@@ -938,8 +917,12 @@ def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
                     since = total
             else:
                 since = total
+        elif idle is not None and idle.skip(bell):
+            pass            # no room can hold a row yet (helm.beacon_idle)
         elif bell is not None:
-            bell.ring()     # the per-row leg's drain, announce-only
+            rung = bell.ring()   # the per-row leg's drain, announce-only
+            if once and rung:
+                return rung      # the one-shot's one ring is its exit
         else:
             drained = 0
             while True:                     # drain currently-matching rows,
@@ -949,12 +932,14 @@ def wait(seat=None, room="main", any_row=False, timeout=None, poll=None,
                                        ambient=ambient,
                                        channel="beacon" if follow else None,
                                        sink_usable=destination_usable(
-                                           stream, follower=follow))
+                                           stream, follower=follow and not once,
+                                           exit_wakes=once),
+                                       quiet=quiet)
                 except Exception:
                     line = None             # fail-open: never crash the beacon
                 if not line:
                     break
-                if not follow:
+                if not follow or once:
                     return line             # single-shot: first match wins
                 drained += 1
                 if drained >= BEACON_DRAIN_CAP:

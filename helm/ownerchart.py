@@ -29,10 +29,10 @@ source of truth about the same work, and the two would disagree on the day it
 mattered.
 """
 
-import calendar
 import os
 import re
-import time
+
+from . import pk
 
 # ONE SENTINEL, ONE READER. The /afk skill is explicit that posture is declared
 # by the owner's WORDS and that away state, when wired mechanically, rides the
@@ -164,18 +164,16 @@ def _age(since, now):
     THE BOARD USES TWO STAMP SHAPES — measured, not assumed: one row reads
     2026-08-26T09:14:38Z and another 2026-08-04T19:15Z, seconds omitted. A
     parser that knows only one shape silently drops the age off the OLDER
-    rows, which are exactly the ones he needs to see.
+    rows, which are exactly the ones he needs to see. Both shapes are read
+    by pk.parse_ts_epoch. This renderer does not keep a second copy of that
+    grammar: two parsers of one board stamp disagree about the same row.
+    A future stamp still parses. It is not an age, and that decision stays
+    here because the parser has no clock.
     """
-    if not since or now is None:
+    if now is None:
         return ""
-    t = str(since).strip().rstrip("Z")
-    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d"):
-        try:
-            stamp = calendar.timegm(time.strptime(t, fmt))
-            break
-        except ValueError:
-            continue
-    else:
+    stamp = pk.parse_ts_epoch(since)
+    if stamp is None:
         return ""
     mins = (now - stamp) / 60.0
     if mins < 0:

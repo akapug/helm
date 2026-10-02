@@ -186,6 +186,7 @@ class WindowBase(unittest.TestCase):
         self.kills = []
         self.spawns = []
         self.measures = []
+        self.capacities = []
         self.observes = []
         self.gens = {}
         # FAB_EXCLUDE_HOSTS on each measure and submit, as the door passed it
@@ -228,6 +229,13 @@ class WindowBase(unittest.TestCase):
         dispatch and a count of dispatches is what every refusal arm asserts.
         `answer(key)` is the whole (rc, stdout, stderr) of one submit."""
         def _fab(argv, timeout=None, env=None):
+            if argv[:3] == [gatewindow.FAB_BINARY, "capacity", "--json"]:
+                # THE ROUTE READS CAPACITY THROUGH THIS SEAM (task/3923); this
+                # fake answers UNKNOWN, so routing keeps today's choice
+                # setdefault: test_trainblame and test_landwindow reuse this
+                # fake from classes whose setUp never makes the list
+                self.__dict__.setdefault("capacities", []).append(list(argv))
+                return 1, "", "no capacity in this fake"
             self.exclusions.append((argv[2], None if env is None
                                     else env.get(EXCLUDE_ENV)))
             if argv[:3] == [gatewindow.FAB_BINARY, "gate", "measure"]:
@@ -2132,6 +2140,9 @@ class FastHostRouting(WindowBase):
         failed measure when none is left. The submit launches on the host
         the measure named."""
         def _fab(argv, timeout=None, env=None):
+            if argv[:3] == [gatewindow.FAB_BINARY, "capacity", "--json"]:
+                self.__dict__.setdefault("capacities", []).append(list(argv))
+                return 1, "", "no capacity in this fake"   # UNKNOWN (task/3923)
             given = None if env is None else env.get(EXCLUDE_ENV)
             self.exclusions.append((argv[2], given))
             shut = set((given or "").split()) if obey else set()
@@ -2175,6 +2186,19 @@ class FastHostRouting(WindowBase):
         self.assertIn("ROUTED to %s" % self.FAST, text)
         self.assertIn("~16.7 min", text)    # the fast median, 1,000 s
         self.assertIn("~50.0 min", text)    # the slow median, 3,000 s
+
+    def test_the_route_reads_fab_capacity_through_the_launch_fab_seam(self):
+        """task/3923: with measured hosts, the land gate's host choice reads
+        `fab capacity --json` through launch's own fab seam, never a real
+        subprocess; an UNKNOWN answer keeps today's choice (the fast host)."""
+        self.measured_fast_and_slow(fast=1000, slow=3000)
+        rc, text, _req = self.launch(self.room("train01", self.c), "train01",
+                                     self.T0)
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(self.placed, [self.FAST])
+        self.assertEqual(self.capacities,
+                         [[gatewindow.FAB_BINARY, "capacity", "--json"]])
+        self.assertIn("capacity UNKNOWN", text)
 
     def test_a_busy_fast_host_that_still_finishes_first_is_waited_for(self):
         self.measured_fast_and_slow(fast=1000, slow=3000)

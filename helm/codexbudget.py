@@ -643,8 +643,11 @@ def cached_budget(max_age_s=GATE_MAX_AGE_S, now=None):
         return None, None
     if not isinstance(payload, dict) or not isinstance(payload.get("rows"), list):
         return None, None
-    age = now - float(payload.get("ts") or 0)
-    if age < 0 or age > max_age_s:
+    try:
+        age = now - float(payload.get("ts") or 0)
+    except (TypeError, ValueError, OverflowError):
+        return None, None
+    if not 0 <= age <= max_age_s:
         return None, None
     return payload["rows"], age
 

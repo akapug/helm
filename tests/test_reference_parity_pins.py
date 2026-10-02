@@ -29,6 +29,9 @@ _WORDS = {2: "two", 6: "six", 7: "seven", 8: "eight", 9: "nine", 10: "ten",
 
 
 def _doc(name):
+    if name == "HOOKS.md":
+        from tests.test_hooks_doc_fragments import assemble_hooks_doc
+        return assemble_hooks_doc(_ROOT)
     with open(os.path.join(_DOCS, name), encoding="utf-8") as f:
         return f.read()
 

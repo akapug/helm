@@ -173,6 +173,34 @@ class FiltersTest(BacklogViewBase):
         self.assertEqual(self.ids(status="open,in_progress", stale="1"),
                          ["task/8"])
 
+    def test_a_present_flag_that_is_not_on_selects_nothing(self):  # noqa: VACUOUS_ASSERTION — asked=1, stale=1 and a blank status are the positive controls; the empty lists are the typos
+        """Absence is no filter. An on-token narrows. Any other present
+        value selects nothing, so a typo cannot read as every row."""
+        now = time.time()
+        rows = dict(LEDGER)
+        rows["task/8"] = _row("task/8", "old and silent", "open",
+                              project="helm", ts=now - 30 * DAY)
+        self.install(_axis(_stub_tasks(rows)))
+        self.assertEqual(self.ids(status="open,in_progress", asked="1"),
+                         ["task/7"])
+        self.assertEqual(self.ids(status="open,in_progress", asked="yes"),
+                         ["task/7"])
+        self.assertEqual(self.ids(status="open,in_progress", stale="1"),
+                         ["task/8"])
+        self.assertEqual(self.ids(status="open,in_progress", asked="y"), [])
+        self.assertEqual(self.ids(status="open,in_progress", asked="0"), [])
+        self.assertEqual(self.ids(status="open,in_progress", stale="2"), [])
+        self.assertIn("task/6", self.ids(status=""))
+
+    def test_one_unknown_status_selects_nothing(self):  # noqa: VACUOUS_ASSERTION — status=closed and a blank status are the positive controls; the empty lists are the typos
+        """One member outside the known set selects nothing, the known
+        members of that same list included. A blank status is no filter."""
+        self.install(_axis(_stub_tasks(dict(LEDGER))))
+        self.assertEqual(self.ids(status="closed"), ["task/6"])
+        self.assertIn("task/6", self.ids(status=""))
+        self.assertEqual(self.ids(status="open,closedd"), [])
+        self.assertEqual(self.ids(status="nope"), [])
+
     def test_search_reads_the_id_title_and_note_and_needs_every_word(self):
         rows = dict(LEDGER)
         rows["task/11"] = _row("task/11", "a title", "open",

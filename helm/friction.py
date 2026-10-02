@@ -317,11 +317,14 @@ def set_dial(value, by="", expected=None):
 USAGE = ("usage: helm friction [--days N] [--seat] [--json]\n"
          "       helm friction record <guard> [--reason TOKEN] [--session ID]\n"
          "       helm friction dial [N] [--json]\n"
+         "       helm friction autopilot [--dry-run] [--json]\n"
          "  Refusals per guard over the window (default %d days); --seat adds "
          "the per-seat split. `record` counts one refusal and is what a shell "
          "hook calls; it prints nothing and never fails its caller. `dial` "
          "prints how many refusals by one guard in one day a seat meets before "
-         "it is told, with who set that and when; with N (%d to %d) it sets it."
+         "it is told, with who set that and when; with N (%d to %d) it sets it. "
+         "`autopilot` runs one pass that files, counts and re-checks ONE task "
+         "row per refusal cause (`helm friction autopilot --help`)."
          % (WINDOW_DAYS, DIAL_MIN, DIAL_MAX))
 DIAL_USAGE = "helm friction dial [N] [--json]  (N is a whole number from %d to %d)" % (
     DIAL_MIN, DIAL_MAX)
@@ -404,6 +407,9 @@ def cmd(args):
         return _cmd_record(argv[1:])
     if argv and argv[0] == "dial":
         return _cmd_dial(argv[1:])
+    if argv and argv[0] == "autopilot":
+        from . import frictionpilot
+        return frictionpilot.cmd(argv[1:])
     days, by_seat, want_json = WINDOW_DAYS, False, False
     while argv:
         head = argv.pop(0)

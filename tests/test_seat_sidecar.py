@@ -983,6 +983,31 @@ class DeclarationTest(unittest.TestCase):
         self.assertIn("native-read-byte-bounded", proxy["patches"])
         self.assertIn("native-runs-as-caller-tool", proxy["patches"])
 
+    def test_the_vetted_proxy_keeps_cursors_conversation(self):
+        """task/3817: the vetted bridge replayed the whole Claude Code
+        history into a brand-new Cursor conversation (a random id, every
+        message a root-prompt blob, Cursor's checkpoint thrown away) at the
+        start of every run, where Cursor's own CLI sends its last checkpoint
+        back under one conversation id with only the new message. The
+        vetted src/proxy.ts keeps a conversation that closed cleanly and
+        continues it when the next request extends it by the reply and new
+        user text, replaying (and saying why in the log) only on a
+        compaction, /clear, edit or unclean run end; and it names every
+        caller tool, Monitor included, in Cursor's MCP instructions, since
+        the seat decided "the Monitor tool is unavailable" after a
+        compaction and left its beacon dead. A review found the first build
+        of it seeded a continued run with the checkpoint it continued from,
+        so a run that closed with no checkpoint of its own was kept under the
+        new history with the previous turn's state, and the next turn lost
+        this one on Cursor's side; the vetted build keeps only a checkpoint
+        Cursor sent during the run. The patch list names all three closures,
+        so a checkout that drifts back reads as those risks by name."""
+        proxy = seat.FAMILIES[FAMILY]["sidecar"]["required_patches"][
+            "src/proxy.ts"]
+        self.assertIn("conversation-kept", proxy["patches"])
+        self.assertIn("kept-checkpoint-is-the-runs-own", proxy["patches"])
+        self.assertIn("tools-in-mcp-instructions", proxy["patches"])
+
     def test_every_key_is_read_and_no_other_key_is_admitted(self):
         spec = self.table()["fam"]["sidecar"]
         self.assertIn("unknown ['keeper']", seat_catalog._sidecar_error(

@@ -437,6 +437,46 @@ class RefusalTest(HookBase):
         self.assertIn("A  evals/dogfood-2026-07-29.md", status,
                       "refusal leaves the stage intact for the fix-up")
 
+    def test_refusal_prints_corrected_command_and_running_it_passes(self):  # noqa: VACUOUS_ASSERTION — positive control on refusal and regex search match
+        before = self.head()
+        self.stage("docs/clean.md", "clean content\n")
+        self.stage("evals/dogfood-2026-07-29.md", "internal build notes\n")
+        r = self.commit()
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("[helm never-track] REFUSED", r.stderr)
+        m = re.search(r"^corrected:\s*(git restore --staged\s+.+)$", r.stderr, re.MULTILINE)
+        self.assertIsNotNone(m, "refusal output must contain 'corrected: git restore --staged ...'")
+        cmd = m.group(1).strip()
+        # task/4048: the line is built from structured paths, each a literal
+        # pathspec from the work-tree top after the option terminator, so a
+        # path carrying ',', ' — ', a leading '-' or a glob char survives whole
+        # and names the same file from any subdirectory.
+        self.assertEqual(cmd, "git restore --staged -- "
+                              "':(top,literal)evals/dogfood-2026-07-29.md'")
+        res = self.sh(self.root, *shlex.split(cmd))
+        self.assertEqual(res.returncode, 0)
+        r2 = self.commit("commit with clean content after unstage")
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertNotEqual(self.head(), before)
+
+    def test_refusal_with_multiple_violations_names_every_violating_path(self):  # noqa: VACUOUS_ASSERTION — positive control on refusal and regex search match
+        before = self.head()
+        self.stage("docs/clean.md", "clean\n")
+        self.stage("evals/a.md", "internal build notes\n")
+        self.stage("evals/b.md", "internal build notes\n")
+        r = self.commit()
+        self.assertNotEqual(r.returncode, 0)
+        m = re.search(r"^corrected:\s*(git restore --staged\s+.+)$", r.stderr, re.MULTILINE)
+        self.assertIsNotNone(m)
+        cmd = m.group(1).strip()
+        self.assertIn("evals/a.md", cmd)
+        self.assertIn("evals/b.md", cmd)
+        res = self.sh(self.root, *shlex.split(cmd))
+        self.assertEqual(res.returncode, 0)
+        r2 = self.commit("commit with clean content after unstage")
+        self.assertEqual(r2.returncode, 0, r2.stderr)
+        self.assertNotEqual(self.head(), before)
+
     def test_staged_needle_content_is_refused_without_printing_the_needle(self):
         before = self.head()
         self.stage("docs/note.md", "context %s context\n" % NEEDLE)

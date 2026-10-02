@@ -194,8 +194,13 @@ def commit_for_pair(candidate):
             latch = pk.read_json(lp, {}, strict=True)
             if not isinstance(latch, dict):
                 raise ValueError("toolwhisper latch is not an object")
-            if not latch.get(candidate["rule"]):
-                latch[candidate["rule"]] = pk.now_ts()
+            # A candidate carrying its own `latch` value (stop_early's set of
+            # owed ids said) records that value; every rule here latches once.
+            value = candidate.get("latch")
+            if value is not None and latch.get(candidate["rule"]) != value \
+                    or value is None and not latch.get(candidate["rule"]):
+                latch[candidate["rule"]] = pk.now_ts() if value is None \
+                    else value
                 pk.write_json(lp, latch)
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)

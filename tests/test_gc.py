@@ -283,6 +283,77 @@ class CursorRefusalTest(GcBase):
         self.assertFalse(os.path.exists(drop))
 
 
+class SteerLatchReapTest(GcBase):
+    """A steer latch (`ptusteer.<steer>.<session>[.a<agent>]`, chat's
+    once-per-context file) of a DEAD session is reaped. Nothing did: the
+    context-boundary reset drops a session's latches only when that session
+    starts again, so every session that ended left its latches in the chat
+    dir for good, one per (steer, subagent), and the doors add one per bound
+    rule. Dead is the chat-cursors row's own answer (sessions.live_sids plus
+    the sessions a live waiter still runs), and an unprovable liveness reaps
+    nothing."""
+
+    LIVE = "0fa7c4ed-9a5e-46a0-b2da-f862eb8afad6"
+
+    def _latch(self, sid, steer="door.store.friction-tax", agent=None):
+        from helm import chat
+        return self.plant(chat._steer_latch(sid, steer, agent), "1")
+
+    def test_a_dead_sessions_latches_go_and_a_live_ones_stay(self):  # noqa: VACUOUS_ASSERTION — the victim list is asserted equal to the two planted dead latches, and each is asserted gone
+        keep = [self._latch(self.LIVE), self._latch(self.LIVE, agent="a1"),
+                self._latch(self.LIVE, steer="pkill-self")]
+        drop = [self._latch("dead-0001"), self._latch("dead-0001", agent="a2")]
+        room = self.plant(os.path.join(os.environ["HELM_CHAT_DIR"],
+                                       "main.jsonl"), "{}\n")
+        with mock.patch("helm.sessions.live_sids",
+                        return_value={self.LIVE: 4242}):
+            row = self.row(gc.scan(), "chat-steer-latches")
+            self.assertEqual(sorted(row["victims"]), sorted(drop))
+            self.assertTrue(gc._reapable(row))
+            rc, _out, _ = run(gc.cmd_gc, ["--apply"])
+        self.assertEqual(rc, 0)
+        for path in keep + [room]:
+            self.assertTrue(os.path.exists(path), "reaped a LIVE latch: "
+                            + path)
+        for path in drop:
+            self.assertFalse(os.path.exists(path))
+
+    def test_a_live_waiters_session_keeps_its_latches(self):
+        """The same second liveness source chat-cursors reads: a session an
+        armed waiter still runs is not dead."""
+        keep = self._latch("waiter-sid-1")
+        drop = self._latch("dead-0001")                 # positive control
+        with mock.patch("helm.sessions.live_sids", return_value={}), \
+                mock.patch("helm.chat._waiter_cursor_sessions",
+                           return_value={"waiter-sid-1"}):
+            row = self.row(gc.scan(), "chat-steer-latches")
+        self.assertEqual(row["victims"], [drop])
+        self.assertTrue(os.path.exists(keep))
+
+    def test_unprovable_liveness_is_an_error_row_that_reaps_nothing(self):
+        keep = self._latch("dead-0001")
+        with mock.patch("helm.sessions.live_sids",
+                        side_effect=OSError("no /proc")):
+            row = self.row(gc.scan(), "chat-steer-latches")
+            self.assertIn("no /proc", row.get("error", ""))
+            self.assertFalse(gc._reapable(row))
+            run(gc.cmd_gc, ["--apply"])
+        self.assertTrue(os.path.exists(keep))
+
+    def test_no_latch_asks_no_liveness(self):  # noqa: VACUOUS_ASSERTION — the same scan with one latch planted is asserted to ask, on the same row
+        with mock.patch("helm.sessions.live_sids",
+                        side_effect=AssertionError("asked")):
+            row = self.row(gc.scan(), "chat-steer-latches")
+        self.assertNotIn("error", row)
+        self.assertFalse(row["over"])
+        # the same scan with one latch does ask (the positive control)
+        self._latch("dead-0001")
+        with mock.patch("helm.sessions.live_sids",
+                        side_effect=AssertionError("asked")):
+            row = self.row(gc.scan(), "chat-steer-latches")
+        self.assertIn("asked", row.get("error", ""))
+
+
 class OrphanCursorLockTest(GcBase):
     """The lock outlives its cursor and NO rung in the tree could select it.
 

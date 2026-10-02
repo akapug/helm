@@ -26,7 +26,7 @@ from unittest import mock
 import os as _os, sys as _sys  # noqa: E401,E402
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
-from helm import chat, dispatches, meld  # noqa: E402
+from helm import chat, dispatches, meld, tasks  # noqa: E402
 from helm import meld_standing as S  # noqa: E402
 from helm import review_door as RD  # noqa: E402
 from tests import test_meld as tm  # noqa: E402
@@ -459,17 +459,23 @@ class StandingDispatchTest(trd.DoorBase):
         self.author = dispatches._acting_author()[0]
 
     def meld_rooms(self):
-        return sorted(r for r in chat.list_rooms() if r.startswith("meld-"))
+        """Every meld room, a task's `<scope>-<N>` pair meld included."""
+        return sorted(r for r in chat.list_rooms()
+                      if r.startswith("meld-") or RD.is_pair_room(r))
 
-    def test_three_tasks_run_through_one_standing_room(self):
+    def test_three_tasks_run_through_one_standing_room(self):  # noqa: VACUOUS_ASSERTION — the loop runs a fixed three-task tuple and asserts the standing room IN each output; the meld-room list is asserted EQUAL to that one room
         room, _lines = S.open_room(self.READER, seat=self.author)
         rows = []
         for n, tip in zip((9101, 9102, 9103), (self.a, self.b, self.c)):
+            self.review_task, err = tasks.add(
+                "fixture standing %d" % n, "author", tid=n,
+                project="helm-test", force_new=True)
+            self.assertIsNone(err, err)
             self.lane = "standing-task-%d" % n
             rc, out, err, sent = self.send(None, tip)
             self.assertEqual(rc, 0, err)
             self.assertIn(room, out)
-            self.assertNotIn(RD.PAIR_PREFIX, out)
+            self.assertNotIn("your pair meld for this task", out)
             rows.append(sent)
         # zero per-task rooms: the standing room is the only meld room
         self.assertEqual(self.meld_rooms(), [room])
@@ -493,11 +499,15 @@ class StandingDispatchTest(trd.DoorBase):
         self.assertEqual(self.meld_rooms(), [room])
 
     def test_without_a_standing_room_the_pair_meld_is_unchanged(self):
+        self.review_task, err = tasks.add(
+            "fixture standing 9104", "author", tid=9104,
+            project="helm-test", force_new=True)
+        self.assertIsNone(err, err)
         self.lane = "standing-task-9104"
         rc, out, err, sent = self.send(None, self.a)
         self.assertEqual(rc, 0, err)
-        self.assertIn(self.pair_room(sent), out)
-        self.assertIn(RD.PAIR_PREFIX, out)
+        self.assertIn("your pair meld for this task: %s (task/9104"
+                      % self.pair_room(sent), out)
 
     def test_a_retried_round_is_posted_once(self):
         room, _lines = S.open_room(self.READER, seat=self.author)

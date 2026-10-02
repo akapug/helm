@@ -1219,9 +1219,11 @@ class TheCompositionIsItsOwnClaimTest(ReassignBase):
         brief = ("REVIEW the thing. Attack the loader identity first — it "
                  "reads code objects off bound callables and I have not "
                  "proven what it does with a decorated test.")
+        from tests._tmphome import review_task
         row, why, _sent = dispatches.send(
             "seat-a", "composed-lane", brief, self.tip, kind="review",
-            new_work=True, repo=self.repo)
+            new_work=True, repo=self.repo,
+            task=review_task(self, "composition brief", owner="integrator"))
         self.assertIsNotNone(row, "fixture: the send was refused (%s)" % why)
 
         # CONTROL BEFORE THE MOVE: the brief is readable on the ORIGINAL row,
@@ -1269,9 +1271,11 @@ class TheCompositionIsItsOwnClaimTest(ReassignBase):
         os.environ["HELM_CHAT_NAME"] = "integrator"
         self.seat("seat-a", session="s-seat-a-0002")
         self.seat("seat-b", session="s-seat-b-0002")
+        from tests._tmphome import review_task
         row, why, _s = dispatches.send(
             "seat-a", "authorship-lane", "a brief with an author", self.tip,
-            kind="review", new_work=True, repo=self.repo)
+            kind="review", new_work=True, repo=self.repo,
+            task=review_task(self, "composition author", owner="integrator"))
         self.assertIsNotNone(row, "fixture: send refused (%s)" % why)
         original_sender = row.get("sender")
         self.assertTrue(original_sender, "fixture: the row has no sender")
@@ -1632,9 +1636,6 @@ class TheSameSeatOnBothSidesMovesNothingTest(ReassignBase):
         self.assertEqual(rc2, 0, lines2)
 
 
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 class ASentRowIsNotAReceivedRowTest(ReassignBase):
@@ -2930,6 +2931,13 @@ class ATargetTheMoversCannotAddressTest(ReassignBase):
             row, err = tasks.add("a movable row", "holder", project="helm")
             self.assertIsNone(err, "fixture: task refused (%s)" % err)
             made["task"] = row["id"]
+        # A dispatch needs a real task even when this arm deliberately gives
+        # the source no TASK holding. That case's task belongs to integrator.
+        if inbound or outbound:
+            from tests._tmphome import review_task
+            dispatch_task = (made["task"] if task else review_task(
+                self, "unheld dispatch fixture", owner="integrator",
+                project="helm"))
         if lease:
             ok, why, _lease = seats_claims.claim("a-live-resource", "holder",
                                                  ttl=7200)
@@ -2939,7 +2947,7 @@ class ATargetTheMoversCannotAddressTest(ReassignBase):
             os.environ["HELM_CHAT_NAME"] = "integrator"
             row, why, _s = dispatches.send(
                 "holder", "inbound-lane", "a brief", self.tip, kind="review",
-                new_work=True, repo=self.repo)
+                new_work=True, repo=self.repo, task=dispatch_task)
             self.assertIsNotNone(row, "fixture: inbound send refused (%s)"
                                  % why)
             made["inbound"] = row["id"]
@@ -2947,7 +2955,8 @@ class ATargetTheMoversCannotAddressTest(ReassignBase):
             os.environ["HELM_CHAT_NAME"] = "holder"
             row, why, _s = dispatches.send(
                 "bystander", "outbound-lane", "a brief", self.tip,
-                kind="review", new_work=True, repo=self.repo)
+                kind="review", new_work=True, repo=self.repo,
+                task=dispatch_task)
             self.assertIsNotNone(row, "fixture: outbound send refused (%s)"
                                  % why)
             made["outbound"] = row["id"]
@@ -3182,9 +3191,12 @@ class ATargetTheMoversCannotAddressTest(ReassignBase):
         self.assertNotIn("Worker", seats_roster.roster())
         prior = os.environ.get("HELM_CHAT_NAME")
         os.environ["HELM_CHAT_NAME"] = "integrator"
+        from tests._tmphome import review_task
         row, why, _s = dispatches.send(
             "Worker", "inbound-lane", "a brief", self.tip, kind="review",
-            new_work=True, repo=self.repo)
+            new_work=True, repo=self.repo,
+            task=review_task(self, "case-variant dispatch", owner="integrator",
+                             project="helm"))
         self.assertIsNotNone(row, "fixture: inbound send refused (%s)" % why)
         os.environ["HELM_CHAT_NAME"] = prior or "integrator"
         man, unread = seat_reassign.holdings("Worker")
@@ -3373,3 +3385,63 @@ def setUpModule():
     (task/3039; see tests._tmphome.pin_live_seats)."""
     from tests._tmphome import pin_live_seats
     pin_live_seats()
+
+
+class WalledIsNotLiveForWorkTest(unittest.TestCase):
+    """task/3881: a seat whose pane process runs but whose liveness reading
+    (the one `helm seat cubicles` asks) is WALLED or BLOCKED_ON_QUOTA, its
+    reset past the dark-seat mover's RESET_WAIT_S, cannot take a turn. It is
+    WALLED, not LIVE, and the capability proceeds without --force. Every
+    reading here is a double: nothing reads the live fleet."""
+
+    def disposition(self, state, pool_reset=None):
+        from helm import (burnflags, darkmove, harness, poolwall,
+                          seat as seat_mod, seat_resume_all)
+        wall = ({"expires_at": pool_reset}, None) if pool_reset \
+            else (None, "no pool refusal")
+        with mock.patch.object(harness, "detect", return_value=object()), \
+                mock.patch.object(seat_resume_all, "prove_reboot_dead",
+                                  return_value=(seat_resume_all.LIVE, None,
+                                                "its pane runs")), \
+                mock.patch.object(seat_mod, "seat_liveness", return_value={
+                    "seat": "seat-a", "state": state,
+                    "blocked_on": "upstream QUOTA since 03:00Z"}), \
+                mock.patch.object(poolwall, "seat_wall", return_value=wall), \
+                mock.patch.object(burnflags, "cached_flags",
+                                  return_value=({}, None)), \
+                mock.patch.object(darkmove, "_family_of", return_value=None):
+            return seat_reassign.source_disposition("seat-a")
+
+    def test_a_live_pane_reading_WALLED_is_not_refused_as_LIVE(self):
+        for state in ("WALLED", "BLOCKED_ON_QUOTA"):
+            got, why = self.disposition(state)
+            self.assertEqual(got, seat_reassign.SOURCE_WALLED, why)
+            self.assertIn("%s (upstream QUOTA since 03:00Z), reset not known"
+                          % state, why)
+
+    def test_a_live_pane_reading_healthy_is_still_LIVE(self):
+        got, why = self.disposition("IDLE")
+        self.assertEqual(got, seat_reassign.SOURCE_LIVE, why)
+
+    def test_a_wall_resetting_within_the_wait_is_still_LIVE(self):
+        import time
+        got, why = self.disposition("BLOCKED_ON_QUOTA",
+                                    pool_reset=time.time() + 600)
+        self.assertEqual(got, seat_reassign.SOURCE_LIVE, why)
+
+    def test_the_capability_mints_for_WALLED_without_force(self):
+        from helm import takeover
+        with mock.patch.object(seat_reassign, "source_disposition",
+                               return_value=(seat_reassign.SOURCE_WALLED,
+                                             "reads WALLED")):
+            disp, err = takeover.mint_source_disposition("seat-a")
+            self.assertIsNone(err, err)
+            auth, err = takeover.mint_seat_reassign(
+                "task/1", {"id": "task/1", "owner": "seat-a"}, "seat-a",
+                "seat-b", {"kind": "test"}, force=False, disposition=disp)
+        self.assertIsNotNone(auth, err)
+        self.assertFalse(auth.disposition["forced"])
+
+
+if __name__ == "__main__":
+    unittest.main()

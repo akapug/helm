@@ -15,6 +15,7 @@ host's /proc or cgroup tree, posts to a real room, pushes to a phone or
 reaches systemd.
 """
 import contextlib
+import glob
 import io
 import json
 import os
@@ -33,6 +34,7 @@ from tests._tmphome import home as _tmp_home
 _tmp_home(prefix="helm-test-pressurewatch-", var="HELM_HOME")
 
 from helm import hookrun, pressurewatch, seatceiling  # noqa: E402
+from helm import seats_integrator, tasks  # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 WRAPPER = os.path.join(ROOT, "bin", "helm-hook")
@@ -62,8 +64,15 @@ def _psi(avg, total):
 class Tree(object):
     """A user manager's cgroup tree and a /proc, built in a temp dir: the
     watcher runs from app.slice (proc/self/cgroup says so), agents.slice
-    carries the fleet's PSI, and each seat slice holds processes whose own
-    cgroup lines name it."""
+    carries the fleet's PSI and its cpu.stat, /proc/stat carries the host's
+    process count, and each seat slice holds processes whose own cgroup lines
+    name it.
+
+    EACH CPU WINDOW moves every sampled process's ticks on by (after -
+    before), agents.slice's usage_usec by the ticks it moved plus
+    `short_usec` (cpu no pid sample sees), the host's process count by
+    `window_forks`, and starts each process queued with born(), alive after
+    the window."""
 
     def __init__(self, case, controllers=True, fleet=True):
         self.base = tempfile.mkdtemp(prefix="helm-test-pressurewatch-tree-")
@@ -81,13 +90,30 @@ class Tree(object):
         _w(os.path.join(self.proc, "meminfo"),
            "MemTotal: 64000000 kB\nSwapTotal: 1000 kB\nSwapFree: 480 kB\n")
         self.totals = {"cpu": 10 ** 9, "memory": 10 ** 9}
-        self.ticks = {}
+        self.ticks, self.at, self.births = {}, {}, []
+        self.usage, self.forks = 7 * 10 ** 9, 40000
+        self.short_usec = self.window_forks = 0
+        self.cpu_stat = True
         if fleet:
             os.makedirs(self.fleet)
             _w(os.path.join(self.fleet, "memory.current"), "%d\n" % (47 * GB))
             _w(os.path.join(self.fleet, "memory.high"), "%d\n" % (48 * GB))
             _w(os.path.join(self.fleet, "cpu.max"), "800000 100000\n")
             self.write(0, 0)
+        self.counters()
+
+    def counters(self):
+        """/proc/stat's `processes` and agents.slice's cpu.stat, in the
+        shapes the kernel writes them."""
+        _w(os.path.join(self.proc, "stat"),
+           "cpu  10 0 10 100 0 0 0 0 0 0\ncpu0 10 0 10 100 0 0 0 0 0 0\n"
+           "intr 9 1 2 3\nctxt 99\nbtime 1\nprocesses %d\nprocs_running 2\n"
+           "procs_blocked 0\n" % self.forks)
+        if self.cpu_stat and os.path.isdir(self.fleet):
+            _w(os.path.join(self.fleet, "cpu.stat"),
+               "usage_usec %d\nuser_usec %d\nsystem_usec 0\n"
+               "nr_periods 0\nnr_throttled 0\nthrottled_usec 0\n"
+               % (self.usage, self.usage))
 
     def write(self, cpu, memory):
         """The fleet's two PSI files, `avg` set to each kind's percent."""
@@ -115,6 +141,12 @@ class Tree(object):
         _w(os.path.join(d, "memory.events"), "low 0\nhigh 0\nmax 0\n")
         _w(os.path.join(d, "memory.pressure"), _psi(35.0, 1))
         _w(os.path.join(d, "cpu.pressure"), _psi(12.0, 1))
+        self.process(rel, pid, cmdline, ticks, rss_gb, env_name)
+        return d
+
+    def process(self, rel, pid, cmdline, ticks, rss_gb=0.25, env_name=None,
+                cwd=None):
+        """One process in the slice at `rel`; `cwd` becomes its cwd link."""
         pd = os.path.join(self.proc, str(pid))
         _w(os.path.join(pd, "cgroup"), "0::/%s/run-p%d.scope\n" % (rel, pid))
         _w(os.path.join(pd, "wchan"), "0")
@@ -125,9 +157,17 @@ class Tree(object):
         _w(os.path.join(pd, "environ"),
            ("HELM_CHAT_NAME=%s\0" % env_name if env_name else "")
            + "PATH=/usr/bin\0")
+        if cwd is not None:
+            os.symlink(cwd, os.path.join(pd, "cwd"))
         self.ticks[pid] = ticks
+        self.at[pid] = ticks[0]
         self.stat(pid, ticks[0])
-        return d
+
+    def born(self, seat, pid, cmdline, ticks, cwd=None):
+        """A process the next CPU window starts in `seat`'s slice, alive
+        after it, having spent `ticks` since its birth."""
+        rel = "%s/%s" % (AGENTS, seatceiling.seat_slice_name(seat))
+        self.births.append((rel, pid, cmdline, ticks, cwd))
 
     def stat(self, pid, ticks):
         _w(os.path.join(self.proc, str(pid), "stat"),
@@ -135,11 +175,23 @@ class Tree(object):
            % (pid, ticks))
 
     def sleep(self, seconds):
-        """The sample seam: the CPU window moves every process's ticks to
-        their 'after' value; any other sleep moves nothing."""
-        if seconds == pressurewatch.CPU_WINDOW_S:
-            for pid, (_a, b) in self.ticks.items():
-                self.stat(pid, b)
+        """The sample seam: the CPU window moves every process's ticks on by
+        (after - before), and the counters with them (see the class); any
+        other sleep moves nothing."""
+        if seconds != pressurewatch.CPU_WINDOW_S:
+            return
+        moved = 0
+        for pid, (a, b) in self.ticks.items():
+            self.at[pid] += b - a
+            moved += b - a
+            self.stat(pid, self.at[pid])
+        self.usage += moved * 10 ** 6 // os.sysconf("SC_CLK_TCK") \
+            + self.short_usec
+        self.forks += self.window_forks
+        for rel, pid, cmdline, ticks, cwd in self.births:
+            self.process(rel, pid, cmdline, (ticks, ticks), cwd=cwd)
+        self.births = []
+        self.counters()
 
 
 class Room(object):
@@ -898,6 +950,12 @@ class ProgramOnlyTest(_Base):
             (["node", "--print=1", MARK], "node"),
             (["node", "--run=build", MARK], "node"),
             (["bun", "--eval=x", MARK], "bun"),
+            # A bare `--` ends the options: the word after it is the script.
+            # bin/helm-hook runs every hook as `<python> -S -- <bin/helm>`.
+            (["/opt/py/bin/python3.14", "-S", "--", "/srv/h/bin/helm",
+              "hook", MARK], "helm"),
+            (["bash", "--", "/srv/x/run.sh", MARK], "run.sh"),
+            (["python3", "--"], "python3"),
             (["/home/u/.local/share/claude/versions/2.1.285", "--resume",
               MARK], "claude"),
             # A title rewritten into argv[0]: its first word is the program.
@@ -912,6 +970,315 @@ class ProgramOnlyTest(_Base):
             _w(os.path.join(proc, str(pid), "comm"), "kthreadd\n")
             with self.subTest(argv=argv):
                 self.assertEqual(pressurewatch._cmd(proc, pid), want)
+
+
+class HelmIsTheLoadTest(_Base):
+    """task/3841: the stall alarm says whether HELM ITSELF is the load, and
+    when it is, files or refreshes ONE P-1 row to the integrator. The
+    measured stalls were mostly SHORT-LIVED hook pythons (~15 births/s),
+    which a before/after sample of living pids never sees, so the window
+    also reads agents.slice's cpu.stat and the host's process count. Every
+    row here lands in this module's temp HELM_HOME, never the real ledger."""
+
+    def setUp(self):
+        _Base.setUp(self)
+        self.clear_ledger()
+        self.addCleanup(self.clear_ledger)
+        seat = mock.patch.object(seats_integrator, "integrator_seat",
+                                 return_value=("seat-integrator", None))
+        seat.start()
+        self.addCleanup(seat.stop)
+        self.root, self.rooms = pressurewatch.helm_checkouts()
+
+    def clear_ledger(self):
+        for path in glob.glob(tasks.ledger_path() + "*"):
+            if os.path.isdir(path):
+                shutil.rmtree(path, True)
+            else:
+                os.remove(path)
+
+    def helm(self, *rest):
+        """This checkout's bin/helm under an interpreter, as a seat runs it."""
+        return ["/usr/bin/python3", os.path.join(self.root, "bin", "helm")] \
+            + list(rest)
+
+    def p1_rows(self):
+        return [r for r in tasks.rows().values()
+                if r.get("title") == pressurewatch.P1_TITLE]
+
+    def helm_tree(self):
+        """helm's own web process at 200% of one core beside a 50% node:
+        helm is 200 of the slice's 250."""
+        tree = Tree(self)
+        tree.seat("seat-a", 5101, current=int(9.5 * GB), high=12 * GB,
+                  rss_gb=2.0, cmdline=self.helm("web", "--token", MARK),
+                  ticks=(0, 200), env_name="seat-a")
+        tree.seat("seat-b", 5202, current=2 * GB, high=12 * GB, rss_gb=1.0,
+                  cmdline=["node", "/srv/app/cli.js", MARK], ticks=(0, 50),
+                  env_name="seat-b")
+        return tree
+
+    def restall(self, tree, start, at):
+        """Two clear minutes close the open episode; a new stall then holds
+        until its alarm opens at start + `at`."""
+        for t in (240, 300):
+            tree.advance(0.0, 0.0)
+            self.tick(tree, start + t)
+        for t in (at - 120, at - 60, at):
+            tree.advance(85.0, 40.0)
+            self.tick(tree, start + t)
+        self.assertEqual(len(self.room.stalls), 2,
+                         "control: a second alarm opened")
+        return self.room.stalls[1]["text"]
+
+    def test_a_helm_own_consumer_over_half_names_helm_and_files_one_row(self):  # noqa: VACUOUS_ASSERTION — the HELM line, the cpu line and the filed row are asserted positively before the planted marker's absence
+        tree = self.helm_tree()
+        got = self.stalled(tree, 3)
+        self.assertEqual(got[3][0], 1)
+        text = self.room.stalls[0]["text"]
+        rows = self.p1_rows()
+        self.assertEqual(len(rows), 1, rows)
+        row = rows[0]
+        self.assertIn("Processes by cpu: 200% cpu pid 5101 helm, seat-a; 50% "
+                      "cpu pid 5202 cli.js, seat-b; short-lived 0% cpu of "
+                      "agents.slice's 250% over 1s (its cpu.stat usage less "
+                      "every process sampled at both ends), 0 births/s "
+                      "host-wide.", text)
+        self.assertIn("HELM IS THE LOAD (P-1: fixed ahead of everything): "
+                      "helm's own processes used 200% of agents.slice's 250% "
+                      "cpu over 1s: 200% cpu pid 5101 helm, seat-a; "
+                      "short-lived 0% cpu (0 of 0 births caught alive were "
+                      "helm's); 0 births/s host-wide. P-1 row " + row["id"]
+                      + " filed to seat-integrator.", text)
+        self.assertEqual(text.count("HELM IS THE LOAD"), 1)
+        self.assertEqual(
+            (row["status"], row["priority"], row["origin"], row["owner"],
+             row["project"], row["source"]),
+            ("open", "P0", "owner", "seat-integrator", tasks.OWN_PROJECT,
+             pressurewatch.POSTER))
+        self.assertIn(pressurewatch.P1_RULE, row["note"])
+        self.assertIn("used 200% of agents.slice's 250% cpu over 1s",
+                      row["note"])
+        self.assertIn("200% cpu pid 5101 helm, seat-a", row["note"])
+        for where, seen in (("row", text), ("task", json.dumps(row))):
+            self.assertNotIn(MARK, seen, where)
+        self.assert_logged(text)
+
+    def test_short_lived_births_are_counted_and_name_helm(self):
+        """The load is births no pid sample sees: 200% of one core spent by
+        processes born inside the window, 15 births/s. Three of the four
+        caught alive are helm's (bin/helm, bin/helm-hook by a path relative
+        to its cwd, python -m helm), and they spent 60 of the 62 ticks."""
+        tree = Tree(self)
+        tree.seat("seat-a", 5101, current=4 * GB, high=12 * GB, rss_gb=1.0,
+                  cmdline=["/opt/claude/versions/2.1.285"], ticks=(0, 5),
+                  env_name="seat-a")
+        tree.short_usec, tree.window_forks = 2 * 10 ** 6, 15
+        tree.born("seat-a", 6001, self.helm("hook", "stop-guard"), 20)
+        tree.born("seat-a", 6002, ["/bin/sh", "bin/helm-hook", "gate", "x"],
+                  20, cwd=self.root)
+        tree.born("seat-a", 6003, ["python3", "-m", "helm", "hook"], 20)
+        tree.born("seat-a", 6004, ["git", "status"], 2)
+        self.stalled(tree, 3)
+        text = self.room.stalls[0]["text"]
+        rows = self.p1_rows()
+        self.assertEqual(len(rows), 1, rows)
+        self.assertIn("Processes by cpu: 5% cpu pid 5101 claude, seat-a; "
+                      "short-lived 200% cpu of agents.slice's 205% over 1s "
+                      "(its cpu.stat usage less every process sampled at "
+                      "both ends), 15 births/s host-wide.", text)
+        self.assertIn("HELM IS THE LOAD (P-1: fixed ahead of everything): "
+                      "helm's own processes used 194% of agents.slice's 205% "
+                      "cpu over 1s: short-lived 194% cpu (3 of 4 births "
+                      "caught alive were helm's); 15 births/s host-wide. P-1 "
+                      "row " + rows[0]["id"] + " filed to seat-integrator.",
+                      text)
+
+    def test_another_programs_load_says_nothing_and_files_nothing(self):  # noqa: VACUOUS_ASSERTION — the measured short-lived clause of the same row is asserted before the absences
+        tree = self.consumers_tree()
+        self.stalled(tree, 3)
+        text = self.room.stalls[0]["text"]
+        self.assertIn("short-lived 0% cpu of agents.slice's 321% over 1s",
+                      text, "control: the window was measured")
+        self.assertNotIn("HELM IS THE LOAD", text)
+        self.assertNotIn("Helm's own cpu share UNKNOWN", text)
+        self.assertEqual(tasks.rows(), {})
+
+    def test_a_second_alarm_within_30_minutes_files_no_second_row(self):
+        start = time.time()
+        tree = self.helm_tree()
+        self.stalled(tree, 3, start=start)
+        first = self.p1_rows()
+        self.assertEqual(len(first), 1, "control: the first alarm filed")
+        text = self.restall(tree, start, 480)
+        rows = self.p1_rows()
+        self.assertEqual([r["id"] for r in rows], [first[0]["id"]])
+        self.assertEqual(rows[0].get("comments") or [], [])
+        self.assertIn("HELM IS THE LOAD", text)
+        self.assertIn("P-1 row %s was filed or refreshed " % rows[0]["id"],
+                      text)
+        self.assertIn("it is written at most once per 30m.", text)
+
+    def test_a_second_alarm_later_comments_once_on_the_same_row(self):
+        start = time.time()
+        tree = self.helm_tree()
+        self.stalled(tree, 3, start=start)
+        text = self.restall(tree, start, 40 * 60)
+        rows = self.p1_rows()
+        self.assertEqual(len(rows), 1, rows)
+        notes = [c for c in rows[0].get("comments") or []
+                 if c.get("by") == pressurewatch.POSTER]
+        self.assertEqual(len(notes), 1, rows[0].get("comments"))
+        self.assertTrue(notes[0]["text"].startswith(
+            "[pressure-watch] helm is still the load at "), notes[0]["text"])
+        self.assertIn("used 200% of agents.slice's 250% cpu over 1s",
+                      notes[0]["text"])
+        self.assertIn("P-1 row %s refreshed with a comment." % rows[0]["id"],
+                      text)
+
+    def test_an_unwritable_ledger_is_named_and_nothing_raises(self):  # noqa: VACUOUS_ASSERTION — the NOT filed sentence of the same row is asserted before the empty ledger
+        os.makedirs(tasks.ledger_path() + ".lock")
+        tree = self.helm_tree()
+        got = self.stalled(tree, 3)
+        self.assertEqual(got[3][0], 1)
+        text = self.room.stalls[0]["text"]
+        self.assertIn("HELM IS THE LOAD (P-1: fixed ahead of everything): ",
+                      text)
+        self.assertIn("P-1 row NOT filed: task ledger is not writable", text)
+        self.assertEqual(self.p1_rows(), [])
+        self.assert_logged(text)
+
+    def test_a_stall_on_memory_alone_files_no_p1(self):  # noqa: VACUOUS_ASSERTION — the alarm and its measured cpu line are asserted positively before the absences
+        """The share is of cpu. In a stall on memory alone, helm's processes
+        can be most of a small cpu total while another process holds the
+        memory, so no HELM line and no row."""
+        tree = self.helm_tree()
+        got = self.stalled(tree, 3, cpu=0.0, memory=85.0)
+        self.assertEqual(got[3][0], 1, "control: the memory stall opened")
+        text = self.room.stalls[0]["text"]
+        self.assertIn("short-lived 0% cpu of agents.slice's 250% over 1s",
+                      text, "control: the window was measured")
+        self.assertNotIn("HELM IS THE LOAD", text)
+        self.assertEqual(self.p1_rows(), [])
+
+    def test_hook_pythons_in_the_wrappers_shape_are_helms_load(self):
+        """bin/helm-hook starts each hook as `<python> -S -- <bin/helm>`:
+        the births caught alive in that shape are helm's."""
+        tree = Tree(self)
+        tree.seat("seat-a", 5101, current=4 * GB, high=12 * GB, rss_gb=1.0,
+                  cmdline=["/opt/claude/versions/2.1.285"], ticks=(0, 5),
+                  env_name="seat-a")
+        tree.short_usec, tree.window_forks = 2 * 10 ** 6, 15
+        hook = ["/opt/py/bin/python3.14", "-S", "--",
+                os.path.join(self.root, "bin", "helm"), "hook", "stop-guard"]
+        tree.born("seat-a", 6001, hook, 20)
+        tree.born("seat-a", 6002, hook, 20)
+        self.stalled(tree, 3)
+        text = self.room.stalls[0]["text"]
+        self.assertIn("short-lived 200% cpu (2 of 2 births caught alive "
+                      "were helm's)", text)
+        self.assertEqual(len(self.p1_rows()), 1)
+
+    def test_a_retitled_row_is_still_the_one_row(self):
+        start = time.time()
+        tree = self.helm_tree()
+        self.stalled(tree, 3, start=start)
+        first = self.p1_rows()
+        self.assertEqual(len(first), 1, "control: the first alarm filed")
+        tid = first[0]["id"]
+        _row, err = tasks.update(tid, title="P-1: the hook storm (retitled)")
+        self.assertIsNone(err)
+        text = self.restall(tree, start, 40 * 60)
+        mine = [r for r in tasks.rows().values()
+                if r.get("source") == pressurewatch.POSTER]
+        self.assertEqual([r["id"] for r in mine], [tid])
+        self.assertIn("P-1 row %s refreshed with a comment." % tid, text)
+
+    def test_a_row_closed_inside_the_30_minutes_is_said_closed(self):
+        start = time.time()
+        tree = self.helm_tree()
+        self.stalled(tree, 3, start=start)
+        tid = self.p1_rows()[0]["id"]
+        _row, err = tasks.update(tid, status="closed", closed_reason="fixed")
+        self.assertIsNone(err)
+        text = self.restall(tree, start, 480)
+        self.assertEqual([r["id"] for r in self.p1_rows()], [tid])
+        self.assertIn("P-1 row %s was filed or refreshed " % tid, text)
+        self.assertIn("and is now closed, so no P-1 row is open; it is "
+                      "written at most once per 30m.", text)
+
+    def test_a_read_only_pass_files_nothing_and_says_so(self):
+        tree = self.helm_tree()
+        self.stalled(tree, 2)
+        tree.advance(85.0, 40.0)
+        rc, lines, _data = self.tick(tree, T0 + 180, apply=False)
+        self.assertEqual(rc, 1, "control: the read-only pass opened")
+        out = "\n".join(lines)
+        self.assertIn("HELM IS THE LOAD", out)
+        self.assertIn(pressurewatch.P1_READ_ONLY + ".", out)
+        self.assertEqual(tasks.rows(), {})
+        self.assertEqual(self.room.calls, [])
+
+    def test_an_unreadable_slice_cpu_is_named_not_guessed(self):  # noqa: VACUOUS_ASSERTION — the UNKNOWN line of the same row is asserted before the absences
+        tree = self.helm_tree()
+        os.remove(os.path.join(tree.fleet, "cpu.stat"))
+        tree.cpu_stat = False
+        self.stalled(tree, 3)
+        text = self.room.stalls[0]["text"]
+        self.assertIn("Helm's own cpu share UNKNOWN: agents.slice's cpu.stat "
+                      "usage_usec would not read at %s." % tree.fleet, text)
+        self.assertNotIn("HELM IS THE LOAD", text)
+        self.assertEqual(self.p1_rows(), [])
+
+    def test_helm_own_is_read_from_the_command_line(self):  # noqa: VACUOUS_ASSERTION — a fixed, non-empty literal table; every case asserts identity with a literal True or False
+        """HELM-OWN by command line: this checkout's bin/helm and
+        bin/helm-hook (through a link, or relative to the process's cwd),
+        python -m helm, helm/*.py, the chat node, and a fab client whose cwd
+        is a helm checkout. The checkout comes from the module's own
+        location; its lane rooms follow work.lane_path."""
+        root, rooms = self.root, self.rooms
+        links = tempfile.mkdtemp(prefix="helm-test-pressurewatch-bin-")
+        self.addCleanup(shutil.rmtree, links, True)
+        link = os.path.join(links, "helm")
+        os.symlink(os.path.join(root, "bin", "helm"), link)
+        fab = "/opt/tools/bin/fab"
+        cases = (
+            (self.helm("hook", "stop-guard"), None, True),
+            (["python3", "-u", link, "chat", "wait"], None, True),
+            (["/bin/sh", os.path.join(root, "bin", "helm-hook"), "gate"],
+             None, True),
+            (["/bin/sh", "bin/helm-hook", "gate"], root, True),
+            (["python3", "helm/gateslice.py", "--modules", "x"], root, True),
+            (["python3", "-m", "helm", "gate"], None, True),
+            (["python3", "-mhelm.cli"], None, True),
+            (["python3", os.path.join(rooms, "a-lane", "bin", "helm")], None,
+             True),
+            (["/home/u/.local/bin/dregg-node-rebased", "run"], None, True),
+            (["dregg-cave-node"], None, True),
+            (["bash", fab, "test", "--repo", "."], root, True),
+            ([fab, "gate", "observe"], os.path.join(rooms, "a-lane"), True),
+            (["bash", fab, "test", "--repo", "."], links, False),
+            (["python3", "bin/helm"], None, False),
+            (["python3", "/srv/other/bin/helm"], None, False),
+            (["python3", "-m", "helmet"], None, False),
+            (["python3", "-c", "import helm"], None, False),
+            # THE HOOK PYTHON'S OWN SHAPE on a fleet host (bin/helm-hook
+            # once it has an interpreter recorded), the stall's measured
+            # short-lived load.
+            (["/opt/py/bin/python3.14", "-S", "--",
+              os.path.join(root, "bin", "helm"), "hook", "stop-guard"], None,
+             True),
+            (["/opt/py/bin/python3.14", "-S", "--", "/srv/other/bin/helm"],
+             None, False),
+            (["node", "/srv/app/cli.js"], root, False),
+            (["git", "status"], root, False),
+            ([], root, False),
+        )
+        for argv, cwd, want in cases:
+            with self.subTest(argv=argv, cwd=cwd):
+                self.assertIs(pressurewatch._helm_own(argv, cwd), want)
+        from helm import work
+        self.assertEqual(rooms, os.path.dirname(work.lane_path(root, "x")))
 
 
 class _FleetDir(object):

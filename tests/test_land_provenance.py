@@ -641,9 +641,10 @@ class ForwardOnlyRowArms(_focus.FocusBase):
         """The review row `FocusVerdictArms` opens, for this arm's approve."""
         from helm import dispatches
         os.makedirs(os.environ["HELM_HOME"], exist_ok=True)
+        from tests._tmphome import review_task
         row, err = dispatches.add("reviewer", "a-lane", tip, kind="review",
                                   repo=self.repo, notify=False, _reason=True,
-                                  new_work=True)
+                                  new_work=True, task=review_task(self))
         self.assertIsNone(err, err)
         return row
 

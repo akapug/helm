@@ -381,6 +381,18 @@ function famBilled(fl) {
     : esc(g) + ' <span class="bmut">(no account on this page carries that name)</span>')));
 }
 
+/* AN OWNER DECLARATION THE WATCHDOG HAS NOT FOLDED YET (task/4027), as one
+   plain sentence: its colour, until when, and when the fold takes it. It is
+   PENDING, never a colour: the reading beside it stays the fold's own. */
+function famPending(p) {
+  const day = t => new Date(t * 1e3).toLocaleString(undefined, {month: "short", day: "numeric", hour: "numeric", minute: "2-digit"});
+  const late = typeof p.folds_by === "number" && p.folds_by * 1e3 <= Date.now();
+  return "DECLARED " + p.colour + " by the owner until " + (p.until ? day(p.until) : "no stated time") + "; the watchdog folds it "
+    + (typeof p.folds_by === "number" && !late
+      ? "by " + new Date(p.folds_by * 1e3).toLocaleTimeString(undefined, {hour: "numeric", minute: "2-digit"})
+      : "at its next pass" + (late ? ", which is overdue" : ""));
+}
+
 /* THE FAMILY SHEET: one family's reading, what lasts, the shares across
    projects, the credits and the declare control. */
 function famSheet(fam, fl, d) {
@@ -393,6 +405,8 @@ function famSheet(fam, fl, d) {
     + '<div class="gmeta twrap">' + esc(fl.cause || "")
     + (fl.provenance === "owner-declared" ? " · <b>DECLARED by the owner, not measured</b>" : "")
     + (fl.money_provenance === "certified-local" ? " · <b>money CERTIFIED by the seat that runs the local hardware, not a vendor measurement</b>" : "") + "</div>"
+    + (fl.declared_pending ? '<div class="gmeta twrap"><b>' + esc(famPending(fl.declared_pending)) + ".</b>"
+      + (fl.declared_pending.why ? " Why: " + esc(fl.declared_pending.why) : "") + "</div>" : "")
     + (failedHere.length ? '<div class="gmeta twrap bunk">readings FAILED: '
       + esc(failedHere.map(k => k + " (" + sec.failed[k] + ")").join(", ")) + " — not unmeasured</div>" : "")
     + famBilled(fl);
@@ -811,6 +825,9 @@ async function famDeclare(fam, box) {
   } catch (e) {
     FAM_MSG = {family: fam, err: true, text: (e.body && e.body.error) || e.message};
   }
+  // the board is read again at once, so the sheet shows the declaration as
+  // pending now rather than at the minute's read (task/4027)
+  if (!FAM_MSG.err) await boardReload();
   famRender(true);
   const open = document.querySelector("#flagrows .tdeclare");
   if (open) open.open = true;

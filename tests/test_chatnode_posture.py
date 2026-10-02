@@ -744,14 +744,32 @@ EPOCH_REFUSAL = (
 
 
 def _show(active, sub, restarts=0, result="", invocation="",
-          started_ago=None):
+          started_ago=None, pid=None):
     """`systemctl show` output. `started_ago` seconds sets the main process
-    start (ExecMainStartTimestampMonotonic, CLOCK_MONOTONIC microseconds)."""
+    start (ExecMainStartTimestampMonotonic, CLOCK_MONOTONIC microseconds);
+    `pid` its MainPID."""
     started = (int((time.monotonic() - started_ago) * 1e6)
                if started_ago is not None else 0)
     return (0, "ActiveState=%s\nSubState=%s\nNRestarts=%d\nResult=%s\n"
-               "InvocationID=%s\nExecMainStartTimestampMonotonic=%d"
-            % (active, sub, restarts, result, invocation, started))
+               "InvocationID=%s\nExecMainStartTimestampMonotonic=%d%s"
+            % (active, sub, restarts, result, invocation, started,
+               "\nMainPID=%d" % pid if pid else ""))
+
+
+# HUNG IS MEASURED, NEVER AGED (task/3891): a flat main-thread window, past
+# the boot wait. The arms below that pin the hung words give the unit a main
+# process and stand in for the /proc measurement that
+# tests/test_chatnode_booting.py drives on a planted /proc.
+NODE_PID = 4242
+FLAT = {"cpu_s": 4868.0, "delta_s": 0.0, "window_s": 45.0, "progress": "flat"}
+
+
+@contextlib.contextmanager
+def _measured_flat():
+    with mock.patch.object(chatnode, "cpu_progress",
+                           side_effect=lambda pid: dict(FLAT)), \
+            mock.patch.object(chatnode, "api_listener", return_value="none"):
+        yield
 
 
 RUN_ID = "3a5e9072fdb646a5b04f327152efb149"
@@ -777,6 +795,9 @@ class BootBase(PostureBase):
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
         self.shows = [_show("active", "running")]
         self.calls = []
+        # the timeout each daemon-reload `up` passed (task/4204), recorded
+        # separately from `self.calls` so its shape stays positional-only
+        self.reload_timeouts = []
 
     def tearDown(self):
         for k, v in self.prior.items():
@@ -786,8 +807,15 @@ class BootBase(PostureBase):
                 os.environ[k] = v
         super().tearDown()
 
-    def systemctl(self, *args):
+    def systemctl(self, *args, timeout=30):
         self.calls.append(args)
+        if args == ("daemon-reload",):
+            # `up`'s daemon-reload passes its own bound (task/4204); record it
+            self.reload_timeouts.append(timeout)
+        if args[:1] == ("show",) and "--property=DropInPaths" in args:
+            # `up`'s drop-in census (chatnode.unit_dropins), not a read of
+            # the unit's state: it takes no answer from the scripted `shows`
+            return 0, "DropInPaths="
         if args and args[0] == "show":
             return self.shows.pop(0) if len(self.shows) > 1 else self.shows[0]
         if args and args[0] == "is-active":
@@ -966,7 +994,7 @@ class BootWaitTest(BootBase):
         self.assertNotIn("did not come up", err)
         self.assertNotIn("exited", err)
 
-    def test_up_against_a_hung_node_says_hung_at_once_in_status_words(self):
+    def test_up_against_a_hung_node_says_hung_at_once_in_status_words(self):  # noqa: VACUOUS_ASSERTION — the absent "still initializing" is read on the same `err` that must carry "it is hung, not booting"
         """`up` re-run on a node that has been running two hours without
         its API: `enable --now` does not restart it, so wait_boot must see
         the old run's clock and say `hung` at the first look — the same line
@@ -974,14 +1002,16 @@ class BootWaitTest(BootBase):
         call it "still initializing" while status says restart it."""
         os.environ["HELM_CHAT_NODE_BOOT_WAIT_S"] = "8"
         self.shows = [_show("active", "running", 0, "success", RUN_ID,
-                            started_ago=7200)]
+                            started_ago=7200, pid=NODE_PID)]
         t0 = time.time()
-        rc, _out, err = self._up()
+        with _measured_flat():
+            rc, _out, err = self._up()
         self.assertEqual(rc, 1)
         self.assertLess(time.time() - t0, 5, "waited out the boot wait")
         self.assertNotIn("still initializing", err)
         status = io.StringIO()
         with mock.patch.object(chatnode, "_systemctl", self.systemctl), \
+                _measured_flat(), \
                 mock.patch.object(chatnode.cell, "get_json", return_value=None), \
                 mock.patch("helm.chat.transport_status",
                            return_value={"mode": "unsigned"}), \
@@ -999,9 +1029,10 @@ class BootWaitTest(BootBase):
 
     def test_up_relays_a_refusal_at_once_with_its_cure(self):
         os.environ["HELM_CHAT_NODE_BOOT_WAIT_S"] = "30"
-        # `up` clears the unit (reset-failed) and queues the start; the new
-        # run — a new InvocationID — refuses and fails
-        self.shows = [_show("inactive", "dead"),
+        # `up`'s door reads the stopped unit (task/3891), `up` clears it
+        # (reset-failed) and queues the start; the new run — a new
+        # InvocationID — refuses and fails
+        self.shows = [_show("inactive", "dead"), _show("inactive", "dead"),
                       _show("failed", "failed", 1, "exit-code", "b" * 32)]
         t0 = time.time()
         with self.journal("Started helm-chat-node.service\n" + EPOCH_REFUSAL + "\n"):
@@ -1032,7 +1063,9 @@ class BootWaitTest(BootBase):
                  "empty here" % (chatnode.PEER_UNIT, UNVERIFIED, UNAUDITED))):
             with self.subTest(said):
                 peer()
+                # the first read is `up`'s door (task/3891)
                 self.shows = [_show("inactive", "dead"),
+                              _show("inactive", "dead"),
                               _show("failed", "failed", 1, "exit-code",
                                     "b" * 32)]
                 with self.journal("Started helm-chat-node.service\n"
@@ -1247,9 +1280,10 @@ class UnreachableDiagnosisTest(BootBase):
 
     def test_a_node_running_past_the_boot_wait_is_hung_not_initializing(self):
         self.shows = [_show("active", "running", 0, "success", RUN_ID,
-                            started_ago=7200)]
-        _rc, out = self._status()
-        rows = self._doctor()
+                            started_ago=7200, pid=NODE_PID)]
+        with _measured_flat():
+            _rc, out = self._status()
+            rows = self._doctor()
         self.assertIn("NOT INITIALIZING", out)
         self.assertNotIn("INITIALIZING VERIFIED RUNTIME", out)
         self.assertIn("hung", out)
@@ -1281,19 +1315,26 @@ class UnreachableDiagnosisTest(BootBase):
         os.environ["HELM_CHAT_NODE_BOOT_WAIT_S"] = "30"
         booting = ("active", "running", 0, "success", RUN_ID)
         self.assertEqual(chatnode.hung_after_s(), 600)
-        self.assertEqual(self._diagnosis(*booting, started_ago=45)["state"],
-                         "initializing")
-        self.assertEqual(self._diagnosis(*booting, started_ago=599)["state"],
-                         "initializing")
-        d = self._diagnosis(*booting, started_ago=601)
-        self.assertEqual(d["state"], "hung")
-        self.assertIn("600s boot wait", d["line"])
-        os.environ["HELM_CHAT_NODE_BOOT_WAIT_S"] = "1200"
-        self.assertEqual(chatnode.hung_after_s(), 1200)
-        self.assertEqual(self._diagnosis(*booting, started_ago=601)["state"],
-                         "initializing")
-        self.assertEqual(self._diagnosis(*booting, started_ago=1201)["state"],
-                         "hung")
+        with _measured_flat():
+            # a main thread flat over its window is still booting inside
+            # the floor; only past it does the flat window read hung
+            self.assertEqual(self._diagnosis(*booting, started_ago=45,
+                                             pid=NODE_PID)["state"],
+                             "booting")
+            self.assertEqual(self._diagnosis(*booting, started_ago=599,
+                                             pid=NODE_PID)["state"],
+                             "booting")
+            d = self._diagnosis(*booting, started_ago=601, pid=NODE_PID)
+            self.assertEqual(d["state"], "hung")
+            self.assertIn("600s boot wait", d["line"])
+            os.environ["HELM_CHAT_NODE_BOOT_WAIT_S"] = "1200"
+            self.assertEqual(chatnode.hung_after_s(), 1200)
+            self.assertEqual(self._diagnosis(*booting, started_ago=601,
+                                             pid=NODE_PID)["state"],
+                             "booting")
+            self.assertEqual(self._diagnosis(*booting, started_ago=1201,
+                                             pid=NODE_PID)["state"],
+                             "hung")
 
     def test_a_node_being_stopped_is_down_not_hung(self):
         """`systemctl stop` on a node that served for two hours leaves it
@@ -1317,12 +1358,17 @@ class UnreachableDiagnosisTest(BootBase):
 class PriorityTest(BootBase):
     """THE NODE YIELDS THE CPU TO THE OWNER'S PANES, and `up` keeps it so.
 
-    Measured on the owner's 8-core laptop while his typing lagged: load
+    Measured on the owner's laptop while his typing lagged: load
     38.7, CPU pressure some=55-63%, the node at 303% CPU proving signed chat
     turns. A runtime CPUWeight=20 and renice +10 brought
     pressure to 32% within a minute and were lost at the next restart; the
     drop-in `up` writes is what outlives one. Proofs attach after a turn
-    commits, so the priority delays proofs, never delivery."""
+    commits, so the priority delays proofs, never delivery.
+
+    AND IT BOUNDS THE PROVER (task/3851). A signed send cost the node about
+    25 CPU-seconds in bursts of 7-12 cores, from a 24-thread rayon pool, in
+    app.slice at weight 100 against the fleet's 25. The same drop-in now
+    holds RAYON_NUM_THREADS, DREGG_PROVE_WORKERS=1 and background.slice."""
 
     def dropin(self):
         return os.path.join(chatnode._dropin_dir(chatnode.UNIT),
@@ -1343,28 +1389,34 @@ class PriorityTest(BootBase):
         stdout and, per daemon-reload, whether the drop-in was on disk."""
         loaded = []
 
-        def systemctl(*args):
+        def systemctl(*args, timeout=30):
             if args[:1] == ("daemon-reload",):
                 loaded.append(os.path.exists(self.dropin()))
-            return self.systemctl(*args)
-        out = io.StringIO()
+            return self.systemctl(*args, timeout=timeout)
+        out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(chatnode, "_systemctl", systemctl), \
                 self.node_bin(), \
                 mock.patch.object(chatnode, "wait_boot",
                                   return_value=("initializing", 1)), \
                 contextlib.redirect_stdout(out), \
-                contextlib.redirect_stderr(io.StringIO()):
+                contextlib.redirect_stderr(err):
             chatnode.cmd_node(["up"])
+        self.err = err.getvalue()
         return out.getvalue(), loaded
 
     def test_up_writes_the_priority_even_with_no_posture_declared(self):
         out, loaded = self.up()
         body = self.body()
         self.assertIn("[Service]", body.splitlines())
-        self.assertEqual(self.keys(body), ["CPUWeight", "Nice"],
-                         "exactly the two keys, and no IOWeight")
+        self.assertEqual(self.keys(body), ["CPUWeight", "Nice", "Slice",
+                                           "Environment", "Environment"],
+                         "exactly these keys, and no IOWeight")
         self.assertIn("CPUWeight=%d" % chatnode.CPU_WEIGHT, body.splitlines())
         self.assertIn("Nice=%d" % chatnode.NICE, body.splitlines())
+        self.assertIn("Slice=background.slice", body.splitlines())
+        self.assertEqual(_environment_set(body), {
+            "RAYON_NUM_THREADS": str(chatnode.prove_threads()),
+            "DREGG_PROVE_WORKERS": "1"})
         self.assertLess(chatnode.CPU_WEIGHT, 100,
                         "systemd weighs every sibling 100 by default")
         self.assertGreater(chatnode.NICE, 0)
@@ -1377,6 +1429,7 @@ class PriorityTest(BootBase):
         self.assertIn(chatnode.PRIORITY_DROPIN, out)
 
     def test_rerunning_up_leaves_one_identical_file(self):
+        self.peer_runs([UNVERIFIED + "=1", UNAUDITED + "=1"])
         self.up()
         first = self.body()
         self.assertIn("[Service]", first.splitlines())
@@ -1412,12 +1465,79 @@ class PriorityTest(BootBase):
         self.up()
         self.assertEqual(oct(os.stat(self.dropin()).st_mode)[-3:], "600")
 
-    def test_up_says_why_it_proved_nothing_and_what_it_set_empty(self):
+    def test_the_prover_bound_follows_the_online_cpus(self):
+        """RAYON_NUM_THREADS is max(2, online // 6), from the CPUs the
+        kernel counts online. Never nproc, which a cgroup CPU quota shrinks:
+        it printed 8 on the owner's 24-CPU laptop."""
+        self.assertEqual([chatnode.prove_threads(n) for n in (1, 8, 12, 24, 96)],
+                         [2, 2, 2, 4, 16])
+        real = os.sysconf
+        asked = []
+
+        def sysconf(name):
+            asked.append(name)
+            return 48 if name == "SC_NPROCESSORS_ONLN" else real(name)
+        with mock.patch.object(chatnode.os, "sysconf", side_effect=sysconf):
+            out, _loaded = self.up()
+        self.assertIn("SC_NPROCESSORS_ONLN", asked)
+        self.assertEqual(_environment_set(self.body()), {
+            "RAYON_NUM_THREADS": "8", "DREGG_PROVE_WORKERS": "1"})
+        self.assertIn("CPUWeight=20 Nice=10 Slice=background.slice "
+                      "RAYON_NUM_THREADS=8 DREGG_PROVE_WORKERS=1", out)
+        self.assertIn("next start", out)
+
+    def test_a_dropin_that_is_not_helms_is_named_and_never_written(self):  # noqa: VACUOUS_ASSERTION — the quiet files' absence sits beside straight-line assertIn on the same out and self.err, which name the 30- and 05- files
+        """F3's local cure was a hand-made 30-prove-bound.conf. `up` never
+        writes a drop-in it did not write, not even its mode: it names each
+        one that sets a directive 20-helm-priority.conf sets, and says which
+        of the two systemd applies. One that sets none of them, or sets one
+        outside [Service], is not news, and helm's own two are never named."""
+        d = chatnode._dropin_dir(chatnode.UNIT)
+        os.makedirs(d, exist_ok=True)
+        planted = {
+            "30-prove-bound.conf": "[Service]\nEnvironment=RAYON_NUM_THREADS=12"
+                                   "\nSlice=app.slice\n",
+            "05-early.conf": "[Service]\nNice=0\n",
+            "40-memory.conf": "[Service]\nMemoryHigh=8G\n",
+            "45-unit.conf": "[Unit]\nDescription=CPUWeight=1 in prose\n",
+        }
+        self.peer_runs([UNVERIFIED + "=1", UNAUDITED + "=1"])
+        for name, text in planted.items():
+            with open(os.path.join(d, name), "w", encoding="utf-8") as f:
+                f.write(text)
+            os.chmod(os.path.join(d, name), 0o644)
+        out, _loaded = self.up()
+        out2, _loaded = self.up()
+        for name, text in planted.items():
+            with open(os.path.join(d, name), encoding="utf-8") as f:
+                self.assertEqual(f.read(), text, name)
+            self.assertEqual(oct(os.stat(os.path.join(d, name)).st_mode)[-3:],
+                             "644", name)
+        self.assertEqual(sorted(os.listdir(d)),
+                         sorted(list(planted) + list(chatnode.HELM_DROPINS)))
+        self.assertIn(
+            "30-prove-bound.conf is not helm's and also sets Slice, "
+            "Environment; it sorts after 20-helm-priority.conf, so systemd "
+            "applies its values over helm's. helm never writes it", self.err)
+        self.assertIn(
+            "05-early.conf is not helm's and also sets Nice; it sorts before "
+            "20-helm-priority.conf, so helm's values win", out)
+        self.assertIn("05-early.conf", out2, "named on every `up`")
+        for quiet in ("40-memory.conf", "45-unit.conf"):
+            self.assertNotIn(quiet, out + self.err)
+        for own in chatnode.HELM_DROPINS:
+            self.assertNotIn(own + " is not helm's", out + out2 + self.err)
+        self.assertEqual(_environment_set(self.body())["RAYON_NUM_THREADS"],
+                         str(chatnode.prove_threads()),
+                         "helm's own file keeps helm's value beside it")
+
+    def test_up_says_why_it_proved_nothing_and_keeps_the_previous_mirror(self):
         """`up` reloads first, then reads the peer, then reloads again after
         writing drop-ins. A peer that is not running has no environment to
-        read: `up` says so in the fixed words, and rewrites the mirror an
-        earlier `up` wrote with both loosening flags empty, naming them. A
-        flag the peer runs without is named the same way beside the one it
+        read: `up` says so in the fixed words, and keeps the mirror an earlier
+        `up` wrote (a failed probe must never overwrite the posture, which a
+        successful probe that read the running node's values alone may write).
+        A flag the peer runs without is named the same way beside the one it
         mirrors."""
         self.peer_runs([UNVERIFIED + "=1"])
         out, _loaded = self.up()
@@ -1427,11 +1547,10 @@ class PriorityTest(BootBase):
                                                   UNAUDITED), out)
         self.props["MainPID"] = "0"
         out, _loaded = self.up()
-        self.assertIn("helm chat node: no posture proven for %s: %s; "
-                      "10-helm-posture.conf sets %s and %s empty, which dregg "
-                      "reads as refusal" % (
-                          chatnode.PEER_UNIT, chatnode.POSTURE_WHY["stopped"],
-                          UNVERIFIED, UNAUDITED), out)
+        self.assertIn("helm chat node: %s — %s; keeping "
+                      "the existing 10-helm-posture.conf unchanged"
+                      % (chatnode.PEER_UNIT, chatnode.POSTURE_WHY["stopped"]),
+                      out)
         self.assertEqual(sorted(os.listdir(chatnode._dropin_dir(chatnode.UNIT))),
                          ["10-helm-posture.conf", chatnode.PRIORITY_DROPIN])
         self.assertIn(PEER_ASKED, self.asked)
@@ -1471,13 +1590,15 @@ class PriorityTest(BootBase):
         that follows."""
         self.peer_runs([UNVERIFIED + "=1"])
         reload_positions = []
+        reload_timeouts = []
         posture_asked = None
 
-        def track_chatnode_systemctl(*args):
+        def track_chatnode_systemctl(*args, timeout=10):
             nonlocal posture_asked
             if args[:1] == ("daemon-reload",):
                 reload_positions.append(len(self.calls))
-            return self.systemctl(*args)
+                reload_timeouts.append(timeout)
+            return self.systemctl(*args, timeout=timeout)
 
         def track_timerhealth_systemctl(argv, timeout=10):
             nonlocal posture_asked
@@ -1502,20 +1623,42 @@ class PriorityTest(BootBase):
                         "first reload must precede peer posture read")
         self.assertLess(posture_asked, reload_positions[1],
                         "posture read must precede second reload")
+        self.assertEqual(reload_timeouts, [chatnode.RELOAD_TIMEOUT_S] * 2,
+                         "both daemon-reloads carry the reload bound, not the "
+                         "30 s default — the second reload loads the drop-in "
+                         "`up` just wrote and must not time out on ~7k units")
+        self.assertGreaterEqual(chatnode.RELOAD_TIMEOUT_S, 120,
+                                "the reload bound is not sized for the measured "
+                                "reload")
 
-    def status(self, weight, nice, running):
+    def status(self, weight, nice, running, slice_="background.slice",
+               env=None, group=None, dropins=""):
         """`status` over a unit systemd describes with these values. The
         main process's nice is `running`; None is a stopped node, MainPID 0,
         and getpriority then answers 0 — what the kernel says for PID 0, the
-        CALLER — so a read that asks it anyway prints a nice it must not."""
+        CALLER — so a read that asks it anyway prints a nice it must not.
+        `env` is the unit's Environment as systemctl prints it (by default
+        the prover bound beside another variable), `group` the running
+        process's control group (by default in `slice_`; empty when
+        stopped), `dropins` the DropInPaths line."""
+        if env is None:
+            env = ("RUST_LOG=info,dregg_node::blocklace_sync=warn "
+                   "RAYON_NUM_THREADS=%d DREGG_PROVE_WORKERS=1"
+                   % chatnode.prove_threads())
+        if group is None:
+            group = "" if running is None else (
+                "/user.slice/user-1000.slice/user@1000.service/%s/%s"
+                % (slice_, chatnode.UNIT))
         asked = []
 
-        def systemctl(*args):
+        def systemctl(*args, timeout=30):
             if any(a.startswith("--property=CPUWeight") for a in args):
                 asked.extend(args)
-                return 0, "CPUWeight=%s\nNice=%s\nMainPID=%d" % (
-                    weight, nice, 0 if running is None else 4242)
-            return self.systemctl(*args)
+                return 0, ("CPUWeight=%s\nNice=%s\nSlice=%s\nEnvironment=%s\n"
+                           "ControlGroup=%s\nDropInPaths=%s\nMainPID=%d" % (
+                               weight, nice, slice_, env, group, dropins,
+                               0 if running is None else 4242))
+            return self.systemctl(*args, timeout=timeout)
         out, err = io.StringIO(), io.StringIO()
         with mock.patch.object(chatnode, "_systemctl", systemctl), \
                 mock.patch.object(chatnode.os, "getpriority",
@@ -1531,7 +1674,10 @@ class PriorityTest(BootBase):
         rc, out, err, asked = self.status(20, 10, 10)
         line = [ln for ln in out.splitlines() if "CPUWeight" in ln]
         self.assertEqual(len(line), 1, out)
-        self.assertIn("CPUWeight 20, Nice 10, main process nice 10", line[0])
+        self.assertIn("yields the CPU to interactive work — CPUWeight 20, "
+                      "Nice 10, Slice background.slice, RAYON_NUM_THREADS %d, "
+                      "DREGG_PROVE_WORKERS 1, main process nice 10"
+                      % chatnode.prove_threads(), line[0])
         self.assertNotIn("CPUWeight", err)
         self.up()
         props = [a for a in asked if a.startswith("--property=")][0]
@@ -1555,8 +1701,123 @@ class PriorityTest(BootBase):
 
     def test_a_stopped_node_is_judged_by_its_unit_alone(self):
         _rc, out, err, _asked = self.status(20, 10, None)
-        self.assertIn("CPUWeight 20, Nice 10, main process nice -", out)
+        self.assertIn("DREGG_PROVE_WORKERS 1, main process nice -", out)
         self.assertNotIn("CPUWeight", err)
+
+    def test_a_running_node_in_its_old_slice_takes_the_bound_at_next_start(self):
+        """`up` reloads systemd, which then holds Slice=background.slice, but
+        a process keeps the control group, the environment and the nice it
+        was started with. Its slice says which it runs with."""
+        old = ("/user.slice/user-1000.slice/user@1000.service/app.slice/%s"
+               % chatnode.UNIT)
+        _rc, out, err, _asked = self.status(20, 10, 10, group=old)
+        self.assertNotIn("CPUWeight", out)
+        self.assertIn("yields the CPU by weight, not yet by slice", err)
+        self.assertIn("main process nice 10 in app.slice", err)
+        self.assertIn("its slice, prover bound and Nice=10 at its next start",
+                      err)
+
+    def test_status_says_when_the_prover_is_not_bound(self):
+        _rc, out, err, _asked = self.status(20, 10, 10, env="RUST_LOG=info",
+                                            slice_="app.slice")
+        self.assertNotIn("CPUWeight", out)
+        self.assertIn("does NOT yield", err)
+        self.assertIn("Slice app.slice, RAYON_NUM_THREADS unset, "
+                      "DREGG_PROVE_WORKERS unset", err)
+        self.assertIn("RAYON_NUM_THREADS=%d DREGG_PROVE_WORKERS=1. Fix: helm "
+                      "chat node up" % chatnode.prove_threads(), err)
+
+    def test_status_reads_only_the_prover_names_from_the_environment(self):
+        """The unit's Environment can hold a token. status prints the two
+        values it judges, and nothing else from that line."""
+        env = ('DREGG_ADMIN_TOKEN=%s "NOTE=a b" RAYON_NUM_THREADS=%d '
+               'DREGG_PROVE_WORKERS=1' % (SECRET, chatnode.prove_threads()))
+        _rc, out, err, _asked = self.status(20, 10, 10, env=env)
+        self.assertIn("yields the CPU to interactive work", out)
+        self.assertNotIn(SECRET, out + err)
+        self.assertNotIn("DREGG_ADMIN_TOKEN", out + err)
+        _rc, out, err, _asked = self.status(
+            20, 10, 10, env="RAYON_NUM_THREADS=%s DREGG_PROVE_WORKERS=1"
+            % SECRET)
+        self.assertIn("RAYON_NUM_THREADS (a value not shown)", err)
+        self.assertNotIn(SECRET, out + err)
+
+    def test_status_names_a_later_dropin_that_is_not_helms(self):
+        """When the values are wrong because someone else's drop-in sorts
+        after helm's, `up` would change nothing: the line names that file,
+        from systemd's own list of the unit's drop-ins, in any directory."""
+        d = os.path.join(self.tmp, "user.control", chatnode.UNIT + ".d")
+        os.makedirs(d)
+        theirs = os.path.join(d, "50-Slice.conf")
+        with open(theirs, "w", encoding="utf-8") as f:
+            f.write("[Service]\nSlice=app.slice\n")
+        ours = os.path.join(chatnode._dropin_dir(chatnode.UNIT),
+                            chatnode.PRIORITY_DROPIN)
+        _rc, _out, err, _asked = self.status(
+            20, 10, 10, slice_="app.slice", dropins="%s %s" % (ours, theirs))
+        self.assertIn("does NOT yield", err)
+        self.assertIn("50-Slice.conf is not helm's and also sets Slice; it "
+                      "sorts after 20-helm-priority.conf, so systemd applies "
+                      "its values over helm's", err)
+        self.assertNotIn("Fix: helm chat node up", err)
+
+    def later_dropin(self, name, text):
+        """A drop-in systemd reads from user.control, where `systemctl
+        set-property` writes: (helm's own file's path, that file's path)."""
+        d = os.path.join(self.tmp, "user.control", chatnode.UNIT + ".d")
+        os.makedirs(d, exist_ok=True)
+        theirs = os.path.join(d, name)
+        with open(theirs, "w", encoding="utf-8") as f:
+            f.write(text)
+        return (os.path.join(chatnode._dropin_dir(chatnode.UNIT),
+                             chatnode.PRIORITY_DROPIN), theirs)
+
+    def test_a_later_dropin_is_blamed_only_for_a_value_it_sets(self):
+        """Measured on the owner's laptop: a `set-property --runtime`
+        50-CPUWeight.conf holds CPUWeight=20, helm's own value, while the
+        unit had no Slice or prover bound yet. status named that file and
+        dropped the cure, `up`. A later file is named only when it sets a
+        directive whose value is wrong, and a wrong value no later file sets
+        still needs `up`."""
+        ours, theirs = self.later_dropin("50-CPUWeight.conf",
+                                         "[Service]\nCPUWeight=20\n")
+        _rc, _out, err, _asked = self.status(
+            20, 10, 10, slice_="app.slice", env="RUST_LOG=info",
+            dropins="%s %s" % (ours, theirs))
+        self.assertIn("does NOT yield", err)
+        self.assertIn("Fix: helm chat node up", err)
+        self.assertNotIn("50-CPUWeight.conf", err)
+        ours, theirs = self.later_dropin("60-Slice.conf",
+                                         "[Service]\nSlice=app.slice\n")
+        _rc, _out, err, _asked = self.status(
+            20, 10, 10, slice_="app.slice", env="RUST_LOG=info",
+            dropins="%s %s" % (ours, theirs))
+        self.assertIn("60-Slice.conf is not helm's and also sets Slice; it "
+                      "sorts after", err)
+        self.assertIn("Fix: helm chat node up", err,
+                      "the prover bound is still unset, and only `up` sets it")
+
+    def test_up_names_a_later_dropin_in_another_directory(self):
+        """`up` weighs every drop-in systemd reads, not only the files in
+        helm's own directory: `systemctl set-property` writes its
+        50-<Property>.conf into user.control, which sorts after
+        20-helm-priority.conf and wins."""
+        ours, theirs = self.later_dropin("50-CPUWeight.conf",
+                                         "[Service]\nCPUWeight=100\n")
+        real = self.systemctl
+
+        def systemctl(*args, timeout=30):
+            if args[:1] == ("show",) and "--property=DropInPaths" in args:
+                return 0, "DropInPaths=%s %s" % (ours, theirs)
+            return real(*args, timeout=timeout)
+        self.systemctl = systemctl
+        _out, _loaded = self.up()
+        self.assertIn("50-CPUWeight.conf is not helm's and also sets "
+                      "CPUWeight; it sorts after 20-helm-priority.conf, so "
+                      "systemd applies its values over helm's", self.err)
+        with open(theirs, encoding="utf-8") as f:
+            self.assertEqual(f.read(), "[Service]\nCPUWeight=100\n",
+                             "helm never writes it")
 
     def test_a_systemd_that_does_not_describe_the_unit_prints_nothing(self):
         out = io.StringIO()
@@ -1570,7 +1831,8 @@ class PriorityTest(BootBase):
         self.assertIn("helm chat node: unit " + chatnode.UNIT, out.getvalue())
         self.assertNotIn("CPUWeight", out.getvalue())
         self.assertIn(("show", chatnode.UNIT,
-                       "--property=CPUWeight,Nice,MainPID"), self.calls,
+                       "--property=CPUWeight,Nice,Slice,Environment,"
+                       "ControlGroup,DropInPaths,MainPID"), self.calls,
                       "the silence must be systemd's, not a skipped read")
 
 
@@ -1611,12 +1873,13 @@ class RunningPeerUpTest(BootBase):
         self.assert_neutralised(text)
         self.assertIn("\nEnvironment=%s=\n" % UNAUDITED, text)
 
-    def test_a_reader_failure_writes_the_flags_empty_and_keeps_the_file(self):  # noqa: VACUOUS_ASSERTION — the loop is over a non-empty literal tuple; every row asserts its control (the mirror `up` wrote grants both), then the drop-in still on disk and neutralised
-        """meta-claude on LAND 410: every path where the reader cannot
-        answer wrote nothing and removed the earlier mirror, which is F1
-        again. Each writes the loosening flags empty over the same file. The
-        peer declares both flags throughout, and runs with both until the
-        failure."""
+    def test_a_reader_failure_keeps_the_previous_drop_in(self):  # noqa: VACUOUS_ASSERTION — the loop is over a non-empty literal tuple; every row asserts its control (the mirror `up` wrote grants both), then the drop-in still on disk and byte-identical
+        """task/4204: `up` wrote the empty mirror on EVERY run, so a probe that
+        failed mid a ~36 s daemon-reload overwrote the peer's good bypass with
+        both flags empty — the refusal the node had cleared. A probe that fails
+        or times out proves nothing and must not write its empty result; it
+        keeps the previous drop-in byte-identical and says why. The peer
+        declares both flags throughout and runs with both until the failure."""
         declared = {"Environment": "%s=1 %s=1" % (UNVERIFIED, UNAUDITED)}
         failures = (
             ("systemctl cannot be run",
@@ -1641,14 +1904,38 @@ class RunningPeerUpTest(BootBase):
                 self.answer = None
                 self.peer_runs([UNVERIFIED + "=1", UNAUDITED + "=1"],
                                **declared)
-                _out, _err, text = self.up()
+                _out, err, text = self.up()
                 self.assertTrue(_dregg_runs_unaudited_pq(_effective(text)),
                                 "the control: the running peer's bypass "
                                 "is mirrored")
+                before = text
                 fail()
-                _out, _err, text = self.up()
+                _out, err, text = self.up()
                 self.assertIsNotNone(text, "the drop-in was removed")
-                self.assert_neutralised(text)
+                self.assertEqual(text, before,
+                                 "the probe wrote its empty result over the "
+                                 "good mirror")
+                self.assertIn("keeping the existing", _out)
+                # the peer's real bypass is still set here, not blanked
+                self.assertTrue(_dregg_runs_unaudited_pq(_effective(text)))
+
+    def test_a_systemctl_timeout_is_an_explicit_unknown_not_an_empty_write(self):  # noqa: VACUOUS_ASSERTION — the timeout case asserts rc None; the success case asserts rc 0 with a captured body, neither reaching a real systemctl
+        """task/4204's reload timed past the probe's 30 s bound: _systemctl
+        reports that as rc None, the explicit "unknown" — never rc 0 (success)
+        and never an empty posture another layer could write as a real
+        reading. `up` writes its empty result on any non-success probe, so a
+        timeout must read as "keep", never "write empty"."""
+        with mock.patch("helm.chatnode.subprocess.run",
+                        side_effect=subprocess.TimeoutExpired("systemctl", 1)):
+            rc, out = chatnode._systemctl("show", "x", timeout=1)
+        self.assertIsNone(rc)
+        self.assertIn("unavailable", out)
+        with mock.patch("helm.chatnode.subprocess.run",
+                        return_value=mock.Mock(stdout="Loaded=loaded\n",
+                                               stderr="", returncode=0)):
+            rc, out = chatnode._systemctl("show", "x", timeout=30)
+        self.assertEqual(rc, 0)
+        self.assertIn("Loaded=loaded", out)
 
     def test_the_mirror_follows_the_running_process_not_its_unit(self):
         """An env-file revocation: the unit declares both bypasses (its
@@ -1696,6 +1983,20 @@ class RunningPeerUpTest(BootBase):
                 out, err, text = self.up()
                 for leak in (SECRET, "DREGG_ADMIN_TOKEN", "DISCORD_TOKEN"):
                     self.assertNotIn(leak, out + err + (text or ""))
+
+    def test_ups_daemon_reload_passes_its_own_reload_timeout(self):
+        """task/4204: the measured cutover timed daemon-reload at 29-36 s over
+        ~7k units, past the probe's 30 s bound, which is what failed the probe
+        mid-reload. `up`'s daemon-reload passes its own 120 s bound, not the
+        probe's 30 s, so the probe survives the reload that preceded it."""
+        self.peer_runs([UNVERIFIED + "=1"])
+        with mock.patch.object(chatnode, "_systemctl", self.systemctl):
+            self.up()
+        self.assertTrue(self.reload_timeouts)
+        self.assertEqual(self.reload_timeouts[0], chatnode.RELOAD_TIMEOUT_S)
+        self.assertGreaterEqual(chatnode.RELOAD_TIMEOUT_S, 120,
+                                "the probe-bound reload timeout is not sized "
+                                "for the measured reload")
 
 
 if __name__ == "__main__":

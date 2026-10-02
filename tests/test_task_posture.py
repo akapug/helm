@@ -273,12 +273,32 @@ class DoorBase(unittest.TestCase):
         os.environ["HELM_CHAT_NAME"] = "seat-a"
 
     def tearDown(self):
+        if getattr(self, "prior_cwd", None):
+            os.chdir(self.prior_cwd)
         for k, v in self.env_prior.items():
             if v is None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
         shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def home_cwd(self):
+        """Stand inside a registered placeholder project for the whole arm.
+
+        `helm task add` refuses a row with no project (task/3745), and the
+        arms of the task-door classes test the posture guard and the argv
+        rules behind that refusal, so they file from a project's checkout."""
+        where = os.path.realpath(os.path.join(self.tmp, "homeproj-repo"))
+        os.makedirs(where)
+        gdir = os.path.dirname(tasks.ledger_path())
+        os.makedirs(gdir, exist_ok=True)
+        with open(os.path.join(gdir, "registry.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump({"version": 1, "projects": {"homeproj": {
+                "name": "homeproj", "path": where}}}, fh)
+        self.prior_cwd = os.getcwd()
+        os.chdir(where)
+        self.assertEqual(tasks.current_project(), "homeproj")
 
     def ledger(self):
         p = tasks.ledger_path()
@@ -289,6 +309,10 @@ class DoorBase(unittest.TestCase):
 
 
 class TaskDoorTest(DoorBase):
+    def setUp(self):
+        super().setUp()
+        self.home_cwd()
+
     def test_the_1345_specimen_is_refused_at_exit_2_with_the_three_questions(self):
         # kills: the guard removed from cmd_task add; rc 1 instead of 2; the
         # questions not printed; a write before the refusal
@@ -441,6 +465,10 @@ class DispatchDoorTest(DoorBase):
 class TaskAddArgvAndIdentityTest(DoorBase):
     """task/1450 + task/1451 — cmd_task add's flag consumption and the --mine
     identity shortcut. Both arms are written to FAIL on the pre-cure code."""
+
+    def setUp(self):
+        super().setUp()
+        self.home_cwd()
 
     # A title that passes the posture door AND contains a flag-shaped word
     # further in. The posture clause is carried by the note so the ONLY thing

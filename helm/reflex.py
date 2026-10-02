@@ -24,9 +24,14 @@ Signal kinds (cheap, observable — a false-firing reflex is theater):
   nested-spawn  NEVER fires on a turn: the SubagentStart hook (saguide) hands
                 it to every build-capable subagent before its first step
                 (spawn_steers; a read-only agent_type holds no Agent tool).
-  act           NEVER fires on a turn: argv-guard says it at the act itself
-                (helm/actsteer.py, chat._STEERS). The entry stays as the
-                record of the rule; the act owns the moment (task/2980).
+  act           NEVER fires on a turn: argv-guard says it at the act itself.
+                With a `route:` field (a CSV of act route ids, written by
+                `reflex add --signal act --route ID` or `--verb "<helm verb>
+                [--flag]"`) its steer is DATA the door says at that verb,
+                once per context (helm/doors.py, task/1135). Without one it
+                is the record of a rule a hand-written rung says
+                (helm/actsteer.py, chat._STEERS; task/2980), and `reflex
+                add` refuses a new one, because nothing could ever say it.
 
 Counter/latch v2 (the record.py counters upgrade steering static->situational):
   * threshold   fire when counters[name] >= threshold (specificity law: a
@@ -82,6 +87,10 @@ _DEFAULTS = {
     # PERSON types; matched against a peer's wake it is wallpaper (0 of 55
     # correction-language fires were on typed turns, MEASURED designer).
     "arrival": "",
+    # THE ACT ROUTES an `act` reflex is said at (task/1135): a CSV of
+    # moments.ROUTES-style ids the door reads off a tool call's argv,
+    # act.helm.<verb>[.<sub>|.<flag>|.<value>] or act.spawn.
+    "route": "",
 }
 
 EVERY_TURN_BUDGET = 3  # max constant steers per injection — habituation guard
@@ -408,11 +417,14 @@ def spawn_steers(project=None):
             and (project or entry_project(e) == FLEET)]
 
 
-def _dirs(project=None):
+def _dirs(project=None, every=False):
+    """The reflex directories of `project`, its own first. `every` lists the
+    project's even before it exists (the door's freshness key must see it
+    appear)."""
     out = []
     if project:
         d = os.path.join(home.project_dir(project), "reflexes")
-        if os.path.isdir(d):
+        if every or os.path.isdir(d):
             out.append(d)
     out.append(os.path.join(home.global_dir(), "reflexes"))
     return out
@@ -492,7 +504,8 @@ def write(e, project=None):
     # `project` rides the optional list so it round-trips: written only when
     # set, and absent means unrecorded, which load_all reads as fleet.
     for opt in ("pattern", "marker", "counter", "threshold", "latch",
-                "escalate", "window", "notes", "source", "project", "arrival"):
+                "escalate", "window", "notes", "source", "project", "arrival",
+                "route"):
         if e.get(opt):
             body.append("  " + opt + ": " + str(e[opt]))
     body += ["  status: " + (e.get("status") or "live"),
@@ -501,6 +514,26 @@ def write(e, project=None):
              "REFLEX: " + e["steer"], ""]
     pk.atomic_write(path, "\n".join(body))
     return path
+
+
+_ACT_ROUTE = re.compile(r"^act\.[a-z0-9][a-z0-9.-]*$")
+
+
+def act_routes(e):
+    """The act route ids a reflex is said at (its `route` CSV)."""
+    return {r.strip().lower() for r in str(e.get("route") or "").split(",")
+            if _ACT_ROUTE.match(r.strip().lower())}
+
+
+def act_steers(route_ids, project=None):
+    """The live `act` reflexes this project's seats receive whose route is
+    one of `route_ids` (every routed one when None), for the door
+    (helm/doors.py). A routeless act reflex is a hand rung's record and is
+    never returned: the rung says it."""
+    want = None if route_ids is None else set(route_ids)
+    return [e for e in load_all(project, seat=True)
+            if e.get("signal") == ACT_SIGNAL and act_routes(e)
+            and (want is None or act_routes(e) & want)]
 
 
 # ── counter/latch mechanics ────────────────────────────────────────────────
@@ -735,7 +768,8 @@ def _sig_desc(e):
             s += " latch"
         return sig + ":" + s
     tail = (":" + e["pattern"]) if e.get("pattern") else \
-           (":" + e["marker"]) if e.get("marker") else ""
+           (":" + e["marker"]) if e.get("marker") else \
+           (":" + ",".join(sorted(act_routes(e)))) if act_routes(e) else ""
     return sig + tail
 
 
@@ -784,7 +818,7 @@ def cmd_reflex(args):
 
 
 _ADD_FLAGS = ("--signal", "--pattern", "--marker", "--counter", "--threshold",
-              "--escalate", "--window", "--project")
+              "--escalate", "--window", "--project", "--route", "--verb")
 
 
 def _cmd_add(args):
@@ -813,13 +847,32 @@ def _cmd_add(args):
     if len(parts) < 2 or not parts[0] or not parts[1]:
         print("usage: helm reflex add <id> | <steer> [--signal S] [--pattern RE] "
               "[--marker PATH] [--counter NAME --threshold N [--latch] "
-              "[--escalate N] [--window S]] [--project P]", file=sys.stderr)
+              "[--escalate N] [--window S]] [--signal act --verb \"<helm verb> "
+              "[--flag]\" | --route ID] [--project P]", file=sys.stderr)
         return 2
     e = {"id": parts[0], "steer": parts[1], "signal": flags.get("signal", "prompt"),
          "pattern": flags.get("pattern", ""), "marker": flags.get("marker", ""),
          "counter": flags.get("counter", ""), "threshold": flags.get("threshold", ""),
          "escalate": flags.get("escalate", ""), "window": flags.get("window", ""),
          "latch": flags.get("latch", ""), "stated_ts": pk.now_ts()}
+    if e["signal"] == ACT_SIGNAL:
+        # AN ACT REFLEX NEEDS ITS DOOR (task/1135). `signal: act` was skipped
+        # by fire() and said by no rung unless one was hand-written for it,
+        # so /learn's "a measurable moment gets a reflex" sent lessons to a
+        # trigger nothing read. The route is what the door reads.
+        route = flags.get("route", "").strip().lower()
+        if not route and flags.get("verb"):
+            from . import doors
+            route = doors.verb_route(flags["verb"]) or ""
+        if not _ACT_ROUTE.match(route):
+            print("helm reflex add: an act reflex needs the act it is said "
+                  "at, or nothing ever says it: --verb \"<helm verb> "
+                  "[--flag]\" (e.g. --verb \"task --priority\") or --route "
+                  "act.helm.<verb>[.<sub>|.<flag>] (or act.spawn). Check "
+                  "what a command stands in with `helm store resolve --act "
+                  "'<command>'`.", file=sys.stderr)
+            return 2
+        e["route"] = route
     if e["signal"] == "prompt" and not e["pattern"]:
         e["pattern"] = r"\b" + re.escape(parts[0]) + r"\b"
     if e["signal"] in COUNTER_SIGNALS and not counter_spec(e):
@@ -828,6 +881,14 @@ def _cmd_add(args):
               % e["signal"], file=sys.stderr)
         return 2
     path = write(e, flags.get("project"))
+    if e["signal"] == ACT_SIGNAL:
+        # the door's table caches which routes are bound; a reflex is not a
+        # store file, so tell it (helm/doors.py) instead of waiting it out
+        try:
+            from . import doors
+            doors.invalidate()
+        except Exception:                      # noqa: BLE001 — fail open
+            pass
     print("helm reflex: LIVE '%s' (%s) -> %s" % (parts[0], _sig_desc(e), path))
     return 0
 

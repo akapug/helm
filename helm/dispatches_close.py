@@ -1764,6 +1764,11 @@ def _close_event_error(event, state, current=None, verdicts=None,
         # verified capture and still dies one rung later. The captured value
         # was just re-walked against the ledger by the carve-out above.
         polarity = event.get("contradiction_polarity")
+    if reason == "source-clean-landed" \
+            and dispatches._concur_held_source_clean(state):
+        # A HOLD OVER ITS OWN CONCUR AT THAT CONCUR'S TIP is this door's
+        # source-clean hold (task/4089): its polarity here is the hold's.
+        polarity = None
     if not compose_landed and polarity not in dispatches._CLOSE_POLARITY[reason]:
         return "verdict polarity outside --reason %s's domain" % reason
     version = event.get("close_proof_version")

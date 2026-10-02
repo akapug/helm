@@ -13,7 +13,8 @@ prints on success, seconds before the ledger stamped the hold.
 WHAT THESE ARMS PIN:
   * one successful tool call, in the recipient's store under the helm home,
     inside the 60 s before the hold -> RECOVERABLE; `--apply` appends one
-    `hold-actor-backfill` event and source-clean-landed then closes the row;
+    `hold-actor-backfill` event but does not retroactively grant hold-time
+    approval; an actual recipient re-hold can record that proof and close;
   * every other shape stays OWED and names the proof that failed: no match,
     a match only in another seat's home, two candidates, a call outside the
     window, a result that is missing or not a success, a call in another
@@ -250,7 +251,7 @@ class RecoverableTest(BackfillBase):
                          "the dry run appended to the ledger")
         self.assertNotIn("hold_actor", self.state(row["id"]))
 
-    def test_apply_writes_ONE_backfill_and_source_clean_landed_then_closes(self):
+    def test_apply_recovers_actor_but_only_a_proven_rehold_can_close(self):
         row, held = self.pre_stamp("lane/bf-close")
         self.session(row, held, [self.call(row, held, "tool_B1")])
         token = self.mint(self.c)
@@ -274,7 +275,20 @@ class RecoverableTest(BackfillBase):
         self.assertEqual(state["hold_actor"], READER)
         self.assertEqual(state["hold_actor_evidence"], entry["evidence"])
         self.assertEqual(state["status"], "held")
-        # AND THE CLOSE NOW OPENS, recording the recovered holder.
+        # The recovered hand is not authority frozen at the historic hold:
+        # a successful old tool call cannot retroactively mint approval proof.
+        self.assertNotIn("hold_approval", state)
+        before = self.history()
+        _out, err = self.close(row, token)
+        self.assertIn("no proven approval-tier holder at the hold", err or "")
+        self.assertEqual(self.history(), before)
+        self.assertEqual(self.state(row["id"])["status"], "held")
+        # CONTROL: this same recipient can release and truly re-hold through
+        # the live door, freezing exact-session policy at the new hold time.
+        _out, err = dispatches.mark_release(row["id"])
+        self.assertIsNone(err, err)
+        held = self.hold(row, self.b)
+        self.assertIn("hold_approval", held)
         _out, err = self.close(row, token)
         self.assertIsNone(err, err)
         close = self.close_event(row["id"])

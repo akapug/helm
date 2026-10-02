@@ -33,14 +33,30 @@ HOW IT FINDS THE CULPRIT, in order:
   window's job log that bound it. A receipt that is green, has no readable
   verdict or names no failing test is refused by name.
 
-  BLAME BY DIFF. A car is NAMED when its lane diff (`git diff P0...tip`)
-  touches a failing test's file or a `helm/*.py` path that failure's
-  traceback names (a frame, or a dotted `helm.module` in its message). The
-  slice runner's leak verdict carries a frame of its own (`helm/gateslice.py`,
-  line 1, in the leak test); that frame is the runner speaking for a unit, not
-  a traceback, so it names nobody. Exactly one named car, with every car's
-  diff readable, is the culprit and nothing runs. Zero named, two or more, or
-  a diff git could not give: bisect.
+  BLAME BY DIFF. A car is NAMED when what its merge added to the room (`git
+  diff P(k-1) Pk`, never a merge-base diff of its lane: a lane that merged
+  trunk back in is charged only with its own changes, task/4145) touches a
+  failing test's file or a `helm/*.py` path that failure's traceback names
+  (a frame, or a dotted `helm.module` in its message). The slice runner's
+  leak verdict carries a frame of its own (`helm/gateslice.py`, line 1, in
+  the leak test); that frame is the runner speaking for a unit, not a
+  traceback, so it names nobody. Exactly one named car, with every car's
+  diff readable, is the culprit and no prefix is bisected. Zero named, two
+  or more, or a diff git could not give: bisect.
+
+  TRUNK ON THE RED'S OWN HOST LICENSES EVERY EJECTION (task/4145). Before
+  any car is ejected, by diff or by bisect, the failing modules run on P0,
+  trunk alone, pinned to the host the red ran on (the window job log's node,
+  else the receipt's; the audits' placement line for a red audit), through
+  the same runner the prefixes use. A host that fails every tree reads as
+  a car's fault to a diff, and auto-land's re-run of the red tests on that
+  host repeats the fault rather than clearing it (train561: one host's
+  CPython 3.14.7 failed 9 tests that passed on another at the same tree).
+  Trunk RED there is TRUNK-RED, naming the host: nothing is ejected. A trunk
+  run that cannot be made (no host recorded, the host excluded or busy, a run
+  Fab placed or moved elsewhere or that could not be read) is UNKNOWN: nothing
+  is ejected. Only a trunk pass there licenses the ejection. The bisect's own
+  P0 run is placed on that host first, so it is the same run.
 
   BISECT THE PREFIXES. Only the failing modules run, through the gate's own
   runner in the gate's mode: the slice runner's `--modules` scope with the
@@ -59,9 +75,11 @@ HOW IT FINDS THE CULPRIT, in order:
   failure of any other test is reported beside it and decides nothing.
 
   THE VERDICTS, each one explicit:
-    TRUNK-RED  P0, trunk alone, fails the failing modules. Nothing is
-               ejected; the failure is on trunk and a composition cure is
-               owed (train283: leaked process state from modules on trunk).
+    TRUNK-RED  P0, trunk alone, fails the failing modules (in the bisect,
+               or on the red's own host before an ejection). Nothing is
+               ejected; the failure is on trunk or its host, and a
+               composition cure is owed (train283: leaked process state from
+               modules on trunk) or the host is at fault (train561).
     FLAKE      Pn, the whole train, passes them on a re-run. Nothing is
                ejected; the re-gate line is printed.
     EJECT      The first red prefix Pk names car k. When k > 1 its tip is
@@ -79,9 +97,9 @@ launched through `gatewindow.launch`. BEFORE it composes, the ejection is told:
   THE DM goes to the car's author (its land request's `author`, the dispatch
   row's `sender`) through `seats.dm`, with the failing tests, the window log,
   the receipt, blame's own run log, the evidence and the cars it clashed with.
-  THE TASK COMMENT goes to the task the car's chain serves (`lane_task`,
-  through `taskkey.join`: the stored key, else exactly one task/N or task-N
-  in its first row's lane or note).
+  THE TASK COMMENT goes to the task proven by both the car's own lane and
+  its chain (`lane_task` through `taskkey.car_key`). If they conflict or a
+  record cannot be read, task UNKNOWN is said; no other task is commented.
   Either one failing REFUSES the ejection loudly, prints the undelivered text,
   and composes nothing. A lane that names no task gets no comment, and the
   output says so: helm has no note door for a verdicted dispatch row (the
@@ -160,7 +178,11 @@ SHOWN = 5
 _MERGE = re.compile(r"\A(?P<train>[A-Za-z0-9][A-Za-z0-9._-]{0,63}): merge "
                     r"lane (?P<lane>[^\s:]+)(?:[:\s].*)?\Z")
 _CAR = re.compile(r"land request (?P<id>\S+), (?P<basis>source-clean held|"
-                  r"reviewed) tip (?P<tip>[0-9a-f]{40})")
+                  r"landed before review, unread|reviewed) tip "
+                  r"(?P<tip>[0-9a-f]{40})")
+# THE BASIS each merge body's words name (landwindow._BODY_WORD).
+_BASIS = {"source-clean held": "source-clean",
+          "landed before review, unread": "land-first"}
 _TOKEN = re.compile(r"\A(?:gate:)?([0-9a-f]{4,64})\Z")
 _LOADER = "unittest.loader._FailedTest."
 _FRAME = re.compile(r'File "([^"]+)"')
@@ -181,7 +203,11 @@ _BLOCK_HEAD = re.compile(r"^(?:FAIL|ERROR): \S+ \((?P<id>[\w.<>]+)\)", re.M)
 _BLOCK_RULE = re.compile(r"^={20,}$", re.M)
 # unittest's summary line, the one a run's report ends on (`audit_red`)
 _SUMMARY = re.compile(r"^(?:OK(?: \(.*\))?|FAILED \(.*\))[ \t]*$", re.M)
-_PLACED = re.compile(r"role=\S+ -> (\S+) \(")
+# THE HOSTS FAB'S OWN LINES SAY A RUN WENT TO (`placements`): the placement
+# line, the line a re-placed job's MOVE prints, and the closing line, which
+# names the node the job ended on. Each is anchored at a line's start.
+_WENT = re.compile(r"^fab: (?:role=\S+ -> (\S+) \(|id=\S+\s+MOVED \S+ -> "
+                   r"(\S+)\s|exit=\S+\s+LOG: ([^:\s]+):)")
 # the command line `autoland.Ops.audits` writes above the audits' run
 _RAN = re.compile(r"^\$ (.*)$", re.M)
 
@@ -244,8 +270,8 @@ def read_room(room):
             cars.append({
                 "id": said.group("id") if said else "?",
                 "lane": hit.group("lane"), "tip": parents[1], "merge": sha,
-                "basis": "source-clean" if said and said.group(
-                    "basis").startswith("source-clean") else "approved"})
+                "basis": _BASIS.get(said.group("basis") if said else None,
+                                    "approved")})
             continue
         if not cars:
             return None, ("the room's head %s is not a `<train>: merge lane` "
@@ -372,7 +398,8 @@ def read_red(train, token=None, receipts=None, logs=None):
     `red` carries the receipt `id`, its `mode`, the failing `tests` (each with
     its `kind`, `module`, `file` and the helm `paths` its traceback names),
     the `modules` to run, how many identities the receipt `omitted` from its
-    diagnostics, and the window `log` that bound it."""
+    diagnostics, the window `log` that bound it and the `host` it ran on
+    (`red_host`)."""
     rows, unavailable, _skipped = (receipts or gatemod.receipts)()
     if unavailable:
         return None, ("the gate ledger could not be read (%s), so there is "
@@ -419,14 +446,27 @@ def read_red(train, token=None, receipts=None, logs=None):
     total = row.get("failure_total")
     total = total if type(total) is int and total >= len(tests) \
         else len(tests)
+    log = window_log(gid, logs) if logs else None
     return {"id": gid, "head": head, "label": row.get("label"),
             "tree": row.get("tree"),
             "mode": gatehost.SLICED if row.get("v") == gatemod.SLICE_VERSION
             else gatehost.SERIAL,
             "tests": tests,
             "modules": list(dict.fromkeys(t["module"] for t in tests)),
-            "omitted": total - len(tests),
-            "log": window_log(gid, logs) if logs else None}, None
+            "omitted": total - len(tests), "log": log,
+            "host": red_host(row, log)}, None
+
+
+def red_host(row, log):
+    """The host a red gate ran on, or None: the node the window's job log
+    names for it (Fab's own word, `gatehost._terminal`), else the node the
+    receipt itself records. A name that is not a host token is no host."""
+    event = gatehost._terminal(log) if log else None
+    for node in ((event or {}).get("node"),
+                 gatemod._host_of(row).get("node")):
+        if isinstance(node, str) and gatehost._ATOM.match(node):
+            return node
+    return None
 
 
 def _placed(train, row, who):
@@ -467,18 +507,19 @@ def audit_red(train, log):
     pass, a failure count its blocks do not match) or a failure no test
     module of this tree holds is refused: nobody is blamed from a list that
     cannot be read. `red` carries the log as `audits` and `log`, the host
-    Fab placed the run on as `host` (its `fab: role=... -> HOST` line, None
-    when the log has none), the runner its `$ ` command line ran as `mode`
-    (SLICED when that line runs the slice runner, so the re-run before blame
-    is the audits' own line and a failure only slices show repeats; None
-    when the log has no command line), and no receipt `id` or `tree`."""
+    Fab ran it on as `host` (the last host Fab's own lines name, `placements`:
+    its `fab: role=... -> HOST` line, or the node a MOVE took it to; None when
+    the log has none), the runner its `$ ` command line ran as `mode` (SLICED
+    when that line runs the slice runner, so the re-run before blame is the
+    audits' own line and a failure only slices show repeats; None when the log
+    has no command line), and no receipt `id` or `tree`."""
     said = "the pre-gate audits' log %s" % log
     try:
         with open(log, encoding="utf-8", errors="replace") as fh:
             text = fh.read()
     except (OSError, TypeError, ValueError) as exc:
         return None, "%s cannot be read (%s)" % (said, exc)
-    placed, ran = _PLACED.search(text), _RAN.search(text)
+    placed, ran = placements(text), _RAN.search(text)
     mode = None if ran is None else gatehost.SLICED \
         if gatemod.SLICE_RUNNER in ran.group(1).split() else gatehost.SERIAL
     ends = [hit.end() for hit in _SUMMARY.finditer(text)]
@@ -497,7 +538,7 @@ def audit_red(train, log):
             "tests": tests,
             "modules": list(dict.fromkeys(t["module"] for t in tests)),
             "omitted": 0, "log": log,
-            "host": placed.group(1) if placed else None}, None
+            "host": placed[-1] if placed else None}, None
 
 
 def _red_name(red):
@@ -509,22 +550,32 @@ def _red_name(red):
 
 # -- blame by diff -----------------------------------------------------------
 
-def lane_files(be, root, trunk, tip):
-    """The files a car's lane changed, `git diff trunk...tip` (from the
-    merge-base, so trunk's own movement is not the car's), or None."""
-    rc, out, _err = be.text(root, "diff", "--name-only", "-z",
-                            "%s...%s" % (trunk, tip), env=_env())
+def lane_files(be, root, before, merge):
+    """The files car merge `merge` changed in the room over `before`, the
+    prefix it was merged onto (`git diff before merge`), or None.
+
+    WHAT THE CAR ADDED, NEVER ITS LANE'S HISTORY (task/4145). A merge-base
+    diff (`trunk...tip`) charged a lane that back-merged trunk with trunk's
+    own changes: lane/train-resume-wording-4133 was cut from a lane trunk
+    later merged, then merged trunk itself, so it had two merge bases with
+    trunk, git picked one, and its 2-file change read as 43 files, one of
+    them the red module trunk had changed. Its merge over the prefix below it
+    holds only what the lane brought that the room did not already have."""
+    rc, out, _err = be.text(root, "diff", "--name-only", "-z", before, merge,
+                            env=_env())
     return {f for f in out.split("\0") if f} if rc == 0 else None
 
 
 def blame_by_diff(train, red, be):
-    """Mark each car: `files` (its lane diff, None when git could not give
-    it) and `named` (the failing files and traceback paths that diff touches;
-    None for UNKNOWN). Returns the named cars."""
+    """Mark each car: `files` (what its merge added to the room over the
+    prefix below it, `lane_files`; None when git could not give it) and
+    `named` (the failing files and traceback paths those touch; None for
+    UNKNOWN). Returns the named cars."""
     failing = {t["file"] for t in red["tests"]}
     paths = set().union(*(t["paths"] for t in red["tests"]))
     for car in train["cars"]:
-        files = lane_files(be, train["root"], train["trunk"], car["tip"])
+        files = lane_files(be, train["root"], train["prefixes"][car["n"] - 1],
+                           car["merge"])
         car["files"] = None if files is None else sorted(files)
         car["named"] = None if files is None \
             else sorted(files & (failing | paths))
@@ -722,11 +773,43 @@ def _run_one(ctx, probe, host, where):
     except Exception as exc:                # noqa: BLE001 — named, UNKNOWN
         rc, text, err = None, "", "%s: %s" % (type(exc).__name__, exc)
     got = read_run(rc, text, err, nonce, ctx["red"])
-    placed = _PLACED.search(text or "")
+    placed = placements((text or "") + "\n" + (err or ""),
+                        "%s-%s" % (MARK, nonce))
+    off = [h for h in placed if h != host]
+    if host and off:
+        # A RUN PINNED TO ONE HOST THAT FAB PLACED, OR MOVED, ONTO ANOTHER
+        # answers for the other host, never for the one asked about.
+        got = {"status": UNKNOWN, "failed": [], "other": [],
+               "why": "pinned to %s, Fab placed it on %s" % (host, off[-1])}
     got.update({"label": probe["label"],
-                "host": host or (placed.group(1) if placed else None),
+                "host": host or (placed[-1] if placed else None),
                 "exclude": exclude, "output": (text or "") + (err or "")})
     return got
+
+
+def placements(text, mark=None):
+    """Every host Fab's own lines in `text` say a run went to, in order
+    (`_WENT`): placed, MOVED to another node while it queued, and ended on.
+    The last is where it ran. A line between a run's `mark` BEGIN and END is
+    the run's own output, never Fab's, so a test that prints Fab's words
+    cannot speak for it.
+
+    THE FIRST LINE IS NOT THE ANSWER: a job that waits in one node's slot
+    queue can be withdrawn and launched on another, whose placement Fab
+    prepares out of sight and reports only as `MOVED a -> b` and in its
+    closing `LOG: b:` line, so a pin read from the first line alone passes a
+    run that ran elsewhere."""
+    went, inside = [], False
+    for line in (text or "").splitlines():
+        if mark and line.strip() == mark + " BEGIN":
+            inside = True
+        elif mark and line.strip().startswith(mark + " END"):
+            inside = False
+        elif not inside:
+            hit = _WENT.match(line)
+            if hit:
+                went.append(next(g for g in hit.groups() if g))
+    return went
 
 
 def run_probes(ctx, probes):
@@ -765,8 +848,11 @@ def run_probes(ctx, probes):
              "host": results[p["key"]]["host"],
              "status": results[p["key"]]["status"],
              "why": results[p["key"]].get("why")} for p, _h in wave])
-        for probe, _host in wave:
+        for probe, host in wave:
             got = results[probe["key"]]
+            if host and probe["at"] == ctx["train"]["trunk"] \
+                    and not probe.get("car"):
+                ctx.setdefault("trunk_runs", {})[host] = got
             print("  %-22s on %s: %s%s" % (
                 got["label"], got["host"] or "a host Fab placed", got["status"],
                 " — %s" % got["why"] if got.get("why") else ""),
@@ -827,12 +913,40 @@ def bisect(ctx):
     return verdict
 
 
+def trunk_check(ctx, host):
+    """(GREEN | RED | UNKNOWN, why): the red's failing modules on P0, trunk
+    alone, pinned to `host`, the host the red ran on, through the prefixes'
+    own runner: the run that licenses an ejection (task/4145). The bisect's
+    own P0 run on that host is that run, and is not run twice."""
+    said = "trunk %s on %s" % (_short(ctx["train"]["trunk"]), host)
+    if not host:
+        return UNKNOWN, ("no host is recorded for %s, so trunk cannot be run "
+                         "where it went red" % _red_name(ctx["red"]))
+    if host in ctx["shut"]:
+        return UNKNOWN, "%s: %s excludes it" % (said, gatehost.EXCLUDE_ENV)
+    if host in ctx["busy"]:
+        return UNKNOWN, "%s: it is running a gate" % said
+    got = (ctx.get("trunk_runs") or {}).get(host)
+    if got is None:
+        got = run_probes(dict(ctx, slots=[host]), [{
+            "key": "trunk", "name": "trunk", "at": ctx["train"]["trunk"],
+            "label": "P0 (trunk)"}])["trunk"]
+    status = got["status"]
+    if status == RED:
+        return RED, ("%s fails the red's own tests too (%s): a host or trunk "
+                     "fault, not a car's" % (said, ", ".join(
+                         got["failed"][:SHOWN])))
+    if status == GREEN:
+        return GREEN, "%s passes the red's own tests" % said
+    return UNKNOWN, "%s could not be read: %s" % (
+        said, got.get("why") or "no reason given")
+
+
 # -- telling -----------------------------------------------------------------
 
-def lane_task(rid, snapshot=None):
-    """(task, unknown, refusal): the task the car's chain serves by the one
-    join (`taskkey.join`: the task its first row or its lane records, else
-    exactly one `task/N` or `task-N` in the first row's lane or note).
+def lane_task(rid, snapshot=None, lane=None):
+    """(task, unknown, refusal): the car's own lane proof reconciled with
+    its chain's first row; disagreement or unreadable proof is UNKNOWN.
 
     `unknown` is the join's reason when it could not decide (two records
     that disagree, a record that cannot be read, two tasks named): said on
@@ -849,7 +963,7 @@ def lane_task(rid, snapshot=None):
     row = current.get(rid)
     if row is None:
         return None, None, None
-    key = taskkey.join(row=row, current=current)
+    key = taskkey.car_key(row, current, lane=lane)
     unknown = None if key.task or key.why == taskkey.NO_TASK else key.why
     return key.task, unknown, None
 
@@ -900,7 +1014,7 @@ def _car_words(car):
 def _clash_words(verdict):
     if verdict["by"] == BY_DIFF:
         return ("not measured: blame by diff named this car alone, so no "
-                "prefix ran")
+                "car's prefix ran")
     if verdict["alone"] == RED:
         return "none: it fails alone on trunk"
     if verdict["alone"] != GREEN:
@@ -932,7 +1046,7 @@ def telling(train, red, verdict, name, runlog):
             "the audits ran before any gate, so no receipt names them"
             if red.get("audits") else
             "receipt: `helm gate show %s`" % red["id"],
-            runlog or "none (no prefix ran)"),
+            runlog or "none (no run was logged)"),
         "  evidence: %s" % verdict["why"],
         "  clashed with: %s" % _clash_words(verdict),
         "  %s composes the train again without it, on trunk %s. Your lane "
@@ -975,8 +1089,9 @@ def write_runlog(train, red, outputs):
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as fh:
-            fh.write("%s: %s at %s, gate:%s (%s)\n" % (
-                PROG, train["train"], train["head"], red["id"], red["mode"]))
+            fh.write("%s: %s at %s, %s (%s)\n" % (
+                PROG, train["train"], train["head"], _red_name(red),
+                red["mode"]))
             for got in outputs:
                 fh.write("\n=== %s on %s: %s%s\n%s\n" % (
                     got["label"], got["host"], got["status"],
@@ -1019,7 +1134,7 @@ def eject(ctx, verdict, door=None, tell=None, project=None, snapshot=None):
               file=say)
         return 1
     car["id"] = lr.get("id") or car["id"]
-    task, unknown, why = lane_task(car["id"], snapshot)
+    task, unknown, why = lane_task(car["id"], snapshot, lane=car["lane"])
     if why:
         print("%s: REFUSED — %s; the car is not ejected." % (PROG, why),
               file=say)
@@ -1105,6 +1220,33 @@ def eject(ctx, verdict, door=None, tell=None, project=None, snapshot=None):
 
 # -- the verb ----------------------------------------------------------------
 
+def _routing(doorkw, path, logs, environ):
+    """(free, known, shut, busy, environ): where blame's runs may go now.
+
+    LIVENESS IS ASKED, NEVER REMEMBERED, in the dry run too: the red train's
+    own finished gate still has its row in the window store, and read as
+    busy it would hide the fastest host from the plan. A host whose node
+    cannot be read is not routed to."""
+    environ = os.environ if environ is None else environ
+    live, _retired, unknown = gatewindow.live_runs(
+        gatewindow.read_runs(path), inflight=doorkw.get("inflight"),
+        observe=doorkw.get("observe"), pid_alive=doorkw.get("pid_alive"),
+        now=doorkw.get("now"))
+    free, known, shut, busy = hosts(
+        environ, logs, live + [{"host": h} for h in unknown])
+    return free, known, shut, busy, environ
+
+
+def _context(say, train, red, be, known, shut, busy, environ, fab, result):
+    """The run context every run of one blame shares (`run_probes`)."""
+    return {"say": say, "train": train, "red": red, "be": be,
+            "root": train["root"], "nonce": _nonce(), "slots": [],
+            "known": known, "shut": shut, "busy": busy,
+            "environ": dict(environ), "fab": fab or gatewindow._fab,
+            "rounds": result["rounds"], "outputs": [], "trunk_runs": {},
+            "runlog": None}
+
+
 def _car_json(car):
     return {k: car.get(k) for k in ("n", "id", "lane", "tip", "basis",
                                     "named", "overlap") if k in car} \
@@ -1118,7 +1260,8 @@ def blame(room, gate=None, apply=False, as_json=False, fab=None, door=None,
 
     Read-only unless `apply`: it reads the room and the red, blames by diff
     and prints the plan. With `apply` it bisects (when the diff does not name
-    exactly one car) and ejects. `audits` is the log of the room's red
+    exactly one car), runs trunk on the red's own host (`trunk_check`), and
+    ejects only when trunk passes there. `audits` is the log of the room's red
     PRE-GATE AUDIT run (`audit_red`), read in place of a gate receipt by
     `helm train auto`: that red is blamed by diff alone, and a diff that does
     not name exactly one car refuses, since a red audit is never bisected.
@@ -1204,15 +1347,23 @@ def blame(room, gate=None, apply=False, as_json=False, fab=None, door=None,
                    "why": "blame by diff: lane %s's diff touches %s, and no "
                           "other car's does" % (car["lane"],
                                                 ", ".join(car["named"]))}
-        print("  blame by diff names exactly one car: EJECT %s, no bisect"
+        print("  blame by diff names exactly one car, %s: no bisect; it is "
+              "EJECTED only if trunk passes on the red's own host"
               % _car_words(car), file=say)
         if not apply:
             result["verdict"] = dict(verdict, car=_car_json(car))
             print("  dry run: nothing told, minted or launched. `%s %s "
-                  "--apply` ejects it and composes the train again without "
-                  "it." % (PROG, train["room"]), file=say)
+                  "--apply` first runs the failing tests on trunk on %s, the "
+                  "host %s ran on, and only a pass there ejects it and "
+                  "composes the train again without it." % (
+                      PROG, train["room"], red.get("host") or "(no host "
+                      "recorded: UNKNOWN, nothing is ejected)",
+                      _red_name(red)), file=say)
             return done(0)
-        ctx = {"say": say, "train": train, "red": red, "runlog": None}
+        _free, known, shut, busy, environ = _routing(doorkw, path, logs,
+                                                     environ)
+        ctx = _context(say, train, red, be, known, shut, busy, environ, fab,
+                       result)
     else:
         unsure = " and %d car's diff is UNKNOWN" % len(unread) \
             if unread else ""
@@ -1224,17 +1375,11 @@ def blame(room, gate=None, apply=False, as_json=False, fab=None, door=None,
         print("  blame by diff names %d car(s)%s, so the verb bisects the "
               "prefixes P0..P%d" % (len(named), unsure,
                                     len(train["cars"])), file=say)
-        environ = os.environ if environ is None else environ
-        # LIVENESS IS ASKED, NEVER REMEMBERED, in the dry run too: the red
-        # train's own finished gate still has its row in the window store,
-        # and read as busy it would hide the fastest host from the plan. A
-        # host whose node cannot be read is not routed to.
-        live, _retired, unknown = gatewindow.live_runs(
-            gatewindow.read_runs(path), inflight=doorkw.get("inflight"),
-            observe=doorkw.get("observe"), pid_alive=doorkw.get("pid_alive"),
-            now=doorkw.get("now"))
-        free, known, shut, busy = hosts(
-            environ, logs, live + [{"host": h} for h in unknown])
+        free, known, shut, busy, environ = _routing(doorkw, path, logs,
+                                                    environ)
+        # THE RED'S OWN HOST TAKES P0 when it is free, so the bisect's trunk
+        # run is the one that licenses an ejection (`trunk_check`).
+        free = sorted(free, key=lambda h: h != red.get("host"))
         slots = free or ([] if known else [None])
         print("  hosts: %s%s%s" % (
             ", ".join(free) or ("none known: Fab places each run" if not known
@@ -1257,18 +1402,34 @@ def blame(room, gate=None, apply=False, as_json=False, fab=None, door=None,
                   "runs the bisect and ejects the culprit." % (
                       PROG, train["room"]), file=say)
             return done(0)
-        ctx = {"say": say, "train": train, "red": red, "be": be,
-               "root": train["root"], "nonce": _nonce(), "slots": slots,
-               "known": known, "shut": shut, "busy": busy,
-               "environ": dict(environ),
-               "fab": fab or gatewindow._fab, "rounds": result["rounds"],
-               "outputs": []}
+        ctx = dict(_context(say, train, red, be, known, shut, busy, environ,
+                            fab, result), slots=slots)
         verdict = bisect(ctx)
-        ctx["runlog"] = write_runlog(train, red, ctx["outputs"])
-        result["runlog"] = ctx["runlog"]
+    if verdict["kind"] == EJECT:
+        status, why = trunk_check(ctx, red.get("host"))
+        print("  trunk on the red's own host: %s — %s" % (status, why),
+              file=say)
+        if status == GREEN:
+            verdict["why"] += "; %s" % why
+        else:
+            verdict = {"kind": TRUNK_RED if status == RED else UNKNOWN,
+                       "by": verdict["by"], "car": None, "alone": None,
+                       "clash": [], "why": why, "spared": verdict["car"]}
+    ctx["runlog"] = write_runlog(train, red, ctx["outputs"])
+    result["runlog"] = ctx["runlog"]
     result["verdict"] = dict(verdict, car=_car_json(verdict["car"]),
-                             clash=[_car_json(c) for c in verdict["clash"]])
+                             clash=[_car_json(c) for c in verdict["clash"]],
+                             **({"spared": _car_json(verdict["spared"])}
+                                if verdict.get("spared") else {}))
     kind = verdict["kind"]
+    if kind == TRUNK_RED and verdict.get("spared"):
+        print("  TRUNK-RED — %s. Nothing is ejected (%s is spared): the "
+              "failure is on trunk %s or on that host, not in any car; a "
+              "composition cure is owed on trunk, or the host is at fault "
+              "and the same tree gated on another host tells which."
+              % (verdict["why"], _car_words(verdict["spared"]),
+                 _short(train["trunk"])), file=say)
+        return done(0)
     if kind == TRUNK_RED:
         print("  TRUNK-RED — %s: the failure is on trunk %s, not in any car. "
               "Nothing is ejected; a composition cure is owed on trunk."
@@ -1292,7 +1453,7 @@ def blame(room, gate=None, apply=False, as_json=False, fab=None, door=None,
                 {"room": train["room"], "label": train["train"]})), file=say)
         return done(0)
     if kind != EJECT:
-        return refuse("the bisect is UNKNOWN (%s), so nothing is ejected"
+        return refuse("the verdict is UNKNOWN (%s), so nothing is ejected"
                       % verdict["why"])
     print("  EJECT %s — %s" % (_car_words(verdict["car"]), verdict["why"]),
           file=say)

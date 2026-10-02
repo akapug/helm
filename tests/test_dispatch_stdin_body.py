@@ -332,10 +332,10 @@ class VerdictPolarityRequiredTest(unittest.TestCase):
             if paths:
                 argv += ["--worse-than-main", paths[0]]
             if p == "fix":
-                # A FIX NAMING NO CURE STATES WHY. This sweep is about the
-                # EXIT ANSWER, so it carries the one recorded reason rather
-                # than meeting a door it is not measuring.
+                # A FIX WITH NO PATCH STATES WHY AND NAMES ITS FINDING. This
+                # sweep is about the exit answer, not the cure itself.
                 argv += ["--no-patch-because", "a design finding for a meld",
+                         "--finding", "A design finding for a meld",
                          "--finding-count", "1", "--prior-relation", "new"]
             rc, called, _err = self._verdict(argv + ["evidence", "here"])
             observed.append((rc, called.get("polarity"), called.get("basis"),
@@ -375,6 +375,7 @@ class VerdictPolarityRequiredTest(unittest.TestCase):
         rc, called, _err = self._verdict(
             ["verdict", "a" * 32, "b" * 40, "--fix", "--measured",
              "--finding-count", "1", "--prior-relation", "new",
+             "--finding", "A design finding for a meld",
              "--worse-than-main", self.PATH,
              "--no-patch-because", "a design finding for a meld",
              "evidence", "here"])

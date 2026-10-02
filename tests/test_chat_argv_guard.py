@@ -649,11 +649,15 @@ class SpecWiringTest(unittest.TestCase):
         so the refusal would exist in code and fire nowhere. NotebookEdit
         joined for task/3301: the file-tool branch already reads
         notebook_path, and Claude Code never routes the tool unless the
-        matcher names it."""
+        matcher names it. Workflow joined for the narrow-goal rung: its
+        script spawns agents with no Agent call, so the Workflow call is the
+        build act the rung must see."""
         s = self.spec()
         self.assertEqual(s["event"], "PreToolUse")
         self.assertEqual(
-            s["matcher"], "Bash|Monitor|Write|Edit|NotebookEdit|Agent")
+            s["matcher"],
+            "Bash|Monitor|Write|Edit|NotebookEdit|Agent|Workflow")
+        self.assertIn("Workflow", s["matcher"].split("|"))
         self.assertIn("NotebookEdit", s["matcher"].split("|"))
         self.assertIn("Agent", s["matcher"].split("|"))
         self.assertTrue(s.get("gate"),
@@ -1446,9 +1450,8 @@ class GitHubActionsRungTest(unittest.TestCase):
                 self.assertIn(row + " at character",
                               self.assert_refused(command))
         root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
-        with open(_os.path.join(root, "docs", "HOOKS.md"),
-                  encoding="utf-8") as fh:
-            hooks = fh.read()
+        from tests.test_hooks_doc_fragments import assemble_hooks_doc
+        hooks = assemble_hooks_doc(root)
         with open(_os.path.join(root, "CHANGELOG.md"),
                   encoding="utf-8") as fh:
             changelog = " ".join(fh.read().split())
@@ -3639,8 +3642,13 @@ class GitHubActionsRungTest(unittest.TestCase):
         # substitution is read whole, so the window is what passes it
         captured = 'out=$(%s 2>&1); echo "$out" | tail -2' % filed
         self.assert_allowed(captured)
-        self.assert_refused(captured.replace("%s to get" % self.NOUN,
+        # the twin names gh in its prose: prose that names no gh is not read
+        # for gh's verb grammar at all (task/3945), so the hole beside the
+        # noun is a row only where the head stands too
+        self.assert_allowed(captured.replace("%s to get" % self.NOUN,
                                              "%s $V to get" % self.NOUN))
+        self.assert_refused(captured.replace("%s to get" % self.NOUN,
+                                             "gh %s $V to get" % self.NOUN))
 
     def test_the_window_keeps_every_spelling_gh_runs(self):  # noqa: VACUOUS_ASSERTION — every arm runs assert_refused unconditionally (rc 2 plus four required substrings)
         """What the window may never give up: options in either gap, the verb
@@ -4582,6 +4590,33 @@ class SteerRungTest(unittest.TestCase):
         self.assertNotIn(  # noqa: VACUOUS_ASSERTION — P1b/P2 kill this arm
             "[helm steer]", out,
             "the cure itself — passing a variable — was flagged")
+        typed = self.run_hook(
+            "helm dispatch verdict a1b2c3d4e5f6 deadbeef --approve ok",
+            session="hex-1b")[1]
+        self.assertIn("isolated worktree", typed)
+        self.assertIn("32-hex", typed)
+        self.assertIn("plain argument", typed)
+        self.assertIn("add no hex", typed)
+
+    def test_a_plain_full_ledger_id_is_the_worktree_form(self):  # noqa: VACUOUS_ASSERTION — the 16-hex and 40-hex steers are the positive controls; silence on a full 32-hex id is that plain form
+        """An isolated worktree cannot expand a variable into helm. The full
+        32-hex id a ledger command printed is the plain argument that guard
+        can verify, so it is not told to switch to a variable. A shorter or
+        longer token is still the invented-suffix shape."""
+        full = "3e86984100b5c4cbafff8926bdd0bc53"
+        self.assertEqual(len(full), 32)
+        rc, out = self.run_hook(
+            "helm dispatch triage " + full, session="hex-full")
+        self.assertEqual(rc, 0)
+        self.assertNotIn("TYPED RATHER THAN INTERPOLATED", out)
+        rc, out = self.run_hook(
+            "helm work release e196c6a7eb1d6d0d", session="hex-short")
+        self.assertIn("TYPED RATHER THAN INTERPOLATED", out)
+        self.assertIn("isolated worktree", out)
+        longer = "ab" * 20
+        self.assertEqual(len(longer), 40)
+        rc, out = self.run_hook("helm lr show " + longer, session="hex-long")
+        self.assertIn("TYPED RATHER THAN INTERPOLATED", out)
 
     def test_a_pipeline_exit_read_is_heard_and_a_bare_pipeline_is_not(self):
         rc, out = self.run_hook("pytest -q | tail -3 ; rc=$?", session="pipe-1")

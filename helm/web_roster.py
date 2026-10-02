@@ -117,6 +117,7 @@ _GATESLICE_MUTABLE = {
         "each room's last rebuild cost, emptied with the cache"),
     "_ROSTER_REP_HOME": (
         "the roster file the cache describes; a change empties the cache"),
+    "_ROSTER_MOOD_CACHE": "per helm home, rebuilt after its 60s window",
 }
 
 
@@ -623,6 +624,40 @@ def _api_roster_git(qs):
         if info:
             out[cwd] = info
     return {"commits": out}, 200
+
+
+
+# THE MOOD DOT rides the roster tab's 60-second side channel too: a mood is
+# a full `seatmood.floor` (ledger folds and git reads per pass), so it stays
+# off the 2-second presence poll, behind one single-flight cache per helm
+# home. An unreadable floor answers `unavailable` with its reason, never an
+# empty map that would draw every seat as unmeasured-and-fine.
+_ROSTER_MOOD_CACHE = {}   # helm home -> (built_at, body)
+_ROSTER_MOOD_TTL = 60
+_ROSTER_MOOD_LOCK = threading.Lock()
+
+
+def _api_roster_mood(qs):
+    """{moods: {seat: dot projection}, at} for every live seat (task/3899):
+    the measured state, the reason, the seat's own word and rating, a
+    blocker, divergence and a recency bucket (`seatmood_surface`)."""
+    from . import seatmood_surface
+    key = seatmood_surface.home_key()
+    hit = _ROSTER_MOOD_CACHE.get(key)
+    if hit and time.time() - hit[0] < _ROSTER_MOOD_TTL:
+        return hit[1], 200
+    with _ROSTER_MOOD_LOCK:
+        hit = _ROSTER_MOOD_CACHE.get(key)
+        if hit and time.time() - hit[0] < _ROSTER_MOOD_TTL:
+            return hit[1], 200
+        now = time.time()
+        try:
+            body = {"moods": seatmood_surface.roster_moods(now), "at": now}
+        except Exception as e:    # noqa: BLE001 — named, never a 500
+            body = {"moods": {}, "at": now, "unavailable": True,
+                    "why": "%s: %s" % (e.__class__.__name__, e)}
+        _ROSTER_MOOD_CACHE[key] = (time.time(), body)
+    return body, 200
 
 
 

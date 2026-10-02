@@ -39,7 +39,7 @@ class MirrorBase(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def plant(self, sid, tid, subject, status="pending", project=None,
-              raw=None):
+              raw=None, cwd=None):
         d = os.path.join(self.home, "tasks", sid)
         os.makedirs(d, exist_ok=True)
         p = os.path.join(d, "%s.json" % tid)
@@ -53,8 +53,81 @@ class MirrorBase(unittest.TestCase):
         if project:
             pd = os.path.join(self.home, "projects", project)
             os.makedirs(pd, exist_ok=True)
-            open(os.path.join(pd, "%s.jsonl" % sid), "w").close()
+            with open(os.path.join(pd, "%s.jsonl" % sid), "w",
+                      encoding="utf-8") as fh:
+                if cwd:
+                    fh.write(json.dumps({"type": "summary"}) + "\n")
+                    fh.write(json.dumps({"type": "user", "cwd": cwd}) + "\n")
         return p
+
+
+class MirroredRowsNameAProjectTest(MirrorBase):
+    """A mirrored row names its project (task/3745): the cwd its session's
+    transcript records, resolved through the registry the way `helm task
+    list` resolves a cwd; when nothing resolves, the mirror's own project."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo = os.path.realpath(os.path.join(self.tmp, "mirproj-repo"))
+        os.makedirs(self.repo)
+        gdir = os.path.dirname(tasks.ledger_path())
+        os.makedirs(gdir, exist_ok=True)
+        with open(os.path.join(gdir, "registry.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump({"version": 1, "projects": {"mirproj": {
+                "name": "mirproj", "path": self.repo}}}, fh)
+
+    def project_of(self, subject):
+        got = [r for r in tasks.rows(self.ledger).values()
+               if r.get("title") == subject]
+        self.assertEqual(len(got), 1, got)
+        return got[0].get("project")
+
+    def test_a_session_in_a_registered_checkout_files_there(self):
+        self.plant("s1", "1", "work in the checkout", project="-slug-a",
+                   cwd=os.path.join(self.repo, "docs"))
+        self.plant("s2", "1", "work in a lane", project="-slug-b",
+                   cwd=self.repo + "-wt/some-lane")
+        rep = tasksmirror.sweep(apply=True, path=self.ledger)
+        self.assertEqual(len(rep["imported"]), 2, rep)
+        self.assertEqual(self.project_of("work in the checkout"), "mirproj")
+        self.assertEqual(self.project_of("work in a lane"), "mirproj")
+
+    def test_a_session_nothing_resolves_files_under_the_mirrors_project(self):
+        self.plant("s1", "1", "work nowhere registered", project="-slug-c",
+                   cwd=os.path.join(self.tmp, "elsewhere"))
+        self.plant("s2", "1", "work with no transcript")
+        self.plant("s3", "1", "work with a silent transcript",
+                   project="-slug-d")
+        rep = tasksmirror.sweep(apply=True, path=self.ledger)
+        self.assertEqual(len(rep["imported"]), 3, rep)
+        self.assertEqual(tasksmirror.PROJECT, "helm")
+        for subject in ("work nowhere registered", "work with no transcript",
+                        "work with a silent transcript"):
+            self.assertEqual(self.project_of(subject), "helm")
+
+    def test_a_malformed_registry_is_reported_and_not_defaulted_to_helm(self):  # noqa: VACUOUS_ASSERTION — the repaired registry then files the same row under mirproj, so an empty import is the refusal and not a sweep that files nothing
+        """A registry that will not parse must not become an empty table.
+        An empty table routes every row to helm, which is a home the broken
+        file never named (task/3994)."""
+        self.plant("s1", "1", "work behind a broken registry",
+                   project="-slug-a", cwd=os.path.join(self.repo, "docs"))
+        reg = os.path.join(os.path.dirname(tasks.ledger_path()),
+                           "registry.json")
+        with open(reg, "w", encoding="utf-8") as fh:
+            fh.write("{ this is not registry json\n")
+        rep = tasksmirror.sweep(apply=True, path=self.ledger)
+        self.assertTrue(rep.get("registry_unreadable"), rep)
+        self.assertEqual(rep["imported"], [])
+        self.assertFalse(any(r.get("project") == "helm"
+                             for r in tasks.rows(self.ledger).values()))
+        with open(reg, "w", encoding="utf-8") as fh:
+            json.dump({"version": 1, "projects": {"mirproj": {
+                "name": "mirproj", "path": self.repo}}}, fh)
+        rep = tasksmirror.sweep(apply=True, path=self.ledger)
+        self.assertIsNone(rep.get("registry_unreadable"), rep)
+        self.assertEqual(self.project_of("work behind a broken registry"),
+                         "mirproj")
 
 
 class NormalizeProjectTest(unittest.TestCase):

@@ -115,6 +115,11 @@ BUDGETS = {
     # cancelled row is dead however open its chat looks — and they are why
     # this ceiling is not lower.
     "SessionStart/resume-turn": 800,
+    # SessionStart after compaction, the WORKING SET (task/4054). It is the
+    # one surface whose content IS the seat's own recent facts, so its
+    # ceiling is the builder's own cap: Claude Code saves hook context past
+    # 10,000 characters to a file and shows only a preview.
+    "SessionStart/working-set": 7000,
     # Stop, allow path. The clean-stop line is the highest-frequency message
     # helm prints; on a repeat within one session it is a reminder only.
     "Stop/inbox-clean-first": 280,
@@ -249,6 +254,29 @@ class StaticMessageBudgetTest(BudgetAssertion):
                     self.assert_within("PreToolUse/refusal-ci-runner",
                                        chat.github_actions_message(act))
         self.assertEqual(drawn, 2 * len(chat._ACTIONS_ROWS) + 2 * len(anchors))
+
+    def test_pretooluse_ci_runner_python_test_text_at_its_worst(self):  # noqa: VACUOUS_ASSERTION — assert_within carries the unconditional positive control on the same observable (a floor on its length), and each witness is first asserted to BE the python-text refusal of its own row at a five-digit position
+        """THE PYTHON-TEXT SHAPE (task/3430 (5)): a spelling standing only in
+        python text that imports helm renders its own clause and a cure that
+        names the move that works. Every row of the shipped table is drawn
+        through the rung inside such text, past character 9,999."""
+        pad = "x" * 10000
+        drawn = 0
+        for spelling, _pieces, _says in chat._ACTIONS_ROWS:
+            sample = spelling.replace("*", "x").replace(
+                "gh api ", "gh api -X PUT ")
+            with self.subTest(row=spelling):
+                act = chat.github_actions_refusal(
+                    command="python3 -c \"import helm; x = '%s %s'\""
+                    % (pad, sample))
+                self.assertIsNotNone(act, spelling)
+                self.assertRegex(act, r"^%s at character \d{5} of the "
+                                 r"folded command" % re.escape(spelling))
+                self.assertTrue(act.endswith(chat._IN_PYTHON_TEXT), act)
+                drawn += 1
+                self.assert_within("PreToolUse/refusal-ci-runner",
+                                   chat.github_actions_message(act))
+        self.assertEqual(drawn, len(chat._ACTIONS_ROWS))
 
     def test_pretooluse_sidechain_beacon_refusal(self):  # noqa: VACUOUS_ASSERTION — assert_within carries the unconditional positive control on the SAME observable (a floor on its length), so a renderer returning "" reddens before any ceiling is reached
         self.assert_within(
@@ -465,6 +493,29 @@ class StaticMessageBudgetTest(BudgetAssertion):
                 if "%s" in raw else raw
             with self.subTest(variant=name):
                 self.assert_within("SessionStart/resume-turn", text)
+
+    def test_session_start_working_set_at_its_widest(self):  # noqa: VACUOUS_ASSERTION — assert_within carries the unconditional positive control on the SAME observable (a floor on its length), so a renderer returning "" reddens before any ceiling is reached
+        """THE WORST REALISTIC RENDER: a full ring, every section at its cap,
+        every path at the line width. The builder's own cap must hold it."""
+        import tempfile
+        from helm import workingset
+        with tempfile.TemporaryDirectory() as d:
+            rows = []
+            for i in range(workingset.RING_ROWS):
+                p = os.path.join(d, ("p" * 200) + "%03d" % (i % 60))
+                if not os.path.exists(p):
+                    open(p, "w").close()
+                rows.append({"t": "Bash", "ok": i % 5 != 0, "p": [p],
+                             "v": ["helm verb%d --a --b --c" % i],
+                             "x": ["helm bad%d --x" % i] if i % 5 == 0 else [],
+                             "id": ["task/%d" % i], "bg": "bg%07d" % i,
+                             "bk": "bash"})
+            text = workingset.build(rows, tasks_dir=d,
+                                    nag=["helm handoff: " + "n" * 300] * 4,
+                                    caveat=True)
+        self.assertEqual(workingset.MAX_CHARS,
+                         BUDGETS["SessionStart/working-set"])
+        self.assert_within("SessionStart/working-set", text, floor=4000)
 
     def test_stop_block_rungs(self):  # noqa: VACUOUS_ASSERTION — assert_within carries the unconditional positive control on the SAME observable (a floor on its length), so a renderer returning "" reddens before any ceiling is reached
         self.assert_within(
@@ -821,10 +872,9 @@ class PointerResolutionTest(unittest.TestCase):
         msg = chat.github_actions_message("an Actions spelling", "Bash")
         self.assertIn(chat.GITHUB_ACTIONS_DOC, msg)
         self.assertIn(chat.GITHUB_ACTIONS_PREMISE, msg)
-        doc = os.path.join(os.path.dirname(os.path.dirname(
-            os.path.abspath(__file__))), chat.GITHUB_ACTIONS_DOC.split(",")[0])
-        with open(doc, encoding="utf-8") as f:
-            text = f.read()
+        from tests.test_hooks_doc_fragments import assemble_hooks_doc
+        text = assemble_hooks_doc(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))))
         for phrase in ("gh pr list", "gh issue view", "SINGLE spelling"):
             self.assertIn(phrase, text)
         write = chat.github_actions_message("/x/a.yml", "Write")

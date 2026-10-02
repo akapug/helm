@@ -18,7 +18,8 @@ add:
   * do-not-disturb — `git worktree lock --reason lease:<id8>` (git-native:
                    even raw prune/remove refuses while locked).
   * housekeeping — `work gc`, dry-run default (gc.py culture). LOCKED or
-                   OCCUPIED (any live process cwd) rooms are immune. The ONLY
+                   OCCUPIED (any live process cwd but git's own auto
+                   maintenance) rooms are immune. The ONLY
                    write to authored bytes anywhere here is a RESCUE COMMIT
                    onto the lane's own branch — lost-and-found, never the
                    dumpster; no code path discards uncommitted work.
@@ -62,14 +63,16 @@ from ._lanes import (
     _wrote_ago,
 )
 from ._gc import (
-    EnactResult, RETIRABLE, UNSTARTED, estate_phantom_records,
+    EnactResult, LANDED_EQUIVALENT, LandedMemo, RETIRABLE, UNSTARTED,
+    estate_phantom_records,
     format_gc_summary,
     gc_enact, gc_orphans, was_reclassified,
     LANE_GONE, LANE_LANDED, LANE_UNKNOWN, LANE_UNLANDED, LANE_UNSTARTED,
     landed_leases, lanes_landed, release_command, rooms_dirty,
     gc_scan, lane_overlaps, list_rows, phantom_records,
     phantom_scan, seam_candidates,
-    post_gc_summary, prune_phantom_records, _base, _delete_lane_branch, _dirty,
+    post_gc_summary, prune_phantom_records, refresh_trunk,
+    _base, _delete_lane_branch, _dirty,
     _has_branch, _live, _merge_state, _merged, _moved_under_scan,
     _moved_since, _proof_word, _removal_blocker, _room_fingerprint,
     _room_state, _sweep_state, _wip_commit,

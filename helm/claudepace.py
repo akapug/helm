@@ -50,18 +50,66 @@ THE STATE, with hysteresis so it does not flap:
   state is said at most once per window, and a step back down (TIGHT to
   WATCH) is not said at all.
 
+THE SWITCH POOL (task/3871). The default-home watcher (store heuristic
+fleet-autoswitch-at-the-wall) switches the baseload home between the Max
+accounts only, so the POOL is the accounts whose newest history row names a
+Max plan (`tier`, written by the creds probe; a row that names none takes
+the plan from the providers' account census, a read of home and Orca
+metadata files with no vendor call). A Team account homed to a
+project is not in it, however much room it has. SWITCHABLE mirrors the
+watcher's candidate rule: a pool account whose weekly window is under
+SWITCH_WEEKLY_PCT, and whose 5h window is either IDLE or OK under
+SWITCH_SESSION_PCT.
+
+  IDLE IS MEASURED, NOT ASSUMED. An account nobody has used since its last
+  window reads 0% with NO reset instant (the vendor opens a window at the
+  first use; measured on every account in the history). That is a read row
+  saying the window is not open, so it counts as room, for at most
+  IDLE_MAX_AGE_S (the watcher's own trust bound for a remembered reading),
+  and past IDLE_FRESH_S only under IDLE_STALE_WEEKLY_PCT of its week (the
+  watcher's bound for a stale reading). ANY NEWER ROW for the account that
+  did not read it idle (a 429, a lapsed copy's refresh-due row) ends it:
+  the account may be in use. A window that is OPEN but has too few readings
+  for a pace, a probe that did not read, or a gauge with no percent is an
+  account in use that nothing can read: that is UNKNOWN, and never room.
+  THE BLIND SPOT, stated: a probe cycle that writes NO row at all leaves
+  the last idle reading standing, so an account put to use unseen reads
+  idle until its next row, within the two bounds above.
+
+THE POOL READING, from the same rows: each account's newest weekly reading
+of the week still open, and what it spent over the last BURN_S. The pool's
+BURN is those spends summed, per hour (percent of one account's week per
+hour; a Max 20x and a Max 5x week are added as equals, a stated bound). Its
+LEFT is the weekly headroom summed. The HORIZON is what the pool must last
+until: the owner's (`helm burn horizon anthropic <iso>`, read at most
+HORIZON_MAX_S out, so no account resets twice before it), else the soonest
+weekly reset that returns at least CARRY_PCT of a week. An account whose
+week resets before the horizon adds a whole week, beside the headroom it
+has until then. The ratio of the
+burn to the burn that lasts exactly to the horizon is the PACE: EASE (runs
+out before it: "ease off about N%", ORANGE, RED when the run-out is inside
+one 5h window), EVEN ("on pace", YELLOW) or FASTER ("can go faster",
+GREEN), each held with hysteresis. It is advice, and it moves no burn flag.
+
 WHAT IT DOES, and only this: one line per account on `helm creds` and `helm
-burn` and a field on the quota page's account rows; a steer said at most once
-per state per window to a seat running on a WATCH or TIGHT account (`steer`,
-through `helm inject`). A seat on the BASELOAD home hears it only while no
-other Claude account reads OK: the watcher moves its credential when its
-window caps, so while another account has room it has nothing to act on, and
-when none is known to have room, the steer asks it to route new work to other
-families and keep its own going. An account with no reading (UNKNOWN) is not
-known to have room, so it is never counted as room. A seat HOMED to one
-credential (a named credhome) is not moved, so it always hears it and is asked
-to rank its work and pace it to the reset. Neither is told to stop or wait for
-a reset. And a tie-break where helm ranks Claude accounts for new work
+burn` and a field on the quota page's account rows; the pool line and one
+line per project with an authored light on `helm burn` (the light's own
+sentence, `registry.LIGHT_SAYS`, and its authored reason: one meaning per
+light); a steer said at most
+once per state per window to a seat running on a WATCH or TIGHT account
+(`steer`, through `helm inject`). A seat on the BASELOAD home whose pool has
+a SWITCHABLE account hears that the watcher will switch it, with the pool's
+pace and its project's advice, and is never told to route away. Only when no
+account is known to be switchable does the steer ask it to route new work to
+other families and keep its own going. A seat HOMED to one credential (a
+named credhome) is not moved, so it always hears it and is asked to rank its
+work and pace it to the reset. Neither is told to stop or wait for a reset.
+When the default home's account changes (the watcher's switch, or a hand
+switch in Orca), every native Claude seat that takes a turn inside
+HANDOFF_SAY_S hears ONE line for that switch (`handoff`): the pool's burn,
+what is left, the run-out against the horizon, one adjustment, and its
+project's advice. A seat homed to an account outside the pool does not.
+And a tie-break where helm ranks Claude accounts for new work
 (`providers.allocate`, through `pressed_accounts`): of two equal choices the
 account that is not WATCH or TIGHT ranks first, which rarely decides anything,
 since a Claude account's headroom is its 5h headroom and exact ties are
@@ -116,6 +164,38 @@ STEER_ASK = ("no other Claude account is known to have room, so route NEW "
 STEER_HOMED = ("this seat is homed to this account, so the watcher will not "
                "move it: rank your work and pace it to the reset, and route "
                "new builds to other seats")
+#: A baseload seat whose pool has a switchable account: never route away.
+STEER_SWITCH = "the watcher will switch this home to one with room"
+
+#: THE WATCHER'S CANDIDATE RULE (fleet-autoswitch-at-the-wall v2): a Max
+#: account under 90% weekly and under 70% of its 5h session.
+POOL_TIER = "Max"
+SWITCH_WEEKLY_PCT = 90.0
+SWITCH_SESSION_PCT = 70.0
+#: How old a reading of an unused account may be and still count (the
+#: watcher's READING_MAX_AGE_S): an idle copy's token lapses in hours. Past
+#: IDLE_FRESH_S (a lapsed idle copy's age) the watcher's stale bound holds.
+IDLE_MAX_AGE_S = 24 * 3600
+IDLE_FRESH_S = 8 * 3600
+IDLE_STALE_WEEKLY_PCT = 80.0
+WEEK_LABEL = "7d"
+#: The pool's burn is read over the rows the pass already holds.
+BURN_S = WINDOW_S + HOUR
+MIN_BURN_SPAN_S = HOUR
+#: THE PACE, as the pool's burn over the burn that lasts to the horizon.
+#: Each band is entered past its mark and left only inside the other one.
+EASE, EVEN, FASTER = "EASE", "EVEN", "FASTER"
+EASE_AT, EASE_CLEAR = 1.10, 1.00
+FASTER_AT, FASTER_CLEAR = 0.70, 0.80
+#: The owner's horizon: AUTHORED, one record per family.
+HORIZON_NAME = "pace-horizon.json"
+HORIZON_MAX_S = 7 * 86400
+#: The handoff line: its seen-state key, ledger id, and how long after a
+#: switch a seat taking a turn still hears it.
+HANDOFF_KEY = "pacecoach"
+HANDOFF_ID = "steer:pacecoach"
+HANDOFF_SAY_S = 2 * 3600
+#: The words a baseload seat hears while its pool has a switchable account.
 
 
 def snapshot_path():
@@ -131,13 +211,18 @@ def _hm(at):
     return time.strftime("%H:%MZ", time.gmtime(at)) if at else "?"
 
 
+def _day(at):
+    return time.strftime("%a %H:%MZ", time.gmtime(at)) if at else "?"
+
+
 # ------------------------------------------------------------------ reading
 
-def _readings(rows):
-    """History rows -> {account: [(ts, used_pct, reset_at)]}, oldest first.
+def _readings(rows, label=LABEL):
+    """History rows -> {account: [(ts, used_pct, reset_at)]}, oldest first,
+    for one account-wide gauge (the 5h one unless `label` names another).
     A row counts only when the probe read it (`burnflags.READ_STATUSES`) and
-    its account-wide 5h gauge carries a percent; a row whose gauges are not
-    a list is no reading."""
+    that gauge carries a percent; a row whose gauges are not a list is no
+    reading."""
     from . import burnflags
     out = {}
     for row in rows or ():
@@ -151,7 +236,7 @@ def _readings(rows):
             continue
         at = pk.parse_ts_epoch(row.get("probed_at"))
         gauge = next((g for g in gauges
-                      if isinstance(g, dict) and g.get("label") == LABEL), None)
+                      if isinstance(g, dict) and g.get("label") == label), None)
         used = burnflags._utilization_pct(gauge) if gauge else None
         if not at or used is None:
             continue
@@ -174,12 +259,19 @@ def account_reading(points, now, prior=None):
     from . import codexpace
     rec = {"state": UNKNOWN, "why": None, "used_pct": None,
            "pct_per_hour": None, "projected_pct": None, "hit_at": None,
-           "reset_at": None, "measured_at": None, "points": 0, "span_s": 0}
+           "reset_at": None, "measured_at": None, "points": 0, "span_s": 0,
+           "idle": False}
     if not points:
         rec["why"] = "no reading of this account's 5h window"
         return _latched(rec, prior, now)
     at, used, reset = points[-1]
     rec.update(used_pct=used, reset_at=reset, measured_at=at)
+    if reset is None and used == 0.0:
+        # IDLE: the vendor opens a window at the first use, so 0% with no
+        # reset is a read row saying no window is open.
+        rec["idle"] = now - at <= IDLE_MAX_AGE_S
+        rec["why"] = "no 5h window is open (unused since %s)" % _hm(at)
+        return _latched(rec, prior, now)
     if reset is None:
         rec["why"] = "the newest 5h reading carries no reset instant"
         return _latched(rec, prior, now)
@@ -233,29 +325,278 @@ def _latched(rec, prior, now):
     return rec
 
 
-def read(rows, now, prior=None):
-    """History rows + the prior snapshot -> the reading. PURE."""
+def _tiers(rows):
+    """History rows -> {account: the plan its newest row names}."""
+    out = {}
+    for row in rows or ():
+        if isinstance(row, dict) and row.get("account") \
+                and isinstance(row.get("tier"), str):
+            out[row["account"]] = row["tier"]
+    return out
+
+
+def _last_rows(rows):
+    """{account: the instant of its newest row, whatever its status}."""
+    out = {}
+    for row in rows or ():
+        if isinstance(row, dict) and row.get("account"):
+            at = pk.parse_ts_epoch(row.get("probed_at")) or 0
+            out[row["account"]] = max(at, out.get(row["account"], 0))
+    return out
+
+
+def _same_reset(a, b):
+    return a is None and b is None or a is not None and b is not None \
+        and abs(a - b) <= RESET_TOLERANCE_S
+
+
+def week_reading(points, now):
+    """One account's weekly readings (oldest first) -> its weekly fields: the
+    newest reading, when it reads the week still open (a reset ahead, or 0%
+    with no reset: a week nobody has started), and what the account spent
+    of it over the last BURN_S. PURE."""
+    rec = {"weekly_pct": None, "weekly_reset_at": None, "weekly_at": None,
+           "weekly_spent_pct": None, "weekly_spent_from": None}
+    if not points:
+        return rec
+    at, used, reset = points[-1]
+    if not (reset is None and used == 0.0 or reset is not None
+            and reset > now):
+        return rec
+    rec.update(weekly_pct=used, weekly_reset_at=reset, weekly_at=at)
+    spent = [p for p in points if p[0] >= now - BURN_S
+             and _same_reset(p[2], reset)]
+    if spent:
+        rec.update(weekly_spent_pct=round(max(0.0, used - spent[0][1]), 1),
+                   weekly_spent_from=spent[0][0])
+    return rec
+
+
+def read(rows, now, prior=None, default_key=None, horizon=None, census=None):
+    """History rows + the prior snapshot -> the reading: each account's 5h
+    record with its weekly fields and pool membership, the pool, and the
+    default home's account (`default_key`, None when unread) with the last
+    switch of it. `census` is {account: plan} for rows that name none. PURE."""
     from . import accounts
-    before = (prior or {}).get("accounts") if isinstance(prior, dict) else None
+    prior = prior if isinstance(prior, dict) else {}
+    before = prior.get("accounts")
     before = before if isinstance(before, dict) else {}
+    weekly, tiers, last = (_readings(rows, WEEK_LABEL), _tiers(rows),
+                           _last_rows(rows))
     out = {}
     for name, points in sorted(_readings(rows).items()):
         key = accounts.measured_key(name)
         rec = account_reading(points, now, before.get(key))
+        if rec["idle"] and last.get(name, 0) > rec["measured_at"]:
+            rec.update(idle=False, why="read idle at %s; a newer probe did "
+                       "not read it" % _hm(rec["measured_at"]))
+        rec["idle_stale"] = rec["idle"] \
+            and now - rec["measured_at"] > IDLE_FRESH_S
         rec["label"] = accounts.mask_identity(name)
+        rec.update(week_reading(weekly.get(name) or [], now))
+        plan = tiers.get(name) or (census or {}).get(name)
+        rec["pool"] = str(plan or "").startswith(POOL_TIER)
         out[key] = rec
-    return {"v": V, "ts": now, "accounts": out}
+    reading = {"v": V, "ts": now, "accounts": out,
+               "pool": pool_reading(out, now, horizon, prior.get("pool"))}
+    reading.update(_switched(prior, default_key, now))
+    return reading
+
+
+def _switched(prior, key, now):
+    """{"default", "switch"}: the default home's account this pass, and the
+    last time it changed. An unread home carries both forward."""
+    held = prior.get("default") if isinstance(prior.get("default"), dict) \
+        else {}
+    last = prior.get("switch") if isinstance(prior.get("switch"), dict) \
+        else None
+    if not key:
+        return {"default": held or None, "switch": last}
+    if held.get("key") and held["key"] != key:
+        last = {"at": now, "from": held["key"], "to": key}
+    since = held.get("since") if held.get("key") == key else now
+    return {"default": {"key": key, "since": since}, "switch": last}
+
+
+# ------------------------------------------------------------------ the pool
+
+def switchable(rec):
+    """True when the watcher can switch the baseload home onto this
+    account: a pool account under SWITCH_WEEKLY_PCT of its week whose 5h
+    window is IDLE, or OK under SWITCH_SESSION_PCT. An account in use that
+    nothing can read (UNKNOWN with an open window, or no reading) is not."""
+    if not isinstance(rec, dict) or not rec.get("pool"):
+        return False
+    weekly = _num(rec.get("weekly_pct"))
+    if weekly is None or weekly >= SWITCH_WEEKLY_PCT:
+        return False
+    if rec.get("idle") is True:
+        return not rec.get("idle_stale") or weekly < IDLE_STALE_WEEKLY_PCT
+    used = _num(rec.get("used_pct"))
+    return rec.get("state") == OK and used is not None \
+        and used < SWITCH_SESSION_PCT
+
+
+def _horizon(known, now, horizon):
+    """(instant, source) the pool must last until: the owner's while it is
+    ahead, else the soonest weekly reset returning at least CARRY_PCT of a
+    week, else the soonest weekly reset; (None, None) with none."""
+    from . import burnflags
+    at = _num((horizon or {}).get("at"))
+    if at is not None and at > now:
+        return min(at, now + HORIZON_MAX_S), "owner"
+    resets = sorted((r["weekly_reset_at"], r["weekly_pct"]) for r in known
+                    if _num(r.get("weekly_reset_at")) is not None
+                    and r["weekly_reset_at"] > now)
+    real = [t for t, used in resets if used >= burnflags.CARRY_PCT]
+    if real:
+        return real[0], "reset"
+    return (resets[0][0], "reset") if resets else (None, None)
+
+
+def _step(pct):
+    """A percentage to the nearest 5, never under 5."""
+    return max(5, int(round(pct / 5.0)) * 5)
+
+
+def pool_reading(recs, now, horizon=None, prior=None):
+    """The switch pool's weekly pace against its horizon -> its record.
+    PURE. `horizon` is the owner's record ({"at": ...}) or None; `prior` is
+    the last pass's pool record, which carries the hysteresis."""
+    from . import burnflags
+    members = [r for r in (recs or {}).values()
+               if isinstance(r, dict) and r.get("pool")]
+    known = [r for r in members if _num(r.get("weekly_pct")) is not None]
+    out = {"state": UNKNOWN, "colour": burnflags.GREY, "advice": None,
+           "why": None, "accounts": len(members), "read": len(known),
+           "left_pct": None, "pct_per_hour": None, "span_s": 0,
+           "runout_at": None, "horizon_at": None, "horizon_from": None,
+           "ratio": None}
+    if not known:
+        out["why"] = "no account in the switch pool has a weekly reading"
+        return out
+    left = sum(max(0.0, 100.0 - r["weekly_pct"]) for r in known)
+    at, source = _horizon(known, now, horizon)
+    out.update(left_pct=round(left, 1), horizon_at=at, horizon_from=source)
+    spent = [(r["weekly_spent_pct"], r["weekly_spent_from"]) for r in known
+             if _num(r.get("weekly_spent_pct")) is not None
+             and _num(r.get("weekly_spent_from")) is not None]
+    span = max(0.0, now - min(f for _s, f in spent)) if spent else 0.0
+    out["span_s"] = int(span)
+    if span < MIN_BURN_SPAN_S:
+        out["why"] = ("the pool's weekly readings span %dm; a burn needs %dm"
+                      % (span // 60, MIN_BURN_SPAN_S // 60))
+        return out
+    rate = sum(s for s, _f in spent) / (span / HOUR)
+    out["pct_per_hour"] = round(rate, 2)
+    if at is None:
+        out["why"] = "no horizon: no pool account names a weekly reset"
+        return out
+    # A reset before the horizon adds a whole week; the headroom until it
+    # is already in `left`. The horizon is at most a week out: one reset.
+    supply = left + 100.0 * sum(1 for r in known
+                                if _num(r.get("weekly_reset_at")) is not None
+                                and r["weekly_reset_at"] < at)
+    if rate > 0:
+        out["runout_at"] = now + supply / rate * HOUR
+    if supply <= 0:
+        out.update(state=EASE, colour=burnflags.RED, runout_at=now,
+                   advice="the pool is spent until %s" % _day(at))
+        return out
+    ratio = rate / (supply / max((at - now) / HOUR, 1e-6))
+    out["ratio"] = round(ratio, 2)
+    held = (prior or {}).get("state") if isinstance(prior, dict) else None
+    if held == EASE and ratio >= EASE_CLEAR or ratio >= EASE_AT:
+        imminent = out["runout_at"] is not None \
+            and out["runout_at"] - now <= WINDOW_S
+        out.update(state=EASE, colour=burnflags.RED if imminent
+                   else burnflags.ORANGE,
+                   advice="ease off about %d%%" % _step(100 * (1 - 1 / ratio)))
+    elif held == FASTER and ratio <= FASTER_CLEAR or ratio <= FASTER_AT:
+        more = "" if ratio <= 0 else " (about %d%% more)" % min(
+            200, _step(100 * (1 / ratio - 1)))
+        out.update(state=FASTER, colour=burnflags.GREEN,
+                   advice="can go faster" + more)
+    else:
+        out.update(state=EVEN, colour=burnflags.YELLOW, advice="on pace")
+    return out
+
+
+def pool_clause(pool, short=False):
+    """The pool's pace in one clause: the colour, the adjustment, and (in
+    full) the burn, what is left, the run-out and the horizon."""
+    pool = pool if isinstance(pool, dict) else {}
+    if pool.get("state") in (None, UNKNOWN):
+        return "Claude pool pace UNKNOWN: %s" % (pool.get("why")
+                                                   or "not measured")
+    out, horizon = pool.get("runout_at"), pool.get("horizon_at")
+    vs = ("out ~%s, before horizon %s" % (_day(out), _day(horizon))
+          if out and horizon and out < horizon
+          else "lasts past horizon %s" % _day(horizon))
+    if short:
+        return "Claude pool %s: %s, %s" % (pool["colour"], pool["advice"], vs)
+    return ("Claude pool %s: %s; %.1f%%/h of a week over %.0fh, %.0f%% left, "
+            "%s" % (pool["colour"], pool["advice"],
+                    pool.get("pct_per_hour") or 0.0,
+                    (pool.get("span_s") or 0) / HOUR,
+                    pool.get("left_pct") or 0.0, vs))
+
+
+def _project_light(cwd):
+    """(project, authored colour, its reason) for a working directory, or
+    (None, None, ""): only an authored light binds (`registry.admits`' law).
+    Never raises."""
+    try:
+        from . import registry
+        from .inject import _ledger
+        reg = registry.load(strict=True)
+        key = _ledger.project_for_cwd(cwd, projects=reg.get("projects") or {})
+        if not key:
+            return None, None, ""
+        lit = registry.light(key, reg["projects"].get(key))
+    except Exception:                           # noqa: BLE001
+        return None, None, ""
+    if not lit["authored"] or lit["colour"] not in registry.LIGHT_SAYS:
+        return key, None, ""
+    return key, lit["colour"], str(lit.get("reason") or "")
+
+
+def advice(pool, cwd, short=False):
+    """What a seat hears after its headline: its project's light in the
+    registry's own sentence, the pool's pace, and LAST the light's authored
+    reason, so a cap at the steer cuts the reason and never the advice."""
+    from . import registry
+    key, colour, why = _project_light(cwd) if cwd else (None, None, "")
+    light = " %s is %s: %s." % (key, colour.upper(),
+                                registry.LIGHT_SAYS[colour]) if colour else ""
+    why = " %s's light: %s." % (key, why.strip().rstrip(".")) \
+        if colour and why.strip() else ""
+    return "%s %s.%s" % (light, pool_clause(pool, short=short), why)
 
 
 # ------------------------------------------------------------------ the pass
 
 def _recent_rows(now):
-    """The native history's rows from the last window and an hour: every
-    reading an open window can hold, and the newest one of a closed one."""
+    """The native history's rows from the last window and an hour (every
+    reading an open window can hold, and the pool's burn span), and each
+    account's newest READ row from the IDLE_MAX_AGE_S before that: an
+    unused account is read rarely, and that row is its idle reading and its
+    week."""
     from . import burnflags
-    floor = now - WINDOW_S - HOUR
-    return [row for row in burnflags._history_lines()
-            if (pk.parse_ts_epoch(row.get("probed_at")) or 0) >= floor]
+    floor, older, latest = now - WINDOW_S - HOUR, {}, {}
+    recent = []
+    for row in burnflags._history_lines():
+        at = pk.parse_ts_epoch(row.get("probed_at")) or 0
+        if at >= floor:
+            recent.append(row)
+        elif at >= now - IDLE_MAX_AGE_S:
+            # and its newest row of any status, which ends an idle reading
+            latest[row["account"]] = row
+            if str(row.get("status") or "").startswith(
+                    burnflags.READ_STATUSES):
+                older[row["account"]] = row
+    later = [r for a, r in latest.items() if r is not older.get(a)]
+    return list(older.values()) + later + recent
 
 
 def write_snapshot(reading, path=None):
@@ -269,15 +610,133 @@ def write_snapshot(reading, path=None):
         return False
 
 
+def _default_key():
+    """The default home's account handle, or None when it is unreadable."""
+    from . import homes
+    return _account_key(homes.DEFAULTS["claude"])
+
+
+def _census_tiers():
+    """{account name: plan} from the providers' account census: each home's
+    and Orca's account metadata files, with no vendor call."""
+    from . import providers
+    return {a["name"]: a["tier"]
+            for a in providers.NativeQuotaProvider().accounts()
+            if a.get("provider") == FAMILY and isinstance(a.get("tier"), str)}
+
+
 def watch_pass(now=None, rows=None, path=None):
     """The watchdog pass's rung: read the history, fold it against the prior
-    snapshot's states, persist -> the reading."""
+    snapshot's states, persist -> the reading. The account census is asked
+    only when some row names no plan (rows written before rows carried
+    one)."""
     now = time.time() if now is None else now
     rows = _recent_rows(now) if rows is None else rows
     prior = pk.read_json(path or snapshot_path(), default=None)
-    reading = read(rows, now, prior)
+    try:
+        default_key = _default_key()
+    except Exception:                           # noqa: BLE001
+        default_key = None
+    tiers, census = _tiers(rows), {}
+    if any(isinstance(r, dict) and r.get("account")
+           and r["account"] not in tiers for r in rows):
+        try:
+            census = _census_tiers()
+        except Exception:                       # noqa: BLE001
+            census = {}
+    reading = read(rows, now, prior, default_key=default_key,
+                   horizon=load_horizon(now), census=census)
     write_snapshot(reading, path=path)
     return reading
+
+
+# ------------------------------------------------------------------ horizon
+
+def horizon_path():
+    return os.path.join(home.helm_home(), home.GLOBAL, ".state", HORIZON_NAME)
+
+
+def load_horizon(now=None, path=None):
+    """The owner's horizon for the Claude pool ({"at", "by", "why", "ts"})
+    while it is ahead, else None."""
+    doc = pk.read_json(path or horizon_path(), default=None)
+    rec = doc.get(FAMILY) if isinstance(doc, dict) else None
+    at = _num((rec or {}).get("at")) if isinstance(rec, dict) else None
+    now = time.time() if now is None else now
+    return dict(rec, at=at) if at is not None and at > now else None
+
+
+def set_horizon(at, by=None, why=None, now=None, path=None):
+    """Record (or, with `at` None, clear) the owner's horizon -> (ok, err)."""
+    import json
+    now = time.time() if now is None else now
+    if at is not None and not now < at <= now + HORIZON_MAX_S:
+        return False, ("the horizon must be ahead of now and at most %d days "
+                       "out" % (HORIZON_MAX_S // 86400))
+    target = path or horizon_path()
+    doc = pk.read_json(target, default=None)
+    doc = doc if isinstance(doc, dict) else {}
+    if at is None:
+        doc.pop(FAMILY, None)
+    else:
+        doc[FAMILY] = {"at": at, "by": by or "unknown", "why": why or "",
+                       "ts": now}
+    try:
+        pk.atomic_write(target, json.dumps(doc, sort_keys=True))
+    except OSError as exc:
+        return False, "cannot write %s (%s)" % (target, exc)
+    return True, None
+
+
+_HORIZON_USAGE = ("helm burn horizon [anthropic <utc-iso> [reason...] | "
+                  "anthropic --clear]")
+
+
+def cmd_horizon(args):
+    """horizon [anthropic <utc-iso> [reason...] | anthropic --clear] — what
+    the Claude pool must last until. Bare prints it. Exit 2 on usage."""
+    import sys
+    args = list(args or ())
+    if not args:
+        rec = load_horizon()
+        if rec:
+            print("helm burn horizon: anthropic lasts until %s (set by %s%s)"
+                  % (_day(rec["at"]), rec.get("by") or "?",
+                     ": " + rec["why"] if rec.get("why") else ""))
+        else:
+            print("helm burn horizon: anthropic has no owner horizon; the "
+                  "pool paces to the soonest weekly reset that returns at "
+                  "least half a week")
+        return 0
+    if args[0] != FAMILY or len(args) < 2:
+        print("helm burn horizon: only %s has a pool horizon (codex paces to "
+              "its next Pro reset: `helm burn runway`)\nusage: %s"
+              % (FAMILY, _HORIZON_USAGE), file=sys.stderr)
+        return 2
+    if args[1] == "--clear":
+        ok, err = set_horizon(None)
+        print(("helm burn horizon: anthropic horizon cleared" if ok
+               else "helm burn horizon: %s" % err),
+              file=sys.stdout if ok else sys.stderr)
+        return 0 if ok else 2
+    at = pk.parse_ts_epoch(args[1])
+    if at is None:
+        print("helm burn horizon: %r is not a UTC instant (e.g. "
+              "2026-10-03T07:00Z)\nusage: %s" % (args[1], _HORIZON_USAGE),
+              file=sys.stderr)
+        return 2
+    from . import freetext
+    why, rc = freetext.tail("helm burn horizon", "reason", args[2:],
+                            "the reason", usage=_HORIZON_USAGE)
+    if rc is not None:
+        return rc
+    ok, err = set_horizon(at, by=home.chat_name(), why=why)
+    if not ok:
+        print("helm burn horizon: %s" % err, file=sys.stderr)
+        return 2
+    print("helm burn horizon: anthropic lasts until %s; the next watchdog "
+          "pass paces the pool to it" % _day(at))
+    return 0
 
 
 def _load(path=None):
@@ -344,7 +803,8 @@ def account_line(name, snap):
 
 
 def burn_lines(now=None):
-    """`helm burn`'s lines about the Claude 5h pace. Never raises."""
+    """`helm burn`'s lines about the Claude pace: one per account, the
+    pool's, and one per project with an authored light. Never raises."""
     try:
         snap = cached(now=now)
         if snap is None:
@@ -354,10 +814,52 @@ def burn_lines(now=None):
                       key=lambda r: str(r.get("label")))
         if not rows:
             return ["  claude 5h pace: no Claude account in the usage history"]
-        return ["  claude 5h pace %s: %s" % (r.get("label"), describe(r))
-                for r in rows]
+        out = ["  claude 5h pace %s: %s%s" % (r.get("label"), describe(r),
+                                              _week_suffix(r))
+               for r in rows]
+        # THE OWNER'S HORIZON AS IT STANDS NOW, over the pass's accounts, so
+        # a horizon just set shows here before the next pass carries it.
+        pool = pool_reading(snap["accounts"], snap["ts"],
+                            load_horizon(snap["ts"]), snap.get("pool"))
+        out.append("  claude pool pace: %s%s" % (
+            pool_clause(pool), _pool_suffix(pool)))
+        return out + _project_lines()
     except Exception as exc:                    # noqa: BLE001
         return ["  claude 5h pace: unreadable (%s)" % type(exc).__name__]
+
+
+def _week_suffix(rec):
+    if _num(rec.get("weekly_pct")) is None:
+        return ""
+    return "; week %.0f%%%s" % (rec["weekly_pct"],
+                                " (switch pool)" if rec.get("pool") else "")
+
+
+def _pool_suffix(pool):
+    if pool.get("state") in (None, UNKNOWN):
+        return ""
+    return "; %d of %d pool account(s) read, horizon %s" % (
+        pool["read"], pool["accounts"],
+        "owner-set" if pool.get("horizon_from") == "owner"
+        else "the soonest reset returning half a week")
+
+
+def _project_lines():
+    """One line per project whose light is authored, green first. An
+    unreadable registry costs these lines only, named."""
+    from . import registry
+    try:
+        lit = registry.lights(registry.load(strict=True))
+    except Exception as exc:                    # noqa: BLE001
+        return ["  claude pace per project: unreadable (%s)"
+                % type(exc).__name__]
+    order = ("green", "yellow", "orange", "red")
+    rows = sorted((order.index(v["colour"]), k) for k, v in lit.items()
+                  if v.get("authored") and v.get("colour") in order)
+    return ["  claude pace for %s (%s): %s%s" % (
+        k, order[i].upper(), registry.LIGHT_SAYS[order[i]],
+        " (reason: %s)" % lit[k]["reason"] if lit[k].get("reason") else "")
+        for i, k in rows]
 
 
 def steer_line(rec, homed=False):
@@ -369,6 +871,15 @@ def steer_line(rec, homed=False):
                      if rec.get("hit_at") else "",
                      _hm(rec.get("reset_at")),
                      STEER_HOMED if homed else STEER_ASK))
+
+
+def switch_line(rec, snap, cwd=None):
+    """The baseload seat's line while its pool has a switchable account: the
+    watcher will switch it, the pool's pace, and its project's advice."""
+    return ("REFLEX: 5h %s at %.0f%%, resets %s; %s.%s"
+            % (rec.get("state"), rec.get("used_pct") or 0.0,
+               _hm(rec.get("reset_at")), STEER_SWITCH,
+               advice((snap or {}).get("pool"), cwd, short=True)))
 
 
 def _pressed(snap):
@@ -420,22 +931,73 @@ def steer(context, said=None, now=None, snap=None):
         return None
     from . import cred
     homed = cred.is_credhome(context["config_home"])
-    if not homed and _room_elsewhere(payload, key) or _proxy_seat():
+    if _proxy_seat():
         return None
+    if not homed and _room_elsewhere(payload, key):
+        return switch_line(rec, payload, context.get("cwd")), _heard(key, rec)
     return steer_line(rec, homed), _heard(key, rec)
 
 
 def _room_elsewhere(snap, key):
-    """True when some other Claude account reads OK. The watcher moves a
-    BASELOAD seat's credential when its window caps, so such a seat on a
-    pressed account has nothing to do about it while another account has
-    room, and hears nothing. A seat homed to one credential (a named
-    credhome) is not moved, so this is never asked for it. UNKNOWN IS NOT
-    ROOM: an account with no reading of its window, or a record that names
-    no state, may be as full as this one, so only OK counts."""
-    return any(isinstance(r, dict) and r.get("state") == OK
+    """True when the watcher can switch a BASELOAD seat's home onto another
+    account (`switchable`). Such a seat is then told the switch is coming,
+    never to route away. A seat homed to one credential (a named credhome)
+    is not moved, so this is never asked for it. UNKNOWN IS NOT ROOM (task
+    3718): an account in use that nothing can read may be as full as this
+    one. An IDLE one is read: its window is not open (task/3871)."""
+    return any(switchable(r)
                for k, r in ((snap or {}).get("accounts") or {}).items()
                if k != key)
+
+
+def handoff(context, said=None, now=None, snap=None):
+    """(line, key) for a native Claude seat that has not heard the default
+    home's latest switch (`said` is the key it last heard), taking a turn
+    within HANDOFF_SAY_S of it, else None. One line per switch: the pool's
+    pace and the seat's project advice. A seat homed to an account outside
+    the pool does not hear it. Words only."""
+    context = context or {}
+    if context.get("harness") != "claude":
+        return None
+    payload = _load() if snap is None else snap
+    last = (payload or {}).get("switch")
+    at = _num(last.get("at")) if isinstance(last, dict) else None
+    if at is None:
+        return None
+    key = "switch|%d" % at
+    now = time.time() if now is None else now
+    if said == key or not 0 <= now - at <= HANDOFF_SAY_S:
+        return None
+    if snap is None and not _fresh(payload, now):
+        return None
+    if _off_pool(context, payload) or _proxy_seat():
+        return None
+    return ("REFLEX: " + switched_text(payload, context.get("cwd")), key)
+
+
+def switched_text(snap, cwd=None):
+    """The default home's latest switch with the advice after it (the
+    project's light for `cwd`, the pool's pace), or None when no switch is
+    recorded. The words each seat hears (`handoff`) and the #seats row
+    (task/3876, no cwd) share it. Words only."""
+    last = (snap or {}).get("switch")
+    at = _num(last.get("at")) if isinstance(last, dict) else None
+    if at is None:
+        return None
+    return ("the Claude home switched accounts at %s.%s"
+            % (_hm(at), advice(snap.get("pool"), cwd)))
+
+
+def _off_pool(context, snap):
+    """True for a seat homed (a named credhome) to an account the snapshot
+    does not read as in the switch pool: its spend is not known to be the
+    pool's, so it is not told."""
+    home_dir = context.get("config_home")
+    from . import cred
+    if not home_dir or not cred.is_credhome(home_dir):
+        return False
+    rec = ((snap or {}).get("accounts") or {}).get(_account_key(home_dir))
+    return not (isinstance(rec, dict) and rec.get("pool"))
 
 
 def _heard(key, rec):

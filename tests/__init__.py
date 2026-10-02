@@ -725,6 +725,37 @@ PLANTED["HELM_STOP_TIMING_AFTER"] = os.environ["HELM_STOP_TIMING_AFTER"]
 os.environ["HELM_QWEN27_FINDINGS"] = "off"
 PLANTED["HELM_QWEN27_FINDINGS"] = os.environ["HELM_QWEN27_FINDINGS"]
 
+# NO TEST MAY RING THE OWNER'S PHONE THROUGH THE OFFICE WEATHER (task/3902).
+#
+# Every bare idle-dispatch tick runs the office weather's pass, which reads
+# the live fleet (the chat node, the land timer through systemctl, the burn
+# flags) and pushes a settled storm to the owner's phone through
+# notify.owner_push. A suite inherits the environment that started it, and
+# HELM_NTFY_TOPIC is often in it, so one settled storm in any module that
+# drives the tick would ring a real phone. `off` is the production switch
+# (officeweather.SWITCH_ENV), not a test-only escape hatch: it makes the
+# weather's one phone seam inert and the tick's pass read nothing, in this
+# process and in every child it runs. It is set UNCONDITIONALLY, so an
+# inherited `on` cannot re-arm it. The arms ABOUT delivery hand the pass a
+# fake phone; tests/test_officeweather.py pins this plant and drives a
+# settled storm and a bare tick past it with HELM_NTFY_TOPIC set. Must equal
+# officeweather.SWITCH_ENV (this module may not import helm).
+os.environ["HELM_OFFICE_WEATHER"] = "off"
+PLANTED["HELM_OFFICE_WEATHER"] = os.environ["HELM_OFFICE_WEATHER"]
+
+# NO ARM'S FAILING LEG MAY COUNT TOWARD ANOTHER ARM'S TICK ALARM (task/4189).
+#
+# Every tick leg (the dark-seat mover, the friction autopilot, the office
+# weather, the idle-dispatch pass, and the timer entries of proxywatch, gc,
+# auto-land and beacons) records each pass in one state file under HELM_HOME,
+# and three failures in a row post a #seats row. The suite shares one
+# HELM_HOME per process, so arms that drive a leg into a planted failure
+# would add up across modules and post rows other arms count. `off` is the
+# production switch (tickalarm.SWITCH_ENV), set UNCONDITIONALLY. The arms
+# ABOUT the alarm (tests/test_tickalarm.py) turn it on for themselves.
+os.environ["HELM_TICK_ALARM"] = "off"
+PLANTED["HELM_TICK_ALARM"] = os.environ["HELM_TICK_ALARM"]
+
 # NO TEST MAY CHANGE THIS HOST'S SCHEDULER.
 #
 # `helm seat launch`, `spawn` and `resume` call autocompact.ensure_timer, which

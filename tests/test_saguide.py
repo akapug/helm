@@ -477,9 +477,8 @@ class WiredIntoTheContract(unittest.TestCase):
     def test_hooks_doc_enumerates_the_subagentstart_contract(self):
         """No stale docs: HOOKS.md enumerated every wired event except this one."""
         root = os.path.dirname(os.path.dirname(os.path.abspath(saguide.__file__)))
-        with open(os.path.join(root, "docs", "HOOKS.md"),
-                  encoding="utf-8") as fh:
-            doc = fh.read()
+        from tests.test_hooks_doc_fragments import assemble_hooks_doc
+        doc = assemble_hooks_doc(root)
         self.assertIn("`SubagentStart`", doc)          # the event
         self.assertIn("helm saguide --hook-json", doc)  # its command
         # The status line must state INSTALLATION, never delivery — the
@@ -751,6 +750,22 @@ class ReviewAndSiblingPhysicsTest(unittest.TestCase):
                       "same-question", "xfam-reviewer-fixes-its-own-findings",
                       "reviewer-implements-own-findings"):
             self.assertIn(entry, g)
+
+    def test_the_long_form_bounds_the_review_room_exception(self):
+        g = " ".join(saguide.guidance().split())
+        for rule in ("reviewer SUBAGENT has NO room of its own",
+                     "only route generic reviewer authority grants",
+                     "git clone --shared <repo> <scratch>/wt",
+                     "fetch --no-write-fetch-head <scratch>/wt <sha>",
+                     "no refspec", "For an explicit BUILD",
+                     "sole delegate a REGISTERED lane room",
+                     "PARENT owns the lease through completion or accepted handoff",
+                     "helm work release", "unfinished work is not released",
+                     "git worktree add", "unregistered shared worktree",
+                     "unleased shared branch", "permission bypass",
+                     "config/canon edit", "test-home leak", "publication"):
+            with self.subTest(rule=rule):
+                self.assertIn(rule, g)
 
 
 if __name__ == "__main__":

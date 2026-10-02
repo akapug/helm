@@ -112,10 +112,15 @@ class LaneWorld(object):
         import os
         from unittest import mock as _mock
         from helm import dispatches
+        from tests._tmphome import review_task
+        tasks = self.__dict__.setdefault("_fixture_review_tasks", {})
+        if kind == "review" and lane not in tasks:
+            tasks[lane] = review_task(self, "stop facts %s" % lane)
+        task = tasks.get(lane) if kind == "review" else None
         with _mock.patch.dict(os.environ, {"HELM_CHAT_NAME": "gate-fixture"}):
             row = dispatches.add("ds4pro", lane, ref=ref or self.head,
                                  kind=kind, notify=False, repo=self.root,
-                                 new_work=True)
+                                 new_work=True, task=task)
         self.assertIsNotNone(row, "plant: the real writer refused")
         dispatches._mark_delivered(row["id"], ref or self.head)
         return row

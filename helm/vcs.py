@@ -4,7 +4,7 @@
 SCOPE, stated honestly up front: this module owns the version-control calls of
 `helm work` (the worktree + lane lifecycle), `helm ship`, `helm capsule`, the
 handoff/now probes, the lane gc verdict reads, and automap's root resolver. It
-is NOT yet every git call in helm — 51 direct spawns remain outside it.
+is NOT yet every git call in helm — 54 direct spawns remain outside it.
 Script-run hook scanners are standing exceptions because an installed snapshot
 cannot import helm; every remaining entry is declared migration debt. Those
 are ENUMERATED AND PINNED by `DirectSpawnAuditTest` in tests/test_vcs.py, whose
@@ -1258,6 +1258,12 @@ class Vcs:
         identity, hooks bypassed. Strictly loss-reducing."""
         raise NotImplementedError
 
+    def wip_commit_side_ref(self, path, msg, side_ref):
+        """(rc, out, err) — stage everything and commit to side_ref under the
+        janitor identity without moving HEAD or current branch.
+        Strictly loss-reducing."""
+        raise NotImplementedError
+
     def ahead_behind(self, root, base, tip):
         """(behind, ahead) as printed, or None when the read failed."""
         raise NotImplementedError
@@ -2220,14 +2226,14 @@ class GitVcs(Vcs):
         """ANCESTOR / PATCH_EQUIVALENT / NOT_ANCESTOR / UNKNOWN — did the WORK
         in `tip` reach `ref`?
 
-        ANCESTRY ASKS THE WRONG QUESTION AND GETS A TRUTHFUL 'NO'. Almost
-        nothing lands under the sha its author wrote: the integrator REBASES
-        the chain onto current trunk and gates the rebased tree, so the commit
-        on trunk is patch-identical and object-different. `merge-base
-        --is-ancestor` then correctly answers "that exact object is not
-        reachable", the reaper reads NOT LANDED, and the well-behaved lane
-        keeps its branch FOREVER. Every agent following the rule correctly
-        accumulates lanes — measured on this repo 2026-08-03: 107 `lane/*`
+        ANCESTRY ANSWERS SHA REACHABILITY, NOT EVERY WAY CONTENT CAN LAND.
+        Today's exact-sha train merge preserves the reviewed commit as an
+        ancestor, so ancestry answers yes. Historical rebases and cherry-picks
+        carried patch-identical content under different objects; `merge-base
+        --is-ancestor` truthfully answered "that exact object is not
+        reachable", the reaper read NOT LANDED, and the well-behaved lane
+        kept its branch forever. Those historical lanes accumulated —
+        measured on this repo 2026-08-03: 107 `lane/*`
         branches, 20 reachable by ancestry, and 7 whose entire content was
         already on trunk under different shas and therefore invisible to the
         only predicate the reaper had.
@@ -2555,8 +2561,8 @@ class GitVcs(Vcs):
           benign rebase, identical content -> the two ids are IDENTICAL (recall kept)
           trailing-whitespace difference   -> the two ids DIFFER      (hole closed)
         The first arm is what makes this admissible at all: this predicate
-        guards the path that exists BECAUSE helm lands work rebased, so a check
-        that broke on a rebase would delete the feature it is protecting.
+        guards the historical rebase/cherry-pick path: a check that broke
+        on those content-equivalent lands would delete the feature it protects.
 
         HONEST LIMIT: `--verbatim` keeps context lines, so a rebase that shifts
         the lines AROUND a hunk changes the id and this reads False -> UNKNOWN
@@ -2733,6 +2739,48 @@ class GitVcs(Vcs):
         return self.text(path, "-c", "user.name=helm-work",
                          "-c", "user.email=helm-work@local",
                          "commit", "--no-verify", "-m", msg, env=env)
+
+    def wip_commit_side_ref(self, path, msg, side_ref):
+        """The lost-and-found write to a side ref: stage EVERYTHING, write tree,
+        commit under the janitor identity onto side_ref, and reset the index
+        to HEAD so the branch ref and HEAD are left UNMOVED.
+        Strictly loss-reducing and reversible."""
+        # A SUCCESS MUST NAME A WRITE. The caller reports "rescued -> <ref>"
+        # on rc 0 and envtidy may then remove the room, whose dirt this path
+        # leaves on disk; so a failed add, or a tree with nothing to rescue,
+        # is non-zero and the room is kept, as main's `wip_commit` keeps it
+        # when its commit finds nothing staged (task/4002).
+        rc_a, _, err_a = self.text(path, "add", "-A")
+        if rc_a != 0:
+            return rc_a, "", err_a or "add -A failed"
+        rc, tree, err = self.text(path, "write-tree")
+        if rc != 0:
+            return rc, "", err or "write-tree failed"
+        tree = tree.strip()
+        rc_head, head, err_head = self.text(path, "rev-parse", "--verify", "HEAD")
+        if rc_head != 0:
+            return rc_head, "", err_head or "rev-parse HEAD failed"
+        head = head.strip()
+        rc_ht, head_tree, _ = self.text(path, "rev-parse", "--verify", head + "^{tree}")
+        if rc_ht == 0 and tree == head_tree.strip():
+            self.text(path, "reset", "-q", "HEAD")
+            return 1, "", ("nothing to rescue: the staged tree equals HEAD's, "
+                           "so no side ref was written")
+        env = dict(os.environ)
+        env.update(GIT_AUTHOR_NAME="helm-work", GIT_COMMITTER_NAME="helm-work",
+                   GIT_AUTHOR_EMAIL="helm-work@local",
+                   GIT_COMMITTER_EMAIL="helm-work@local")
+        rc_c, commit, err_c = self.text(
+            path, "-c", "user.name=helm-work", "-c", "user.email=helm-work@local",
+            "commit-tree", tree, "-p", head, "-m", msg, env=env)
+        if rc_c != 0:
+            return rc_c, "", err_c or "commit-tree failed"
+        commit = commit.strip()
+        rc_u, _, err_u = self.text(path, "update-ref", side_ref, commit)
+        if rc_u != 0:
+            return rc_u, "", err_u or ("update-ref %s failed" % side_ref)
+        self.text(path, "reset", "-q", "HEAD")
+        return 0, commit, ""
 
 
     def ahead_behind(self, root, base, tip):

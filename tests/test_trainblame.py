@@ -101,10 +101,13 @@ class BlameBase(_lw.TrainBase):
         return rows
 
     def red(self, traceback="AssertionError: boom", room=None, status="FAILED",
-            test=TEST_ID):
+            test=TEST_ID, host=None):
         """A red receipt for the room's head, in the minting grammar, plus the
-        window's job log that names it -> (receipt id, log path)."""
+        window's job log that names it -> (receipt id, log path). It ran on
+        `host` (default FAST), the node both the receipt and the job log's
+        gate-job event record; "" records none."""
         room = room or self.room()
+        host = self.FAST if host is None else host
         head = self.git("rev-parse", "HEAD", cwd=room)
         tree = self.git("rev-parse", "HEAD^{tree}", cwd=room)
         failures = [] if status == "OK" else [
@@ -115,7 +118,7 @@ class BlameBase(_lw.TrainBase):
                "interpreter": {"name": "cpython", "version": "3.13.7",
                                "language": "3.13.7",
                                "executable": "/usr/bin/python3"},
-               "host": {"node": "fixture-node", "system": "Linux",
+               "host": {"node": host, "system": "Linux",
                         "release": "6.8.0", "id": "ab" * 8},
                "argv": ["/usr/bin/python3", "-m", "unittest", "discover",
                         "-s", "tests", "-t", "."],
@@ -137,6 +140,10 @@ class BlameBase(_lw.TrainBase):
         log = gatewindow.log_path(self.store, "gate-" + "e" * 64)
         os.makedirs(os.path.dirname(log), exist_ok=True)
         with open(log, "w", encoding="utf-8") as fh:
+            if host:
+                fh.write(json.dumps({"event": "gate-job", "node": host,
+                                     "snapshot": {"receipt": row["id"]}})
+                         + "\n")
             fh.write(json.dumps({"exit": row["rc"], "receipt": row["id"],
                                  "state": "COMPLETED",
                                  "verdict": "imported"}) + "\n")
@@ -144,9 +151,17 @@ class BlameBase(_lw.TrainBase):
 
     # -- the seams ---------------------------------------------------------
 
-    def prefix_fab(self, red_when):
+    def prefix_fab(self, red_when, sick=None, unread=None, place=None,
+                   moved=None, echo=None):
         """The prefix-run seam: red exactly when `red_when(worktree)` says
         so, placed on the first configured host the exclusion leaves.
+
+        `sick` is a host that fails every tree (train561's red host); a run at
+        commit `unread` never reaches its end marker; `place` is a host Fab
+        places every run on whatever the exclusion says; `moved` is a host
+        Fab moves every run to while it queues, after placing it on its pin,
+        as a node's slot-queue MOVE does; `echo` is a line the run itself
+        prints, between its markers.
 
         Both unittest reports are printed HERE, in the arm's thread: the verb
         calls `_fab` from its thread pool, and a TextTestRunner opened there
@@ -157,18 +172,26 @@ class BlameBase(_lw.TrainBase):
         def _fab(argv, timeout=None, env=None):
             given = None if env is None else env.get(EXCLUDE_ENV)
             shut = set((given or "").split())
-            host = next((h for h in (self.FAST, self.SLOW) if h not in shut),
-                        "anywhere")
+            host = place or next((h for h in (self.FAST, self.SLOW)
+                                  if h not in shut), "anywhere")
             where = argv[argv.index("--repo") + 1]
             head = self.git("rev-parse", "HEAD", cwd=where)
             self.runs.append({"argv": list(argv), "exclude": given,
                               "host": host, "head": head})
+            if head == unread:
+                return 1, "fab: no host could place the run\n", ""
             nonce = _NONCE.search(argv[-1]).group(1)
-            red = red_when(where)
-            out = ("fab: role=test-primary -> %s (priority=normal)\n"
-                   "helm-train-blame-%s BEGIN\n%s"
-                   "helm-train-blame-%s END %d\nfab: exit=%d\n"
-                   % (host, nonce, report[red], nonce, int(red), int(red)))
+            ran = moved or host
+            self.runs[-1]["host"] = ran
+            red = ran == sick or red_when(where)
+            out = ("fab: role=test-primary -> %s (priority=normal)\n%s"
+                   "helm-train-blame-%s BEGIN\n%s%s"
+                   "helm-train-blame-%s END %d\nfab: exit=%d  LOG: "
+                   "%s:~/fab/logs/j1.log\n"
+                   % (host, "fab: id=j1  MOVED %s -> %s  LOG: %s:~/fab/logs/"
+                      "j1.log\n" % (host, moved, moved) if moved else "",
+                      nonce, echo + "\n" if echo else "", report[red], nonce,
+                      int(red), int(red), ran))
             return int(red), out, ""
         return _fab
 
@@ -192,12 +215,12 @@ class BlameBase(_lw.TrainBase):
                                  for p in paths)
 
     def blame(self, apply=True, gate_token=None, red_when=None, tell=None,
-              as_json=False, room=None, audits=None):
+              as_json=False, room=None, audits=None, **seam):
         out = io.StringIO()
         rc = _blame().blame(
             room or self.room(), gate=gate_token, apply=apply,
             as_json=as_json,
-            fab=self.prefix_fab(red_when or (lambda _w: False)),
+            fab=self.prefix_fab(red_when or (lambda _w: False), **seam),
             door=self.door("r2", live=()), tell=tell or self.tell(), out=out,
             **({"audits": audits} if audits else {}))
         return rc, out.getvalue()
@@ -230,8 +253,10 @@ class OneNamedCarIsEjectedWithoutBisect(BlameBase):
         self.assertEqual(rc, 0, text)
         self.assertIn("EJECT", text)
         self.assertIn("lane two", text)
-        # NO BISECT: blame by diff named exactly one car (R2).
-        self.assertEqual(self.runs, [])
+        # NO BISECT: blame by diff named exactly one car (R2). The one run is
+        # trunk on the red's own host, the pass that licenses the ejection.
+        self.assertEqual([(r["head"], r["host"]) for r in self.runs],
+                         [(self.trunk, self.FAST)])
         # THE TRAIN GOES ON WITHOUT IT, composed the same way, through the
         # door: a new room, the other cars in their order, one more launch.
         again = self.room("train1b")
@@ -398,6 +423,31 @@ class EjectionIsNeverSilent(BlameBase):
             for fact in (TEST_ID, log, gid):
                 self.assertIn(fact, said)
         self.assertTrue(os.path.isdir(self.room("train1b")))
+
+    def test_a_disputed_car_ejects_with_dm_but_no_wrong_task_comment(self):
+        from helm import dispatches, taskkey
+        rows = self.compose(("one", "g"), ("fix-task-7", TEST_FILE))
+        self.red()
+        first, target = rows[0][0]["id"], rows[1][0]["id"]
+        original = dispatches.snapshot
+
+        def contradictory():
+            current, why = original()
+            current[first] = dict(current[first], task="task/7")
+            current[target] = dict(current[target], chain_root=first)
+            return current, why
+
+        with mock.patch.object(dispatches, "snapshot", contradictory), \
+                mock.patch.object(taskkey, "lane_records", return_value=(
+                    {"fix-task-7": frozenset({"task/8"})}, None)):
+            rc, text = self.blame()
+        self.assertEqual(rc, 0, text)
+        self.assertIn("task UNKNOWN", text)
+        self.assertIn("task/7", text)
+        self.assertIn("task/8", text)
+        self.assertEqual(len(self.dms), 1)
+        self.assertEqual(self.comments, [])
+        self.assertEqual(len(self.ejections()), 1)
 
     def test_a_failing_dm_refuses_loudly_and_composes_nothing(self):  # noqa: VACUOUS_ASSERTION — the refusal is the contract; the refusal text and the printed undelivered text are positive, and the sibling arm composes
         self.compose_task_lane()
@@ -696,8 +746,10 @@ class ARedPreGateAuditIsBlamedByDiffAlone(BlameBase):
         self.assertEqual(rc, 0, text)
         self.assertIn("EJECT car 2 (lane two", text)
         self.assertIn("pre-gate audits", text)
-        # BY DIFF, NEVER A BISECT: no prefix ran.
-        self.assertEqual(self.runs, [])
+        # BY DIFF, NEVER A BISECT: the one run is trunk, on the host the
+        # audits' placement line names, which licenses the ejection.
+        self.assertEqual([(r["head"], r["host"]) for r in self.runs],
+                         [(self.trunk, self.FAST)])
         # THE TRAIN GOES ON WITHOUT IT, composed and gated by the same door.
         again = self.room("train1b")
         self.assertEqual(self.cars_of(again), ["one", "three"])
@@ -788,7 +840,8 @@ class ARedPreGateAuditIsBlamedByDiffAlone(BlameBase):
     def test_the_audits_red_names_the_host_the_audits_ran_on(self):
         """Auto-land re-runs the failing modules alone
         on the audits' own host before blame, and that host is the log's
-        `fab: role=... -> HOST` placement line."""
+        `fab: role=... -> HOST` placement line, or the node Fab MOVED the
+        job to after it, which the closing `LOG: HOST:` line confirms."""
         trainblame = _blame()
         self.compose(("one", "g"), ("two", TEST_FILE))
         train, why = trainblame.read_room(self.room("train1"))
@@ -797,6 +850,20 @@ class ARedPreGateAuditIsBlamedByDiffAlone(BlameBase):
         red, why = trainblame.audit_red(train, log)
         self.assertIsNone(why, why)
         self.assertEqual(red["host"], self.FAST)
+        # A JOB FAB MOVED while it queued ran on the node it moved to.
+        with open(log, encoding="utf-8") as fh:
+            text = fh.read()
+        moved = os.path.join(self.tmp, "moved-audits.log")
+        with open(moved, "w", encoding="utf-8") as fh:
+            fh.write(text.replace(
+                "(priority=normal)\n", "(priority=normal)\nfab: id=j1  "
+                "MOVED %s -> %s  LOG: %s:~/fab/logs/j1.log\n"
+                % (self.FAST, self.SLOW, self.SLOW), 1).replace(
+                "fab: exit=1\n", "fab: exit=1  LOG: %s:~/fab/logs/j1.log\n"
+                % self.SLOW))
+        red, why = trainblame.audit_red(train, moved)
+        self.assertIsNone(why, why)
+        self.assertEqual(red["host"], self.SLOW)
         self.assertEqual([t["id"] for t in red["tests"]], [TEST_ID])
         # CONTROL: the same red log without its placement line names none.
         with open(log, encoding="utf-8") as fh:
@@ -887,6 +954,188 @@ class ARedPreGateAuditIsBlamedByDiffAlone(BlameBase):
         self.assertEqual([r["tip"] for r in self.ejections()
                           if r["event"] == "eject"], [tip])
         self.assertEqual(len(self.posts), 1, self.posts)
+
+
+class ABackMergedLaneIsChargedOnlyWithItsOwnChanges(BlameBase):
+    """task/4145 (a). lane/train-resume-wording-4133 was cut from a lane
+    trunk later merged, then merged trunk back in: two merge bases with
+    trunk, and its merge-base diff (`trunk...tip`) charged it with trunk's
+    own changes, among them the red module. A car's touched set is what its
+    merge ADDED to the room over the prefix below it."""
+
+    TRACE = ('File "/node/wt/helm/alpha.py", line 2, in f | File '
+             '"/node/wt/helm/beta.py", line 3, in g | AssertionError: boom')
+
+    def back_merged(self):
+        """Lane `back`, cut from lane `base`, merges trunk back in and adds
+        its own file; trunk then merges `base`. -> back's tip."""
+        self.git("checkout", "-q", "-b", "base", self.trunk)
+        base = self.commit("base", path="helm/alpha.py")
+        self.git("checkout", "-q", self.main)
+        self.commit("trunk moves", path="helm/beta.py")
+        self.git("checkout", "-q", "-b", "back", base)
+        self.git("merge", "-q", "--no-ff", "-m",
+                 "merge origin/main into lane/back", self.main)
+        tip = self.commit("back's own", path="own")
+        self.git("checkout", "-q", self.main)
+        self.git("merge", "-q", "--no-ff", "-m", "trunk merges base", "base")
+        return tip
+
+    def test_a_back_merged_lane_is_not_blamed_for_trunks_module(self):  # noqa: VACUOUS_ASSERTION — back named for nothing is the contract; real named for helm/alpha.py and its ejection are the positive control on the same observable
+        back = self.back_merged()
+        trunk = self.git("rev-parse", self.main)
+        row = self.dispatch(ref=back, lane="back")
+        _row, err = self.mark_verdict(row["id"], back, "ok",
+                                      polarity="approve")
+        self.assertIsNone(err, err)
+        rows = [(row, back), self.ready("real", "helm/alpha.py", base=trunk)]
+        for step, (row, _tip) in enumerate(rows):
+            self.age(row["id"], 100 * (len(rows) - step))
+        rc, text = self.train()
+        self.assertEqual(rc, 0, text)
+        self.red(self.TRACE)
+        # THE DEFECT'S SHAPE, MEASURED: two merge bases, and the merge-base
+        # diff of back's tip charges it with a trunk file the red names.
+        self.assertEqual(len(self.git("merge-base", "--all", trunk,
+                                      back).split()), 2)
+        charged = set(self.git("diff", "--name-only", "%s...%s"
+                               % (trunk, back)).split())
+        self.assertTrue(charged & {"helm/alpha.py", "helm/beta.py"},
+                        charged)
+        rc, text = self.blame(apply=False, as_json=True)
+        self.assertEqual(rc, 0, text)
+        got = json.loads(text)
+        cars = {c["lane"]: c for c in got["cars"]}
+        # BACK IS CHARGED ONLY WITH ITS OWN FILE, and named for nothing.
+        self.assertEqual(cars["back"]["named"], [])
+        # CONTROL: the car whose own change touches the named module is
+        # named, alone, so blame by diff takes it without a bisect.
+        self.assertEqual(cars["real"]["named"], ["helm/alpha.py"])
+        self.assertEqual((got["verdict"]["by"], got["verdict"]["car"]["lane"]),
+                         ("diff", "real"))
+        rc, text = self.blame()
+        self.assertEqual(rc, 0, text)
+        self.assertIn("EJECT car 2 (lane real", text)
+        self.assertEqual([s.split("merge lane ")[1] for s in self.git(
+            "log", "--first-parent", "--format=%s", "%s..HEAD" % trunk,
+            cwd=self.room("train1b")).splitlines()], ["back"])
+
+
+class TrunkOnTheRedsHostLicensesTheEjection(BlameBase):
+    """task/4145 (b). train561 went red on a host that fails every tree, and
+    auto-land's re-run of the red tests on that host failed again, as a host
+    fault does, so blame by diff ejected an innocent car. Before any car is
+    ejected, the failing tests run on TRUNK on the host the red ran on:
+    trunk red there is TRUNK-RED naming the host, a trunk run that cannot be
+    made or read is UNKNOWN, and either ejects nothing."""
+
+    def assert_nothing_ejected(self, rc, text, spawned, kind):
+        self.assertIn(kind, text)
+        self.assertNotIn("EJECT car", text)
+        self.assertFalse(os.path.exists(self.room("train1b")))
+        self.assertEqual(len(self.spawns), spawned)
+        self.assertEqual((self.dms, self.comments, self.posts), ([], [], []))
+        self.assertEqual(self.ejections(), [])
+        self.assertEqual(self.blame_rooms(), [])
+
+    def test_a_red_host_that_fails_trunk_too_ejects_nothing(self):
+        self.compose(("one", "g"), ("two", TEST_FILE), ("three", "i"))
+        self.red()
+        spawned = len(self.spawns)
+        rc, text = self.blame(as_json=True, sick=self.FAST)
+        self.assertEqual(rc, 0, text)
+        got = json.loads(text)
+        self.assertEqual(got["verdict"]["kind"], "TRUNK-RED")
+        self.assertIn(self.FAST, got["verdict"]["why"])
+        self.assertEqual(got["verdict"]["spared"]["lane"], "two")
+        self.assertIsNone(got["verdict"]["car"])
+        # ONE RUN: trunk, pinned to the red's host.
+        self.assertEqual([(r["head"], r["host"]) for r in self.runs],
+                         [(self.trunk, self.FAST)])
+        self.assert_nothing_ejected(rc, got["text"], spawned, "TRUNK-RED")
+        # CONTROL: the same red, the sick host one the red never ran on.
+        rc2, text2 = self.blame(sick=self.SLOW)
+        self.assertEqual(rc2, 0, text2)
+        self.assertIn("EJECT car 2 (lane two", text2)
+        self.assertEqual(self.cars_of(self.room("train1b")), ["one", "three"])
+
+    def test_the_bisect_runs_trunk_on_the_reds_host_first(self):
+        # two named cars, so the verb bisects; the red ran on SLOW, the host
+        # that fails every tree, and FAST is listed first.
+        self.compose(("one", "helm/alpha.py"), ("two", TEST_FILE),
+                     ("three", "i"))
+        self.red('File "/node/wt/helm/alpha.py", line 2, in f | '
+                 'AssertionError: boom', host=self.SLOW)
+        spawned = len(self.spawns)
+        rc, text = self.blame(sick=self.SLOW, as_json=True)
+        self.assertEqual(rc, 0, text)
+        got = json.loads(text)
+        self.assertEqual(got["verdict"]["kind"], "TRUNK-RED")
+        trunk = [r["host"] for r in self.runs if r["head"] == self.trunk]
+        self.assertEqual(trunk, [self.SLOW])
+        self.assert_nothing_ejected(rc, got["text"], spawned, "TRUNK-RED")
+        # CONTROL: no sick host, only car two breaks it: ejected.
+        def broken(where):
+            with open(os.path.join(where, TEST_FILE), encoding="utf-8") as fh:
+                return "two" in fh.read()
+        rc2, text2 = self.blame(red_when=broken)
+        self.assertEqual(rc2, 0, text2)
+        self.assertEqual(self.cars_of(self.room("train1b")), ["one", "three"])
+
+    def test_an_unreadable_trunk_run_ejects_nothing(self):
+        self.compose(("one", "g"), ("two", TEST_FILE))
+        self.red()
+        spawned = len(self.spawns)
+        rc, text = self.blame(unread=self.trunk)
+        self.assertEqual(rc, 1, text)
+        self.assertIn("REFUSED", text)
+        self.assertIn("never reached its end marker", text)
+        self.assert_nothing_ejected(rc, text, spawned, "UNKNOWN")
+        # A RUN FAB PLACED OFF ITS PIN answers for another host: UNKNOWN.
+        rc, text = self.blame(place=self.SLOW)
+        self.assertEqual(rc, 1, text)
+        self.assertIn("Fab placed it on %s" % self.SLOW, text)
+        self.assert_nothing_ejected(rc, text, spawned, "UNKNOWN")
+        # CONTROL: the same red, trunk read green on its host, ejects.
+        rc, text = self.blame()
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(self.cars_of(self.room("train1b")), ["one"])
+
+    def test_a_trunk_run_fab_moved_off_its_pin_ejects_nothing(self):
+        # The red ran on FAST, the host that fails every tree; Fab places the
+        # pinned trunk run there, then MOVES it off its slot queue to SLOW,
+        # where trunk passes. That pass answers for SLOW, never for FAST.
+        self.compose(("one", "g"), ("two", TEST_FILE))
+        self.red()
+        spawned = len(self.spawns)
+        rc, text = self.blame(sick=self.FAST, moved=self.SLOW)
+        self.assertEqual(rc, 1, text)
+        self.assertIn("pinned to %s, Fab placed it on %s"
+                      % (self.FAST, self.SLOW), text)
+        self.assertEqual([(r["head"], r["host"]) for r in self.runs],
+                         [(self.trunk, self.SLOW)])
+        self.assert_nothing_ejected(rc, text, spawned, "UNKNOWN")
+        # CONTROL: the run's OWN output naming another host is not Fab's
+        # word: trunk read green on its pin ejects.
+        rc, text = self.blame(echo="fab: id=j9  MOVED %s -> %s  LOG: "
+                                   "%s:x" % (self.FAST, self.SLOW, self.SLOW))
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(self.cars_of(self.room("train1b")), ["one"])
+
+    def test_a_red_with_no_recorded_host_ejects_nothing(self):  # noqa: VACUOUS_ASSERTION — nothing run and nothing ejected are the contract; the recorded-host red of the same head ejects
+        self.compose(("one", "g"), ("two", TEST_FILE))
+        gid, _log = self.red(host="")
+        spawned = len(self.spawns)
+        rc, text = self.blame(gate_token="gate:" + gid)
+        self.assertEqual(rc, 1, text)
+        self.assertIn("no host is recorded", text)
+        self.assertEqual(self.runs, [])
+        self.assert_nothing_ejected(rc, text, spawned, "UNKNOWN")
+        # CONTROL: a red of the same head that records its host ejects.
+        gid2, _log2 = self.red(host=self.FAST)
+        rc, text = self.blame(gate_token="gate:" + gid2)
+        self.assertEqual(rc, 0, text)
+        self.assertEqual(self.cars_of(self.room("train1b")), ["one"])
 
 
 class TheSeamPrintsItsReportsInTheArmsThread(BlameBase):

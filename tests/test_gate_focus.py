@@ -1222,9 +1222,11 @@ class FocusVerdictArms(FocusBase):
 
     def _dispatch(self, tip):
         os.makedirs(os.environ["HELM_HOME"], exist_ok=True)
+        from tests._tmphome import review_task
+        task = review_task(self)
         row, err = dispatches.add("reviewer", "a-lane", tip, kind="review",
                                   repo=self.repo, notify=False, _reason=True,
-                                  new_work=True)
+                                  new_work=True, task=task)
         self.assertIsNone(err, err)
         return row
 
@@ -1501,9 +1503,11 @@ class CounterfeitArms(FocusBase):
         # THE CEILING: the land-authorizing verdict refuses it, before the
         # ledger, at the exact tip it was assembled for.
         os.makedirs(os.environ["HELM_HOME"], exist_ok=True)
+        from tests._tmphome import review_task
         d, err = dispatches.add("reviewer", "unrun-lane", self.head,
                                 kind="review", repo=self.repo, notify=False,
-                                _reason=True, new_work=True)
+                                _reason=True, new_work=True,
+                                task=review_task(self, "unrun receipt fixture"))
         self.assertIsNone(err, err)
         got, err = dispatches.mark_verdict(
             d["id"], self.head, gate.evidence_line(row), "approve")
@@ -1526,7 +1530,8 @@ class CounterfeitArms(FocusBase):
         # second row rather than asserted from the CLI help.
         d2, err = dispatches.add("reviewer", "untokened-lane", self.head,
                                  kind="review", repo=self.repo, notify=False,
-                                 _reason=True, new_work=True)
+                                 _reason=True, new_work=True,
+                                 task=review_task(self, "untokened fixture"))
         self.assertIsNone(err, err)
         bare, err = dispatches.mark_verdict(d2["id"], self.head,
                                             "2 blockers", "fix")

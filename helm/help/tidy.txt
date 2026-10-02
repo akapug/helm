@@ -1,0 +1,1 @@
+tidy [--apply] [--repo PATH] — the umbrella: census + hooks sync + mcp sync + worktree gc, all dry-run; one consolidated report (--apply runs them all backup-first; --repo points the census + worktree-gc legs at another repo root)

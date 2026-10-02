@@ -48,13 +48,21 @@ FOUR PASSES, ONE PLAN, and the plan is the same object in a dry run and an
   4. RECEIPTS. Every automatic act leaves a comment on the task that starts
      with tasks.SWEEP_RECEIPT_MARK, and nothing is ever deleted.
 
-THE CANDIDATE LIST IS THE RECEIPTS, NOT A SIDE FILE. A row is a close
-candidate, marked landed, because its own comments say a full land was
-linked to it; a row
+THE CANDIDATE LIST IS THE LAND, NOT A SIDE FILE (task/3746). A row is a
+close candidate, marked landed, because a full land names it: its own
+comments carry the sweep's LANDED receipt, or the land step's question or
+whole-land note (helm/landtask.py), or trunk carries a train merge that
+names it and no receipt was written yet. The last is the one that listed
+nothing: seven open rows' lanes had landed their whole ask while `helm task
+close-candidates` found none, because a row was a candidate only once a
+`helm stale sweep --apply` had written its receipt, and the scheduled sweep
+runs dry. A candidate names its LAND (the land step's, else the land log's
+number for its train) and whether its lane carried the whole ask. A row
 was pinged because its own comments say so. There is no second store to
 drift from the ledger, and every state this module acts on is readable in
-`helm task show`. The receipts are never motion (a bot saying a row is stale
-must not make it fresh), and tasks.noted_epoch skips them for the same reason.
+`helm task show`. The receipts and the land step's comments are never motion
+(a machine saying a row landed or is stale must not make it fresh), and
+tasks.noted_epoch skips the receipts for the same reason.
 """
 import os
 import re
@@ -83,8 +91,10 @@ RECORDED, INFERRED = "recorded", "inferred"
 # A train merge's subject. The parenthetical is free prose; only its FIRST
 # token is read as the car's task, because later mentions are other rows
 # ("change 2 cut to task/3552", "verdict machinery moved to task/3558").
-_TRAIN = re.compile(r"^(train\d+): merge lane (\S+)(?: at ([0-9a-f]{7,40}))?"
-                    r"(?:\s+\((.*))?$")
+# A recomposed train keeps its number and takes a letter (train555b): it is
+# the same kind of land, so its merges are read like any other train's.
+_TRAIN = re.compile(r"^(train\d+[a-z]?): merge lane (\S+)"
+                    r"(?: at ([0-9a-f]{7,40}))?(?:\s+\((.*))?$")
 _HEAD_TASK = re.compile(r"^\s*task[/-](\d{1,6})\b", re.IGNORECASE)
 # a lane that marks a PART of the task it already carries: -3529a (part a),
 # -3533p2 (part 2); -3301-r3 is a third attempt at the whole task, not a
@@ -397,13 +407,36 @@ def _latest_land(receipts):
     return None
 
 
+def _machine_note(c):
+    """Is comment `c` a machine's record: the sweep's receipt, the friction
+    autopilot's count, or the land step's question or whole-land note?"""
+    from . import frictionpilot, landtask
+    return tasks.is_sweep_receipt(c) or frictionpilot.is_receipt(c) or (
+        isinstance(c, dict) and landtask.parse_comment(c.get("text"))
+        is not None)
+
+
+def _land_steps(row):
+    """The land step's own comments on the row, oldest first ->
+    [(ts, {land, sha, lane, tip, whole})] (helm/landtask.py)."""
+    from . import landtask
+    out = []
+    for c in tasks.comments_of(row):
+        got = landtask.parse_comment(c.get("text")) \
+            if isinstance(c, dict) else None
+        if got:
+            out.append((tasks.stamp_epoch(c.get("ts")) or 0.0, got))
+    return out
+
+
 def _bot_event(row, prior):
-    """Did this ledger event only carry the sweep's own act? A receipt
-    comment appended, or the stale-bot's unassign — never motion."""
+    """Did this ledger event only carry a machine's act? A sweep receipt or
+    a land step comment appended, or the stale-bot's unassign — never
+    motion."""
     before = [c for c in prior.get("comments") or () if isinstance(c, dict)]
     new = [c for c in row.get("comments") or ()
            if isinstance(c, dict) and c not in before]
-    if new and all(tasks.is_sweep_receipt(c) for c in new):
+    if new and all(_machine_note(c) for c in new):
         return True
     rel = row.get("released")
     return isinstance(rel, dict) and rel.get("by") == BOT \
@@ -436,7 +469,7 @@ def motion_of(row, commit_motion, dispatch_at, history):
     tid = row.get("id")
     best = (tasks.filed_epoch(row) or 0.0, "filed")
     for c in tasks.comments_of(row):
-        if not tasks.is_sweep_receipt(c):
+        if not _machine_note(c):
             at = tasks.stamp_epoch(c.get("ts"))
             if at and at > best[0]:
                 best = (at, "comment")
@@ -453,11 +486,15 @@ def motion_of(row, commit_motion, dispatch_at, history):
 
 
 def _children(rows_):
+    """{id: [the open rows below it, at ANY depth]} over the story roll-up
+    (`tasks.story_facts`, task/3746): an open grandchild under a closed
+    child still holds its story's root, as it does `helm task close`."""
     out = {}
-    for r in rows_.values():
-        parent = r.get("continues")
-        if parent and r.get("status") in tasks.OPEN_STATUSES:
-            out.setdefault(parent, []).append(r.get("id"))
+    for tid, facts in tasks.story_facts(rows_).items():
+        kids = [r.get("id") for r in facts.get("below") or ()
+                if r.get("status") in tasks.OPEN_STATUSES]
+        if kids:
+            out[tid] = kids
     return out
 
 
@@ -477,6 +514,18 @@ def _reverted(sha, reverted):
     """Is land `sha` (full or a 12-char prefix) named by any revert?"""
     return next((r for r in reverted
                  if r.startswith(sha) or sha.startswith(r)), None)
+
+
+def _land_numbers(root):
+    """{train: "LAND N"} from the land log, or {} when it cannot be read: a
+    candidate's LAND is a label, never a condition."""
+    try:
+        from . import autoland
+        lands, _why = autoland.land_log(root)
+    except Exception:                           # noqa: BLE001 — a label only
+        return {}
+    return {str(line.get("train")): "LAND %d" % n
+            for n, line in sorted(lands.items()) if line.get("train")}
 
 
 def _needs_word(row):
@@ -559,6 +608,7 @@ def plan(now=None, path=None, repo=None, trunk=None, dispatch_path=None,
     blind = "motion UNKNOWN: %s" % "; ".join(unavailable) \
         if unavailable else None
     children = _children(snap)
+    numbers = _land_numbers(root)
     quiet = quiet_s()
     actions, candidates = [], []
     counts = {"close_candidates": 0, "landed_unread": 0,
@@ -578,7 +628,7 @@ def plan(now=None, path=None, repo=None, trunk=None, dispatch_path=None,
             continue
         receipts = _receipts(row)
         linked = _linked_shas(receipts)
-        new_full = False
+        new_full, unreceipted = False, None
         for c in sorted(lands.get(tid, ()), key=lambda c: c["ct"]):
             if c["sha"][:12] in linked or c["sha"] in linked:
                 continue
@@ -587,11 +637,22 @@ def plan(now=None, path=None, repo=None, trunk=None, dispatch_path=None,
             tr = c["train"]
             kind = ANNOTATE_PART if tr["partial"] else ANNOTATE
             new_full = new_full or not tr["partial"]
+            if not tr["partial"]:
+                unreceipted = {"sha": c["sha"][:12], "train": tr["train"],
+                               "land_at": c["ct"], "noted_at": c["ct"]}
             actions.append({"kind": kind, "id": tid, "sha": c["sha"][:12],
                             "train": tr["train"], "lane": tr["lane"],
                             "land_at": c["ct"], "text": _land_text(
                                 kind, tid, c["sha"][:12], tr, c["ct"])})
-        land = _latest_land(receipts)
+        receipted = _latest_land(receipts)
+        steps = _land_steps(row)
+        step_at, step = steps[-1] if steps else (None, None)
+        # A FULL LAND NAMES THE ROW (task/3746): the sweep's receipt, else
+        # a trunk land no receipt records yet, else the land step's own
+        # comment. Only a receipted land is ever asked of its holder.
+        land = receipted or unreceipted or ({
+            "sha": step["sha"], "train": None, "land_at": step_at,
+            "noted_at": step_at} if step else None)
         mot_at, mot_what = motion_of(row, commit_motion, dispatch_at, history)
         if land:
             counts["close_candidates"] += 1
@@ -623,9 +684,16 @@ def plan(now=None, path=None, repo=None, trunk=None, dispatch_path=None,
                     "train": land["train"], "noted_at": land["noted_at"],
                     "quiet_left_s": max(0.0, quiet - waited),
                     "blockers": blockers, "state": state,
-                    "needs_confirm": word}
+                    "needs_confirm": word,
+                    "land": (step or {}).get("land")
+                    or numbers.get(str(land["train"])),
+                    "whole": step["whole"] if step else None,
+                    "receipted": bool(receipted),
+                    # a whole land's seen-working check (helm/observed.py)
+                    "check": _check_note(row)}
             candidates.append(cand)
-            if blockers or waited < quiet or not word:
+            if blockers or waited < quiet or not word or not receipted \
+                    or cand["check"]:
                 continue
             # A P0 OR AN OWNER-ASKED ROW'S HOLDER IS DMed once per land to
             # re-read and confirm; the row stays a candidate for
@@ -651,6 +719,13 @@ def plan(now=None, path=None, repo=None, trunk=None, dispatch_path=None,
             "duplicates": propose_duplicates(snap) if duplicates else [],
             "counts": counts, "links_refused": refused,
             "unavailable": unavailable}
+
+
+def _check_note(row):
+    """The seen-working check `row` owes, in words, or None."""
+    from . import observed
+    owed = observed.owes(row)
+    return observed.note(owed, row["id"]) if owed else None
 
 
 def _land_text(kind, tid, sha, tr, ct):
@@ -853,28 +928,51 @@ def close_candidates(**kw):
     return rep["candidates"], rep["unavailable"]
 
 
-def confirm_close(token, by, path=None):
+def confirm_close(token, by, path=None, plan_lands=False,
+                  open_children=None):
     """The owner's one word -> (row, error): close a CURRENT close candidate
-    with its land in the reason. Refused for a row with no full-land
-    receipt, and for a row another seat holds."""
+    with its land in the reason. A candidate's land is its full-land
+    receipt, else the land step's comment, else (`plan_lands`, the CLI's
+    reading) the trunk land the candidate list names it by. Refused for a
+    row no full land names, for a row another seat holds, and, as `helm task
+    close` is (task/3746), for a row with open sub-tasks unless
+    `open_children` is tasks.OPEN_CHILDREN_STAY, which records them."""
     row = tasks.get(token, path=path)
     if not row:
         return None, "%s does not exist" % token
     if row.get("status") not in tasks.OPEN_STATUSES:
         return None, "%s is already closed" % row["id"]
     land = _latest_land(_receipts(row))
+    steps = _land_steps(row)
+    if not land and steps:
+        step = steps[-1][1]
+        land = {"sha": step["sha"], "train": step["land"] or "a hand land"}
+    if not land and plan_lands:
+        got = {c["id"]: c for c in close_candidates(path=path)[0]}
+        land = got.get(row["id"])
     if not land:
         return None, ("%s is not a close candidate: no train naming the "
                       "whole task is linked to it (a part-land never is). "
                       "Close it with `helm task close %s <reason>`"
                       % (row["id"], row["id"]))
+    # A WHOLE LAND'S TASK CLOSES ON A SEEN-WORKING CHECK (helm/observed.py),
+    # never on a confirm with no evidence.
+    from . import observed
+    owed = observed.owes(row)
+    if owed:
+        return None, ("%s landed whole and %s; it closes with that check, "
+                      "not with confirm-close" % (row["id"],
+                                                  observed.note(owed,
+                                                                row["id"])))
     holder = tasks.owner_of(row)
     if holder and not tasks.held_by(row, by):
         return None, ("%s is held by %s — the owner confirms its close, "
                       "not %s" % (row["id"], holder, by))
     return tasks.close(row["id"], "landed on trunk at %s (%s); close "
                        "confirmed by @%s" % (land["sha"], land["train"], by),
-                       path=path, expect=row)
+                       path=path, expect=row,
+                       open_children=open_children
+                       or tasks.OPEN_CHILDREN_REFUSE)
 
 
 def freshness_counts(**kw):

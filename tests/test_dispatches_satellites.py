@@ -49,7 +49,7 @@ IMPORT_TIME = {
 #: How many names the six declarations hand over, measured at the cut. An
 #: absence below proves nothing about an empty declaration, so each arm first
 #: asserts the population it searches is this size.
-DECLARED = {"dispatches_spiral": 21, "dispatches_tier": 30,
+DECLARED = {"dispatches_spiral": 21, "dispatches_tier": 36,
             "dispatches_carriage": 11, "dispatches_announce": 34,
             "dispatches_rebind": 13, "dispatches_retract": 15}
 

@@ -861,6 +861,27 @@ class FlushIsolationTest(RestoreBase):
         self.assertNotIn("meld row that must NOT reach disk", journal)
         self.assertIn("meld-bad", report.get("quarantined") or {})
 
+    def test_a_task_pair_meld_is_skipped_when_the_lifecycle_leg_is_down(self):
+        """A task's pair meld is named `<scope>-<N>` (helm-3742), with no
+        `meld-` prefix, and its lifecycle is mirrored like any meld's: a
+        globally failed lifecycle leg skips it by name too."""
+        chat.post("healthy room row", room="helm", who="alice")
+        chat.post("task meld row that must NOT reach disk", room="helm-3742",
+                  who="bob")
+        chat.post("legacy pair row that must NOT reach disk",
+                  room="meld-0-pair-helm-task-3112", who="bob")
+        boom = meld.LifecycleError("meld lifecycle RAM directory UNKNOWN: nope")
+        report = {}
+        with mock.patch.object(meld, "flush_lifecycle", side_effect=boom):
+            chat.log_flush(report=report)
+        journal = self.journal_text()
+        # CONTROL: the ordinary room still reaches disk
+        self.assertIn("healthy room row", journal)
+        self.assertNotIn("task meld row that must NOT reach disk", journal)
+        self.assertNotIn("legacy pair row that must NOT reach disk", journal)
+        self.assertEqual(sorted(report.get("quarantined") or {}),
+                         ["helm-3742", "meld-0-pair-helm-task-3112"])
+
     def test_one_unreadable_room_does_not_discard_the_rooms_after_it(self):
         """The room loop had no per-room guard: same blast radius, one level down.
 

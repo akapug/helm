@@ -274,9 +274,9 @@ class OneLinePerVerbListingTest(unittest.TestCase):
         self.assertEqual(got["ship"], "[pull|hosts]")
         self.assertEqual(got["record"], "[status|install|swallows]")
         self.assertEqual(got["todos"], "[promote <id>|demote]")
-        self.assertEqual(got["friction"], "[record <guard>|dial]")
+        self.assertEqual(got["friction"], "[record <guard>|dial|autopilot]")
         self.assertEqual(got["scratch"],
-                         "[small|big|durable|gc|unattributable|status]")
+                         "[small|big|durable|gc|evicted|restore <path>...]")
         for verb, start in (
                 ("burn",
                  "[why <family>|burst|runway|calibrate|declare"),

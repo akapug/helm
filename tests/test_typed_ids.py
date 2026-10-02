@@ -396,13 +396,13 @@ class TipMatrixTest(DispatchBase):
         with mock.patch.object(dispatches, "_acting_author", acting), \
                 mock.patch.object(dispatches, "_nudge", lambda *a: None):
             rc, _out, err = run(dispatches.cmd_dispatch, [
-                "hold", row["id"], "awaiting the land gate",
+                "hold", row["id"], "awaiting the land gate; fab Ran 5 tests OK",
                 "--source-clean", self.c[:12] + "0" * 28])
             self.assertEqual(rc, 1, err)
             self.assertIn(self.c, err)
             self.assertEqual(self.kinds(row["id"]), ["dispatch"])
             rc, _out, err = run(dispatches.cmd_dispatch, [
-                "hold", row["id"], "awaiting the land gate",
+                "hold", row["id"], "awaiting the land gate; fab Ran 5 tests OK",
                 "--source-clean", self.c[:12]])
         self.assertEqual(rc, 0, err)
         self.assertEqual(

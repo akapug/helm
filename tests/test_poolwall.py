@@ -27,7 +27,8 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from helm import poolwall, proxywatch, seat, seat_lifecycle  # noqa: E402
+from helm import (chat, home, localnames, poolwall, proxywatch,  # noqa: E402
+                  seat, seat_lifecycle)
 
 SEAT = "seat-under-test"
 FAMILY = "codex"
@@ -572,6 +573,56 @@ class OneLinePerWallTest(_Home):
         self.assertIsNone(poolwall.announce(SEAT, now=self.at + 60,
                                             post=posted.append))
         self.assertEqual(len(posted), 1)
+
+
+class TheWallReachesItsStewardTest(_Home):
+    """task/3876 cure F1: a pool wall is a credential wall. Its one line goes
+    to #seats and @mentions the credentials steward, never to #helm addressed
+    to nobody."""
+
+    def setUp(self):
+        super().setUp()
+        self.at = _epoch(STAMP)
+        self.write_log(_row(STAMP, 429, MESSAGE))
+        self.family = _family_by_name()
+        self.family.start()
+        self.addCleanup(self.family.stop)
+        os.makedirs(home.global_dir(), exist_ok=True)
+        with open(os.path.join(home.global_dir(), localnames.CONFIG), "w",
+                  encoding="utf-8") as f:
+            f.write('{"cred-steward-seat": "creds-steward"}')
+        localnames._cache["stat"] = None
+
+    @staticmethod
+    def room(name):
+        path = chat.room_path(name)
+        if not os.path.exists(path):
+            return []
+        with open(path, encoding="utf-8") as f:
+            return [json.loads(line)["text"] for line in f if line.strip()]
+
+    def test_the_pass_posts_each_wall_once_to_seats_for_the_steward(self):  # noqa: VACUOUS_ASSERTION — the #seats row counts (1, then 2) are the unconditional positive controls; the empty #helm is the moved room
+        proxywatch._seat_events_pass([SEAT], None, self.at + 60)
+        proxywatch._seat_events_pass([SEAT], None, self.at + 120)
+        rows = self.room("seats")
+        self.assertEqual(len(rows), 1, rows)
+        self.assertTrue(rows[0].startswith("@creds-steward "), rows[0])
+        self.assertIn("6 cooling down", rows[0])
+        self.assertEqual(self.room("helm"), [])
+        # A FRESH REFUSAL AFTER EXPIRY is a new wall on the same seat, and
+        # its own row: poolwall's claim is the episode, not the seat
+        later = "2026-09-16 06:30:00"
+        self.write_log(_row(STAMP, 429, MESSAGE), _row(later, 429, MESSAGE))
+        proxywatch._seat_events_pass([SEAT], None, _epoch(later) + 60)
+        rows = self.room("seats")
+        self.assertEqual(len(rows), 2, rows)
+        self.assertIn(poolwall.iso(_epoch(later) + RESET_S), rows[1])
+
+    def test_announce_posts_its_line_to_seats(self):
+        body = poolwall.announce(SEAT, now=self.at + 60)
+        self.assertIsNotNone(body)
+        self.assertEqual(self.room("seats"), ["@creds-steward " + body])
+        self.assertEqual(self.room("helm"), [])
 
 
 class VendorCauseTest(unittest.TestCase):

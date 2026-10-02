@@ -118,7 +118,8 @@ import shutil
 import sys
 import time
 
-from . import home
+from . import cvcompat, home
+
 
 # Fire at >= this pct (override: HELM_AUTOCOMPACT_THRESHOLD). 80, not 90, per the
 # owner (2026-07-29: "autocompact ACTUALLY fires at 80" for every proxied seat).
@@ -154,6 +155,10 @@ SUBMIT_VERIFY_READ_TIMEOUT_S = 0.5
 RECOVERY_SYSTEM_HEADROOM = 30000  # cv: resumed load is window + ~30k system
 RECOVERY_MAX_WINDOW = 180000       # transcripts.prune_session's proven ceiling
 RECOVERY_MIN_WINDOW = 2000
+# the context-wall recovery's name as an UNATTENDED caller of `seat._resume`
+# (task/3695): an automatic recovery never becomes manual for a recipe
+# missing only fields a defaults resume never carried
+RECOVERY = "the context-wall recovery"
 
 _USAGE = """usage: helm seat autocompact [--seat S] [--threshold N] [--once]
                              [--dry-run] [--quiet] [--json]
@@ -226,7 +231,7 @@ def scan_claude():
         ("0", "off", "no", "false")
 
 
-def _window(family, model=None):
+def _window(family, model=None, role=None):
     """(window_tokens, source) for a seat of `family` running `model`;
     (None, reason) when unknowable. `model` None = the family default.
 
@@ -237,14 +242,37 @@ def _window(family, model=None):
     gpt-5.6-sol (320k). Dividing a sol seat's reading by astra's window read
     231,746 tokens as 105% and posted a CLIMBING refusal for a seat Claude
     Code was compacting natively at 240k. The source names the key that
-    decided, spelled as pi.py spells it."""
+    decided, spelled as pi.py spells it.
+
+    `role` is the seat's launch posture (task/4049): a LEAD is taught a
+    narrower window, and this gauge must divide by the SAME number — one dial,
+    two readers, or a lead is compacted against a window it was never taught."""
+    # THE ROLE REACHES THE NATIVE LEG ONLY, and the gate lives HERE rather
+    # than at read()'s call site because this is where the number is computed
+    # — a caller that reaches `_window` directly must get the same answer the
+    # gauge does (task/4049 cure). The lead window exists because a native
+    # claude pane is taught NO window today and the alternative is Claude
+    # Code's unchosen 200k default. A PROXY pane is already taught its
+    # family's catalog window by its own launch line
+    # (`seat_launch_assets.launch_line` -> `launch_window(fam, model)`, no
+    # role), so narrowing the GAUGE for a proxy lead would divide the reading
+    # by a number that pane was never taught: measured, a codex seat taught
+    # 320k and a kimi seat taught 380k would have been compacted at 80% of
+    # 240k. The one-dial rule cuts this way — the gauge must equal the line,
+    # so the role counts only where the line reads it.
     from . import seat
-    from .seat_catalog import launch_window
+    # The lead working window is the catalog's, never repeated here
+    # (task/4049): the launch line stamps it and this gauge divides by it.
+    from .seat_catalog import LEAD_CONTEXT_WINDOW, launch_window
+    if family in seat.FAMILIES:
+        role = None
     fam = seat.FAMILIES.get(family) or {}
     per_model = (fam.get("model_context") or {}).get(model) \
         if isinstance(model, str) else None
-    win = launch_window(fam, model if per_model else None)
+    win = launch_window(fam, model if per_model else None, role=role)
     if win:
+        if role == "lead" and win == LEAD_CONTEXT_WINDOW:
+            return win, "FAMILIES.lead_window"
         if win != (per_model or fam.get("max_context")):
             return win, "FAMILIES.context_budget"
         if per_model:
@@ -541,6 +569,16 @@ def read(seat_name):
     d = seat._instance_dir(family, seat_name)
     rec = seat._spawn_record(d) or {}
     owned = rec if rec.get("seat") == seat_name else {}
+    # THE POSTURE COMES FROM THE SEAT'S OWN REGISTER, never from the seat's
+    # name: what a lead IS was decided by whoever spawned it, and the record
+    # is where that decision was written down (seat.py persists `role`, and
+    # the worker branch deliberately drops an inherited marker). A register
+    # with no role is an ordinary worker.
+    #
+    # IT REACHES THE NATIVE LEG ONLY (task/4049 cure) — the gate itself lives
+    # in `_window`, so a direct caller and this gauge agree.
+    from .seat_role import recorded_role
+    role = recorded_role(seat_name)
     registered = owned.get("session")
     row = {"seat": seat_name, "family": family, "ctx_tokens": None,
            "pct": None, "source": None, "model": None, "session": None,
@@ -548,7 +586,7 @@ def read(seat_name):
            "pane_handle": owned.get("handle"),
            "pane_harness": owned.get("harness"), "age_s": None,
            "reading": None, "reading_at": None}
-    win, win_src = _window(family)
+    win, win_src = _window(family, role=role)
     row["window"], row["window_src"] = win, win_src
     if win is None:
         row["status"] = "window-unset"
@@ -596,7 +634,7 @@ def read(seat_name):
         from .seat_catalog import instance_launch_model
         model = owned.get("model") or instance_launch_model(
             seat.FAMILIES.get(family) or {}, seat_name)
-    win, win_src = _window(family, model)
+    win, win_src = _window(family, model, role=role)
     row["window"], row["window_src"] = win, win_src
     if row["ctx_tokens"] is None:
         row["status"] = "no-context-data"
@@ -1006,7 +1044,7 @@ def _prune_context(row):
     if glob.glob(target_glob):
         return None, "pinned prune target already exists", False
     cmd = ["cv", "prune", sid, "--to", target, "--window", str(budget),
-           "--thinking", "--json"]
+           cvcompat.drop_thinking(), "--json"]
     env = home.cv_env()
     env["CLAUDE_CONFIG_DIR"] = os.path.join(d, "claude")
 
@@ -1037,9 +1075,9 @@ def _prune_context(row):
         report = json.loads((p.stdout or "").strip())
     except (TypeError, ValueError):
         return failed("cv prune returned no valid JSON report")
-    if not isinstance(report, dict) or report.get("newId") != target:
+    if not isinstance(report, dict) or cvcompat.field(report, "new_id") != target:
         return failed("cv prune report did not identify the pinned target")
-    if report.get("sourceId") not in (None, sid):
+    if cvcompat.field(report, "source_id") not in (None, sid):
         return failed("cv prune report identified a different source session")
     copy = seat._seat_session_path_by_id(d, target)
     if not copy:
@@ -1069,15 +1107,50 @@ def _fire_prune_resume(row, ad, handle, detail, tail):
         mode, clear_detail = _fire_clear(row["seat"], ad, handle, detail, tail)
         return mode, "%s; LAST RESORT /clear because %s" % (
             clear_detail, prune_detail)
-    rc = seat._resume(row["seat"], [], _locked=True, target_sid=new_sid,
-                      expected_session=row.get("registered_session"), adapter=ad)
+    import contextlib
+    import io
+    said, erred = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(said), \
+                contextlib.redirect_stderr(erred):
+            rc = seat._resume(row["seat"], [], _locked=True,
+                              target_sid=new_sid,
+                              expected_session=row.get("registered_session"),
+                              adapter=ad, unattended=RECOVERY)
+    finally:
+        # the pass's own output keeps every line, as before, a resume that
+        # raised included
+        sys.stdout.write(said.getvalue())
+        sys.stderr.write(erred.getvalue())
+    # THE LOUD LINE REACHES THE OWNER'S RECORD (task/3695): the detail is
+    # what the chat post carries, and stdout reaches no one. A resume on
+    # today's defaults, or one that leaves the seat down, says so there in
+    # the resume's own words; only an exact resume reads "exact"
+    loud = _loud_line(said.getvalue() + "\n" + erred.getvalue())
     if rc:
-        return ("resume-manual", "%s; automatic exact-session resume failed; "
-                "the original and pruned session %s both survive — run `helm "
-                "seat resume %s` after inspecting the pane" %
-                (prune_detail, new_sid, row["seat"]))
+        return ("resume-manual", "%s; automatic resume did not run%s; the "
+                "original and pruned session %s both survive — run `helm seat "
+                "resume %s` after inspecting the pane" % (
+                    prune_detail, " (%s)" % loud if loud else "", new_sid,
+                    row["seat"]))
+    if loud:
+        return ("pruned-resumed", "%s; resumed session %s on TODAY'S "
+                "defaults, not exactly: %s" % (prune_detail, new_sid, loud))
     return ("pruned-resumed", "%s; resumed exact session %s" %
             (prune_detail, new_sid))
+
+
+def _loud_line(text):
+    """The resume's own line saying it did not resume exactly — the
+    unattended WARNING that it took today's defaults, or the refusal naming
+    why it left the seat down — or None."""
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("WARNING: ") and RECOVERY in line:
+            return line
+        if line.startswith("helm seat: ") and "refus" in line.lower():
+            return line[len("helm seat: "):]
+    return None
 
 
 def _context_recovery_action(row, adapter, fire, limit, evidence):
@@ -1206,22 +1279,33 @@ def _rebrief_after_clear(seat_name, ad, handle):
     return "cleared", "session cleared; onboarding brief re-injected into pane %s" % handle
 
 
+def _classify_current(handle, tail, read_error=None):
+    """One current composer, with the injection record that names Helm's line.
+
+    A successful read is itself a positive output observation. Classify still
+    keeps an empty or unlocatable tail in CANNOT_TELL. An expired record still
+    proves whose text is stranded (task/3594): identity does not expire.
+    """
+    from . import composers, resumeturn
+    return composers.classify(
+        {"handle": handle, "last_output_at": True}, tail,
+        read_error=read_error,
+        injection=resumeturn.recorded_injections(
+            include_expired=True).get(handle))
+
+
 def _fire_clear(seat_name, ad, handle, detail, tail):
     """Queue /clear once, but only into a positively empty current composer."""
     from . import composers, harness
     if _command_pending(tail, "clear"):
         return "clear-pending", "pane %s already has /clear queued" % handle
-    # This door's successful read is itself a positive output observation;
-    # classify still keeps an empty/unlocatable tail in CANNOT_TELL.
-    pane = {"handle": handle, "last_output_at": True}
     try:
         current = ad.read(handle, limit=2000)
         if _command_pending(current, "clear"):
             return "clear-pending", "pane %s already has /clear queued" % handle
-        state, body, why = composers.classify(pane, current)
+        state, body, why = _classify_current(handle, current)
     except (harness.HarnessError, OSError) as e:
-        state, body, why = composers.classify(
-            pane, None, read_error=str(e))
+        state, body, why = _classify_current(handle, None, read_error=str(e))
     if state != composers.CLEAR or body != "":
         return ("recovery-manual", "pane %s current composer is %s — %s; "
                 "/clear was NOT injected" % (handle, state, why))
@@ -1483,9 +1567,20 @@ def _fire(row, adapter):
                     (handle, state or "UNKNOWN",
                      " (%s)" % blocked_on if blocked_on else ""))
         if not _EMPTY_COMPOSER.match(composer or ""):
+            from . import composers
+            owned, _body, why = _classify_current(handle, tail)
+            # /compact is not the sweep. A dead deliverer's exact line is
+            # cleared by the next helm beacons --post pass.
+            pointer = (
+                " — the next helm beacons --post sweep "
+                "(resumeturn.sweep_stranded) clears a dead deliverer's "
+                "exact line"
+                if owned in (composers.HELM_PENDING, composers.HELM_STRANDED)
+                else "")
             return ("refused-unknown",
-                    "pane %s composer contains unsent input; /compact was not "
-                    "injected" % handle)
+                    "pane %s composer contains unsent input (%s — %s)%s; "
+                    "/compact was not injected"
+                    % (handle, owned, why, pointer))
         return _actuate_compact(
             row, ad, handle, detail, tail, "/compact", "injected",
             "/compact + Enter")

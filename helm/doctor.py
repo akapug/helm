@@ -1435,6 +1435,23 @@ def check_filesystems():
                        "inode pressure UNKNOWN" % (e.__class__.__name__, e))]
 
 
+def check_slice_limits(read=None):
+    """agents.slice's limits against the derivation from this box (task/3847,
+    helm/slicelimits.py). Names every limit not produced by it, a live value
+    the unit files would change at the next daemon-reload, every other
+    drop-in that sets one (a second source), and every drop-in whose comment
+    waits 'until task/N' when task/N is closed: a stopgap whose exit
+    condition was met while its number stayed. A box with no agents.slice
+    unit answers one OK. READ-ONLY, and it never FAILs."""
+    try:
+        from . import slicelimits
+        rows = (read or slicelimits.doctor_rows)()
+    except Exception as exc:              # noqa: BLE001 — a rung that cannot
+        return [(WARN, "slice limits: cannot tell (%s: %s)"  # look says so
+                       % (exc.__class__.__name__, exc))]
+    return [(WARN if level == "warn" else OK, text) for level, text in rows]
+
+
 def check_build_skew():
     """Each built tool's installed commit against its source checkout's HEAD
     (buildskew.py, task/2963): SAME is OK; a SKEW names the installed commit
@@ -1575,6 +1592,25 @@ def check_local_names():
     from . import localnames
     return [(WARN, "local names: %s — that setting takes its neutral default "
                    "until it is fixed" % why) for why in localnames.problems()]
+
+
+def check_dark_mover():
+    """The dark-seat mover's kill switch (task/3881): automatic, or OFF."""
+    from . import darkmove
+    on, text = darkmove.switch_state()
+    return [(OK if on else WARN, text)]
+
+
+def check_tick_legs():
+    """Each tick leg's RESULT, never its switch (task/4189).
+
+    The rung above says the dark-seat mover is "automatic"; it said so for
+    the three days the mover raised on every pass. A switch is an intent. This
+    rung reads what each leg's last passes did (`tickalarm`, which every tick
+    leg reports to): a leg at the alarm count is a FAILURE, a leg whose last
+    pass failed a WARN."""
+    from . import tickalarm
+    return tickalarm.doctor_rows()
 
 
 # The harness versions the physics facts were probed against (physics.py
@@ -2196,13 +2232,17 @@ def check_chat_node():
                          "chat " + chat._safe_reason(report[1])))
     head = chat.node_head(url)
     if head is None:
-        # WHY IT IS NOT ANSWERING, WHEN THE UNIT CAN SAY: a node still in its
-        # verified-runtime init is not down; a refusal with one known cure,
-        # and a process running past the boot wait with no API, are FAILs
-        # that say so (chatnode.unreachable_line, the same line `helm chat
-        # node status` prints). A clean stop stays the plain WARN below.
+        # WHY IT IS NOT ANSWERING, WHEN THE UNIT CAN SAY: a node still
+        # booting (its blocklace replay, its verified-runtime init) is not
+        # down, and neither is one listening past boot; one whose CPU helm
+        # cannot read is a WARN that says so, never hung; a refusal with one
+        # known cure, and a process with no listener whose main thread made
+        # no progress past the boot wait, are FAILs that say so
+        # (chatnode.unreachable_line, the same line `helm chat node status`
+        # prints). A clean stop stays the plain WARN below.
         d = _node.boot_diagnosis(url)
-        if d["state"] in ("initializing", "preparing"):
+        if d["state"] in ("booting", "unanswered", "unmeasured",
+                          "initializing", "preparing"):
             return degraded + [(WARN, "chat room node " +
                                 _node.unreachable_line(url, d))]
         if d["state"] in ("refused", "hung"):
@@ -2747,6 +2787,15 @@ def check_metaharness(detect=None, which=None):
                 "; also present: " + ", ".join(others) if others else ""))]
 
 
+def check_cubicle_mover():
+    """The cubicle mover's switch and floor (helm/cubicles.py, task/3900):
+    whether the seat resume tick moves fleet seats' tabs between the owner's
+    Orca panes, plans only, or is off."""
+    from . import cubicles
+    ok, text = cubicles.switch_state()
+    return [(OK if ok else WARN, text)]
+
+
 def check_authoring_disclosure():
     """Machine-authorship notes that have already reached published history.
 
@@ -2862,6 +2911,16 @@ def check_harness_mirror():
                           "every mirrored row, so the loop is STOPPED, not "
                           "idle" % rep["dedup_unreadable"]))
         return out
+    if rep.get("registry_unreadable"):
+        # Same shape as the dedup refusal above. An empty import with no
+        # line here reads as a healthy mirror, and the sweep refused rather
+        # than filing every row under helm (task/3994).
+        out.append((WARN, "harness mirror: the project registry is "
+                          "UNREADABLE (%s) — the sweep refuses rather than "
+                          "filing every row under %s, so the loop is STOPPED, "
+                          "not idle" % (rep["registry_unreadable"],
+                                        tasksmirror.PROJECT)))
+        return out
     live = len(rep["imported"])
     if live:
         out.append((WARN, "harness mirror: %d live task(s) in %d session(s) "
@@ -2887,6 +2946,99 @@ def check_harness_mirror():
                           "a loop that stops work vanishing must not vanish "
                           "what it cannot read" % (len(bad), shown)))
     return out
+
+
+def check_task_homes():
+    """Open task rows that name no project (task/3745).
+
+    EVERY ROW LIVES IN EXACTLY ONE PROJECT: a row with none is listed by no
+    project's default `helm task list`, so no lead burns it down. `helm task
+    add` refuses such a row, but API callers can still file one, so this
+    rung counts what is left. OK at zero. A closed row is history and is not
+    counted. An unreadable ledger is UNKNOWN, never zero."""
+    try:
+        from . import tasks
+        snap, unavailable = tasks.snapshot()
+    except Exception as exc:              # noqa: BLE001 — a rung that cannot
+        return [(WARN, "task homes: cannot tell (%s)"      # look says so
+                       % type(exc).__name__)]
+    if unavailable:
+        return [(WARN, "task homes: the task ledger is UNREADABLE (%s) — how "
+                       "many open rows have no project is UNKNOWN, not zero"
+                 % unavailable)]
+    n = sum(1 for r in snap.values()
+            if r.get("status") in tasks.OPEN_STATUSES
+            and tasks.project_of_row(r) is None)
+    if not n:
+        return [(OK, "task homes: every open task row names its project")]
+    return [(WARN, "task homes: %d open task row(s) have no project, so no "
+                   "project's `helm task list` shows them — `helm task rehome "
+                   "--plan FILE` gives them one (a dry run until --apply)"
+             % n)]
+
+
+def check_seen_working(proc=None):
+    """Landed tasks that owe a seen-working check (helm/observed.py).
+
+    A whole land leaves its task open until someone named records what was
+    seen working, so this rung counts the pile and its oldest age. OK while
+    no check is past its day; a check past it WARNs (the auto-land tick
+    moves each one once to its fallback owner). It holds no land. An
+    unreadable ledger is UNKNOWN, never zero. Installed is not live outside
+    a land either: one more line names the seat processes that run a
+    replaced binary (observed.replaced, task/3717)."""
+    try:
+        from . import observed
+        stale = observed.replaced_line(observed.replaced(proc))
+    except Exception:                     # noqa: BLE001 — a probe never fails
+        stale = None                      # the rung it rides on
+    extra = [(WARN, "seen-working checks: " + stale)] if stale else []
+    try:
+        from . import observed, tasks
+        snap, unavailable = tasks.snapshot()
+        if unavailable:
+            return [(WARN, "seen-working checks: the task ledger is "
+                           "UNREADABLE (%s) — how many landed tasks owe a "
+                           "check is UNKNOWN, not zero" % unavailable)]
+        got = observed.pile(rows=snap.values())
+    except Exception as exc:              # noqa: BLE001 — a rung that cannot
+        return [(WARN, "seen-working checks: cannot tell (%s)"  # look says so
+                       % type(exc).__name__)]
+    if not got["n"]:
+        return [(OK, "seen-working checks: no landed task owes one")] + extra
+    text = ("seen-working checks: %d landed task(s) owe one, the oldest %dh "
+            "old; %d past %dh — `helm task observed <id> --evidence "
+            "\"%s\"` closes one" % (got["n"], got["oldest_s"] // 3600,
+                                      got["over"], observed.CHECK_S // 3600,
+                                      observed.EVIDENCE_HINT))
+    return [(WARN if got["over"] else OK, text)] + extra
+
+
+def check_own_project_registered():
+    """helm's own fallback project is a registered home, or this says it is not.
+
+    Recovery rows and mirrored rows the cwd cannot place are filed under
+    `tasks.OWN_PROJECT` anyway (task/3994): the row must exist. A readable
+    registry that does not contain that name means the row has no project's
+    list. An unreadable registry is UNKNOWN, never OK and never counted as
+    not registered.
+    """
+    try:
+        from . import tasks
+        known, err = tasks.registered_projects()
+    except Exception as exc:              # noqa: BLE001 — a rung that cannot
+        return [(WARN, "own project: cannot tell (%s)"      # look says so
+                       % type(exc).__name__)]
+    name = tasks.OWN_PROJECT
+    if known is None:
+        return [(WARN, "own project: whether %s is a registered project is "
+                       "UNKNOWN (%s) — an unreadable registry is not an empty "
+                       "one, and not zero" % (name, err))]
+    if name not in known:
+        return [(WARN, "own project: %s is not a registered project, so a "
+                       "recovery row filed under it has no project's list"
+                % name)]
+    return [(OK, "own project: %s is a registered project" % name)]
 
 
 def check_keepalive_cadence():
@@ -4820,17 +4972,20 @@ def check_deployed_artifact_canon(deploy_dir=None, project=None, repo=None):
 
 
 CHECKS = ("check_home", "check_actuator_wiring", "check_harness_mirror",
+          "check_task_homes", "check_seen_working",
+          "check_own_project_registered",
           "check_authoring_disclosure",
           "check_authored", "check_projects", "check_adoption",
           "check_doc_task_conditionals",
           "check_projection_registry",
           "check_adopted_store", "check_lexicon_dead_vocabulary",
           "check_know_your_user", "check_cv", "check_filesystems",
-          "check_seat_memory_ceilings", "check_build_skew",
+          "check_seat_memory_ceilings", "check_slice_limits",
+          "check_build_skew",
           "check_inject_coverage", "check_guard_contract", "check_hook_scopes",
           "check_startup_doors",
           "check_env",
-          "check_local_names",
+          "check_local_names", "check_dark_mover", "check_tick_legs",
           "check_physics_currency", "check_memory_base_honoured",
           "check_memory_base_sessions",
           "check_record", "check_fold_checkpoint", "check_resume_state",
@@ -4839,6 +4994,7 @@ CHECKS = ("check_home", "check_actuator_wiring", "check_harness_mirror",
           "check_home_benefits",
           "check_git",
           "check_work_guard", "check_gate_canary", "check_metaharness",
+          "check_cubicle_mover",
           "check_stale_bot",
           "check_keepalive_cadence", "check_cred_copy_staleness",
           "check_timers", "check_unit_drift", "check_stop_timings",

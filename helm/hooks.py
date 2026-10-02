@@ -150,6 +150,19 @@ SPECS = (
     {"name": "resume-turn", "event": "SessionStart",
      "args": "seat resume-turn --hook-json", "timeout": 5,
      "own": ("seat resume-turn --hook-json",), "matcher": "*"},
+    # working-set: the compaction's WORKING SET (task/4054). After each
+    # compaction a seat slipped for about 50 calls (wrong verbs and paths
+    # about 4x); about half named a value from its own last few hundred calls,
+    # which record.py already saw. This hands them back as additionalContext:
+    # existing paths, spellings that worked and DON'T ones, ids, background
+    # tasks, scratch dirs (helm/workingset.py). Matcher "compact" so it runs
+    # on no other SessionStart, AND gated on source == "compact" inside the
+    # verb, so a group installed under the wrong matcher still says nothing
+    # wrong. 3s, fail open: any fault prints nothing. Unscoped: the ring is
+    # session-keyed and holds no helm fleet state, so it serves every project.
+    {"name": "working-set", "event": "SessionStart",
+     "args": "now show --hook-json", "timeout": 3,
+     "own": ("now show --hook-json",), "matcher": "compact"},
     # stop-guard: the IDLE GATE (the predecessors' arbiter capability). Blocks a stop
     # on undelivered mentions/held leases (once per pending-fingerprint),
     # warns to arm the beacon on a clean stop, silently runs the index cap.
@@ -221,16 +234,19 @@ SPECS = (
     # here it rides the one spec every home and seat already carries, so it
     # holds fleet-wide, and argv-guard stays unscoped for that reason. An
     # Agent call is judged on its model key alone and admitted at once
-    # otherwise. The matcher is a list of exact tool names, so the Workflow
-    # tool, whose script spawns its agents without an Agent tool call, is
-    # not matched.
+    # otherwise. The matcher is a list of exact tool names.
     # NOTEBOOKEDIT JOINS for the shared-checkout write rung (task/3301): the
     # file-tool branch already reads notebook_path, and Claude Code never
     # routes NotebookEdit unless the matcher names it.
+    # WORKFLOW JOINS for the narrow-goal rung (helm/narrow_goal.py): a
+    # Workflow's script spawns its agents with no Agent tool call, so the
+    # Workflow call itself is the build act the rung must see. Every other
+    # rung admits it at once.
     {"name": "argv-guard", "event": "PreToolUse",
      "args": "chat argv-guard --hook-json", "timeout": 2,
      "own": ("chat argv-guard --hook-json",),
-     "matcher": "Bash|Monitor|Write|Edit|NotebookEdit|Agent", "gate": True},
+     "matcher": "Bash|Monitor|Write|Edit|NotebookEdit|Agent|Workflow",
+     "gate": True},
     # continuity: the compaction/session-end handoff contract (sessions lane).
     {"name": "handoff-precompact", "event": "PreCompact",
      "args": "handoff check --hook-json", "timeout": 5,
@@ -1160,6 +1176,8 @@ _ADVISORY_LOST = {
              "looks idle and is UNREACHABLE"),
     "resume-turn": ("this seat resumed WITHOUT its resume-turn — it may not "
                     "know its own obligations"),
+    "working-set": ("this compaction resumed WITHOUT its working set — "
+                    "re-read paths and verb spellings before you reuse them"),
     "handoff-precompact": "this compaction proceeds with NO handoff verified",
     "handoff-sessionend": "this session ended with NO handoff verified",
     "record": "this tool call was NOT recorded to the journal",
@@ -4372,7 +4390,8 @@ _USAGE = """usage: helm hooks install [--harness claude|codex] [--home NAME] [--
        helm hooks latency --hours H [--json]   (the END window stream: each hook's rows and p95/p99 over H hours, every timed-out row with the raw box readings at its END)
        helm hooks sync [--apply]   (reconcile every home to the canonical set)
        helm hooks run <EVENT> [--tool NAME] [--hook-json]   (every in-process handler for one event, in one interpreter)
-       helm hooks preflight --config-dir DIR   (may a session start here? resolve+refresh+verify; fail-closed)"""
+       helm hooks preflight --config-dir DIR   (may a session start here? resolve+refresh+verify; fail-closed)
+       helm hooks resident [--status]   (serve argv-guard from a warm process; the console `helm web` keeps one running)"""
 
 
 def _select_homes(name):
@@ -4391,7 +4410,8 @@ def cmd_hooks(args):
     """hooks install [--harness claude|codex] [--home NAME] [--project DIR] [--dry] | status
     | latency [--json] [--since T] [--until T] | latency --hours H [--json]
     | sync [--apply]
-    | run <EVENT> [--tool NAME] [--hook-json] | preflight --config-dir DIR —
+    | run <EVENT> [--tool NAME] [--hook-json] | preflight --config-dir DIR
+    | resident [--status] —
     self-wire the complete hook contract into every claude home and seat config
     dir; latency reports the retained hook stage telemetry (with --hours, the
     END window stream); sync (envtidy)
@@ -4399,7 +4419,8 @@ def cmd_hooks(args):
     run dispatches every in-process handler for one event in a SINGLE
     interpreter (the one-spawn-per-event door, task/630); preflight answers
     whether a session may start in DIR, fail-closed (the call a generated
-    launch.sh makes)."""
+    launch.sh makes); resident serves the per-tool-call hooks helm/hookres.py
+    lists from a warm process (the console `helm web` keeps one running)."""
     args = list(args)
     if not args:
         print(_USAGE, file=sys.stderr)
@@ -4456,6 +4477,13 @@ def cmd_hooks(args):
     if verb == "latency":
         from . import hooklatency
         return hooklatency.cmd(rest)
+
+    if verb == "resident":
+        # THE WARM PATH for the per-tool-call hooks helm/hookres.py serves
+        # (task/1825): the console `helm web` keeps one running; --status
+        # says whether one serves this checkout.
+        from . import hookres
+        return hookres.cmd(rest)
 
     if verb == "preflight":
         # THE DOOR THE GENERATED launch.sh CALLS. Deliberately a real verb

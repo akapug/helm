@@ -1,0 +1,1 @@
+wiring [--verbose] [--json] [--gate] — built/reachable/actuated/exercised/verified: modules no entry point can reach plus declared actions with NO installed schedule or hook. --gate remains the narrower this-tree-added reachability rung used by Stop

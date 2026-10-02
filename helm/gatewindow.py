@@ -1238,7 +1238,7 @@ def launch(room, label=None, trunk_ref=None, supersede=False, path=None,
             return gatehost.plan(
                 gatehost.SLICED if sliced else gatehost.SERIAL, live,
                 logs_dir(path), now=clock(), unread_hosts=unknown,
-                failed=failed)
+                failed=failed, capacity_runner=fab or _fab)
 
         route = None
         if row is None:

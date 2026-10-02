@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests._tmphome import home as _tmp_home  # noqa: E402
 _tmp_home(prefix="helm-test-home-", var="HELM_HOME")
 
-from helm import dispatches  # noqa: E402
+from helm import dispatches, tasks  # noqa: E402
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_ADOPTED_DIR", "MELD_ADOPTED_DIR",
             "HELM_CHAT_DIR", "MELD_CHAT_DIR", "HELM_CHAT_NAME",
@@ -174,6 +174,9 @@ class TheListingNamesAnAbsentRecipientTest(AbsentRecipientBase):
         self.tip = subprocess.run(("git", "rev-parse", "HEAD"), cwd=self.repo,
                                   capture_output=True, text=True
                                   ).stdout.strip()
+        work, why = tasks.add("absent-recipient reviewed work", LIVE,
+                              project="helm-test", force_new=True)
+        self.assertIsNone(why, why)
         for who, lane in ((LIVE, "lane-live"), (GONE, "lane-gone")):
             # `_reason=True` is what makes this door return (row, err); the
             # bare call returns the row or None and a fixture that unpacks it
@@ -182,7 +185,8 @@ class TheListingNamesAnAbsentRecipientTest(AbsentRecipientBase):
             with dispatch_home(self.repo):
                 row, err = dispatches.add(who, lane, ref=self.tip,
                                           kind="review", new_work=True,
-                                          repo=self.repo, notify=False,
+                                          task=work["id"], repo=self.repo,
+                                          notify=False,
                                           _reason=True)
             self.assertIsNone(err, err)
             self.assertTrue(row, "fixture: %s row was not minted" % lane)

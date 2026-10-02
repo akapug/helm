@@ -32,7 +32,7 @@ import unittest
 from unittest import mock
 
 from helm import chat, dispatches, landreq, landreq_close, meld, rowstate, seats
-from helm import review_door, seats_integrator
+from helm import burnflags, review_door, seats_integrator
 from tests import test_dispatches as td
 from tests._verdict import native_author
 from tests._tmphome import pin_live_seats
@@ -150,6 +150,7 @@ class ModeMetricsRetractionTest(RetractBase):
         out, why = dispatches.mark_verdict(
             row["id"], row["tip"], "needs a cure", "fix", basis="measured",
             finding_count=1, prior_relation="new",
+            findings=["Review reports missing cure in helm/dispatches.py"],
             no_patch_because="MELD-DIFF: author applies the cure")
         self.assertIsNone(why, why)
         before, _events, accepted, _verdicts, unavailable = \
@@ -367,11 +368,16 @@ class ReissueTest(RetractBase):
 
     def test_reissued_review_inherits_whole_brief_and_guidance_only_once(self):
         original = "reader needs the whole brief: " + ("facts " * 1100).strip()
+        # A GREEN flag runs the A/B alternation (task/4005): with no fresh
+        # flag the mode is MELD-DIFF, and this arm reads the PATCH arm.
         with mock.patch.object(dispatches, "_verified_family",
-                               return_value="codex"):
+                               return_value="codex"), \
+                mock.patch.object(burnflags, "family_flag",
+                                  return_value={"colour": "GREEN"}):
             row, why, _sent = dispatches.send(
                 self.REVIEWER, "reissue-guidance", original, self.side,
-                repo=self.repo, kind="review", new_work=True)
+                repo=self.repo, kind="review", new_work=True,
+                task=self.review_task["id"])
         self.assertIsNotNone(row, why)
         self.assertEqual(row["review_mode"], "PATCH")
         pre_guidance = dispatches.brief_of(row)[0].removesuffix(
@@ -383,7 +389,9 @@ class ReissueTest(RetractBase):
             row["id"], row["tip"], "needs work", "fix")
         self.assertIsNone(why, why)
         with mock.patch.object(dispatches, "_verified_family",
-                               return_value="codex"):
+                               return_value="codex"), \
+                mock.patch.object(burnflags, "family_flag",
+                                  return_value={"colour": "GREEN"}):
             out, why = self.retract(verdict["id"], reissue=True)
         self.assertIsNone(why, why)
         child = self.state(out["retract_successor"])
@@ -393,7 +401,9 @@ class ReissueTest(RetractBase):
         self.assertEqual(child["review_mode"], "PATCH")
         self.assertEqual(child["message_hash"], row["message_hash"])
         with mock.patch.object(dispatches, "_verified_family",
-                               return_value="codex"):
+                               return_value="codex"), \
+                mock.patch.object(burnflags, "family_flag",
+                                  return_value={"colour": "GREEN"}):
             again, why = self.retract(verdict["id"], reissue=True)
         self.assertIsNone(why, why)
         self.assertEqual(again["reissued"]["id"], child["id"])

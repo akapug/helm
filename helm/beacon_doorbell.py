@@ -47,9 +47,14 @@ tests/test_beacon_doorbell.py:
     cap, and a ring that bypasses it does not count toward it.
   * THE BACKSTOP: while rows a ring announced stay unread, the waiter rings
     again once every HELM_BEACON_BACKSTOP_S (720 s by default) with no new
-    row, so a ring that lands mid-turn and is dropped is not the last one. A
-    backstop ring counts against the hourly cap. An idle waiter reaches it
-    from a time it keeps in memory and takes the state lock only then.
+    row, so a row a ring only counted is not left at that. A backstop ring
+    counts against the hourly cap. An idle waiter reaches it from a time it
+    keeps in memory and takes the state lock only then.
+  * ONE ROW IS DELIVERED ONCE PER SEAT. A ring carries its lead row whole,
+    so that row is marked shown and never leads again: no backstop and no
+    re-armed waiter rings for it (`_due`, `_lead`). A row the hook showed
+    inside the debounce window leaves the ring before it is composed
+    (`_forget_read`). Neither leaves the counts until the seat reads it.
 
 A RING COSTS THE WOKEN SEAT ONE CALL WHEN THERE IS ONE THING TO DO. Measured
 over three days of the fleet: a wake ran a median of 5 and a mean of 12 model
@@ -579,10 +584,17 @@ def _acked(entries, seat):
 
 def _forget_read(st, seat, session):
     """Drop the rows the seat has ACKED from both lists (`_acked`), and the
-    announced rows it has READ: its delivery cursor, the one the
+    rows it has READ from both lists: its delivery cursor, the one the
     tool-boundary hook advances, has passed them, or a pull the seat ran
     printed them whole past a row it still owes, which released their holds
     (`_released`, helm.pull_delivery).
+
+    A ROW NOT YET RUNG IS READ THE SAME WAY. The drain holds each row it
+    wakes for the hook, so a row drained inside the debounce window is still
+    shown at the seat's next tool boundary; once the hook has shown it, a
+    ring for it is a wake for a row already in the seat's context. The
+    delivery cursor passes a row only once the seat was shown it or acked
+    it, so a row it passed leaves the ring before the ring is composed.
 
     A cursor on ANOTHER file is not a read. It is either behind (baselined
     before this file existed, and not moved since), so the row stays unread,
@@ -590,14 +602,12 @@ def _forget_read(st, seat, session):
     now and the row drops. The room's own file decides which. A cursor or a
     file that cannot be read keeps the row."""
     acked = _acked(st["owed"] + st["unrung"], seat)
-    if acked:
-        st["unrung"] = [e for e in st["unrung"] if e["key"] not in acked]
-        st["since"] = st["since"] if st["unrung"] else None
     from .seats_delivery import _cursor
-    cursors, files, keep = {}, {}, []
-    for e in st["owed"]:
+    cursors, files = {}, {}
+
+    def unread(e):
         if e["key"] in acked:
-            continue
+            return False
         room = e["room"]
         if room not in cursors:
             try:
@@ -607,17 +617,16 @@ def _forget_read(st, seat, session):
                 cursors[room] = (None, None)
         (cur, wake), at = cursors[room], tuple(e["at"])
         if cur is None:
-            keep.append(e)
-        elif (cur.get("dev"), cur.get("ino")) == at[:2]:
-            if not (isinstance(cur.get("off"), int) and cur["off"] >= at[2]) \
-                    and not _released(wake, e, at):
-                keep.append(e)
-        else:
-            if room not in files:
-                files[room] = _file_id(room)
-            if files[room] is None or files[room] == at[:2]:
-                keep.append(e)
-    st["owed"] = keep
+            return True
+        if (cur.get("dev"), cur.get("ino")) == at[:2]:
+            return not (isinstance(cur.get("off"), int) and cur["off"] >= at[2]) \
+                and not _released(wake, e, at)
+        if room not in files:
+            files[room] = _file_id(room)
+        return files[room] is None or files[room] == at[:2]
+    st["owed"] = [e for e in st["owed"] if unread(e)]
+    st["unrung"] = [e for e in st["unrung"] if unread(e)]
+    st["since"] = st["since"] if st["unrung"] else None
 
 
 def _ref_states(refs, seat):
@@ -734,13 +743,29 @@ def _recent(rings, now):
 _UNCOUNTED = ("owner", "direct", "catch-up")
 
 
+def _unshown(owed):
+    """The announced rows no ring has led with yet (`_rung` marks the lead
+    `shown`). A ring carries its lead row whole, so that row is delivered;
+    the rows it only counted were named, never shown."""
+    return [e for e in owed if not e.get("shown")]
+
+
 def _due(st, now, catch_up):
     """Why the state owes a ring now, or None. An owner row, a DM and the
     catch-up (the first pass of an armed waiter) ring at once: they skip the
     debounce and the hourly cap. Every other ring waits for the cap. New rows
     ring once their window has run, and with none, rows a ring announced and
     the seat has not read ring again once the backstop has run since the last
-    ring."""
+    ring, but only while one of them was never a ring's lead (`_unshown`).
+
+    ONE ROW IS DELIVERED ONCE PER SEAT. A row a ring led with was shown to
+    the seat whole, so neither the backstop nor a re-armed waiter's first
+    pass rings for it again: measured, one sweep row led a ring every twelve
+    minutes for as long as it stayed unread, and a re-armed waiter's first
+    ring replayed a row a ring had shown two hours before. The row is not
+    dropped: it stays in the counts, the tool-boundary hook still shows it,
+    the stop guard still counts it, and the census still measures how long
+    it has waited."""
     unrung = st["unrung"]
     if any(e["owner"] for e in unrung):
         return "owner"
@@ -753,17 +778,32 @@ def _due(st, now, catch_up):
     if unrung:
         return "debounce" if st["since"] is not None \
             and now - st["since"] >= debounce_s() else None
-    return "backstop" if st["owed"] and st["last"] is not None \
+    return "backstop" if _unshown(st["owed"]) and st["last"] is not None \
         and now - st["last"] >= backstop_s() else None
 
 
 def _next_check(st, now):
-    """When an idle waiter must next read the state with no new event: the
-    backstop's due time while announced rows stay unread, moved past the
-    hourly cap when the cap holds, else never."""
-    if st["unrung"] or not st["owed"] or st["last"] is None:
+    """When an idle waiter must next read the state with no new event, the
+    earliest moment `_due` can answer: at once while an owner row or a DM
+    waits unrung; the end of the debounce window while other rows wait
+    unrung; the backstop's due time while announced rows stay unread; each of
+    the last two moved past the hourly cap when the cap holds; else never.
+
+    A PASS THAT DRAINS NOTHING READS NO STATE BEFORE THIS TIME (task/3873).
+    `_forget_read` reads each room from the oldest waiting row to its end,
+    so reading the state at every pass while rows wait unrung costs a seat
+    under the hourly cap those tails every 2 s for up to an hour. The ring
+    is decided at this time, after `_forget_read`, so a row read or acked
+    meanwhile still rings nothing."""
+    unrung = st["unrung"]
+    if any(e["owner"] or e["kind"] == "direct" for e in unrung):
+        return now
+    if unrung:
+        at = (now if st["since"] is None else st["since"]) + debounce_s()
+    elif _unshown(st["owed"]) and st["last"] is not None:
+        at = st["last"] + backstop_s()
+    else:
         return None
-    at = st["last"] + backstop_s()
     recent, cap = sorted(_recent(st["rings"], now)), rings_per_h()
     if len(recent) >= cap:
         at = max(at, recent[len(recent) - cap] + HOUR_S)
@@ -830,14 +870,17 @@ def _pulls(unread, seat, lead=None):
 def _lead(st):
     """The lead event of a ring of `st`. The pool is the new rows the seat
     has to act on (`_actionable`); with none, the unread ones it was already
-    rung for; with none of those either, the new rows, else the unread ones.
-    So an @all row, a reaction or a room row never leads while a row
-    addressed to the seat is unread. Within the pool, the most direct class
-    leads (`_rank`), and within it the newest row, the later-recorded one on
-    a tie."""
+    rung for and that no ring has led with (`_unshown`); with none of those
+    either, the new rows, else the unread ones never led, else any unread
+    one. So an @all row, a reaction or a room row never leads while a row
+    addressed to the seat is unread, and a row a ring already showed whole
+    does not lead again while another can. Within the pool, the most direct
+    class leads (`_rank`), and within it the newest row, the later-recorded
+    one on a tie."""
+    fresh = _unshown(st["owed"])
     pool = [e for e in st["unrung"] if _actionable(e)] \
-        or [e for e in st["owed"] if _actionable(e)] \
-        or st["unrung"] or st["owed"]
+        or [e for e in fresh if _actionable(e)] \
+        or st["unrung"] or fresh or st["owed"]
     ranked = [(_rank(e["kind"], e["owner"], e["lead"]), e.get("ts") or "", i)
               for i, e in enumerate(pool) if isinstance(e.get("lead"), str)]
     if not ranked:
@@ -863,7 +906,8 @@ def sentences(st):
                    "ack <id> <id> …, one row for them all; the rest: pull, "
                    "and read what is addressed first")
     return handled, ("it rings again when a new row lands, or in %d min "
-                     "while these stay unread" % round(backstop_s() / 60))
+                     "while a row it only counted stays unread"
+                     % round(backstop_s() / 60))
 
 
 def context_epoch(seat, session):
@@ -951,8 +995,12 @@ def ring_line(st, seat, told=None):
 
 
 def _rung(st, now, counted):
-    """Record a ring at `now`: the cap counts it only when `counted`, and
-    the rows it announced move to `owed` until the seat reads them."""
+    """Record a ring at `now`: the cap counts it only when `counted`, the
+    row it led with is marked `shown` (the ring carried it whole), and the
+    rows it announced move to `owed` until the seat reads them."""
+    lead = _lead(st)
+    if lead is not None:
+        lead["shown"] = True
     if counted:
         st["rings"] = _recent(st["rings"], now) + [now]
     st["last"] = now
@@ -976,8 +1024,8 @@ class Doorbell:
         self.usable = usable or (lambda: None)
         self.deliver = deliver       # the `deliver` that `ring` polls with
         self.caught_up = False
-        self.pending = True          # the first pass reads the durable state
-        self.recheck = None          # the backstop's due time, in memory
+        self.pending = True          # the next pass reads the state at once
+        self.recheck = None          # `_next_check`'s due time, in memory
         self.mem, self.unsaved = None, False
         self._warned = set()
         self.told = set()            # the sentences this waiter already rang
@@ -1015,6 +1063,14 @@ class Doorbell:
         """One waiter pass with the `deliver` that `waiter_bell` armed."""
         return self.poll(self.deliver)
 
+    def due(self, now=None):
+        """Whether a pass that drains no new row owes the state a read: the
+        first pass does, and so does the pass after a drain cut short at
+        DRAIN_PASS, because the catch-up ring waits on that read; any other
+        pass owes it only at `recheck` or later."""
+        now = _now() if now is None else now
+        return self.pending or (self.recheck is not None and now >= self.recheck)
+
     def poll(self, deliver):
         try:
             return self._poll(deliver)
@@ -1025,8 +1081,7 @@ class Doorbell:
     def _poll(self, deliver):
         events, more = self._drain(deliver)
         now = _now()
-        if not events and not self.pending \
-                and (self.recheck is None or now < self.recheck):
+        if not events and not self.due(now):
             return None
         path = state_path(self.seat)
         try:
@@ -1085,7 +1140,7 @@ class Doorbell:
                     stale = True
                 if stale:
                     self._store(path, st)
-            self.pending = bool(st["unrung"])
+            self.pending = more
             self.recheck = _next_check(st, now)
         if not more:
             self.caught_up = True

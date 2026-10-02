@@ -48,7 +48,9 @@ ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             # process — which would make an assertion about a fixture fleet
             # depend on how many panes the developer happens to have open.
             # Sandboxed here, and each test that wants an inventory injects one.
-            "HELM_METAHARNESS")
+            "HELM_METAHARNESS", "HELM_NTFY_TOPIC", "MELD_NTFY_TOPIC",
+            "HELM_TELEGRAM_TOKEN", "MELD_TELEGRAM_TOKEN",
+            "HELM_TELEGRAM_CHAT_ID", "MELD_TELEGRAM_CHAT_ID")
 
 SID_A = "aaaaaaaa-1111-2222-3333-444444444444"
 SID_B = "bbbbbbbb-1111-2222-3333-444444444444"
@@ -732,18 +734,8 @@ class LauncherRungTest(Base):
 
 
 class NoOverclaimOnAnySurfaceTest(Base):
-    """CODEX-3 FIX (3). DEAF said "nothing can wake it" and the push said
-    "nothing can wake them". This census reads BEACONS, so what it can prove is
-    the state of HELM'S leg — never the absence of every leg. A project's
-    qwen seat has a designed external, non-consuming wake path and rendered
-    DEAF the moment this lane made its panes visible at all.
-
-    THE PUSH IS THE SURFACE THAT MATTERS MOST and is the one I missed first: I
-    grepped the singular phrasing, found seven sites, fixed them, and reported
-    it done. The PLURAL lived in the phone body — the one line that reaches the
-    owner in the dark, where a wrong claim costs the most and gets the least
-    scrutiny. So the arms below are on the RENDERED text of each surface, not
-    on the verdict constant, because the constant was never what over-claimed."""
+    """The beacon census can prove only helm's wake path, not the absence of
+    another path. Assert that claim on rendered and #seats alarm text."""
 
     def render(self, rep):
         return CensusTest.render(self, rep)
@@ -767,22 +759,11 @@ class NoOverclaimOnAnySurfaceTest(Base):
         self.assertIn("helm's only wake path to a seat", out)
         self.assertNotIn("a seat's ONLY wake path", out)
 
-    def test_the_PHONE_body_claims_only_the_HELM_leg(self):
-        """The one line read in the dark, and the last place the over-claim was
-        still live after I had reported the sweep finished."""
-        body = beacons._push_body([("seat-a", {"alarm": True}, None)])
-        self.assertIn("1 seat UNREACHABLE (seat-a)", body,
-                      "POSITIVE CONTROL: the body must actually describe the "
-                      "alarm, or the phrase assertions read an empty string")
-        self.assertIn("helm cannot wake them", body)
-        self.assertNotIn("nothing can wake them", body)
-
-    def test_a_RECOVERY_push_is_untouched_by_the_correction(self):
-        """The correction must not leak into the other polarity: a recovery
-        body carries no reachability claim at all and must stay that way."""
-        body = beacons._push_body([("seat-a", {"alarm": False}, None)])
-        self.assertIn("reachable again", body)
-        self.assertNotIn("cannot wake", body)
+    def test_the_SEATS_alarm_claims_only_the_HELM_leg(self):
+        body = beacons._alarm_line("seat-a", {"state": beacons.DEAF})
+        self.assertIn("DEAF SEAT seat-a", body)
+        self.assertIn("HELM cannot wake it", body)
+        self.assertNotIn("nothing can wake it", body)
 
 
 class VersionedAgentSpellingTest(Base):
@@ -1925,15 +1906,20 @@ beacons.register = register
 real_probe = beacons._one_live_incumbent
 def probe(*args, **kwargs):
     got = real_probe(*args, **kwargs)
-    with open(os.path.join(root, 'probe', str(pid)), 'w') as out:
+    # Whole before visible, like the result file below: the parent waits
+    # for EXISTENCE and read an empty probe under load (task/4011). The
+    # part file lives outside probe/ so the parent's glob never counts it.
+    tmp_probe = os.path.join(root, 'probe-%d.part' % pid)
+    with open(tmp_probe, 'w') as out:
         json.dump(got['pid'] if got else None, out)
+    os.replace(tmp_probe, os.path.join(root, 'probe', str(pid)))
     os.kill(pid, signal.SIGSTOP)
     return got
 beacons._one_live_incumbent = probe
 touch('ready')
 wait_two('ready')
 report = beacons.arm(seat, session=sid)
-tmp_out = os.path.join(root, 'result', str(pid) + '.part')
+tmp_out = os.path.join(root, 'result-%d.part' % pid)   # outside the globbed dir
 with open(tmp_out, 'w') as out:
     json.dump(report, out)
 # The reader waits for EXISTENCE, so the file must not exist until it is
@@ -2930,7 +2916,7 @@ class VacantTest(Base):
         # line, which is precisely when somebody needs to check the tally
         # still accounts for every seat. MISROUTED broke it on arrival and
         # that is the arm working, not the arm being brittle.
-        self.assertIn("2 seats, 1 covered, 0 WAKING, 0 DEAF, "
+        self.assertIn("2 seats, 1 covered, 0 WAKING, 0 BUSY, 0 DEAF, "
                       "0 DEAF-IN-EFFECT, 0 RESTING, 0 MISROUTED, 1 VACANT, "
                       "0 UNPROVEN",
                       CensusTest.render(self, rep))
@@ -3136,7 +3122,10 @@ class RegisterTest(Base):
         body = posted.call_args[0][0]
         self.assertIn("DEAF SEAT alpha", body)
         self.assertIn("unreachable for", body)       # anchored on covered
-        self.assertEqual(posted.call_args.kwargs["room"], "helm")
+        self.assertEqual(posted.call_args.kwargs["room"], "seats")
+        # no project serves alpha here, so the row wakes nobody and says so
+        self.assertIn("(no steward woken: no project serves this seat",
+                      body)
         att = self.read_roster()["alpha"]["attendance"]
         self.assertEqual(att["alerted"], beacons.DEAF)
         rc, posted = self.post({})                   # pass 3: still deaf
@@ -3301,263 +3290,172 @@ class RollGraceTest(Base):
 
 
 class UnreachableAlarmTest(Base):
-    """THE 03:44 REPLAY. On 2026-08-03 the orca PTY daemon died and took all
-    seven panes with it, and nobody noticed for four hours. The census was the
-    one instrument still correct — and every surface it could shout on was
-    read by the seats that had just died. These tests hold the rule that
-    outage wrote: AN ALARM ABOUT THE FLEET BEING UNREACHABLE MUST NOT DEPEND
-    ON A FLEET MEMBER BEING REACHABLE."""
+    """Isolated seat reachability belongs in #seats, addressed to the project
+    steward. Fleet-wide phone escalation has its own tests and policy."""
 
-    def post(self, live, push=True, configured=True):
-        """One `--post` pass. Returns (rc, chat_post_mock, owner_push_mock).
-
-        `configured` is the PHONE CHANNEL's existence, and it is separate from
-        `push` on purpose: an opted-out fleet returns True from `owner_push`
-        exactly like a delivered one (notify's docstring: "delivered, OR
-        deliberately opted out"), so push=True/configured=False is the one
-        combination that distinguishes a real send from a no-op."""
-        import io
+    def post(self, live):
+        """One `--post` pass, returning (rc, chat_post_mock)."""
         import contextlib
-        self.err = io.StringIO()
         with mock.patch.object(beacons, "live_sessions", return_value=live), \
                 mock.patch.dict(os.environ, {"HELM_PROC": self.proc}), \
                 mock.patch("helm.chat.post") as posted, \
-                mock.patch("helm.notify.owner_push",
-                           return_value=push) as pushed, \
-                mock.patch("helm.notify.configured",
-                           return_value=configured), \
-                contextlib.redirect_stdout(io.StringIO()), \
-                contextlib.redirect_stderr(self.err):
+                contextlib.redirect_stdout(io.StringIO()):
             rc = beacons.cmd_beacons(["--post"])
-        return rc, posted, pushed
+        return rc, posted
 
     def read_roster(self):
         path = os.path.join(os.environ["HELM_CHAT_DIR"], ".roster.json")
         with open(path) as f:
             return json.load(f)
 
-    def test_the_alarm_reaches_the_OWNERS_PHONE_not_only_the_room(self):
-        """The refuter's finding, in one test: the old escalation would have
-        named the incident within five minutes and woken NOBODY, because it
-        posted only to #helm — where every reader was one of the dead seats."""
-        self.roster("alpha", "beta", "gamma")        # present, no beacons
-        rc, posted, pushed = self.post({})
-        self.assertEqual(rc, 1)                      # faults FOUND, not broken
-        posted.assert_called_once()                  # the room still gets it
-        pushed.assert_called_once()                  # and so does the phone
-        body = pushed.call_args[0][0]
+    def test_isolated_seat_reachability_posts_once_to_seats_for_its_steward(self):
+        """One batched #seats row names each unreachable seat and its lead.
+        This is not an owner-phone event; fleet phone policy is separate."""
+        self.roster("alpha", "beta", "gamma")
+        with mock.patch("helm.seatevents.project_of",
+                        return_value={"alpha": "acme", "beta": "acme",
+                                      "gamma": "acme"}), \
+                mock.patch("helm.teams.read",
+                           return_value={"members": [
+                               {"seat": "acme-lead", "role": "lead"}]}), \
+                mock.patch("helm.notify.owner_push") as pushed:
+            rc, posted = self.post({})
+        self.assertEqual(rc, 1)
+        posted.assert_called_once()
+        self.assertEqual(posted.call_args.kwargs["room"], "seats")
+        body = posted.call_args.args[0]
+        self.assertTrue(body.startswith("@acme-lead "), body)
         for seat in ("alpha", "beta", "gamma"):
-            self.assertIn(seat, body)
-        self.assertIn("3 seats UNREACHABLE", body)   # ONE push for the fleet
-        self.assertIn("unreachable",
-                      pushed.call_args.kwargs["title"].lower())
+            self.assertIn("DEAF SEAT " + seat, body)
+        pushed.assert_not_called()
+        self.assertTrue(all(self.read_roster()[seat]["attendance"]["alarmed"]
+                            for seat in ("alpha", "beta", "gamma")))
 
-    def test_a_seat_the_instruments_CANNOT_CLASSIFY_still_wakes_the_owner(self):
-        """The seats this bug survived for. A waiter whose session helm cannot
-        prove live reads UNPROVEN — never DEAF — and UNPROVEN posted nothing at
-        all, so the 2-of-9 seats in that state were silent by construction. No
-        proven wake path is an alarm whatever the verdict is called."""
+    def test_one_previously_covered_seat_goes_deaf_without_owner_push(self):
+        """One down seat in a known two-seat roll is not a fleet outage."""
+        self.roster("alpha", "beta")
+        wdir = self.waiter(620, "alpha", sid=SID_A)
+        adir = self.agent(90, "alpha")
+        self.waiter(621, "beta", sid=SID_B)
+        self.agent(91, "beta")
+        with mock.patch("helm.notify.owner_push") as pushed:
+            rc, posted = self.post({SID_A: 90, SID_B: 91})
+            self.assertEqual(rc, 0)
+            posted.assert_not_called()
+            self.assertEqual([self.read_roster()[seat]["attendance"]["state"]
+                              for seat in ("alpha", "beta")],
+                             [beacons.COVERED, beacons.COVERED])
+            shutil.rmtree(wdir)
+            shutil.rmtree(adir)
+            with mock.patch("helm.seatevents.project_of",
+                            return_value={"alpha": "acme"}), \
+                    mock.patch("helm.teams.read",
+                               return_value={"members": [
+                                   {"seat": "acme-lead", "role": "lead"}]}):
+                rc, posted = self.post({SID_B: 91})
+            pushed.assert_not_called()
+        self.assertEqual(rc, 1)
+        posted.assert_called_once()
+        self.assertEqual(posted.call_args.kwargs["room"], "seats")
+        self.assertIn("@acme-lead ", posted.call_args.args[0])
+        self.assertIn("DEAF SEAT alpha", posted.call_args.args[0])
+        self.assertNotIn("DEAF SEAT beta", posted.call_args.args[0])
+        self.assertTrue(self.read_roster()["alpha"]["attendance"]["alarmed"])
+
+    def test_a_seat_the_instruments_CANNOT_CLASSIFY_still_alerts_its_steward(self):
+        """No proven wake path is an alarm even for an UNPROVEN verdict."""
         self.roster("alpha")
-        self.waiter(401, "alpha", sid=SID_B)         # a live-shaped waiter…
+        self.waiter(401, "alpha", sid=SID_B)
         with mock.patch.object(beacons, "holder_from_records",
-                               return_value=None):  # …whose session is unknown
-            rc, posted, pushed = self.post({})
+                               return_value=None), \
+                mock.patch("helm.seatevents.project_of",
+                           return_value={"alpha": "acme"}), \
+                mock.patch("helm.teams.read",
+                           return_value={"members": [
+                               {"seat": "acme-lead", "role": "lead"}]}):
+            rc, posted = self.post({})
         self.assertEqual(rc, 1)
         att = self.read_roster()["alpha"]["attendance"]
-        self.assertEqual(att["state"], beacons.UNPROVEN)  # still not called DEAF
-        self.assertIn("PROVEN live", att["why"])     # the register keeps why
-        self.assertTrue(att["alarm"])                # and alarms anyway
+        self.assertEqual(att["state"], beacons.UNPROVEN)
+        self.assertIn("PROVEN live", att["why"])
+        self.assertTrue(att["alarm"])
         posted.assert_called_once()
-        self.assertIn("UNREACHABLE SEAT alpha", posted.call_args[0][0])
-        pushed.assert_called_once()
-        self.assertIn("alpha", pushed.call_args[0][0])
+        self.assertEqual(posted.call_args.kwargs["room"], "seats")
+        self.assertIn("@acme-lead ", posted.call_args.args[0])
+        self.assertIn("UNREACHABLE SEAT alpha", posted.call_args.args[0])
 
     def test_an_UNPROVABLE_seat_survives_its_own_beat_decaying(self):
-        """THE VANISHING ALARM, for the seat class it actually killed — end to
-        end through the WRITER, not through a hand-written fixture row.
-
-        A seat helm cannot classify never reaches COVERED, so before this it
-        never earned a grace stamp: ~QUIET_S after its beat stopped it left
-        the roll and every later census was silent about it. Here the register
-        must stamp `standing` itself on pass 1, and pass 2 — after the beat has
-        decayed past the presence cut — must still be measuring the seat."""
+        """The writer's standing stamp keeps an unprovable seat on the roll
+        after its last beat ages past the presence cut."""
         self.roster("alpha")
-        self.waiter(403, "alpha", sid=SID_B)         # unprovable, not dead
+        self.waiter(403, "alpha", sid=SID_B)
         path = os.path.join(os.environ["HELM_CHAT_DIR"], ".roster.json")
         with mock.patch.object(beacons, "holder_from_records",
                                return_value=None):
-            rc, _posted, pushed = self.post({})
+            rc, posted = self.post({})
             self.assertEqual(rc, 1)
             first = self.read_roster()["alpha"]["attendance"]
-            self.assertTrue(first["standing"])       # the WRITER stamps it
-            pushed.assert_called_once()              # and the owner was woken
-            with open(path) as f:                    # 03:44 + QUIET_S: the
-                rows = json.load(f)                  # beat stops arriving
+            self.assertTrue(first["standing"])
+            posted.assert_called_once()
+            with open(path) as f:
+                rows = json.load(f)
             rows["alpha"]["last_seen"] = time.time() - 3600
             with open(path, "w") as f:
                 json.dump(rows, f)
             self.assertEqual(seats.presence_of(rows["alpha"]["last_seen"]),
-                             "absent")               # MUST-HIT: it really did
-            rc, _posted2, _pushed2 = self.post({})
-        self.assertEqual(rc, 1)                      # still a FAULT, not clean
+                             "absent")
+            rc, posted = self.post({})
+        self.assertEqual(rc, 1)
+        posted.assert_not_called()              # already delivered to #seats
         second = self.read_roster()["alpha"]["attendance"]
-        self.assertGreater(second["at"], first["at"])       # still censused
-        self.assertEqual(second["standing"], first["standing"])  # not refreshed
+        self.assertGreater(second["at"], first["at"])
+        self.assertEqual(second["standing"], first["standing"])
         self.assertEqual(second["state"], beacons.UNPROVEN)
-        self.assertIn("PROVEN live", second["why"])         # a real verdict
-        self.assertTrue(second["alarm"])                    # still alarming
+        self.assertIn("PROVEN live", second["why"])
+        self.assertTrue(second["alarm"])
 
-    def test_a_failed_push_RE_PUSHES_without_re_posting_to_the_room(self):  # noqa: VACUOUS_ASSERTION — pass 1's assert_called_once on the SAME chat mock (and assertTrue(alarmed) on the same register row) are the unconditional positive controls; pass 2's silence IS the per-channel claim
-        """PER-CHANNEL at-least-once. A dead phone must not re-post to a
-        healthy room, nor the reverse — one latch each, each advanced only by
-        its own delivery."""
+    def test_failed_chat_post_retries_without_phone_fallback(self):
+        """A failed #seats delivery stays owed; it cannot silently become a
+        phone notification or be counted as a successfully delivered edge."""
         self.roster("alpha")
-        rc, posted, pushed = self.post({}, push=False)
-        posted.assert_called_once()                  # the room has the edge
-        pushed.assert_called_once()                  # the phone did not
-        self.assertIn("owner push FAILED", self.err.getvalue())
-        att = self.read_roster()["alpha"]["attendance"]
-        self.assertTrue(att["alarmed"])              # chat latched
-        self.assertFalse(att["pushed"])              # phone still armed
-        rc, posted, pushed = self.post({}, push=True)
-        # noqa: VACUOUS_ASSERTION — the pass-1 assert_called_once above is the
-        # unconditional positive control on this same chat mock.
-        posted.assert_not_called()                   # the room is not spammed
-        pushed.assert_called_once()                  # the phone is retried
-        self.assertTrue(self.read_roster()["alpha"]["attendance"]["pushed"])
-
-    def test_a_recovered_fleet_pushes_once_and_then_goes_quiet(self):  # noqa: VACUOUS_ASSERTION — the assertIn on pass 2's push body is the unconditional positive control on the same observable; pass 3's silence is the latch claim
-        self.roster("alpha")
-        self.post({})                                # the edge
-        wdir = self.waiter(402, "alpha", sid=SID_A)  # relaunched
-        self.agent(90, "alpha")
-        rc, posted, pushed = self.post({SID_A: 90})
-        self.assertEqual(rc, 0)
-        self.assertIn("reachable again", pushed.call_args[0][0])
-        rc, posted, pushed = self.post({SID_A: 90})
-        self.assertEqual(rc, 0)
-        # noqa: VACUOUS_ASSERTION — the call_args assertion above is the
-        # positive control; latched silence is the claim here.
+        with mock.patch.object(beacons, "live_sessions", return_value={}), \
+                mock.patch.dict(os.environ, {"HELM_PROC": self.proc}), \
+                mock.patch("helm.chat.post", side_effect=OSError("down")) as posted, \
+                mock.patch("helm.notify.owner_push") as pushed, \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = beacons.cmd_beacons(["--post"])
+        self.assertEqual(rc, 2)
+        posted.assert_called_once()
         pushed.assert_not_called()
-        self.assertTrue(os.path.isdir(wdir))         # nothing was signaled
+        self.assertFalse(self.read_roster()["alpha"]["attendance"]["alarmed"])
+        rc, posted = self.post({})
+        self.assertEqual(rc, 1)
+        posted.assert_called_once()
+        self.assertEqual(posted.call_args.kwargs["room"], "seats")
+        self.assertTrue(self.read_roster()["alpha"]["attendance"]["alarmed"])
 
-    def test_an_OPTED_OUT_phone_names_itself_instead_of_reading_as_delivered(self):  # noqa: VACUOUS_ASSERTION — the two stderr assertIns are the positive controls that the alarm RAN; the twin test_the_alarm_reaches_the_OWNERS_PHONE_not_only_the_room proves the same edge DOES push when the channel exists
-        """A half-working alarm is worse than none. An unset topic returns
-        DELIVERED (deliberate opt-out), so the only way this stops reading as
-        success is for the verb to say it on the surface a human is looking
-        at — with the KEY NAME, never a value."""
-        import io
-        import contextlib
+    def test_a_recovered_seat_posts_once_to_seats_then_goes_quiet(self):
         self.roster("alpha")
-        err = io.StringIO()
-        with mock.patch.object(beacons, "live_sessions", return_value={}), \
-                mock.patch.dict(os.environ, {"HELM_PROC": self.proc,
-                                             "HELM_NTFY_TOPIC": "",
-                                             "MELD_NTFY_TOPIC": ""}), \
-                mock.patch("helm.chat.post"), \
-                mock.patch("urllib.request.urlopen") as urlopen, \
-                contextlib.redirect_stdout(io.StringIO()), \
-                contextlib.redirect_stderr(err):
-            beacons.cmd_beacons(["--post"])
-        self.assertIn("phone channel OFF", err.getvalue())
-        self.assertIn("HELM_NTFY_TOPIC", err.getvalue())
-        urlopen.assert_not_called()                  # opted out = no network
-
-    def test_an_OPTED_OUT_phone_does_not_LATCH_a_push_that_never_left(self):  # noqa: VACUOUS_ASSERTION — PASS 2 is the unconditional control on the SAME observable (a real delivery must latch `pushed`), plus assertTrue(att['alarm']) proves an edge existed to latch; mutation-verified 2026-08-04 ('True is not false')
-        """The STATE-MACHINE half of the test above, which fixed only the eyes.
-
-        `owner_push` returns True for two different worlds — its own docstring
-        says "delivered, OR deliberately opted out (no topic: nothing to
-        retry)" — and `pushed` means "the alarm value the last successful PHONE
-        push carried". Latching on that True recorded a push that never left.
-
-        THE HARM IS NOT PERMANENT SILENCE, and stating it precisely is what
-        makes this testable: the next EDGE still pushes. What was lost is the
-        STANDING alarm at configure time. The fleet goes down while the phone
-        is off, the edge latches as though delivered, the owner then sets a
-        topic — and hears nothing about the fleet that is STILL down, because
-        no new transition exists to carry it.
-
-        So the sequence below is the whole contract, and pass 2 doubles as the
-        POSITIVE CONTROL on the same observable: if the latch were broken to
-        never fire, pass 2 would fail too.
-            pass 1, channel OFF -> nothing sent, so nothing latches
-            pass 2, channel ON  -> the SAME edge is still armed, pushes, latches
-        That is also exactly what this module already promises a FAILED push
-        ("it stays armed and re-pushes next pass"). An opt-out sends strictly
-        less than a failed push and must not be treated better than one."""
-        import io
-        import contextlib
-        self.roster("alpha")
-        with mock.patch.object(beacons, "live_sessions", return_value={}), \
-                mock.patch.dict(os.environ, {"HELM_PROC": self.proc,
-                                             "HELM_NTFY_TOPIC": "",
-                                             "MELD_NTFY_TOPIC": ""}), \
-                mock.patch("helm.chat.post"), \
-                mock.patch("urllib.request.urlopen") as urlopen, \
-                contextlib.redirect_stdout(io.StringIO()), \
-                contextlib.redirect_stderr(io.StringIO()):
-            beacons.cmd_beacons(["--post"])
-        urlopen.assert_not_called()          # control: genuinely opted out
-        att = self.read_roster()["alpha"]["attendance"]
-        self.assertTrue(att["alarm"],
-                        "no alarm edge was produced — nothing to latch, so "
-                        "the assertion below would be vacuous")
-        self.assertFalse(att["pushed"],
-                         "an opted-out pass latched `pushed`: the register now "
-                         "records a phone push that never left the machine")
-
-        # PASS 2 — the channel exists now. The edge must still be armed.
-        _rc, _posted, pushed = self.post({})
-        pushed.assert_called_once()
-        self.assertTrue(self.read_roster()["alpha"]["attendance"]["pushed"],
-                        "a real delivery did not latch — the latch is broken "
-                        "in the other direction and pass 1 proved nothing")
-
-    def test_a_RECOVERY_edge_survives_an_opted_out_window(self):  # noqa: VACUOUS_ASSERTION — pass 3's assert_called_once + the "reachable again" body match are unconditional positive controls on the SAME push channel; the two assertFalse calls are guarded by the fixture MUST-HIT directly above each
-        """a6d5d95f's stale-latch wording, pointed at the OTHER edge value —
-        the repro attempt task #199 required before touching anything, banked
-        as a pin because it did NOT reproduce (2104f13a already holds).
-
-        `pushed` latched True by a delivered alarm, then the owner opts out,
-        then the fleet RECOVERS inside the opt-out window. The recovery edge
-        must ride the stale-but-armed latch out of the window: pushed stays
-        True through the opted-out pass (nothing left the machine, so nothing
-        may advance) and the \"reachable again\" push fires the moment the
-        channel returns."""
-        self.roster("alpha")
-        self.post({})                                # alarm, channel ON
-        self.assertTrue(self.read_roster()["alpha"]["attendance"]["pushed"])
-        self.waiter(402, "alpha", sid=SID_A)         # relaunched…
-        self.agent(90, "alpha")
-        _rc, _posted, pushed = self.post({SID_A: 90}, configured=False)
-        att = self.read_roster()["alpha"]["attendance"]
-        self.assertFalse(att["alarm"], "the fixture failed to recover — "
-                         "every assertion below would be vacuous")
-        self.assertTrue(att["pushed"],
-                        "an opted-out recovery advanced the latch: the "
-                        "register recorded a push that never left")
-        _rc, _posted, pushed = self.post({SID_A: 90})
-        pushed.assert_called_once()                  # the edge survived
-        self.assertIn("reachable again", pushed.call_args[0][0])
-        self.assertFalse(self.read_roster()["alpha"]["attendance"]["pushed"])
+        with mock.patch("helm.notify.owner_push") as pushed:
+            self.post({})
+            wdir = self.waiter(402, "alpha", sid=SID_A)
+            self.agent(90, "alpha")
+            rc, posted = self.post({SID_A: 90})
+            self.assertEqual(rc, 0)
+            posted.assert_called_once()
+            self.assertEqual(posted.call_args.kwargs["room"], "seats")
+            self.assertIn("answers again", posted.call_args.args[0])
+            rc, posted = self.post({SID_A: 90})
+            self.assertEqual(rc, 0)
+            posted.assert_not_called()
+            pushed.assert_not_called()
+        self.assertTrue(os.path.isdir(wdir))
 
 
 class ConcurrentPassDeliveryEdgeTest(Base):
-    """a6d5d95f's remaining finding: "concurrent passes deliver same edge
-    twice". `attend` derives the transition batch under the roster lock, but
-    delivery ran outside any lock — so a pass whose attend() landed inside
-    another pass's attend-to-ack window derived the SAME edge, and the owner
-    heard every alarm twice on both channels. Reproduced on this tree
-    2026-08-05 before the fix: chat.post 2x, owner_push 2x for one edge.
-
-    The cure is revalidation where the batch is SPENT: one lock spans
-    revalidate -> deliver -> ack, each row re-checked against the roster's
-    CURRENT latch. These tests pin the exactly-once outcome, the per-channel
-    at-least-once retry that revalidation must NOT break, the fail-closed
-    refusal when the lock cannot be opened, and the lock actually being HELD
-    across delivery (without which revalidation is a smaller window, not a
-    closed one)."""
+    """Concurrent passes must deliver a seat edge once to #seats. Revalidate
+    under the escalation lock, retry a failed chat delivery, and refuse a
+    delivery whose lock cannot be opened instead of racing or dropping it."""
 
     def edge_pass(self):
         """census+attend once — one pass's derivation, no delivery."""
@@ -3569,9 +3467,7 @@ class ConcurrentPassDeliveryEdgeTest(Base):
         with mock.patch.object(beacons, "live_sessions", return_value={}), \
                 mock.patch.dict(os.environ, {"HELM_PROC": self.proc}), \
                 mock.patch("helm.chat.post") as posted, \
-                mock.patch("helm.notify.owner_push",
-                           return_value=True) as pushed, \
-                mock.patch("helm.notify.configured", return_value=True):
+                mock.patch("helm.notify.owner_push") as pushed:
             rep, reg_a = self.edge_pass()            # pass A opens the window
             _rep, reg_b = self.edge_pass()           # pass B lands INSIDE it
             self.assertEqual(len(reg_b["transitions"]), 1,
@@ -3581,39 +3477,32 @@ class ConcurrentPassDeliveryEdgeTest(Base):
             beacons.escalate(reg_a["transitions"], rep)
             beacons.escalate(reg_b["transitions"], rep)
         posted.assert_called_once()                  # the room hears it ONCE
-        pushed.assert_called_once()                  # the phone buzzes ONCE
+        pushed.assert_not_called()
         att = self.read_att()
-        self.assertTrue(att["alarmed"] and att["pushed"],
-                        "exactly-once was achieved by delivering ZERO — the "
-                        "latches never advanced")
+        self.assertTrue(att["alarmed"],
+                        "exactly-once was achieved by delivering ZERO")
 
-    def test_a_FAILED_post_still_retries_while_the_delivered_push_does_not(self):  # noqa: VACUOUS_ASSERTION — posted.call_count==2 and the alarmed-latch flip are unconditional positive controls on the same observables; the mid-test assertFalse is the failed-leg ground truth its control sits directly below
-        """Revalidation must collapse only edges that LANDED. Pass A's chat
-        post fails (latch un-advanced) while its push delivers (latch
-        advanced): pass B must retry exactly the failed leg."""
+    def test_a_FAILED_post_still_retries_after_a_second_pass_derives_the_edge(self):
+        """The first #seats post fails; a batch derived in its window retries
+        the still-owed chat edge instead of treating it as delivered."""
         self.roster("alpha")
         with mock.patch.object(beacons, "live_sessions", return_value={}), \
                 mock.patch.dict(os.environ, {"HELM_PROC": self.proc}), \
                 mock.patch("helm.chat.post",
-                           side_effect=[OSError("tmpfs gone"),
-                                        None]) as posted, \
-                mock.patch("helm.notify.owner_push",
-                           return_value=True) as pushed, \
-                mock.patch("helm.notify.configured", return_value=True):
+                           side_effect=[OSError("tmpfs gone"), None]) as posted, \
+                mock.patch("helm.notify.owner_push") as pushed:
             rep, reg_a = self.edge_pass()
             _rep, reg_b = self.edge_pass()
             out_a = beacons.escalate(reg_a["transitions"], rep)
-            self.assertFalse(out_a["chat"])          # A's room leg FAILED
+            self.assertFalse(out_a["chat"])
             self.assertFalse(self.read_att()["alarmed"])
             out_b = beacons.escalate(reg_b["transitions"], rep)
             self.assertTrue(out_b["chat"])
-        self.assertEqual(posted.call_count, 2,       # attempt + retry
-                         "the failed chat leg was collapsed with the "
-                         "delivered one — revalidation broke at-least-once")
-        pushed.assert_called_once()                  # the delivered leg is not
-        att = self.read_att()                        # re-pushed by pass B
-        self.assertTrue(att["alarmed"], "the retry did not latch")
-        self.assertTrue(att["pushed"])
+        self.assertEqual(posted.call_count, 2)
+        self.assertTrue(all(call.kwargs["room"] == "seats"
+                            for call in posted.call_args_list))
+        pushed.assert_not_called()
+        self.assertTrue(self.read_att()["alarmed"])
 
     def test_an_UNOPENABLE_lock_refuses_delivery_instead_of_racing(self):  # noqa: VACUOUS_ASSERTION — the self-heal control below drives the SAME cmd to a real delivery, so the refusal's assert_not_called measures the guard and not a dead verb
         """Fail-closed, through the WIRE (`cmd_beacons`), because a correct
@@ -3651,9 +3540,8 @@ class ConcurrentPassDeliveryEdgeTest(Base):
         self.assertNotIn("chat post failed", err.getvalue())
         posted.assert_not_called()                   # nothing raced out
         pushed.assert_not_called()
-        att = self.read_att()
-        self.assertFalse(att["alarmed"] or att["pushed"],
-                         "a refused delivery advanced a latch")
+        self.assertFalse(self.read_att()["alarmed"],
+                         "a refused delivery advanced the chat latch")
         # SELF-HEAL CONTROL on the same observables: the next ordinary pass
         # (real locks) delivers the edge the refusal preserved.
         with mock.patch.object(beacons, "live_sessions", return_value={}), \
@@ -3666,7 +3554,8 @@ class ConcurrentPassDeliveryEdgeTest(Base):
                 contextlib.redirect_stderr(io.StringIO()):
             beacons.cmd_beacons(["--post"])
         posted.assert_called_once()
-        pushed.assert_called_once()
+        self.assertEqual(posted.call_args.kwargs["room"], "seats")
+        pushed.assert_not_called()
 
     def test_delivery_runs_with_the_escalation_lock_HELD(self):
         """The exactly-once test above passes for a LOCKLESS revalidation too
@@ -3690,8 +3579,7 @@ class ConcurrentPassDeliveryEdgeTest(Base):
         with mock.patch.object(beacons, "live_sessions", return_value={}), \
                 mock.patch.dict(os.environ, {"HELM_PROC": self.proc}), \
                 mock.patch("helm.chat.post", side_effect=probe), \
-                mock.patch("helm.notify.owner_push", return_value=True), \
-                mock.patch("helm.notify.configured", return_value=True):
+                mock.patch("helm.notify.owner_push") as pushed:
             rep, reg = self.edge_pass()
             out = beacons.escalate(reg["transitions"], rep)
         self.assertEqual(held, [True],
@@ -3701,6 +3589,7 @@ class ConcurrentPassDeliveryEdgeTest(Base):
                         "`held` was recorded on a pass that delivered nothing")
         self.assertTrue(self.read_att()["alarmed"],
                         "the probed delivery did not latch")
+        pushed.assert_not_called()
 
     def read_att(self):
         path = os.path.join(os.environ["HELM_CHAT_DIR"], ".roster.json")
@@ -3709,35 +3598,9 @@ class ConcurrentPassDeliveryEdgeTest(Base):
 
 
 class StaleBatchOppositeEdgeTest(Base):
-    """THE OPPOSITE EDGE — a review's amendment to the delivery-edge fix, and
-    the half latch revalidation could not see.
-
-    Re-checking only the LATCHES asks "has anyone delivered this yet?" and
-    never "is this still TRUE?". Reproduced on this tree before the fix, both
-    polarities:
-
-      ALARM:    pass A derives alarm=True; the seat RECOVERS; pass B writes
-                covered/alarm=False and derives NO edge (both latches are
-                still false, so nothing is owed); A's batch passes latch
-                revalidation and posts "DEAF SEAT alpha ... helm cannot wake
-                it" onto a COVERED row, acking alarmed/pushed=True.
-                Measured: recovery transitions 0, stale chat=1 push=1, final
-                covered + alarm=False + alarmed=True + pushed=True.
-
-      RECOVERY: the mirror, and the dangerous direction — a stale recovery
-                batch delivered onto a row that has since gone DEAF again put
-                "helm fleet: 1 seat reachable again" on the owner's phone
-                while the seat was down, and reset BOTH latches to false.
-                Measured: final DEAF + alarm=True + alarmed=False +
-                pushed=False.
-
-    The cure re-reads the row's CURRENT attendance and collapses a batch row
-    unless the register still records the same (alarm, state). At-least-once
-    is untouched: owedness is a property of the ROW — `attend` re-derives an
-    edge every pass from (alarm vs alarmed) and (alarm vs pushed) — so a
-    collapsed row that is genuinely still owed comes back on the next
-    census, while a retried failed leg carries the verdict the register
-    holds and survives."""
+    """Revalidate the seat's state and alarm before posting to #seats.
+    A stale alarm or recovery cannot advance the chat latch; an unchanged
+    verdict still retries an undelivered chat edge despite timestamp drift."""
 
     def att(self, seat="alpha"):
         path = os.path.join(os.environ["HELM_CHAT_DIR"], ".roster.json")
@@ -3764,18 +3627,15 @@ class StaleBatchOppositeEdgeTest(Base):
                 self.agent(90, "alpha"))
 
     def test_attendance_cannot_commit_INSIDE_revalidate_deliver_ack(self):
-        """The review FIX that the pre-delivery tests cannot see. `escalate`
-        revalidated under `.escalate.lock`, but `attend` once wrote under only
-        `.lock`, so a newer verdict could commit while the old post was leaving.
-        The writer starts from INSIDE chat.post and must remain blocked through
-        the phone leg and both acks; after release it sees the delivered alarm
-        and derives the recovery that is genuinely owed."""
+        """The writer starts from inside chat.post and must remain blocked
+        until delivery and its chat ack complete. It then derives the recovery
+        that the newly committed verdict really owes."""
         import threading
         self.roster("alpha")
         rep_a, reg_a = self.deaf_pass()
         attempted, done = threading.Event(), threading.Event()
         result, failures, bodies = {}, [], []
-        attempted_seen, during_chat, during_push = [], [], []
+        attempted_seen, during_chat = [], []
 
         def recover():
             attempted.set()
@@ -3797,15 +3657,10 @@ class StaleBatchOppositeEdgeTest(Base):
             during_chat.append((done.wait(.2), self.att()["state"]))
             bodies.append(body)
 
-        def push(*_args, **_kwargs):
-            during_push.append((done.is_set(), self.att()["state"]))
-            return True
-
         with mock.patch.object(beacons, "live_sessions", return_value={}), \
                 mock.patch.dict(os.environ, {"HELM_PROC": self.proc}), \
                 mock.patch("helm.chat.post", side_effect=post), \
-                mock.patch("helm.notify.owner_push", side_effect=push), \
-                mock.patch("helm.notify.configured", return_value=True):
+                mock.patch("helm.notify.owner_push") as pushed:
             out = beacons.escalate(reg_a["transitions"], rep_a)
             # JOINED INSIDE THE PATCH SCOPE. The recovery thread opens its own
             # patch of `live_sessions` and HELM_PROC while this block's are
@@ -3824,10 +3679,9 @@ class StaleBatchOppositeEdgeTest(Base):
                          "the attendance writer never entered during chat.post")
         self.assertEqual(during_chat, [(False, beacons.DEAF)],
                          "attendance crossed the lock while chat was posting")
-        self.assertEqual(during_push, [(False, beacons.DEAF)],
-                         "attendance crossed the lock before the phone leg")
+        pushed.assert_not_called()
         self.assertIn("DEAF SEAT alpha", bodies[0])
-        self.assertTrue(out["chat"] and out["push"])
+        self.assertTrue(out["chat"])
         _rep_b, reg_b = result["pass"]
         self.assertEqual([t[1]["alarm"] for t in reg_b["transitions"]], [False],
                          "the recovery committed before the alarm acks and was "
@@ -3835,13 +3689,13 @@ class StaleBatchOppositeEdgeTest(Base):
         att = self.att()
         self.assertEqual((att["state"], att["alarm"]),
                          (beacons.COVERED, False))
-        self.assertTrue(att["alarmed"] and att["pushed"],
+        self.assertTrue(att["alarmed"],
                         "the delivered alarm vanished before recovery can clear it")
 
-    def test_a_stale_ALARM_is_not_delivered_onto_a_RECOVERED_row(self):  # noqa: VACUOUS_ASSERTION — the control at the end drives the SAME chat/push mocks to a real delivery once the seat dies for real (assert_called_once + the DEAF SEAT body match + both latches True), so the assert_not_called measures the freshness rung and not a dead verb; the two fixture MUST-HITs above prove A derived an alarm and B derived nothing
+    def test_a_stale_ALARM_is_not_delivered_onto_a_RECOVERED_row(self):
         """The amendment's exact interleaving. The seat answers again before
         A's alarm ever leaves the machine, so the alarm is not news — it is
-        false — and the owner must not be told a covered seat is dead."""
+        false — and #seats must not say a covered seat is dead."""
         self.roster("alpha")                         # present, no beacon: DEAF
         rep_a, reg_a = self.deaf_pass()              # A derives the alarm
         self.assertEqual([t[1]["alarm"] for t in reg_a["transitions"]], [True],
@@ -3852,22 +3706,20 @@ class StaleBatchOppositeEdgeTest(Base):
         self.assertEqual(self.att()["state"], beacons.COVERED)
         self.assertEqual(len(reg_b["transitions"]), 0,
                          "pass B derived a recovery edge — the premise of "
-                         "this race (B is SILENT because both latches are "
-                         "still false) does not hold and it measures nothing")
+                         "this race requires B to be silent while chat is "
+                         "still unlatched")
         with mock.patch.object(beacons, "live_sessions", return_value={}), \
                 mock.patch.dict(os.environ, {"HELM_PROC": self.proc}), \
                 mock.patch("helm.chat.post") as posted, \
-                mock.patch("helm.notify.owner_push",
-                           return_value=True) as pushed, \
-                mock.patch("helm.notify.configured", return_value=True):
+                mock.patch("helm.notify.owner_push") as pushed:
             out = beacons.escalate(reg_a["transitions"], rep_a)
             self.assertEqual(out["alarms"], 0,
                              "a collapsed row still counted as an alarm that "
                              "reached a channel")
             posted.assert_not_called()               # no "DEAF SEAT alpha"
-            pushed.assert_not_called()               # no phone buzz
+            pushed.assert_not_called()               # no isolated phone buzz
             att = self.att()
-            self.assertFalse(att["alarmed"] or att["pushed"],
+            self.assertFalse(att["alarmed"],
                              "a stale alarm latched onto the covered row")
             # POSITIVE CONTROL on the SAME mocks: the seat dies for real and
             # the very next pass delivers, so the silence above measures the
@@ -3879,26 +3731,23 @@ class StaleBatchOppositeEdgeTest(Base):
             beacons.escalate(reg_c["transitions"], rep_c)
         posted.assert_called_once()
         self.assertIn("DEAF SEAT alpha", posted.call_args[0][0])
-        pushed.assert_called_once()
-        self.assertTrue(self.att()["alarmed"] and self.att()["pushed"])
+        pushed.assert_not_called()
+        self.assertTrue(self.att()["alarmed"])
 
-    def test_a_stale_RECOVERY_does_not_tell_the_owner_the_fleet_is_BACK(self):  # noqa: VACUOUS_ASSERTION — the control at the end delivers a REAL recovery on the SAME mocks (answers again / reachable again + both latches cleared); the assertTrue on the surviving latches is the positive half of the claim, and the DEAF SEAT assertIn above proves the alarm landed first
-        """The mirror, and the direction that lets the owner go back to sleep:
-        a recovery batch delivered onto a row that is DEAF again says "1 seat
-        reachable again" about a seat that is down, and disarms both latches
-        so the standing alarm reads as delivered-and-cleared."""
+    def test_a_stale_RECOVERY_does_not_tell_seats_the_seat_is_BACK(self):
+        """A stale recovery cannot tell #seats that a newly deaf seat is
+        answering or disarm its standing chat alarm."""
         self.roster("alpha")
         with mock.patch.object(beacons, "live_sessions", return_value={}), \
                 mock.patch.dict(os.environ, {"HELM_PROC": self.proc}), \
                 mock.patch("helm.chat.post") as posted, \
-                mock.patch("helm.notify.owner_push", return_value=True), \
-                mock.patch("helm.notify.configured", return_value=True):
+                mock.patch("helm.notify.owner_push") as pushed:
             rep, reg = beacons.census(), None
             reg = beacons.attend(rep)
             beacons.escalate(reg["transitions"], rep)
         self.assertIn("DEAF SEAT alpha", posted.call_args[0][0])   # MUST-HIT:
         att = self.att()                             # the alarm really landed
-        self.assertTrue(att["alarmed"] and att["pushed"])
+        self.assertTrue(att["alarmed"])
         wdir, adir = self.revive()                   # A derives the RECOVERY
         rep_a, reg_a = self.covered_pass()
         self.assertEqual([t[1]["alarm"] for t in reg_a["transitions"]], [False],
@@ -3909,24 +3758,19 @@ class StaleBatchOppositeEdgeTest(Base):
         _rep_b, reg_b = self.deaf_pass()
         self.assertEqual(self.att()["state"], beacons.DEAF)
         self.assertEqual(len(reg_b["transitions"]), 0,
-                         "pass B derived an edge — both latches already carry "
-                         "True, so this race requires B to be silent")
+                         "pass B derived an edge even though the chat alarm "
+                         "is already latched")
         with mock.patch.object(beacons, "live_sessions", return_value={}), \
                 mock.patch.dict(os.environ, {"HELM_PROC": self.proc}), \
                 mock.patch("helm.chat.post") as posted2, \
-                mock.patch("helm.notify.owner_push",
-                           return_value=True) as pushed2, \
-                mock.patch("helm.notify.configured", return_value=True):
+                mock.patch("helm.notify.owner_push") as pushed2:
             beacons.escalate(reg_a["transitions"], rep_a)
             posted2.assert_not_called()
             pushed2.assert_not_called()
             att = self.att()
-            self.assertTrue(att["alarmed"] and att["pushed"],
-                            "a stale recovery DISARMED the standing alarm — "
-                            "the next pass now owes nothing and the phone "
-                            "stays quiet about a seat that is down")
-            # POSITIVE CONTROL on the SAME mocks: a REAL recovery still
-            # delivers "reachable again" on both channels.
+            self.assertTrue(att["alarmed"],
+                            "a stale recovery DISARMED the standing chat alarm")
+            # POSITIVE CONTROL on the same chat mock: a real recovery posts.
             self.revive()
             with mock.patch.object(beacons, "live_sessions",
                                    return_value={SID_A: 90}):
@@ -3934,8 +3778,8 @@ class StaleBatchOppositeEdgeTest(Base):
                 reg_c = beacons.attend(rep_c)
                 beacons.escalate(reg_c["transitions"], rep_c)
         self.assertIn("answers again", posted2.call_args[0][0])
-        self.assertIn("reachable again", pushed2.call_args[0][0])
-        self.assertFalse(self.att()["alarmed"] or self.att()["pushed"])
+        pushed2.assert_not_called()
+        self.assertFalse(self.att()["alarmed"])
 
     def test_a_state_drift_at_EQUAL_alarm_collapses_the_stale_wording(self):  # noqa: VACUOUS_ASSERTION — pass B's own batch is delivered on the SAME chat mock immediately after and asserts the CORRECT sentence (UNREACHABLE SEAT, not DEAF SEAT), so the stale batch's silence is measured against a live verb
         """`state` is revalidated as well as `alarm`, because a DEAF->UNPROVEN
@@ -3961,8 +3805,7 @@ class StaleBatchOppositeEdgeTest(Base):
         with mock.patch.object(beacons, "live_sessions", return_value={}), \
                 mock.patch.dict(os.environ, {"HELM_PROC": self.proc}), \
                 mock.patch("helm.chat.post") as posted, \
-                mock.patch("helm.notify.owner_push", return_value=True), \
-                mock.patch("helm.notify.configured", return_value=True):
+                mock.patch("helm.notify.owner_push") as pushed:
             beacons.escalate(reg_a["transitions"], rep_a)   # the STALE wording
             posted.assert_not_called()
             # POSITIVE CONTROL on the same mock: B's own batch, which the
@@ -4007,8 +3850,7 @@ class StaleBatchOppositeEdgeTest(Base):
                                return_value={SID_A: 90}), \
                 mock.patch.dict(os.environ, {"HELM_PROC": self.proc}), \
                 mock.patch("helm.chat.post") as posted, \
-                mock.patch("helm.notify.owner_push", return_value=True), \
-                mock.patch("helm.notify.configured", return_value=True):
+                mock.patch("helm.notify.owner_push") as pushed:
             beacons.escalate(reg_a["transitions"], rep_a)
             posted.assert_not_called()
             self.assertFalse(self.att()["alarmed"])
@@ -4023,7 +3865,7 @@ class StaleBatchOppositeEdgeTest(Base):
         self.assertIn("alpha", posted.call_args[0][0])
         self.assertTrue(self.att()["alarmed"])
 
-    def test_an_UNCHANGED_verdict_rewritten_by_another_pass_still_DELIVERS(self):  # noqa: VACUOUS_ASSERTION — posted2.assert_called_once + the DEAF SEAT body + the advanced latch are the unconditional positive controls; pushed2.assert_not_called is the already-landed leg, whose ground truth (pushed True) is asserted directly above
+    def test_an_UNCHANGED_verdict_rewritten_by_another_pass_still_DELIVERS(self):
         """The over-tight direction, and the one that would silently break
         at-least-once: freshness is about the VERDICT, not about the row. A
         concurrent pass that re-measures the SAME state rewrites `at` (and
@@ -4035,14 +3877,12 @@ class StaleBatchOppositeEdgeTest(Base):
                 mock.patch.dict(os.environ, {"HELM_PROC": self.proc}), \
                 mock.patch("helm.chat.post",
                            side_effect=OSError("tmpfs gone")) as posted, \
-                mock.patch("helm.notify.owner_push", return_value=True), \
-                mock.patch("helm.notify.configured", return_value=True):
+                mock.patch("helm.notify.owner_push") as pushed:
             rep_a, reg_a = beacons.census(), None
             reg_a = beacons.attend(rep_a)
             out_a = beacons.escalate(reg_a["transitions"], rep_a)
         self.assertFalse(out_a["chat"])              # the room leg FAILED…
         self.assertFalse(self.att()["alarmed"])      # …so nothing latched
-        self.assertTrue(self.att()["pushed"])        # the phone leg landed
         before = self.att()["at"]
         _rep_b, _reg_b = self.deaf_pass()            # same verdict, new stamps
         self.assertNotEqual(self.att()["at"], before,
@@ -4052,72 +3892,14 @@ class StaleBatchOppositeEdgeTest(Base):
         with mock.patch.object(beacons, "live_sessions", return_value={}), \
                 mock.patch.dict(os.environ, {"HELM_PROC": self.proc}), \
                 mock.patch("helm.chat.post") as posted2, \
-                mock.patch("helm.notify.owner_push",
-                           return_value=True) as pushed2, \
-                mock.patch("helm.notify.configured", return_value=True):
+                mock.patch("helm.notify.owner_push") as pushed2:
             out = beacons.escalate(reg_a["transitions"], rep_a)
         self.assertTrue(out["chat"])
         posted2.assert_called_once()                 # the failed leg RETRIED
         self.assertIn("DEAF SEAT alpha", posted2.call_args[0][0])
-        pushed2.assert_not_called()                  # the landed leg did not
+        pushed2.assert_not_called()                  # no per-seat phone leg
         self.assertTrue(self.att()["alarmed"], "the retry did not latch")
 
-    def test_a_collapsed_batch_does_not_claim_the_room_HEARD_the_alarm(self):  # noqa: VACUOUS_ASSERTION — the CONTROL arm runs first on the same stderr and asserts the note DOES fire for a real alarm (plus posted.assert_called_once), so the assertNotIn measures the recount
-        """`alarms` drives the operator note "this alarm reached the fleet
-        room ONLY", so it must count what SURVIVED revalidation rather than
-        what was derived — otherwise the cure above buys silence on the wire
-        and pays for it with a false line on the surface a human reads."""
-        import contextlib
-        self.roster("alpha")
-        err = io.StringIO()
-        with mock.patch.object(beacons, "live_sessions", return_value={}), \
-                mock.patch.dict(os.environ, {"HELM_PROC": self.proc}), \
-                mock.patch("helm.chat.post") as posted, \
-                mock.patch("helm.notify.owner_push", return_value=True), \
-                mock.patch("helm.notify.configured", return_value=False), \
-                contextlib.redirect_stdout(io.StringIO()), \
-                contextlib.redirect_stderr(err):
-            rc = beacons.cmd_beacons(["--post"])     # CONTROL: a real alarm
-        self.assertEqual(rc, 1)
-        posted.assert_called_once()
-        self.assertIn("reached the fleet room ONLY", err.getvalue())
-        self.revive()                                # recover and clear it
-        with mock.patch.object(beacons, "live_sessions",
-                               return_value={SID_A: 90}), \
-                mock.patch.dict(os.environ, {"HELM_PROC": self.proc}), \
-                mock.patch("helm.chat.post"), \
-                mock.patch("helm.notify.owner_push", return_value=True), \
-                mock.patch("helm.notify.configured", return_value=True), \
-                contextlib.redirect_stdout(io.StringIO()), \
-                contextlib.redirect_stderr(io.StringIO()):
-            beacons.cmd_beacons(["--post"])
-        self.assertFalse(self.att()["alarmed"])      # the latch is clear again
-        shutil.rmtree(os.path.join(self.proc, "302"))
-        shutil.rmtree(os.path.join(self.proc, "90"))
-        real_attend = beacons.attend
-
-        def attend_then_recover(rep, now=None):
-            """The seat answers again INSIDE the attend -> escalate window."""
-            out = real_attend(rep, now=now)
-            self.revive()
-            with mock.patch.object(beacons, "live_sessions",
-                                   return_value={SID_A: 90}):
-                real_attend(beacons.census())
-            return out
-        err2 = io.StringIO()
-        with mock.patch.object(beacons, "live_sessions", return_value={}), \
-                mock.patch.dict(os.environ, {"HELM_PROC": self.proc}), \
-                mock.patch.object(beacons, "attend",
-                                  side_effect=attend_then_recover), \
-                mock.patch("helm.chat.post") as posted2, \
-                mock.patch("helm.notify.owner_push", return_value=True), \
-                mock.patch("helm.notify.configured", return_value=False), \
-                contextlib.redirect_stdout(io.StringIO()), \
-                contextlib.redirect_stderr(err2):
-            beacons.cmd_beacons(["--post"])
-        posted2.assert_not_called()                  # nothing was delivered…
-        self.assertNotIn("reached the fleet room ONLY", err2.getvalue())
-        self.assertEqual(self.att()["state"], beacons.COVERED)
 
 
 class BeaconsTimerUnitTest(unittest.TestCase):
@@ -4385,7 +4167,7 @@ class ALeaseExpiryIsWakingNotDeafTest(Base):
         out = CensusTest.render(self, rep)
         self.assertIn("WAKING SEAT alpha", out)
         self.assertIn("30-minute lease", out)
-        self.assertIn("1 WAKING, 0 DEAF", out)
+        self.assertIn("1 WAKING, 0 BUSY, 0 DEAF", out)
 
     def test_the_register_writes_WAKING_and_never_advances_covered(self):  # noqa: VACUOUS_ASSERTION — the register's state WAKING is the positive observable of the same attend; the absent covered stamp and empty transitions are what WAKING must not write
         self.roster("alpha")
@@ -4845,6 +4627,346 @@ class AnUnprovenRecoveryIsNotARecoveryTest(Base):
         self.assertIn("still waiting in helm", beacons._held_why(still_there))
 
 
+class AttendedCensusIsTheOneObservationTest(Base):
+    """task/3939: ONE OBSERVATION, ONE OWNER. A whole-roll --post records the
+    census it ATTENDED beside the register, under the roster lock and with
+    the register's own `at`: after attendance HOLDS an unproven recovery at
+    DEAF-IN-EFFECT, so fleet-down (`beacon_phone.fleet`) judges exactly what
+    the register records. The raw census, taken before the hold, disagrees
+    with the register on that seat and could never be matched."""
+
+    def seed(self, now):
+        self.roster("alpha", "beta")
+        path = os.path.join(os.environ["HELM_CHAT_DIR"], ".roster.json")
+        with open(path) as f:
+            r = json.load(f)
+        r["alpha"]["attendance"] = {
+            "state": beacons.DEAF_IN_EFFECT, "alarm": True, "alarmed": True,
+            "since": now - 600, "at": now - 300, "covered": now - 900,
+            "standing": now - 300, "undrained_row": ["helm", "r1"]}
+        with open(path, "w") as f:
+            json.dump(r, f)
+        return path
+
+    @staticmethod
+    def rep():
+        """Both seats answer; alpha's sample never reached its row's room,
+        so its recovery is UNPROVEN and attendance holds it."""
+        ev = {"oldest": None, "scanned": (), "seen": (), "bounded": {}}
+        rows = [{"seat": s, "verdict": beacons.COVERED, "live": [90 + i],
+                 "why": "answers", "undrained_unreadable": None,
+                 "undrained_evidence": dict(ev)}
+                for i, s in enumerate(("alpha", "beta"))]
+        return {"seats": rows, "covered": list(rows), "unreachable": [],
+                "deaf_in_effect": [], "live_probe": True, "agent_probe": True}
+
+    def test_a_whole_roll_pass_records_the_held_census_qualify_matches(self):  # noqa: VACUOUS_ASSERTION — the recorded file is read back and its rows asserted by value, and qualify is asserted "clear" on it before the raw-census control asserts "unknown"
+        from helm import beacon_phone
+        now = time.time()
+        path = self.seed(now)
+        raw = self.rep()
+        rep = self.rep()
+        with mock.patch.dict(os.environ, {"HELM_STEWARD_SEAT": ""}):
+            out = beacons.attend(rep, now=now, fleet=True)
+            self.assertIsNone(out["error"], out)
+            self.assertIsNone(out["census"], out)
+            self.assertEqual([r["verdict"] for r in rep["seats"]],
+                             [beacons.DEAF_IN_EFFECT, beacons.COVERED],
+                             "fixture: attendance did not hold alpha")
+            with open(beacons.attended_path(path)) as f:
+                got = json.load(f)
+            self.assertEqual(got["at"], now)
+            self.assertEqual([(r["seat"], r["verdict"]) for r in got["seats"]],
+                             [("alpha", beacons.DEAF_IN_EFFECT),
+                              ("beta", beacons.COVERED)])
+            judged = beacon_phone.fleet(now)
+            self.assertEqual((judged["phase"], judged["stale"]),
+                             ("clear", False), judged["why"])
+            # THE CONTROL: the raw census, judged against the same register,
+            # does not match it, which is why the weather never takes one.
+            rows, _rep, _why = beacon_phone._read()
+            self.assertEqual(beacon_phone.qualify(
+                raw, rows, now, True)["phase"], "unknown")
+
+    def test_a_one_seat_pass_records_no_fleet_census(self):  # noqa: VACUOUS_ASSERTION — the sibling arm records the census through the same attend; here its absence IS the claim
+        now = time.time()
+        path = self.seed(now)
+        out = beacons.attend(self.rep(), now=now)
+        self.assertIsNone(out["error"], out)
+        self.assertEqual(out["written"], ["alpha", "beta"])
+        self.assertFalse(os.path.exists(beacons.attended_path(path)),
+                         "a --seat pass is one seat's question, never the "
+                         "fleet's census")
+
+
+class FleetDownEndToEndTest(Base):
+    """task/3939, driven whole: the REAL `attend` records the census it
+    attended, the REAL `beacon_phone.fleet` judges it and the REAL weather
+    pass pages. Only the floor's other readers and the phone are fakes."""
+
+    SEATS = ("ops-steward", "beta", "gamma")
+
+    class Phone:
+        def __init__(self):
+            self.pushes = []
+
+        def configured(self):
+            return True
+
+        def owner_push(self, body, title="helm", receipt=None,
+                       reply_key=None):
+            self.pushes.append(body)
+            return True
+
+    def setUp(self):
+        super().setUp()
+        os.environ.pop("HELM_STEWARD_SEAT", None)
+        self.roster(*self.SEATS)
+        self.phone = self.Phone()
+        self.t0 = time.time() - 10 * 3600
+
+    def step(self, i, states, causes=(), attend=True):
+        """Timer pass `i`: the REAL `beacons --post` attend of a census
+        reading `states` (skipped when `attend` is False: the beacons timer
+        stopped), then the REAL weather pass 30 s later. `causes` is the
+        land-path P0 reader's findings."""
+        now = self.t0 + i * 300
+        if attend:
+            ev = {"oldest": None, "scanned": (), "seen": (), "bounded": {}}
+            rows = [{"seat": s, "verdict": states.get(s, beacons.COVERED),
+                     "live": [90] if states.get(s, beacons.COVERED)
+                     == beacons.COVERED else [], "why": "w",
+                     "undrained_unreadable": None,
+                     "undrained_evidence": dict(ev)}
+                    for s in self.SEATS]
+            out = beacons.attend({"seats": rows, "live_probe": True,
+                                  "agent_probe": True}, now=now, fleet=True)
+            self.assertIsNone(out["error"], out)
+        return self.tick(now + 30, causes)
+
+    def tick(self, now, causes=()):
+        from helm import officeweather
+        quiet = {k: (lambda t: []) for k in ("floor", "stall", "chat",
+                                             "land", "burn")}
+        quiet["causes"] = lambda t: list(causes)
+        quiet["stewards"] = lambda ms: {}
+        return officeweather.tick(now=now, push=True, reads=quiet,
+                                  phone=self.phone)
+
+    def run_to(self, start, end, states, causes=(), attend=True):
+        """Passes `start`..`end` (inclusive) -> the pass results."""
+        return [self.step(i, states, causes, attend)
+                for i in range(start, end + 1)]
+
+    #: The integrator's bound on a heard fleet storm (officeweather's
+    #: FLEET_HOLD_S), pinned by value so an arm reds on behaviour.
+    HOLD = 2 * 3600
+
+    def expiry_pass(self):
+        """The first pass index at which a storm heard on pass 2 has held
+        the bound (passes are 300 s apart)."""
+        return 2 + -(-self.HOLD // 300)
+
+    def test_the_bound_is_two_hours(self):  # noqa: VACUOUS_ASSERTION — an equality of the constant to a nonzero literal; the expiry arms below drive it
+        from helm import officeweather
+        self.assertEqual(officeweather.FLEET_HOLD_S, self.HOLD)
+
+    P0 = ("stormy", "the land-path P0 cause land-guard|refused is open")
+
+    def test_a_seat_that_never_returns_expires_the_storm_once_then_a_p0_pages(self):  # noqa: VACUOUS_ASSERTION — the push count is asserted by value (1, 2, 3) on the same phone before the no-all-clear check
+        """task/3939 bound: a heard majority outage (beta and gamma DEAF)
+        where beta comes back and gamma never does. The storm pages once at
+        onset; a land-path P0 that opens while the phone holds it does not
+        page; at FLEET_HOLD_S the weather pages ONCE that it stops holding the
+        storm (naming gamma, no all-clear), and the P0 then pages."""
+        down = {"beta": beacons.DEAF, "gamma": beacons.DEAF}
+        got = [self.step(0, {})] + self.run_to(1, 4, down)
+        self.assertEqual([g["word"] for g in got][-3:], ["stormy"] * 3)
+        self.assertEqual(len(self.phone.pushes), 1, self.phone.pushes)
+        end = self.expiry_pass()
+        self.run_to(5, 12, {"gamma": beacons.DEAF})
+        self.run_to(13, end - 1, {"gamma": beacons.DEAF}, causes=[self.P0])
+        self.assertEqual(len(self.phone.pushes), 1,
+                         "control: the phone holds the fleet storm, so the "
+                         "P0 does not page before the bound")
+        got = self.step(end, {"gamma": beacons.DEAF}, causes=[self.P0])
+        self.assertEqual(len(self.phone.pushes), 2, self.phone.pushes)
+        page = self.phone.pushes[1]
+        self.assertIn("the fleet has been down 2 h", page)
+        self.assertIn("gamma", page)
+        self.assertIn("so other storms can page", page)
+        self.run_to(end + 1, end + 4, {"gamma": beacons.DEAF},
+                    causes=[self.P0])
+        self.assertEqual(len(self.phone.pushes), 3, self.phone.pushes)
+        self.assertIn("land-guard|refused", self.phone.pushes[2])
+        self.assertFalse([p for p in self.phone.pushes
+                          if p.startswith("all clear")], self.phone.pushes)
+
+    def test_the_same_uncovered_cohort_never_reopens_and_a_new_outage_pages(self):  # noqa: VACUOUS_ASSERTION — the push count is asserted by value (2, 2, 3) on the same phone before the no-all-clear check
+        """After the bound expires a storm whose majority never came back,
+        the SAME uncovered seats read down every pass and never re-page; the
+        steward then going down too is a different outage, and it pages."""
+        down = {"beta": beacons.DEAF, "gamma": beacons.DEAF}
+        self.step(0, {})
+        end = self.expiry_pass()
+        got = self.run_to(1, end, down)
+        self.assertEqual(len(self.phone.pushes), 2, self.phone.pushes)
+        self.assertIn("the fleet has been down", self.phone.pushes[1])
+        self.assertIn("beta, gamma", self.phone.pushes[1])
+        after = self.run_to(end + 1, end + 12, down)
+        self.assertEqual(len(self.phone.pushes), 2, self.phone.pushes)
+        self.assertNotEqual(after[-1]["word"], "stormy", after[-1]["line"])
+        self.assertIn("the weather stopped holding it", after[-1]["line"])
+        new = dict(down, **{"ops-steward": beacons.DEAF})
+        self.run_to(end + 13, end + 16, new)
+        self.assertEqual(len(self.phone.pushes), 3, self.phone.pushes)
+        self.assertIn("the fleet is down", self.phone.pushes[2])
+        self.assertFalse([p for p in self.phone.pushes
+                          if p.startswith("all clear")], self.phone.pushes)
+
+    def test_a_storm_held_by_a_stale_census_expires_the_same_way(self):  # noqa: VACUOUS_ASSERTION — the push count is asserted by value (1, 2) on the same phone before the no-all-clear check
+        """The phone heard the storm, then the beacons timer stopped: the
+        recorded census goes stale and only holds the storm. At the bound
+        the weather pages once, naming the census age, and sends no
+        all-clear."""
+        down = {"beta": beacons.DEAF, "gamma": beacons.DEAF}
+        self.step(0, {})
+        self.run_to(1, 3, down)
+        self.assertEqual(len(self.phone.pushes), 1, self.phone.pushes)
+        end = self.expiry_pass()
+        got = self.run_to(4, end - 1, down, attend=False)
+        self.assertEqual(got[-1]["word"], "stormy", got[-1]["line"])
+        self.assertIn("min old", got[-1]["line"])
+        self.assertEqual(len(self.phone.pushes), 1, self.phone.pushes)
+        self.run_to(end, end + 6, down, attend=False)
+        self.assertEqual(len(self.phone.pushes), 2, self.phone.pushes)
+        self.assertIn("the fleet has been down", self.phone.pushes[1])
+        self.assertIn("min old", self.phone.pushes[1])
+        self.assertFalse([p for p in self.phone.pushes
+                          if p.startswith("all clear")], self.phone.pushes)
+
+    def expiry_fails_once(self, causes=()):
+        """A heard majority outage where gamma never returns, whose expiry
+        push FAILS once; the passes after it read only gamma down (not
+        fleet-down: one seat of three) -> the pushes."""
+        phone = self.phone
+        tries = []
+
+        def flaky(body, title="helm", receipt=None, reply_key=None):
+            tries.append(body)
+            if len(tries) == 2:
+                return False                 # the expiry page does not land
+            return self.Phone.owner_push(phone, body, title, receipt,
+                                         reply_key)
+        phone.owner_push = flaky
+        self.step(0, {})
+        self.run_to(1, 4, {"beta": beacons.DEAF, "gamma": beacons.DEAF})
+        end = self.expiry_pass()
+        self.run_to(5, end - 1, {"gamma": beacons.DEAF}, causes=causes)
+        got = self.step(end, {"gamma": beacons.DEAF}, causes=causes)
+        self.assertIn("the fleet expiry did not land", got["phone"])
+        self.assertEqual(len(tries), 2, "fixture: the expiry was tried")
+        self.run_to(end + 1, end + 16, {"gamma": beacons.DEAF},
+                    causes=causes)
+        return phone.pushes
+
+    def test_an_expiry_page_that_fails_stays_owed_past_a_clear_and_lands_once(self):  # noqa: VACUOUS_ASSERTION — the expiry page is asserted present by count (exactly one) before the no-all-clear check
+        """The expiry push fails, and the very next census is no longer
+        fleet-down (one seat of three): the owed expiry page still lands,
+        once, and no all-clear is sent while gamma is not covered."""
+        pushes = self.expiry_fails_once()
+        self.assertEqual(len([p for p in pushes if "has been down" in p]), 1,
+                         pushes)
+        self.assertFalse([p for p in pushes if p.startswith("all clear")],
+                         pushes)
+
+    def test_an_expiry_page_that_fails_lands_once_then_the_p0_pages(self):
+        pushes = self.expiry_fails_once(causes=[self.P0])
+        self.assertEqual(len([p for p in pushes if "has been down" in p]), 1,
+                         pushes)
+        self.assertEqual(len([p for p in pushes if "land-guard" in p]), 1,
+                         pushes)
+        self.assertLess(pushes.index([p for p in pushes
+                                      if "has been down" in p][0]),
+                        pushes.index([p for p in pushes
+                                      if "land-guard" in p][0]))
+
+    STEWARD_DOWN = {"ops-steward": beacons.DEAF, "gamma": beacons.DEAF}
+
+    def test_an_expiry_page_that_fails_lands_once_then_a_new_outage_pages(self):
+        """The expiry push fails once and the next census is a different
+        outage (the steward down too): the owed expiry lands first, once,
+        then the new outage pages once, and no all-clear is sent."""
+        phone, tries = self.phone, []
+
+        def flaky(body, title="helm", receipt=None, reply_key=None):
+            tries.append(body)
+            return len(tries) != 2 and self.Phone.owner_push(
+                phone, body, title, receipt, reply_key)
+        phone.owner_push = flaky
+        self.step(0, {})
+        self.run_to(1, 4, {"beta": beacons.DEAF, "gamma": beacons.DEAF})
+        end = self.expiry_pass()
+        self.run_to(5, end, {"gamma": beacons.DEAF})
+        self.assertEqual(len(tries), 2, "fixture: the expiry was tried")
+        self.run_to(end + 1, end + 12, self.STEWARD_DOWN)
+        pushes = phone.pushes
+        self.assertEqual(len(pushes), 3, pushes)
+        self.assertIn("has been down 2 h: gamma still", pushes[1])
+        self.assertIn("the steward seat is unreachable", pushes[2])
+
+    def test_a_new_outage_is_not_heard_while_an_expiry_page_is_owed(self):
+        """The phone stays down past FLEET_HOLD_S after the expiry push
+        fails, while a different outage is open: that outage was never
+        paged, so the bound does not run on it and it never replaces the
+        owed expiry. When the phone is back, the owed expiry (naming the
+        expired episode's seat) lands, then the new outage pages, once."""
+        phone, down = self.phone, {"on": False}
+
+        def flaky(body, title="helm", receipt=None, reply_key=None):
+            return not down["on"] and self.Phone.owner_push(
+                phone, body, title, receipt, reply_key)
+        phone.owner_push = flaky
+        self.step(0, {})
+        self.run_to(1, 4, {"beta": beacons.DEAF, "gamma": beacons.DEAF})
+        end = self.expiry_pass()
+        self.run_to(5, end - 1, {"gamma": beacons.DEAF})
+        self.assertEqual(len(phone.pushes), 1, phone.pushes)
+        down["on"] = True
+        self.step(end, {"gamma": beacons.DEAF})
+        back = end + 2 + 2 * -(-self.HOLD // 300)
+        self.run_to(end + 1, back - 1, self.STEWARD_DOWN)
+        self.assertEqual(len(phone.pushes), 1, phone.pushes)
+        down["on"] = False
+        self.run_to(back, back + 12, self.STEWARD_DOWN)
+        pushes = phone.pushes
+        self.assertEqual(len(pushes), 3, pushes)
+        self.assertIn("has been down 2 h: gamma still", pushes[1])
+        self.assertIn("the steward seat is unreachable", pushes[2])
+
+    def test_a_steward_outage_pages_once_and_a_rested_seat_ends_it(self):
+        got = [self.step(0, {})]
+        got += [self.step(i, {"ops-steward": beacons.DEAF,
+                              "gamma": beacons.DEAF}) for i in (1, 2, 3)]
+        self.assertEqual([g["word"] for g in got],
+                         ["sunny", "stormy", "stormy", "stormy"])
+        self.assertEqual(len(self.phone.pushes), 1, self.phone.pushes)
+        self.assertIn("the steward seat is unreachable", self.phone.pushes[0])
+        # the steward comes back; the owner rests gamma instead of restarting
+        # it, and the census reads it RESTING
+        for i in range(4, 20):
+            last = self.step(i, {"gamma": beacons.RESTING})
+        self.assertEqual(last["settled"]["word"], "sunny", last["line"])
+        self.assertEqual(len(self.phone.pushes), 2, self.phone.pushes)
+        self.assertTrue(self.phone.pushes[1].startswith("all clear: "))
+
+    def test_one_seat_of_three_down_never_pages(self):  # noqa: VACUOUS_ASSERTION — the sibling arm pages once through the same real attend and tick; here eight sunny words and no push are the claim
+        got = [self.step(i, {"beta": beacons.DEAF} if i else {})
+               for i in range(8)]
+        self.assertEqual({g["word"] for g in got}, {"sunny"})
+        self.assertEqual(self.phone.pushes, [])
+
+
 class AnEmptySampleIsNotADrainedBacklogTest(Base):
     """task/2463 findings 2 and 3 — the actuator's half of a lesson that was
     already learned one module over.
@@ -5055,15 +5177,12 @@ class TheNudgeRidesTheRevalidatedEdgeTest(Base):
             json.dump(r, f)
 
     def test_an_already_alarmed_seat_that_TURNS_deaf_in_effect_is_repaired(self):
-        """THE HOLE THAT GATING ON TRANSITIONS LEFT. A seat already DEAF and
-        acknowledged on BOTH channels moves to DEAF-IN-EFFECT without moving
-        either latch — alarm was true before and is true after — so there is
-        no notification edge, and the repair leg never ran for exactly the
-        seat that had just acquired one."""
+        """A DEAF seat already acknowledged by chat moves to DEAF-IN-EFFECT
+        without a notification edge. Its newly acquired repair must still run."""
         rep, reg, out, woke = self.pass_with(
             beacons.UNDRAINED_S + 60,
             att={"state": beacons.DEAF, "alarm": True, "alarmed": True,
-                 "pushed": True, "since": 1.0, "at": 1.0})
+                 "since": 1.0, "at": 1.0})
         self.assertEqual([r["verdict"] for r in rep["seats"]],
                          [beacons.DEAF_IN_EFFECT],
                          "fixture: the census did not reach the verdict, so "

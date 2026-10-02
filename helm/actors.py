@@ -22,7 +22,7 @@ smuggles the capability into a durable row without asking for
 plausibly right. A raw seat string cannot be mistaken for it and cannot be
 coerced into it.
 
-WHAT IS *NOT* AN IDENTITY. Two acts that look like identity and are not:
+WHAT IS *NOT* AN IDENTITY. Four acts that look like identity and are not:
   - AUTOCLAIM — a seat handing ITSELF a dispatch lease. It needs an actor AND
     a policy decision about the kind; `AutoClaimCapability` carries both, so
     a stop-guard rung cannot reach `claim()` merely by having a name.
@@ -41,6 +41,11 @@ WHAT IS *NOT* AN IDENTITY. Two acts that look like identity and are not:
     through to `derive_seat`, which enqueued under a MINTED name so "GATE
     QUEUED #3 @helm-fable" was indistinguishable from the real seat of that
     name holding the fleet's gate.
+  - A RANK MADE BY MACHINERY — the friction autopilot raising a row it filed
+    from P1 to P0 on the timer, where no seat runs it.
+    `SystemRankCapability` records `system:<subsystem>` as `ranked_by`,
+    mints only for a subsystem in a closed set, and admits only that one
+    raise of a row the subsystem's own map holds and its `source` names.
 
 THE RECORD LIVES HERE, NOT IN THE ROSTER. Measured, not assumed:
 `roster_path()` is `chat.chat_dir()/.roster.json` (helm/seats_common.py) — the
@@ -325,6 +330,115 @@ class SystemLeaseCapability(object):
 
     def __repr__(self):
         return "<SystemLease %s>" % self.holder
+
+
+# The subsystems that may RANK a task row without being a seat (task/3899).
+# Closed, like the lease set: a caller cannot name itself into it.
+SYSTEM_RANK_SUBSYSTEMS = ("frictionpilot",)
+# The `source` each member files its rows under. A row it may rank is a row it
+# FILED, and this is the half of that fact the row itself carries.
+SYSTEM_RANK_SOURCES = {"frictionpilot": "system:frictionpilot"}
+# The one rank change a system may make: a raise from P1 to P0.
+SYSTEM_RANK_MOVE = ("P1", "P0")
+
+
+class SystemRankCapability(object):
+    """A RANK made by MACHINERY, not by a seat — the fifth authority.
+
+    The friction autopilot is the case. Its rule reads a cause P0 when the
+    cause blocks lands or reaches three seats, and its pass runs on the
+    idle-dispatch timer, where no seat is in the loop. `tasks.update` refuses
+    a rank change without an admitted actor, because `source` records who
+    FILED a row and must not be relabelled as who RANKED it. A seat's
+    admission cannot be borrowed for the timer, and a name cannot be minted
+    for it: either would write a seat into `ranked_by` that never ranked.
+
+    SO THIS IS NARROWER THAN ANY SEAT'S RANK, AND SAYS SO IN ITS TYPE. It
+    mints only for a subsystem in the closed set above, and it carries the
+    row ids that subsystem's own state maps (its cause map, read under its
+    lock). `refusal` admits exactly one change: the priority alone, of a row
+    in that map whose `source` is the subsystem's own, from P1 to P0. Any
+    other row, any other field, a lowering or any other move is refused with
+    the reason. `ranker` is `system:<subsystem>`, which `ranked_by` records
+    and which cannot be read as a seat."""
+
+    __slots__ = ("_subsystem", "_rows")
+
+    def __init__(self, subsystem, rows, *, mint=None):
+        if mint is not _MINT:      # keyword-only: see AdmittedActor.__init__
+            raise ActorRefused(
+                FORGED,
+                "SystemRankCapability cannot be constructed directly — it is "
+                "MINTED by helm.actors.grant_system_rank, which refuses any "
+                "subsystem outside SYSTEM_RANK_SUBSYSTEMS.")
+        object.__setattr__(self, "_subsystem", str(subsystem))
+        object.__setattr__(self, "_rows", frozenset(rows))
+
+    def __setattr__(self, name, value):
+        raise AttributeError("SystemRankCapability is immutable (%s)" % name)
+
+    @property
+    def subsystem(self):
+        return self._subsystem
+
+    @property
+    def rows(self):
+        return self._rows
+
+    @property
+    def source(self):
+        return SYSTEM_RANK_SOURCES[self._subsystem]
+
+    @property
+    def ranker(self):
+        """The name `ranked_by` records."""
+        return "system:%s" % self._subsystem
+
+    def refusal(self, row, fields):
+        """None when this capability may apply `fields` to `row` (the row
+        under the writer's lock), else the reason it may not."""
+        row = row if isinstance(row, dict) else {}
+        fields = fields if isinstance(fields, dict) else {}
+        tid = str(row.get("id") or "")
+        extra = sorted(k for k in fields if k != "priority")
+        if extra:
+            return ("%s changes only a row's priority, and this call also "
+                    "sets: %s" % (self.ranker, ", ".join(extra)))
+        if tid not in self._rows:
+            return ("%s is not a row %s filed: its own cause map does not "
+                    "hold it" % (tid or "the row", self._subsystem))
+        if row.get("source") != self.source:
+            return ("%s was filed by %s, not by %s" % (
+                tid, row.get("source") or "nobody recorded", self.source))
+        move = (row.get("priority"), fields.get("priority"))
+        if move != SYSTEM_RANK_MOVE:
+            return ("%s only raises %s to %s, and this is %s to %s%s" % (
+                self.ranker, SYSTEM_RANK_MOVE[0], SYSTEM_RANK_MOVE[1],
+                move[0] or "unranked", move[1] or "unranked",
+                " — a lowering" if _lower(*move) else ""))
+        return None
+
+    def __repr__(self):
+        return "<SystemRank %s rows=%d>" % (self.ranker, len(self._rows))
+
+
+def _lower(was, want):
+    """True when `want` ranks below `was` (P0 is highest; unranked lowest)."""
+    order = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
+    return order.get(want, 9) > order.get(was, 9)
+
+
+def grant_system_rank(subsystem, rows):
+    """(capability, err) — the ONLY mint for SystemRankCapability.
+
+    `rows` is the subsystem's own map of the rows it filed. A subsystem
+    outside SYSTEM_RANK_SUBSYSTEMS gets no capability and a reason."""
+    if subsystem not in SYSTEM_RANK_SUBSYSTEMS:
+        return None, ("%r is not a subsystem that may rank a row without a "
+                      "seat (allowed: %s)"
+                      % (subsystem, ", ".join(SYSTEM_RANK_SUBSYSTEMS)))
+    return SystemRankCapability(
+        subsystem, (str(r) for r in rows or () if r), mint=_MINT), None
 
 
 # The subsystems that may act FOR another seat. Closed, like the lease one.

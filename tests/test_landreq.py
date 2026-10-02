@@ -21,7 +21,7 @@ import unittest
 from unittest import mock
 
 from helm import chat, dispatches, eventledger, gate, landreq, pk, \
-    projscope, verdicts
+    projscope, tasks, verdicts
 from tests._gate_receipt import serial_process
 
 # CLASSES THIS MODULE HANDED AWAY, read by `helm/retired_name_rung.py`.
@@ -450,6 +450,15 @@ class LandReqBase(unittest.TestCase):
         # tests/test_dispatches.py. A land-loop fixture that stamped --new-work
         # on a superseding round would be asserting the defect.
         kw.setdefault("new_work", "supersedes" not in kw)
+        # Positive review roots serve real, open work. Explicit task=None and
+        # hand-planted historical rows remain available to legacy controls;
+        # superseding rounds inherit the root's task rather than minting one.
+        if kw.get("kind") == "review" and "supersedes" not in kw \
+                and "task" not in kw:
+            work, why = tasks.add("reviewed land-loop work", "integrator",
+                                  project="helm-test", force_new=True)
+            self.assertIsNone(why, why)
+            kw["task"] = work["id"]
         # UNDELIVERED BY DEFAULT, which is what a land loop's FIRST stage means.
         # add() now marks a row delivered on its own mention, and delivery is
         # the very thing that moves the state OPEN -> AWAITING_REVIEW and the
@@ -1167,7 +1176,7 @@ class StallTest(LandReqBase):
         with mock.patch.object(dispatches, "_acting_author",
                                return_value=(clean["recipient"], None)):
             _out, why = dispatches.mark_hold(
-                clean["id"], "awaiting the land gate",
+                clean["id"], "awaiting the land gate; fab Ran 5 tests OK",
                 source_clean_tip=self.side)
         self.assertIsNone(why, why)
         self.age(clean["id"], 3600)
@@ -1210,7 +1219,7 @@ class StallTest(LandReqBase):
         with mock.patch.object(dispatches, "_acting_author",
                                return_value=(row["recipient"], None)):
             _out, why = dispatches.mark_hold(
-                row["id"], "awaiting the land gate",
+                row["id"], "awaiting the land gate; fab Ran 5 tests OK",
                 source_clean_tip=self.side)
         self.assertIsNone(why, why)
         self.age(row["id"], 3600)
@@ -4139,9 +4148,14 @@ class AbandonTerminalTest(LandReqBase):
         # Minted as the OTHER repository's own helm — this arm's subject is
         # that repo_id is part of the row's identity, which needs the row.
         from tests._tmphome import dispatch_home
+        work, why = tasks.add("reviewed cross-repo work", "integrator",
+                              project="helm-test", force_new=True)
+        self.assertIsNone(why, why)
         with dispatch_home(other):
             row = dispatches.add("codex-3", "lane/cross-repo", ref=tip,
-                                 repo=other, new_work=True, kind="review")
+                                 repo=other, new_work=True, kind="review",
+                                 task=work["id"])
+        self.assertIsNotNone(row)
         self.mark_verdict(row["id"], tip, "reviewed", polarity="approve")
         lr, why = landreq.abandon(row["id"], "wrong-repo would call this missing")
         self.assertIsNone(lr)

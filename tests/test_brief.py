@@ -832,6 +832,29 @@ class PlainWordsTest(unittest.TestCase):
         for subject, words in self.CASES:
             self.assertEqual(brief.plain_words(subject), words, subject)
 
+    def test_auto_land_s_subject_with_no_seat_reads_as_its_task_words(self):
+        """task/4033: auto-land's subject names no seat and no model now. The
+        report still reads it as the task's words, and as the lane and its
+        labels when the task has no title, because the reader stops at the
+        priority-and-door label and never needed the provenance after it."""
+        from helm import autoland
+        car = {"id": "d1" * 8, "lane": "one", "task": "task/3001",
+               "title": "the fleet got lane one", "priority": "P1",
+               "doors": [], "author": "a", "reader": "r", "model": "m",
+               "basis": "source-clean"}
+
+        def subject():
+            return "train9: merge lane one (%s)" % autoland._merge_detail(car)
+        self.assertEqual(subject(), "train9: merge lane one (task/3001: the "
+                         "fleet got lane one; P1, not a door)")
+        self.assertEqual(brief.plain_words(subject()),
+                         "task/3001: the fleet got lane one")
+        self.assertEqual(brief.plain_words(subject(), short=True),
+                         "task/3001: the fleet got lane one")
+        car.update(title=None, doors=["guard"])
+        self.assertEqual(brief.plain_words(subject()),
+                         "lane one: task/3001, P1, a DOOR: guard")
+
 
 class MorningReportTest(_Trunk, BriefBase):
     """`helm brief --report` WRITES THE MORNING REPORT (task/3537): one plain
@@ -1131,6 +1154,45 @@ class ReportCheckTest(_Trunk, BriefBase):
                          ["MISSING owner ask: decide the release date"], out)
 
 
+class OfficeWeatherLineTest(BriefBase):
+    """task/3902: the line the owner's phone gets when the floor's word
+    changes is the line the brief opens with, read from the weather pass's
+    own state file (the brief never probes)."""
+
+    def _settle(self, state):
+        from helm import officeweather
+
+        class Phone:
+            def owner_push(self, *a, **k):
+                raise AssertionError("a first reading is a baseline")
+        moods = [{"seat": "alpha", "state": state, "reason": "card 7",
+                  "signals": {"wall": None}}]
+        quiet = {name: (lambda now: []) for name in
+                 ("stall", "chat", "land", "burn")}
+        return officeweather.tick(
+            push=True, phone=Phone(),
+            reads=dict(quiet, floor=lambda now: moods,
+                       stewards=lambda ms: {}))
+
+    def test_the_brief_opens_with_the_settled_weather_line(self):
+        got = self._settle("blocked-on-owner")
+        b = self.compose()
+        self.assertEqual(b["weather"]["word"], "stormy")
+        lines = brief.render(b).splitlines()
+        self.assertTrue(lines[0].startswith("helm brief — "), lines[0])
+        self.assertEqual(lines[1], got["line"])
+        self.assertIn("alpha waits on you: card 7", lines[1])
+
+    def test_no_weather_pass_yet_is_said_and_quiet_still_follows_it(self):  # noqa: VACUOUS_ASSERTION — the rendered second line is asserted to name the unmeasured weather; the None word IS the claim
+        pk.write_json(whoami.profile_path(), {"schema_version": 1,
+                                              "interview_status": "done"})
+        b = self.compose()
+        self.assertIsNone(b["weather"]["word"])
+        lines = brief.render(b).splitlines()
+        self.assertIn("office weather: not measured yet", lines[1])
+        self.assertTrue(lines[2].startswith("quiet — "), lines[:3])
+
+
 class CmdBriefTest(BriefBase):
     def _run(self, args):
         out = io.StringIO()
@@ -1148,7 +1210,7 @@ class CmdBriefTest(BriefBase):
         self.assertEqual(sorted(b), ["built", "generated_at", "hours", "inject",
                                      "knowledge", "owner_asks",
                                      "owner_asks_unavailable", "review", "seats",
-                                     "sessions", "waiting"])
+                                     "sessions", "waiting", "weather"])
         self.assertEqual(b["hours"], 12.0)
         self.assertEqual(b["sessions"]["total"], 1)
         self.assertIsNone(b["inject"])
@@ -1168,7 +1230,9 @@ class CmdBriefTest(BriefBase):
         self.assertEqual(rc, 0)
         lines = out.strip().splitlines()
         self.assertTrue(lines[0].startswith("helm brief — "))
-        self.assertIn("quiet — nothing new in the window.", lines[1])
+        # the office weather heads the brief (task/3902); quiet follows it
+        self.assertIn("office weather: not measured yet", lines[1])
+        self.assertIn("quiet — nothing new in the window.", lines[2])
         self.assertIn("quota: run `helm creds`", out)
         self.assertLessEqual(len(lines), 12)
 
@@ -1574,8 +1638,14 @@ class TheCountFollowsThePopulationThroughTheRealBriefTest(BriefBase):
             self.addCleanup(self._restore_env, key, os.environ.get(key))
             os.environ[key] = value
         pin_dispatch_home(self, self.repo)
+        from helm import tasks
+        work, why = tasks.add("brief fixture reviewed work", "integrator",
+                              project="helm-test", force_new=True)
+        self.assertIsNone(why, why)
 
         def add(lane, ref, **kw):
+            if "supersedes" not in kw:
+                kw["task"] = work["id"]
             row = dispatches.add("seat-a", lane, ref=ref, repo=self.repo,
                                  notify=False, kind="review", **kw)
             # CHECKED HERE, NOT LATER. A refusal three lines down surfaces as

@@ -102,7 +102,10 @@ def _dead_cursors():
     re-read its room and re-deliver what it already saw. The one addition
     is a seat-level cursor whose ROOM LOG is gone and whose seat the roster
     no longer holds (task/3519), once untouched past chat.ROOMLESS_CURSOR_S;
-    a live seat's cursor is never reaped for its room. Budget is count>0
+    a live seat's cursor is never reaped for its room -- unless that room is
+    RETIRED (`helm chat retire-rooms`) and its log gone, once untouched past
+    chat.RETIRED_CURSOR_S (task/3848): the restore never brings it back, and
+    a room reborn under the name has a log again. Budget is count>0
     because a dead session's cursor has no retention value at all — it is pure
     directory-entry tax on every list_rooms, which runs on every tool boundary.
 
@@ -192,6 +195,18 @@ def _unpaired_session_cursors():
     scan() turns that into an ERR row, never an empty stream."""
     from . import chatdebris
     return chatdebris.unpaired_session_cursors()
+
+
+def _dead_steer_latches():
+    """Steer latches of dead sessions (chatdebris.dead_steer_latches). Count
+    0 like chat-cursors: a dead session's latch has no retention value, and
+    each is a directory entry every `list_rooms` pays for. Raises when
+    liveness is unprovable: scan() turns that into an ERR row, never an
+    empty stream. Not owner-bound: nothing re-mints a dead session's latch
+    (a resumed session's context boundary drops its latches anyway), and a
+    live one reaped by a race is one repeated steer line, never a lost one."""
+    from . import chatdebris
+    return chatdebris.dead_steer_latches()
 
 
 def _size(p):
@@ -284,11 +299,16 @@ POLICIES = (
     {"stream": "chat-cursors", "cls": "exhaust", "act": "prune", "count": 0,
      "find": _dead_cursors, "arm": _dead_cursor_proof,
      "owner": "seats-cursor", "lock": _dead_cursor_lock,
-     "note": "cursors of dead sessions, and of seats the roster no longer "
-             "holds on rooms with no log — reap holds the cursor topology "
-             "lock and re-proves each one before it unlinks"},
+     "note": "cursors of dead sessions, of seats the roster no longer "
+             "holds on rooms with no log, and of any holder on a retired "
+             "room whose log is gone — reap holds the cursor topology lock "
+             "and re-proves each one before it unlinks"},
     {"stream": "chat-unpaired-cursors", "cls": "exhaust", "act": "prune",
      "count": 0, "find": _unpaired_session_cursors},
+    {"stream": "chat-steer-latches", "cls": "exhaust", "act": "prune",
+     "count": 0, "find": _dead_steer_latches,
+     "note": "once-per-context steer latches of dead sessions (the "
+             "chat-cursors liveness answer)"},
     {"stream": "chat-cursor-locks", "cls": "exhaust", "act": "prune", "count": 0,
      "find": _cursor_sibling_locks, "still": _cursor_sibling_lock,
      "owner": "seats-cursor", "lock": lambda path: path,
@@ -530,6 +550,12 @@ ExecStart=%(helm)s gc --apply
 # rooms, prunes phantom records, and TTL-drops idle peeks; every live-room
 # refusal (lease, cwd occupant, bound pane, dirty tree) keeps its room.
 ExecStart=%(helm)s work gc --apply --repo %(cwd)s
+# THE ESTATE BESIDE THE LANES (task/4061): stray rooms and orphan lane branches
+# are `helm worktree gc`'s, and nothing scheduled it, so a branch whose room
+# work gc retired or parked was never judged again. It re-reads the lane rooms
+# work gc just judged; their unchanged keep verdicts come from the sweep's
+# memo, so the second read costs little.
+ExecStart=%(helm)s worktree gc --apply --repo %(cwd)s
 Nice=15
 """
 

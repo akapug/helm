@@ -23,9 +23,10 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+from types import SimpleNamespace
 from unittest import mock
 
-from helm import cli, delegate_grant, dispatches, eventledger, review_done
+from helm import cli, delegate_grant, dispatches, eventledger, review_done, tasks
 from tests import test_dispatches as td
 
 run = td.run
@@ -58,11 +59,74 @@ VERDICT_FIELDS = ("event", "v", "reviewed_tip", "verdict_ref", "polarity",
                   "no_patch_because", "verdict_author_session")
 
 
+class ReviewDoneFindingForwardingTest(td.DispatchBase):
+    def test_fix_forwards_every_finding_carried_id_and_note(self):
+        read = SimpleNamespace(
+            row={"id": "a" * 32, "tip": self.b}, outcome="fix",
+            evidence="the read found work",
+            opts={"--finding-count": ["2"], "--prior-relation": ["new"],
+                  "--finding": ["first defect", "second defect"],
+                  "--finding-carried": ["task/77"],
+                  "--note": ["an observation", "another observation"],
+                  "--no-patch-because": ["design needs the task meld"]})
+        argv = review_done._door_argv(read, self.b)
+        for flag, values in (("--finding", ["first defect", "second defect"]),
+                             ("--finding-carried", ["task/77"]),
+                             ("--note", ["an observation", "another observation"])):
+            self.assertTrue(review_done.VALUED[flag])
+            self.assertIn(flag, review_done.NOT_CLEAN)
+            self.assertIn(flag, review_done.USAGE)
+            self.assertEqual([argv[i + 1] for i, word in enumerate(argv[:-1])
+                              if word == flag], values)
+        line, _note = review_done._Read(
+            read.row["id"], "fix", read.evidence, read.opts).line()
+        self.assertIn("--finding 'first defect'", line)
+        self.assertIn("--finding-carried task/77", line)
+        self.assertIn("--note 'another observation'", line)
+
+
 class ReviewDoneBase(td.DispatchBase):
+
+    def setUp(self):
+        super().setUp()
+        self.review_task, err = tasks.add("fixture reviewed work", "author",
+                                          project="helm-test", force_new=True)
+        self.assertIsNone(err, err)
+
+    def test_done_files_two_findings_then_carries_one_with_a_note(self):
+        first = self.row()
+        rc, _out, err = self.done(
+            first["id"], "fix", "the read found two defects",
+            "--finding", "the retry drops the lock",
+            "--finding", "the cap is off by one",
+            "--prior-relation", "new", "--worse-than-main", "helm/x.py",
+            "--no-patch-because", "design needs a meld")
+        self.assertEqual(rc, 0, err)
+        filed = sorted((r for r in tasks.rows().values()
+                        if r.get("found_in") == first["id"]),
+                       key=lambda r: r["title"])
+        self.assertEqual([r["title"] for r in filed],
+                         ["the cap is off by one", "the retry drops the lock"])
+        self.assertTrue(all(r["continues"] == self.review_task["id"]
+                            for r in filed))
+        second = self.row(ref=self.c, supersedes=first["id"])
+        rc, _out, err = self.done(
+            second["id"], "fix", "the retry still loses the lock",
+            "--finding-carried", filed[1]["id"],
+            "--prior-relation", "uncured", "--note", "the cap is now right",
+            "--worse-than-main", "helm/x.py", "--no-patch-because",
+            "design needs a meld")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(dispatches.snapshot()[0][second["id"]][
+            "findings_carried"], [filed[1]["id"]])
+        self.assertIn("the cap is now right", tasks.rows()[
+            self.review_task["id"]]["comments"][-1]["text"])
 
     def row(self, **kwargs):
         kwargs.setdefault("recipient", READER)
         kwargs.setdefault("ref", self.b)
+        if "supersedes" not in kwargs:
+            kwargs.setdefault("task", self.review_task["id"])
         return self.add(**kwargs)
 
     def as_seat(self, seat=READER):
@@ -142,11 +206,11 @@ class DoneRecordsThroughTheExistingDoorsTest(ReviewDoneBase):
     def test_clean_is_the_source_clean_hold_the_hold_door_writes(self):
         mine, theirs = self.row(), self.row()
         rc, out, err = self.done(mine["id"][:6], "clean",
-                                 "read the delta; nothing found")
+                                 "read the delta; nothing found, Ran 5 tests OK")
         self.assertEqual(rc, 0, err)
         self.assertIn("SOURCE-CLEAN at %s" % self.b, out)
         rc, _out, err = self.dispatch("hold", theirs["id"], "--source-clean",
-                                      self.b, "read the delta; nothing found")
+                                      self.b, "read the delta; nothing found, Ran 5 tests OK")
         self.assertEqual(rc, 0, err)
         event = self.same_event(mine["id"], theirs["id"], "hold", HOLD_FIELDS)
         self.assertEqual((event["source_clean_tip"], event["hold_actor"]),
@@ -154,7 +218,7 @@ class DoneRecordsThroughTheExistingDoorsTest(ReviewDoneBase):
         folded = self.folded(mine["id"])
         self.assertEqual((folded["status"], folded["source_clean_tip"],
                           folded["hold_reason"]),
-                         ("held", self.b, "read the delta; nothing found"))
+                         ("held", self.b, "read the delta; nothing found, Ran 5 tests OK"))
 
     def test_concur_is_the_verdict_door_concur_measured(self):
         mine, theirs = self.row(), self.row()
@@ -179,12 +243,14 @@ class DoneRecordsThroughTheExistingDoorsTest(ReviewDoneBase):
             mine["id"][:6], "fix", "the guard is inverted",
             "--finding-count", "1", "--prior-relation", "new",
             "--worse-than-main", "helm/x.py",
+            "--finding", "the guard is inverted",
             "--no-patch-because", "a design finding for a meld")
         self.assertEqual(rc, 0, err)
         rc, _out, err = self.dispatch(
             "verdict", theirs["id"], self.b, "--fix", "--measured",
             "--finding-count", "1", "--prior-relation", "new",
             "--worse-than-main", "helm/x.py",
+            "--finding", "the guard is inverted",
             "--no-patch-because", "a design finding for a meld",
             "the guard is inverted")
         self.assertEqual(rc, 0, err)
@@ -235,19 +301,19 @@ class DoneRecordsThroughTheExistingDoorsTest(ReviewDoneBase):
             line.replace("'<N>'", "1")
             .replace("'<new|uncured|regression-of-cure>'", "new")
             .replace("'<--patch-tip SHA|--no-patch-because REASON>'",
-                     "--no-patch-because 'a meld'"))
+                     "--no-patch-because 'a meld' --finding 'the guard is inverted'"))
         self.assertEqual(rc, 0, err)
         self.assertEqual(self.folded(row["id"])["status"], "verdict")
 
     def test_clean_takes_no_fix_flag(self):
         row = self.row()
-        rc, _out, err = self.done(row["id"][:8], "clean", "nothing found",
+        rc, _out, err = self.done(row["id"][:8], "clean", "nothing found, Ran 5 tests OK",
                                   "--patch-tip", self.c)
         self.assertEqual(rc, 2, err)
         self.assertIn("carries no --patch-tip", err)
         # REFUSED BEFORE THE ROW WAS READ: the line keeps the prefix typed.
         line = self.corrected(err)
-        self.assertEqual(line, "helm review done %s clean -- 'nothing found'"
+        self.assertEqual(line, "helm review done %s clean -- 'nothing found, Ran 5 tests OK'"
                          % row["id"][:8])
         rc, _out, err = self.paste(line)
         self.assertEqual(rc, 0, err)
@@ -337,9 +403,11 @@ class EvidenceOverTheCapTest(ReviewDoneBase):
         self.assertEqual(self.corrected(err),
                          "helm review done %s clean -- '<evidence of at most "
                          "256 chars>'" % row["id"])
-        rc, _out, err = self.done(row["id"][:8], "clean", "y" * 256)
+        full = "y" * 241 + " Ran 5 tests OK"
+        self.assertEqual(len(full), 256)
+        rc, _out, err = self.done(row["id"][:8], "clean", full)
         self.assertEqual(rc, 0, err)
-        self.assertEqual(self.folded(row["id"])["hold_reason"], "y" * 256)
+        self.assertEqual(self.folded(row["id"])["hold_reason"], full)
 
     def test_verdict_evidence_over_the_budget_is_refused_whole(self):  # noqa: VACUOUS_ASSERTION — the same row's verdict_ref is asserted RECORDED at the end of this method
         row = self.row()
@@ -517,11 +585,11 @@ class TheTipMovedTest(ReviewDoneBase):
         not — never the row's tip in its place."""
         row = self.row()
         rc, _out, err = self.dispatch("hold", row["id"], "--source-clean",
-                                      self.side, "nothing found")
+                                      self.side, "nothing found, Ran 5 tests OK")
         self.assertEqual(rc, 1, err)
         line = self.corrected(err)
         self.assertEqual(line, "helm dispatch hold %s --source-clean "
-                         "'<TIP_YOU_READ>' -- 'nothing found'" % row["id"])
+                         "'<TIP_YOU_READ>' -- 'nothing found, Ran 5 tests OK'" % row["id"])
         self.assertIn("is now at %s" % self.b, self.note(err))
         self.paste_refused(line, row["id"], "<TIP_YOU_READ>")
         # THE CONTROL: a descendant the seat typed is kept, resolved in full.
@@ -531,7 +599,7 @@ class TheTipMovedTest(ReviewDoneBase):
         line = self.corrected(err)
         self.assertIn("--source-clean %s --" % self.c, line)
         rc, _out, err = self.paste(line.replace(
-            "'<reason of at most 256 chars>'", "'nothing found'"))
+            "'<reason of at most 256 chars>'", "'nothing found, Ran 5 tests OK'"))
         self.assertEqual(rc, 0, err)
         self.assertEqual(self.folded(row["id"])["source_clean_tip"], self.c)
 
@@ -599,7 +667,8 @@ class EveryRefusalEndsWithTheCorrectedCommandTest(ReviewDoneBase):
             .replace("'<--worse-than-main PATH|--imperfect>'",
                      "--worse-than-main helm/x.py")
             .replace("'<--patch-tip SHA|--no-patch-because REASON>'",
-                     "--no-patch-because 'a meld'"))
+                     "--no-patch-because 'a meld' --finding 'the guard is inverted' "
+                     "--finding 'the inversion bypasses the lock'"))
         self.assertEqual(rc, 0, err)
         event = self.events(row["id"], "verdict")[0]
         self.assertEqual((event["polarity"], event["finding_count"],
@@ -670,7 +739,7 @@ class EveryRefusalEndsWithTheCorrectedCommandTest(ReviewDoneBase):
         self.assertEqual(line, "helm dispatch hold %s --source-clean %s -- "
                          "'<reason of at most 256 chars>'" % (row["id"], self.b))
         rc, _out, err = self.paste(line.replace(
-            "'<reason of at most 256 chars>'", "'nothing found'"))
+            "'<reason of at most 256 chars>'", "'nothing found, Ran 5 tests OK'"))
         self.assertEqual(rc, 0, err)
         self.assertEqual(self.folded(row["id"])["source_clean_tip"], self.b)
 
@@ -723,6 +792,30 @@ class EveryRefusalEndsWithTheCorrectedCommandTest(ReviewDoneBase):
                       review_done.unfilled_refusal(shlex.split(line)[3:]))
         argv, created = pasted(self, line)
         self.assertEqual((argv, created), (shlex.split(line)[1:], []))
+
+    def test_the_send_line_carries_the_task_and_whole(self):
+        with self.as_seat("integrator"):
+            line = review_done.send_line([
+                READER, "lane/carried-task", "cure it", "--ref", self.b,
+                "--kind", "build", "--new-work", "--repo", self.repo,
+                "--task", "task/7", "--whole"])
+        words = shlex.split(line)
+        self.assertEqual(words[words.index("--task") + 1], "task/7")
+        self.assertEqual(words[-1], "--whole")
+
+    def test_the_corrected_send_line_carries_a_part_flag(self):
+        # (task/3938 round 3) the corrected line for a refused send that
+        # carried --part must carry --part back, so the pasted line still
+        # names the path the seat chose.
+        with self.as_seat("integrator"):
+            line = review_done.send_line([
+                READER, "lane/parted-task", "cure the piece",
+                "--ref", self.b,
+                "--kind", "build", "--new-work", "--repo", self.repo,
+                "--task", "task/7", "--part"])
+        words = shlex.split(line)
+        self.assertEqual(words[words.index("--task") + 1], "task/7")
+        self.assertEqual(words[-1], "--part")
 
     def test_a_long_send_body_stays_one_quoted_argument(self):
         body = "x" * 301 + EVIL
@@ -939,7 +1032,8 @@ class APlaceholderIsNeverAValueTest(ReviewDoneBase):
         # THE CONTROL, same argv with the two values typed: it records.
         rc, _out, err = self.dispatch(*[{"<PATH>": "helm/x.py",
                                          "<REASON>": "a meld"}.get(a, a)
-                                        for a in argv])
+                                        for a in argv[:-2]], "--finding",
+                                      "the guard is inverted", *argv[-2:])
         self.assertEqual(rc, 0, err)
         self.assertEqual(self.events(row["id"], "verdict")[0]
                          ["worse_than_main_paths"], ["helm/x.py"])
@@ -985,7 +1079,8 @@ class APlaceholderIsNeverAValueTest(ReviewDoneBase):
                                    .replace("'<new|uncured|regression-of-"
                                             "cure>'", "new")
                                    .replace("'<REASON>'", "'a meld'")
-                                   .replace("'<TIP_YOU_READ>'", self.b))
+                                   .replace("'<TIP_YOU_READ>'", self.b)
+                                   .replace(" -- inverted", " --finding inverted -- inverted"))
         self.assertEqual(rc, 0, err)
         self.assertEqual(self.folded(row["id"])["reviewed_tip"], self.b)
 
@@ -1021,7 +1116,7 @@ class APlaceholderIsNeverAValueTest(ReviewDoneBase):
         self.assertEqual(sorted(dispatches.snapshot()[0]), before)
         # THE CONTROL on the hold door: the reason typed, it holds.
         rc, _out, err = self.dispatch("hold", row["id"], "--source-clean",
-                                      row["tip"], "--", "nothing found")
+                                      row["tip"], "--", "nothing found, Ran 5 tests OK")
         self.assertEqual(rc, 0, err)
 
     def test_a_placeholder_is_a_whole_argument_never_a_word_in_prose(self):
@@ -1083,14 +1178,15 @@ class EvidenceThatLooksLikeAFlagTest(ReviewDoneBase):
     def test_the_hold_door_reason_starting_dash_h(self):
         row = self.row()
         rc, _out, err = self.dispatch("hold", row["id"], "--source-clean",
-                                      row["tip"], "-h foo")
+                                      row["tip"], "-h foo Ran 5 tests OK")
         self.assertEqual(rc, 2, err)
         line = self.corrected(err)
         self.assertEqual(line, "helm dispatch hold %s --source-clean %s -- "
-                         "'-h foo'" % (row["id"], self.b))
+                         "'-h foo Ran 5 tests OK'" % (row["id"], self.b))
         rc, _out, err = self.paste(line)
         self.assertEqual(rc, 0, err)
-        self.assertEqual(self.folded(row["id"])["hold_reason"], "-h foo")
+        self.assertEqual(self.folded(row["id"])["hold_reason"],
+                         "-h foo Ran 5 tests OK")
 
     def test_dash_h_after_the_terminator_is_a_write_to_the_delegate_guard(self):
         """`-h` after `--` is recorded, so the argv-guard may not wave it
@@ -1282,11 +1378,11 @@ class TwoAnswersToOneChoiceTest(ReviewDoneBase):
         row = self.row()
         rc, _out, err = self.dispatch("hold", row["id"], "--owner-gated",
                                       "--source-clean", row["tip"],
-                                      "nothing found")
+                                      "nothing found, Ran 5 tests OK")
         self.assertEqual(rc, 1, err)
         self.assertIn("a hold is owed by ONE holder", err)
         line = self.corrected(err)
-        self.assertEqual(line, "helm dispatch hold %s %s -- 'nothing found'"
+        self.assertEqual(line, "helm dispatch hold %s %s -- 'nothing found, Ran 5 tests OK'"
                          % (row["id"], shlex.quote(HOLDER)))
         # A RE-PASTE PRINTS THE SAME LINE: the placeholder is never read as
         # the first word of the reason.
@@ -1299,7 +1395,7 @@ class TwoAnswersToOneChoiceTest(ReviewDoneBase):
         self.assertEqual((folded["source_clean_tip"],
                           bool(folded.get("owner_gated")),
                           folded["hold_reason"]),
-                         (self.b, False, "nothing found"))
+                         (self.b, False, "nothing found, Ran 5 tests OK"))
 
     def test_a_send_naming_both_work_arms(self):  # noqa: VACUOUS_ASSERTION — the refused send writing nothing is product law; the filled paste's minted row is asserted positively at the end
         sent = self.row(lane="lane-both")
@@ -1517,7 +1613,8 @@ class TheExitAndCureAnswersAreTheSeatsTest(ReviewDoneBase):
         self.assertEqual(self.corrected(err), line)
         rc, _out, err = self.paste(
             line.replace(shlex.quote(EXIT), "--worse-than-main helm/x.py")
-            .replace(shlex.quote(CURE), "--no-patch-because 'a meld'"))
+            .replace(shlex.quote(CURE),
+                     "--no-patch-because 'a meld' --finding inverted"))
         self.assertEqual(rc, 0, err)
         event = self.events(row["id"], "verdict")[0]
         self.assertEqual((event["exit_answer"], event["no_patch_because"]),
@@ -1572,7 +1669,7 @@ class AnOwnerGatedHoldIsNeverLiftedByAPasteTest(ReviewDoneBase):
             lambda: self.dispatch("verdict", row["id"], row["tip"], "--concur",
                                   "--measured", "fine"),
             lambda: self.dispatch("hold", row["id"], "--source-clean",
-                                  row["tip"], "nothing found"),
+                                  row["tip"], "nothing found, Ran 5 tests OK"),
             lambda: self.done(row["id"][:8], "concur", "fine"))
         for n, call in enumerate(refused):
             with self.subTest(call=n):
@@ -1619,7 +1716,11 @@ class AFixDeclaresItsOwnCountsTest(ReviewDoneBase):
                          % (row["id"], shlex.quote(RELATION)))
         self.paste_refused(line, row["id"], "<N>", RELATION)
         rc, _out, err = self.paste(line.replace("'<N>'", "3").replace(
-            shlex.quote(RELATION), "uncured"))
+            shlex.quote(RELATION), "uncured").replace(
+            " -- 'the guard is inverted'",
+            " --finding 'the guard is inverted' "
+            "--finding 'the retry loses the lock' "
+            "--finding 'the guard misses one branch' -- 'the guard is inverted'"))
         self.assertEqual(rc, 0, err)
         event = self.events(row["id"], "verdict")[0]
         self.assertEqual((event["finding_count"], event["prior_relation"]),
@@ -1645,17 +1746,20 @@ class TheFirstTerminatorEndsTheFlagsTest(ReviewDoneBase):
 
     def test_the_rest_is_text_verbatim(self):  # noqa: VACUOUS_ASSERTION — every door's record is asserted equal to the text
         rows = [self.row() for _ in range(4)]
+        # A source-clean hold names its fab run (task/4103), so every text
+        # carries one; the `--` it opens with is what this arm reads.
+        x = "x Ran 5 tests OK"
         for rc, _out, err in (
                 self.dispatch("verdict", rows[0]["id"], self.b, "--concur",
-                              "--measured", "--", "--", "x"),
+                              "--measured", "--", "--", x),
                 self.dispatch("hold", rows[1]["id"], "--source-clean", self.b,
-                              "--", "--", "x"),
-                self.done(rows[2]["id"][:8], "concur", "--", "--", "x"),
-                self.done(rows[3]["id"][:8], "clean", "--", "--", "x")):
+                              "--", "--", x),
+                self.done(rows[2]["id"][:8], "concur", "--", "--", x),
+                self.done(rows[3]["id"][:8], "clean", "--", "--", x)):
             self.assertEqual(rc, 0, err)
         self.assertEqual([self.folded(r["id"]).get("verdict_ref")
                           or self.folded(r["id"]).get("hold_reason")
-                          for r in rows], ["-- x"] * 4)
+                          for r in rows], ["-- " + x] * 4)
         row = self.row()
         rc, _out, err = self.done(row["id"][:8], "concur", "--bogus", "foo",
                                   "--", "bar")

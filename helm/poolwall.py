@@ -44,7 +44,8 @@ ONE ROOM LINE PER WALL PER SEAT. The announcement ledger records the expiry
 instant a seat was last announced for; a wall whose instant is within
 ``ANNOUNCE_TOLERANCE_S`` of the recorded one is the same wall and is not
 announced again. A wall that starts after the recorded one expired has a new
-instant, and earns one new line.
+instant, and earns one new line. The line goes to #seats and @mentions the
+credentials steward (`seatevents`, task/3876).
 
 WHEN THE VENDOR IS THE WALL, THE EPISODE IS ITS IDENTITY. The expiry instant
 is the wall only while the proxy's cooldown IS the wall. When the upstream
@@ -72,8 +73,6 @@ LEDGER = "poolwall.json"
 #: Two rows of one wall disagree on the reset instant by the seconds between
 #: them; a new wall after expiry is hours away. Sixty seconds separates them.
 ANNOUNCE_TOLERANCE_S = 60
-ROOM = "helm"
-WHO = "proxywatch"
 
 # The producer prints the provider clause only when a provider was selected
 # ("for claude-opus-5: 5 cooling down" is a measured spelling without one) and
@@ -191,19 +190,31 @@ def _vendor_cause(code, body, origin, at):
     from . import proxywatch
     low = str(body).lower()
     match = proxywatch._signature_match(low)
-    words = proxywatch._vendor_words(low)
-    if match and match[1] == "none":
-        kind = "balance"
-    elif code not in _QUOTA_CODES or not proxywatch._vendor_quota(low):
+    if not (match and match[1] == "none") and (
+            code not in _QUOTA_CODES or not proxywatch._vendor_quota(low)):
         return None
-    elif not match and _BALANCE_WORDS.search(words):
-        kind = "balance"
-    else:
-        kind = "window"
+    kind = quota_kind(low)
+    words = proxywatch._vendor_words(low)
     window = _WINDOW_RE.search(words) if kind == "window" else None
     return {"code": code, "observed_at": at, "kind": kind,
             "vendor": match[0] if match else None,
             "window": window.group(1) if window else None}
+
+
+def quota_kind(low):
+    """"balance" or "window" for a lower-cased vendor quota refusal.
+
+    THE ONE RULE for which repair a quota wall needs, shared by the log
+    reader here and proxywatch's canary record (`refusal_kind`). A known
+    signature decides by its reset mode: "none" (DeepSeek's 402 Insufficient
+    Balance) is a balance, a timed one a window. With no signature, the
+    balance words decide, and anything else is a window."""
+    from . import proxywatch
+    match = proxywatch._signature_match(low)
+    if match:
+        return "balance" if match[1] == "none" else "window"
+    return "balance" if _BALANCE_WORDS.search(proxywatch._vendor_words(low)) \
+        else "window"
 
 
 def _upstream(wall, family):
@@ -484,8 +495,8 @@ def announce(seat, wall=None, now=None, post=None):
         body = room_line(wall)
         try:
             if post is None:
-                from . import chat
-                chat.post(body, who=WHO, room=ROOM)
+                from . import seatevents
+                seatevents.post(component(wall), body)
             else:
                 post(body)
         except Exception:                 # noqa: BLE001 — retry on the next observer
@@ -496,20 +507,33 @@ def announce(seat, wall=None, now=None, post=None):
         return None
 
 
-def announcements(seats, now=None):
-    """[(seat, body)] — one line per seat whose wall is in force and unposted,
-    claimed here for a caller that delivers through its own durable outbox
-    (proxywatch's pass: the claim is taken once, the outbox retries)."""
+def component(wall):
+    """The seatevents component a wall belongs to (task/3876): a local
+    family's pool is local serving, any other family's is credentials."""
+    from . import burnflags
+    return "local-serving" if wall.get("family") in \
+        burnflags.local_families() else "credentials"
+
+
+def claims(seats, now=None):
+    """[(seat, wall)] — each seat whose wall is in force and unposted,
+    claimed here for a caller that delivers through its own durable ledger
+    (proxywatch's pass: the claim is taken once, seatevents retries)."""
     out = []
     now = time.time() if now is None else now
     for seat in seats:
         try:
             wall, _why = seat_wall(seat, now=now)
             if wall is not None and _claim(seat, wall, now):
-                out.append((seat, room_line(wall)))
+                out.append((seat, wall))
         except Exception:                 # noqa: BLE001 — one seat never blinds the pass
             continue
     return out
+
+
+def announcements(seats, now=None):
+    """[(seat, body)] — `claims` with each wall's one room line."""
+    return [(seat, room_line(wall)) for seat, wall in claims(seats, now=now)]
 
 
 def rearm_hold(seat, session=None):
@@ -532,6 +556,8 @@ def rearm_hold(seat, session=None):
 
 
 __all__ = ["parse_reset", "parse_refusal", "log_statements", "seat_wall",
+           "quota_kind",
            "pane_anchor", "pause", "hold_reason", "blocked_on", "room_line",
-           "announce", "announced", "announcements", "rearm_hold", "iso",
+           "announce", "announced", "announcements", "claims", "component",
+           "rearm_hold", "iso",
            "STATE"]

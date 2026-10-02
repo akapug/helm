@@ -25,6 +25,21 @@ When it alarms it also reads, IN THIS ORDER:
      it did not arrive. Read first, it once held back every record of a
      stall: a pass blocked there until the unit's TimeoutStartSec kill.
 
+WHETHER HELM ITSELF IS THE LOAD (task/3841). The measured stalls were
+mostly SHORT-LIVED processes, hook pythons at about 15 births a second,
+which a before/after sample of living pids never sees. So the same window
+also reads the host's process count (/proc/stat `processes`) and
+agents.slice's own cpu.stat usage_usec; the slice's usage less every pid
+sampled at both ends is SHORT-LIVED cpu. The listed processes, and the
+births still alive after the window, are classified HELM-OWN or OTHER by
+command line (_helm_own). When cpu is a stalled kind and helm's own cpu is
+at least half the slice's, the row gains ONE line, `HELM IS THE LOAD (P-1:
+fixed ahead of everything): ...`, and the pass files ONE open task row
+titled P1_TITLE to the
+integrator, or comments on the open one, at most once per P1_EVERY_S. Both
+run inside the process detail's budget; a failure is a sentence in the row,
+never a raise.
+
 IT KEYS ON SUSTAINED PSI STALL TIME, NEVER ON FULLNESS. agents.slice at
 96-99% of its memory.high with memory PSI 0.00 is its healthy steady state
 (measured on a fleet host), so a fullness alarm would page all day. The
@@ -78,7 +93,7 @@ import threading
 import time
 import uuid
 
-from . import seatceiling
+from . import projscope, seatceiling
 
 INTERVAL_S = 60
 #: How long a hot run must last before it is a stall.
@@ -107,6 +122,18 @@ LATE_MAX = 3
 SERVICE_TIMEOUT_S = 50
 #: The alarm log rolls to one `.1` generation past this size.
 LOG_MAX = 1 << 20
+#: How many births still alive after the CPU window are read to classify
+#: the short-lived cpu; each costs a cmdline read.
+BIRTH_SAMPLE = 16
+#: The one task row the watcher keeps while helm is the load. This exact
+#: title, on an open row, is the dedup key.
+P1_TITLE = "P-1: helm is dragging the fleet (pressure-watch)"
+#: The watcher files or refreshes that row at most once per this many seconds.
+P1_EVERY_S = 30 * 60
+#: The owner's rule the alarm line and the row carry.
+P1_RULE = ("when helm itself is dragging the fleet, the fix happens "
+           "immediately, ahead of everything else")
+P1_READ_ONLY = "P-1 row not filed (read only)"
 
 PCT_ENV = "HELM_PRESSURE_WATCH_PCT"
 SUSTAIN_ENV = "HELM_PRESSURE_WATCH_SUSTAIN_S"
@@ -396,6 +423,10 @@ _PYTHON_FLAGS = frozenset(("-u", "-B", "-O", "-OO", "-s", "-S", "-E", "-I",
 #: word is an argument, or the code), node's --run= (the rest go to the
 #: package script). After one, nothing is known to be the script.
 _CODE_OPTIONS = frozenset(("--eval", "--print", "--run"))
+#: The chat node's programs: dregg-node, dregg-node-rebased, dregg-cave-node.
+_CHAT_NODE = re.compile(r"^dregg-([A-Za-z0-9_]+-)?node")
+#: helm's entry points, relative to a helm checkout; helm/*.py is the third.
+_HELM_ENTRIES = ("bin/helm", "bin/helm-hook")
 
 
 def _read(path, limit=1 << 16):
@@ -468,9 +499,13 @@ def _script(name, args):
     """The script an interpreter runs, or None when it cannot be known: the
     first word that is not an option, reached across only options that
     cannot take the next word (a Python flag, or a --name=value whose name
-    is not one of _CODE_OPTIONS)."""
+    is not one of _CODE_OPTIONS). A bare `--` ends the options, so the word
+    after it is the script: bin/helm-hook runs every hook as `<python> -S --
+    <bin/helm>`, the shape most hook pythons have on a fleet host."""
     python = name.startswith(("python", "pypy"))
-    for arg in args:
+    for i, arg in enumerate(args):
+        if arg == "--":
+            return args[i + 1] if i + 1 < len(args) else None
         if (python and arg in _PYTHON_FLAGS) \
                 or (arg.startswith("--") and "=" in arg
                     and arg.split("=", 1)[0] not in _CODE_OPTIONS):
@@ -496,16 +531,99 @@ def _program(argv):
     return name if _PROGRAM.match(name) else "?"
 
 
-def _cmd(proc, pid):
+def _argv(proc, pid):
+    raw = _read(os.path.join(proc, str(pid), "cmdline"), 4096) or b""
+    return [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+
+
+def _cmd(proc, pid, argv=None):
     """A process's name for a row: its program (_program), or its comm when
     it has no command line."""
-    raw = _read(os.path.join(proc, str(pid), "cmdline"), 4096) or b""
-    argv = [a.decode("utf-8", "replace") for a in raw.split(b"\0") if a]
+    argv = _argv(proc, pid) if argv is None else argv
     if argv:
         return _program(argv)
     comm = (_read(os.path.join(proc, str(pid), "comm"), 64) or b"").decode(
         "utf-8", "replace").strip()
     return comm if _PROGRAM.match(comm) else "?"
+
+
+def _cwd(proc, pid):
+    """A process's working directory, from its cwd link, or None. A link
+    read, never the process's memory, so a stalled process cannot block it."""
+    try:
+        return os.readlink(os.path.join(proc, str(pid), "cwd"))
+    except OSError:
+        return None
+
+
+def helm_checkouts():
+    """(root, rooms): the helm checkout this module sits in, folded to the
+    shared root a lane room was cut from (automap's fold, the one
+    work.find_root uses), and the directory that root's lane rooms sit in
+    (work.lane_path's `<root>-wt/<lane>`). Read from this module's own
+    location, never a literal."""
+    from . import automap
+    here = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    root = automap._strip_worktree(here)
+    return root, root + "-wt"
+
+
+def _checkout_rel(path):
+    """`path` relative to the helm checkout it sits in (the shared root or
+    one of its lane rooms), or None. A checkout's own directory, given with
+    a trailing separator, is ''."""
+    root, rooms = helm_checkouts()
+    if path.startswith(root + os.sep):
+        return path[len(root) + 1:]
+    if path.startswith(rooms + os.sep):
+        lane, _sep, rest = path[len(rooms) + 1:].partition(os.sep)
+        return rest if lane else None
+    return None
+
+
+def _python_module(args):
+    """The module `python -m NAME` runs, or None: reached across only the
+    flags that take no value, as _script reads them."""
+    for i, arg in enumerate(args):
+        if arg in _PYTHON_FLAGS:
+            continue
+        if arg == "-m":
+            return args[i + 1] if i + 1 < len(args) else None
+        return arg[2:] if arg.startswith("-m") else None
+    return None
+
+
+def _helm_own(argv, cwd):
+    """Is this command line HELM'S OWN? This checkout's bin/helm or
+    bin/helm-hook, or a helm/*.py, as the program or the script an
+    interpreter runs (a relative path read against the process's `cwd`, a
+    link such as ~/.local/bin/helm followed); `python -m helm`; the chat
+    node; a fab client started from a helm checkout (its `cwd` in one).
+    Nothing else of the command line is kept."""
+    words = argv[0].split() if argv else []
+    head = words[0] if words else ""
+    name = os.path.basename(head)
+    if _CHAT_NODE.match(name):
+        return True
+    from . import roguescan
+    if roguescan._is_fab_wrapper({"argv": argv, "comm": ""}):
+        return bool(cwd) and os.path.isabs(cwd) \
+            and _checkout_rel(os.path.join(cwd, "")) is not None
+    if _INTERPRETER.match(name):
+        module = _python_module(argv[1:]) \
+            if name.startswith(("python", "pypy")) else None
+        if module is not None:
+            return module == "helm" or module.startswith("helm.")
+        head = _script(name, argv[1:])
+    if not head:
+        return False
+    if not os.path.isabs(head):
+        if not cwd or not os.path.isabs(cwd):
+            return False
+        head = os.path.join(cwd, head)
+    rel = _checkout_rel(os.path.realpath(head))
+    return rel in _HELM_ENTRIES or bool(
+        rel and rel.startswith("helm" + os.sep) and rel.endswith(".py"))
 
 
 def _seat_of(path, pids, proc):
@@ -522,15 +640,96 @@ def _seat_of(path, pids, proc):
     return None
 
 
-def consumers(root, proc, sleep=None, window=CPU_WINDOW_S, named=()):
-    """{"seats", "words", "by_memory", "by_cpu", "why"}: THE PROCESS DETAIL.
-    One /proc walk, a `window` CPU sample over every member's stat, each
-    member's statm, the cmdline of each listed process and the environ of a
-    few processes per named slice. A stalled process's cmdline or environ
-    read can block its reader, so this runs only after the alarm is latched,
-    logged and pushed, and only under DETAIL_BUDGET_S (process_detail).
-    `seats` names the seat of each slice in `named` and of each slice a
-    listed process sits in; `words` is each slice's seatceiling word."""
+def _usage_usec(fleet):
+    """agents.slice's cpu.stat usage_usec, or None."""
+    text = _text(os.path.join(fleet, "cpu.stat")) if fleet else None
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == "usage_usec" and parts[1].isdigit():
+            return int(parts[1])
+    return None
+
+
+def _forks(proc):
+    """The host's processes started since boot (/proc/stat `processes`), or
+    None. The limit is wide: the `intr` line before it grows with the host's
+    interrupt count."""
+    for line in (_read(os.path.join(proc, "stat"), 1 << 20) or b"").split(
+            b"\n"):
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == b"processes" and parts[1].isdigit():
+            return int(parts[1])
+    return None
+
+
+def _caught(root, proc, sampled):
+    """[(helm_own, ticks)] for the births STILL ALIVE after the window: the
+    seat-slice processes a second walk finds that the sampled set did not
+    hold, at most BIRTH_SAMPLE of them, each with the ticks it has spent
+    since its birth."""
+    later, trouble = seatceiling.slice_members(root, proc)
+    if trouble:
+        return []
+    out = []
+    born = sorted({p for ps in later.values() for p in ps} - sampled)
+    for pid in born[:BIRTH_SAMPLE]:
+        argv = _argv(proc, pid)
+        if argv:
+            out.append((_helm_own(argv, _cwd(proc, pid)),
+                        _cpu_ticks(proc, pid) or 0))
+    return out
+
+
+def _helm_share(root, proc, fleet, window, used, forks, sampled_usec, pids,
+                by_cpu):
+    """HELM'S OWN SHARE of agents.slice's cpu over the window, in percent of
+    one core. `used` and `forks` are the slice's usage_usec and the host's
+    process count on each side of the window; `sampled_usec` is the cpu of
+    every pid read at both ends. SHORT-LIVED is the rest of the slice's
+    usage: processes born or gone inside the window. Helm's short-lived part
+    is that times the tick-weighted share of helm's own among the births
+    caught alive (by count while none has a tick). `why` says why the share
+    could not be read; it is never guessed."""
+    out = {"window": window, "slice": None, "short": None, "births": None,
+           "caught": 0, "caught_helm": 0, "own": None, "own_short": None,
+           "load": False, "why": ""}
+    if None not in forks and forks[1] >= forks[0]:
+        out["births"] = (forks[1] - forks[0]) / float(window)
+    if None in used or used[1] < used[0]:
+        out["why"] = ("agents.slice's cpu.stat usage_usec would not read at "
+                      "%s" % fleet if fleet
+                      else "no agents.slice was named to read cpu.stat from")
+        return out
+    scale = 1e4 * window
+    caught = _caught(root, proc, pids)
+    mine = [t for h, t in caught if h]
+    weight = sum(t for _h, t in caught)
+    share = (sum(mine) / float(weight) if weight
+             else len(mine) / float(len(caught))) if caught else 0.0
+    out.update(slice=(used[1] - used[0]) / scale,
+               short=max(0.0, used[1] - used[0] - sampled_usec) / scale,
+               caught=len(caught), caught_helm=len(mine))
+    out["own_short"] = out["short"] * share
+    out["own"] = sum(r["cpu"] for r in by_cpu if r.get("helm")) \
+        + out["own_short"]
+    out["load"] = out["slice"] > 0 and out["own"] >= out["slice"] / 2.0
+    return out
+
+
+def consumers(root, proc, sleep=None, window=CPU_WINDOW_S, named=(),
+              fleet=None):
+    """{"seats", "words", "by_memory", "by_cpu", "helm", "why"}: THE PROCESS
+    DETAIL. One /proc walk, a `window` CPU sample over every member's stat,
+    each member's statm, the cmdline and cwd link of each listed process and
+    the environ of a few processes per named slice. A stalled process's
+    cmdline or environ read can block its reader, so this runs only after
+    the alarm is latched, logged and pushed, and only under DETAIL_BUDGET_S
+    (process_detail). `seats` names the seat of each slice in `named` and of
+    each slice a listed process sits in; `words` is each slice's seatceiling
+    word. The same window reads `fleet`'s cpu.stat and the host's process
+    count, and a second walk after it finds the births still alive; `helm`
+    is _helm_share's answer, and each listed row carries `helm`, whether its
+    command line is helm's own."""
     members, trouble = seatceiling.slice_members(root, proc)
     if trouble:
         return {"seats": {}, "words": {}, "by_memory": [], "by_cpu": [],
@@ -538,17 +737,22 @@ def consumers(root, proc, sleep=None, window=CPU_WINDOW_S, named=()):
     readings, trouble = seatceiling.fleet_pressure(
         root=root, proc=proc, members=members, sleep=sleep)
     pids = sorted({p for ps in members.values() for p in ps})
+    used, forks = [_usage_usec(fleet)], [_forks(proc)]
     before = {p: _cpu_ticks(proc, p) for p in pids}
     (sleep or time.sleep)(window)
     after = {p: _cpu_ticks(proc, p) for p in pids}
+    used.append(_usage_usec(fleet))
+    forks.append(_forks(proc))
     hz = float(os.sysconf("SC_CLK_TCK"))
-    rows = []
+    rows, sampled = [], 0
     for path, ps in members.items():
         for pid in ps:
             a, b = before.get(pid), after.get(pid)
+            whole = a is not None and b is not None and b >= a
+            sampled += b - a if whole else 0
             rows.append({"pid": pid, "slice": path, "rss": _rss(proc, pid),
-                         "cpu": None if a is None or b is None or b < a
-                         else 100.0 * (b - a) / hz / window})
+                         "cpu": 100.0 * (b - a) / hz / window if whole
+                         else None})
     by_memory = sorted([r for r in rows if r["rss"] is not None],
                        key=lambda r: -r["rss"])[:TOP_N]
     by_cpu = sorted([r for r in rows if r["cpu"]],
@@ -557,28 +761,61 @@ def consumers(root, proc, sleep=None, window=CPU_WINDOW_S, named=()):
         | {r["slice"] for r in by_memory + by_cpu}
     seats = {path: _seat_of(path, members[path], proc)
              for path in sorted(wanted)}
-    for row in by_memory + by_cpu:
+    for row in {r["pid"]: r for r in by_memory + by_cpu}.values():
+        argv = _argv(proc, row["pid"])
         row["seat"] = seats.get(row["slice"])
-        row["cmd"] = _cmd(proc, row["pid"])
+        row["cmd"] = _cmd(proc, row["pid"], argv)
+        row["helm"] = _helm_own(argv, _cwd(proc, row["pid"]))
     return {"seats": seats,
             "words": {path: getattr(r, "word", None)
                       for path, r in readings.items()},
-            "by_memory": by_memory, "by_cpu": by_cpu, "why": trouble or ""}
+            "by_memory": by_memory, "by_cpu": by_cpu,
+            "helm": _helm_share(root, proc, fleet, window, used, forks,
+                                sampled * 1e6 / hz, set(pids), by_cpu),
+            "why": trouble or ""}
 
 
-def process_detail(root, proc, sleep, named):
+def process_detail(root, proc, sleep, named, fleet=None, filer=None,
+                   cpu_stalled=True):
     """consumers() under DETAIL_BUDGET_S: its answer, or a sentence saying
     why the process detail is UNKNOWN. It runs in a daemon thread the pass
     stops waiting for when the budget is spent: a read blocked in the kernel
     cannot be interrupted, and the alarm it would have held back is already
-    latched, logged and pushed."""
+    latched, logged and pushed.
+
+    WHEN THE ANSWER SAYS HELM IS THE LOAD, `filer` (file_p1, bound to the
+    pass; None on a read-only pass) runs in the same thread under the same
+    budget: an ambient projscope deadline at the instant this stops waiting
+    bounds its task-ledger lock wait. Its sentence rides the answer as `p1`,
+    and a filing still running when the budget is spent is said so.
+
+    HELM IS JUDGED THE LOAD ONLY WHEN CPU IS A STALLED KIND (`cpu_stalled`:
+    the opening pass's cpu share reached the stall percent). The share is of
+    cpu, so in a stall on memory alone hook pythons can be most of a small
+    cpu total while another process holds the memory: that is no P-1."""
     box = {}
+    end = time.monotonic() + DETAIL_BUDGET_S
 
     def read():
         try:
-            box["got"] = consumers(root, proc, sleep, named=named)
+            got = consumers(root, proc, sleep, named=named, fleet=fleet)
+            if not cpu_stalled and _is_load(got):
+                got["helm"] = dict(got["helm"], load=False)
+            box["got"] = got
         except BaseException as exc:  # noqa: BLE001 — the row says UNKNOWN
             box["why"] = "the process read failed (%s: %s)" % (
+                exc.__class__.__name__, exc)
+            return
+        if not _is_load(got):
+            return
+        if filer is None:
+            box["p1"] = P1_READ_ONLY
+            return
+        try:
+            with projscope.scope(deadline=end):
+                box["p1"] = filer(got)
+        except BaseException as exc:  # noqa: BLE001 — the row names it
+            box["p1"] = "P-1 row NOT filed (%s: %s)" % (
                 exc.__class__.__name__, exc)
 
     worker = threading.Thread(target=read, name="pressure-watch-detail",
@@ -587,11 +824,83 @@ def process_detail(root, proc, sleep, named):
     worker.join(DETAIL_BUDGET_S)
     got = box.get("got")
     if isinstance(got, dict):
-        return got
+        return dict(got, p1=box.get("p1") or (
+            "P-1 row UNKNOWN: its filing did not finish within the %gs "
+            "process detail budget" % DETAIL_BUDGET_S)) if _is_load(got) \
+            else got
     return box.get("why") or (
         "the process read did not finish within %gs (a stalled process's "
         "/proc cmdline or environ read can block its reader)"
         % DETAIL_BUDGET_S)
+
+
+def _is_load(detail):
+    helm = detail.get("helm") if isinstance(detail, dict) else None
+    return isinstance(helm, dict) and bool(helm.get("load"))
+
+
+def _p1_touches(tasks, row):
+    """When the watcher wrote on `row`: its filing, when it filed it, and
+    each of its comments."""
+    got = [tasks.filed_epoch(row)] if row.get("source") == POSTER else []
+    got += [tasks.stamp_epoch(c.get("ts")) for c in row.get("comments") or ()
+            if isinstance(c, dict) and c.get("by") == POSTER]
+    return [t for t in got if t is not None]
+
+
+def file_p1(detail, now):
+    """File, or refresh by a comment, the ONE open P-1 row -> the sentence
+    that ends the HELM line. The dedup key is an open row titled P1_TITLE or
+    filed by this watcher (its source), so a row the integrator retitled is
+    still the one row; the watcher writes on those rows at most once per
+    P1_EVERY_S, judged from the ledger's own stamps (a clock that reads
+    earlier than a stamp writes nothing), and says so when the row it last
+    wrote on has since closed. A new row goes to the integrator
+    (owner-asked, P0, the helm project); an integrator that does not
+    resolve files it unowned and says why. The title is this watcher's own
+    dedup key, so the ledger's near-duplicate refusal is bypassed for it.
+    Never raises."""
+    try:
+        from . import seats_integrator, tasks
+        got, why = tasks.snapshot(strict=True)
+        if why:
+            return "P-1 row NOT filed: the task ledger would not read (%s)" \
+                % why
+        mine = sorted((r for r in got.values()
+                       if r.get("title") == P1_TITLE
+                       or r.get("source") == POSTER), key=tasks.sort_key)
+        touched = [(t, r["id"]) for r in mine for t in _p1_touches(tasks, r)]
+        last = max(touched) if touched else None
+        live = [r for r in mine if r.get("status") in tasks.OPEN_STATUSES]
+        if last is not None and now - last[0] < P1_EVERY_S:
+            return ("P-1 row %s was filed or refreshed %dm ago%s; it is "
+                    "written at most once per %dm"
+                    % (last[1], max(0, now - last[0]) // 60,
+                       "" if live else " and is now %s, so no P-1 row is "
+                       "open" % got[last[1]].get("status"),
+                       P1_EVERY_S // 60))
+        numbers = _helm_numbers(detail)
+        if live:
+            _row, err = tasks.comment(
+                live[0]["id"], "[pressure-watch] helm is still the load at "
+                "%s: %s." % (_iso(now), numbers), by=POSTER)
+            return ("P-1 row %s NOT refreshed: %s" % (live[0]["id"], err)
+                    if err else "P-1 row %s refreshed with a comment"
+                    % live[0]["id"])
+        owner, unowned = seats_integrator.integrator_seat()
+        row, err = tasks.add(
+            P1_TITLE, owner, source=POSTER, origin="owner", priority="P0",
+            project=tasks.OWN_PROJECT, force_new=True,
+            note="Owner rule (P-1): %s. helm pressure-watch measured, at %s: "
+                 "%s. Every alarm is in %s and `journalctl --user -u "
+                 "helm-pressure-watch`." % (P1_RULE, _iso(now), numbers,
+                                             alarm_log_path()))
+        if err:
+            return "P-1 row NOT filed: %s" % err
+        return ("P-1 row %s filed to %s" % (row["id"], owner) if owner
+                else "P-1 row %s filed UNOWNED (%s)" % (row["id"], unowned))
+    except Exception as exc:          # noqa: BLE001 — the row names it
+        return "P-1 row NOT filed (%s: %s)" % (exc.__class__.__name__, exc)
 
 
 def _slice_text(s, seats, word):
@@ -616,10 +925,43 @@ def _proc_text(row, what):
                                      row["slice"]))
 
 
+def _births_text(helm):
+    if helm["births"] is None:
+        return "births UNKNOWN (/proc/stat would not read)"
+    return "%g births/s host-wide" % round(helm["births"], 1)
+
+
+def _short_text(helm):
+    """The window's short-lived cpu and births, for the cpu line."""
+    if helm["short"] is None:
+        return "short-lived cpu UNKNOWN, %s" % _births_text(helm)
+    return ("short-lived %d%% cpu of agents.slice's %d%% over %gs (its "
+            "cpu.stat usage less every process sampled at both ends), %s"
+            % (round(helm["short"]), round(helm["slice"]), helm["window"],
+               _births_text(helm)))
+
+
+def _helm_numbers(detail):
+    """What the HELM line, the P-1 row and its refresh say: helm's own cpu
+    against the slice's, helm's own listed processes, its short-lived part
+    and the births. Programs and seats only, as every row names them."""
+    helm = detail["helm"]
+    parts = [_proc_text(r, "cpu") for r in detail["by_cpu"] if r.get("helm")]
+    parts.append("short-lived %d%% cpu (%d of %d births caught alive were "
+                 "helm's)" % (round(helm["own_short"]), helm["caught_helm"],
+                              helm["caught"]))
+    return ("helm's own processes used %d%% of agents.slice's %d%% cpu over "
+            "%gs: %s; %s" % (round(helm["own"]), round(helm["slice"]),
+                             helm["window"], "; ".join(parts),
+                             _births_text(helm)))
+
+
 def _detail_lines(facts, detail):
     """The slices, and the process detail as far as it is known. `detail`
     is consumers()'s answer, a sentence saying why it is UNKNOWN, or None
-    for the alarm before the read (no process line at all)."""
+    for the alarm before the read (no process line at all). The cpu line
+    ends with the window's short-lived cpu and births; ONE more line says
+    when helm itself is the load, or why that could not be read."""
     whole = isinstance(detail, dict)
     seats, words = (detail["seats"], detail["words"]) if whole else (None, {})
     out = ["Slices UNKNOWN: %s." % facts["why"]] if facts["why"] else []
@@ -634,10 +976,21 @@ def _detail_lines(facts, detail):
         return out
     if detail["why"]:
         out.append("Process detail UNKNOWN: %s." % detail["why"])
+    helm = detail.get("helm") if isinstance(detail.get("helm"), dict) \
+        else None
     for key, what in (("by_memory", "memory"), ("by_cpu", "cpu")):
-        if detail[key]:
-            out.append("Processes by %s: %s." % (what, "; ".join(
-                _proc_text(r, what) for r in detail[key])))
+        parts = [_proc_text(r, what) for r in detail[key]]
+        if what == "cpu" and helm:
+            parts = (parts or ["no sampled process used cpu"]) \
+                + [_short_text(helm)]
+        if parts:
+            out.append("Processes by %s: %s." % (what, "; ".join(parts)))
+    if helm and helm["why"]:
+        out.append("Helm's own cpu share UNKNOWN: %s." % helm["why"])
+    elif helm and helm["load"]:
+        out.append("HELM IS THE LOAD (P-1: fixed ahead of everything): %s. "
+                   "%s." % (_helm_numbers(detail), detail.get("p1")
+                            or "P-1 row UNKNOWN: no filing was tried"))
     return out
 
 
@@ -945,7 +1298,13 @@ def _pass(state, reading, now, path, seams):
         if ep is not None:
             _push(ep, phone, lambda: _save(path, state))
     if opened:
-        detail = process_detail(root, proc, sleep, named)
+        # THE P-1 FILING RIDES THE DETAIL'S THREAD AND BUDGET, and only a
+        # pass that writes files: a read-only pass says it did not.
+        cpu = got.get("cpu")
+        detail = process_detail(
+            root, proc, sleep, named, fleet=reading.fleet,
+            filer=(lambda got: file_p1(got, now)) if path else None,
+            cpu_stalled=bool(cpu) and cpu[0] >= pct)
         opened["body"] = render(*args, detail=detail)[0]
         if path:
             _log(_addendum(opened, alarm), now)
@@ -1057,8 +1416,13 @@ _USAGE = """usage: helm pressure-watch [--post] [--json] | --install-timer
   for 120s. The episode is latched, logged and pushed from cgroup files
   before any process is read; the process detail follows within 10s or the
   row says it is UNKNOWN. A process is named by its program only (the
-  script, for an interpreter), never by any other argument. An UNKNOWN
-  reading is said once, never read as calm.
+  script, for an interpreter), never by any other argument. The cpu line
+  also names SHORT-LIVED cpu (agents.slice's cpu.stat usage less every
+  process sampled at both ends of the window) and births/s; when cpu is a
+  stalled kind and helm's own processes are at least half the slice's cpu,
+  the row says HELM IS THE LOAD and one P-1 task row goes to the
+  integrator, or is refreshed by a comment, at most once per 30 min. An
+  UNKNOWN reading is said once, never read as calm.
   Bare: read and print what a pass would do, and whether the timer is
   installed; nothing is posted or written. --post: the pass the timer runs
   (exit 1 = a stall is open or the reading is UNKNOWN, 2 = the watcher

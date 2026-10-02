@@ -218,11 +218,25 @@ async function cfgInjection(seat, session) {
        skip would instead leave a spinner that never resolves, so the absence
        is written where the owner reads it. tests/test_injectpack.py holds the
        arm that keeps the two fragments shipped together. */
+    /* THE LOOP EDITOR (task/4058; the owner named it). Everything that goes
+       into this seat's request loop sits in one section: the context loop
+       and its knobs, what every request re-sends, the window and budgets,
+       and the injection pack, which becomes this section's last
+       subsection. Each half is guarded the same way and for the same
+       reason: a fragment missing from the page must not take the identity
+       above down with it. */
+    + '<section class="loopsec"><h3>Loop editor</h3>'
+    + '<div class="loopintro">Every request this seat makes re-sends its whole context. '
+    + 'This is that loop: how big each request was, what is in it, what bounds it, and what helm adds to each turn.</div>'
+    + '<div id="loophost"><div class="empty">the context-loop section is not '
+    + 'loaded on this page</div></div>'
     + '<div id="ipkhost"><div class="empty">the injection-pack section is not '
-    + 'loaded on this page</div></div>';
+    + 'loaded on this page</div></div></section>';
+  const boundSeat = target.seat && target.seat.value || seat;
+  const boundSession = target.session && target.session.value || session;
+  if (typeof loopLoad === "function") loopLoad(boundSeat, boundSession, gen);
   if (typeof ipkLoad === "function")
-    ipkLoad(target.seat && target.seat.value || seat,
-            target.session && target.session.value || session, gen);
+    ipkLoad(boundSeat, boundSession, gen);
 }
 
 async function cfgInit(mode) {

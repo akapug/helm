@@ -1523,6 +1523,52 @@ class LandedStateTest(VcsBase):
         self.assertIn("helm-work\thelm-work\thelm-work@local\twip: parked lane/wip-seat",
                       log.stdout)
 
+    def test_wip_commit_side_ref_stages_everything_and_leaves_head_and_branch_unmoved(self):
+        wt = os.path.join(self.tmp, "wt-wip-side")
+        self.git.add_worktree(self.root, wt, "lane/wip-side", base="main")
+        before_head = self.git.head_sha(wt)
+        with open(os.path.join(wt, "rescued-side.txt"), "w") as f:
+            f.write("never discarded from side ref")
+        self.assertTrue(self.git.dirty(wt))
+        side_ref = "refs/helm-rescue/wip-side/2026-10-01T08-35-00Z"
+        rc, out, err = self.git.wip_commit_side_ref(wt, "wip: rescue to side ref", side_ref)
+        self.assertEqual(rc, 0, err)
+        # HEAD and branch must be UNMOVED
+        self.assertEqual(self.git.head_sha(wt), before_head)
+        self.assertEqual(_sh(self.root, "git", "rev-parse", "lane/wip-side").stdout.strip(), before_head)
+        # Side ref must hold the commit with rescued-side.txt
+        log = _sh(self.root, "git", "log", "-1", "--name-only",
+                  "--format=%an%x09%ae%x09%s", side_ref)
+        self.assertIn("helm-work\thelm-work@local\twip: rescue to side ref", log.stdout)
+        self.assertIn("rescued-side.txt", log.stdout)
+
+    def test_wip_commit_side_ref_never_reports_a_write_it_did_not_make(self):
+        """task/4002: rc 0 means a side ref now holds the work. With
+        nothing to stage, or a failed `add -A`, no ref is written, so the
+        answer is non-zero and the caller keeps the room (main's commit fails
+        the same way when nothing is staged)."""
+        wt = os.path.join(self.tmp, "wt-wip-none")
+        self.git.add_worktree(self.root, wt, "lane/wip-none", base="main")
+        side_ref = "refs/helm-rescue/wip-none/2026-10-01T15-00-00Z"
+        rc, out, err = self.git.wip_commit_side_ref(wt, "wip: nothing", side_ref)
+        self.assertNotEqual(rc, 0, "a clean room has nothing to rescue")
+        self.assertIn("no side ref was written", err)
+        self.assertNotEqual(_sh(self.root, "git", "rev-parse", "--verify", "-q",
+                                side_ref).returncode, 0)
+        with open(os.path.join(wt, "precious.txt"), "w") as f:
+            f.write("must not be claimed as rescued")
+        real = self.git.text
+        def text(path, *args, **kw):
+            if args[:1] == ("add",):
+                return 128, "", "fatal: Unable to create index.lock: File exists"
+            return real(path, *args, **kw)
+        with mock.patch.object(self.git, "text", side_effect=text):
+            rc, out, err = self.git.wip_commit_side_ref(wt, "wip: add fails", side_ref)
+        self.assertEqual(rc, 128)
+        self.assertIn("index.lock", err)
+        self.assertNotEqual(_sh(self.root, "git", "rev-parse", "--verify", "-q",
+                                side_ref).returncode, 0)
+
     def test_ahead_behind_counts_and_none_on_a_failed_read(self):
         wt = os.path.join(self.tmp, "wt-ab")
         self.git.add_worktree(self.root, wt, "lane/ab", base="main")
@@ -2586,8 +2632,15 @@ _DIRECT_SPAWN_DEBT = {
                      "commit, for-each-ref raw-SHA unique-local-tip binding) "
                      "plus 3 movement-evidence probes in the moved-lane verdict "
                      "guard (rev-parse branch head, merge-base --is-ancestor, "
-                     "rev-list -g reflog); head/ancestry have seam equivalents, "
-                     "the reflog and exact-tip branch reads do not yet — ordinary "
+                     "rev-list -g reflog) plus 3 review-lane reads at the row "
+                     "writer (for-each-ref --contains of the lane/* holders, "
+                     "read once for the task/3511 refusal and the task/4020 "
+                     "unbound-branch advisory; the advisory's rev-parse of the "
+                     "named lane branch; its for-each-ref over refs/remotes at "
+                     "the tip — the helm-tree identity both judge by rides "
+                     "_repo_info and the seam's memoised common_dir, task/4026); "
+                     "head/ancestry have seam equivalents, the reflog and "
+                     "exact-tip branch reads do not yet — ordinary "
                      "migration debt",
     "record.py": "per-turn dirty probe and the tree it was taken in, both fail-open by contract; the seam exposes no --show-toplevel, and common_dir cannot answer it (a linked worktree shares its main repo's common dir, so it matches everywhere); debt",
     "hardcode.py": "the staged-diff scanner runs as a PLAIN SCRIPT under the "
@@ -2701,6 +2754,18 @@ _DIRECT_SPAWN_DEBT = {
 # this set trips, but a dynamic argv added inside an already-listed module cannot
 # be decoded and this test does not pretend otherwise (see the class docstring).
 _DYNAMIC_ARGV_MODULES = {
+    # hookres.py — CONFIRMED not git, read off every subprocess in the
+    # module. `_supervise_loop` starts `<hook interpreter> -S <checkout>/bin/
+    # helm hooks resident` (the resident itself, never a repository
+    # operation); `_import_env` starts `<this interpreter> -S -c <recorder>`,
+    # which only imports helm modules; the re-exec's import check goes
+    # through stopfacts_resident. The HEAD witness it compares is two file
+    # reads (stopfacts.head_witness).
+    # pileflow.py — CONFIRMED not git, read off every subprocess in the
+    # module. `_fab` runs the runtime-discovered `fab status --live`
+    # READ-ONLY, to report the fleet's job state (task/4184).
+    "hookres.py",
+    "pileflow.py",
     "autocompact.py", "cell.py", "chatnode.py", "doctor.py", "fleet.py",
     "handoff.py", "harness.py", "modelrouter.py", "providers.py", "seat.py",
     "seat_health.py", "seat_lifecycle_runtime.py",

@@ -1,0 +1,1 @@
+gc [--dry | --apply] [--install-timer] — declared retention budgets over the derived exhaust (dry-run default; authored content never touched). --install-timer wires the HOURLY cadence: a retention policy nothing schedules is a policy that does not exist (measured 11,192 items over budget on a gc that had never run)

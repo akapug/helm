@@ -820,6 +820,7 @@ class FollowTest(SeatsBase):
                                ("trunkroute.py", ""), ("selfrepo.py", ""),
                                ("web_server.py", ""), ("webserve.py", ""),
                                ("stopfacts_resident.py", ""),
+                               ("tickalarm.py", ""),
                                ("web.py", "from . import web_common\n"),
                                ("web_common.py", "BIND = '127.0.0.1'\n")):
                 with open(os.path.join(pkg, name), "w") as f:

@@ -254,7 +254,37 @@ if command -v gnutimeout >/dev/null 2>&1; then
     tmo=gnutimeout
 fi
 
-if [ -n "$py" ]; then
+# THE RESIDENT (task/1825): a SERVED hook asks the warm resident first. Even
+# with the interpreter floor above, a cold argv-guard measured about 133 ms of
+# CPU per call on the agents box, and the fleet's per-tool-call hooks were
+# most of the load the day it stalled twice. `bin/helm-hookres` starts no
+# python: it hands the call to `helm hooks resident` (helm/hookres.py), whose
+# forked child runs helm as THIS process, on this process's own stdin, stdout
+# and stderr, in a few milliseconds. When the resident cannot take the call it
+# names why on stderr and execs the very command the next arm runs, under the
+# same budget, so every exit code below keeps its meaning.
+#
+# ONLY ON THE PROVEN PATH: the interpreter floor chose "$py" (the resident
+# serves callers of that interpreter), the argv is one helm/hookres.py SERVED
+# lists (tests/test_hookres.py holds the two to each other), the client ships
+# beside this file, bash exists, and this helm home has a resident directory.
+# Every test and every host that never ran a resident stops at that last
+# `-d`: one stat, no new process. HELM_HOOK_RESIDENT=off turns it off.
+res=
+if [ -n "$py" ] && [ $# -eq 4 ] && [ "$2" = chat ] \
+        && [ "$3" = argv-guard ] && [ "$4" = --hook-json ] \
+        && [ -f "${0%/*}/helm-hookres" ] \
+        && [ -d "${HELM_HOME:-$HOME/.helm}/_global/.state/hookres" ] \
+        && command -v bash >/dev/null 2>&1; then
+    case ${HELM_HOOK_RESIDENT:-on} in
+    0|[Oo][Ff][Ff]|[Nn][Oo]|[Ff][Aa][Ll][Ss][Ee]) ;;
+    *) res=1 ;;
+    esac
+fi
+
+if [ -n "$res" ]; then
+    "$tmo" "$budget" bash -p "${0%/*}/helm-hookres" "$name" "$py" "$@"
+elif [ -n "$py" ]; then
     "$tmo" "$budget" "$py" -S -- "$@"
 elif [ -n "$key" ]; then
     HELM_HOOK_INTERP_RECORD=$pf HELM_HOOK_INTERP_KEY=$key "$tmo" "$budget" "$@"

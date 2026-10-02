@@ -446,7 +446,7 @@ def this_session():
 
 _USAGE = """usage: helm todos [--json]           this seat's mirrored todo list
        helm todos --all [--json]     every seat: who is working on what
-       helm todos promote <id> [--owner S]
+       helm todos promote <id> [--owner S] [--project NAME]
                                      file one personal row into the team ledger
        helm todos demote [--dry-run] [--owner S]
                                      drop personal rows the ledger says are
@@ -663,8 +663,13 @@ def _write_personal(path, row):
         return False
 
 
-def promote(sid, item_id, owner, path=None):
+def promote(sid, item_id, owner, path=None, project=None):
     """One personal row -> a ledger row, with the id stamped back. (row, err).
+
+    THE ROW NAMES ITS PROJECT (task/3745): `project`, else the project the
+    cwd resolves to, the way `helm task add` derives it. With neither the
+    promote is REFUSED and nothing is filed, because a row with no project
+    is listed by no project's task list.
 
     ALREADY-PROMOTED IS NOT AN ERROR AND NOT A SECOND ROW: a re-run returns
     the existing ledger row. Promotion is the kind of thing a seat will
@@ -723,13 +728,20 @@ def promote(sid, item_id, owner, path=None):
                     row[STAMP] = str(existing.get("id") or "")
                     _write_personal(full, row)
                 return existing, None
+        if project is not None:
+            project, _, err = tasks.resolve_scope(project, "helm todos promote")
+            if err:
+                return None, err
+        project = project or tasks.current_project()
+        if not project:
+            return None, tasks.homeless_refusal("helm todos promote")
         # ORIGIN IS DELIBERATELY UNSET. A promoted todo is filed BY an agent,
         # but the field answers "did the OWNER ask for this", and a personal
         # todo is exactly as likely to be the owner's request written down as
         # it is to be the agent's own idea. The bridge cannot witness which,
         # and inventing provenance is the failure the field exists to end.
         new, err = tasks.add(title, owner, note=note, refs=[backref],
-                              path=path)
+                              path=path, project=project)
         if err:
             return None, err
         row[STAMP] = str(new.get("id") or "")
@@ -3891,18 +3903,28 @@ def _cmd_bridge(args):
     # exists to prevent, so both verbs now take --owner and demote REFUSES
     # rather than degrading.
     seat = None
+    project = None
     parsed = []
     i = 0
     while i < len(rest):
         a = rest[i]
-        if a != "--owner":
+        if a not in ("--owner", "--project"):
             parsed.append(a)
             i += 1
             continue
-        if seat is not None or i + 1 >= len(rest) or rest[i + 1].startswith("-"):
+        if i + 1 >= len(rest) or rest[i + 1].startswith("-"):
             print(_USAGE, file=sys.stderr)
             return 2
-        seat = rest[i + 1]
+        if a == "--owner":
+            if seat is not None:
+                print(_USAGE, file=sys.stderr)
+                return 2
+            seat = rest[i + 1]
+        else:
+            if project is not None:
+                print(_USAGE, file=sys.stderr)
+                return 2
+            project = rest[i + 1]
         i += 2
     rest = parsed
     seat = str(seat or home.chat_name() or "").strip()
@@ -3913,14 +3935,18 @@ def _cmd_bridge(args):
               "would silently keep every row another seat owns, and report "
               "that as a clean list.", file=sys.stderr)
         return 2
+    if project is not None and verb != "promote":
+        print(_USAGE, file=sys.stderr)
+        return 2
     if verb == "promote":
         ids = [a for a in rest if not a.startswith("-")]
         if len(ids) != 1 or len(ids) != len(rest):
             print(_USAGE, file=sys.stderr)
             return 2
-        row, err = promote(sid, ids[0], seat)
+        row, err = promote(sid, ids[0], seat, project=project)
         if err and not row:
-            print("helm todos: %s" % err, file=sys.stderr)
+            print(err if err.startswith("helm todos") else
+                  "helm todos: %s" % err, file=sys.stderr)
             return 1
         if as_json:
             print(json.dumps({"row": row, "warning": err}, indent=1,

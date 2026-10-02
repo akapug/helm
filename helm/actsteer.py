@@ -33,6 +33,7 @@ argv-guard runs on every tool call, and a guard that throws wedges the fleet.
 import os
 import re
 import shlex
+import sys
 
 # The whole rendered line: "[helm steer] " + text, one line (design 5.2).
 STEER_CAP = 250
@@ -538,7 +539,7 @@ _TRANSCRIPT = _Rx(r"\.(?:claude(?:-homes/[\w.-]+)?|codex)/"
 _READER = _Rx(_AT + r"(?:/usr/bin/)?(?:rg|grep|ugrep|jq|find|cat|tail|head|"
               r"sed|awk|zcat|less|python3?)\b")
 TRANSCRIPT_STEER = ("You just read a session transcript by hand. For what was "
-                    "said or decided, cv recall or cv search answers first and "
+                    "said or decided, cv search or cv pack answers first and "
                     "names the span; open a jsonl only to check that span.")
 # THE SAME RULE, SHARPENED, for a WHOLE read of a transcript. A subagent
 # read eighty transcripts with `open(f).read().splitlines()` (one was 461 MB)
@@ -550,7 +551,7 @@ TRANSCRIPT_STEER = ("You just read a session transcript by hand. For what was "
 TRANSCRIPT_WHOLE_STEER = ("You just read session transcripts WHOLE. They run "
                           "to hundreds of MB each: stream per line (`for line "
                           "in open(f)`), never .read(), readlines() or "
-                          "json.load, or ask cv recall or cv search first.")
+                          "json.load, or ask cv search or cv pack first.")
 _WHOLE_READ = _Rx(r"\.read\(\s*\)|\.readlines\(|\bread_(?:text|bytes)\("
                   r"|\bjson\.load\(")
 
@@ -951,21 +952,71 @@ def _is_shell_script(path):
                for s in _SHELLS)
 
 
+#: The scripts a hook runs through: a shell running one of these is the hook
+#: itself (bin/helm-hook, the wrapper; bin/helm-hookres, the resident client).
+_HOOK_SCRIPTS = (b"helm-hook", b"helm-hookres")
+
+
+def _argv(pid, proc):
+    try:
+        with open(os.path.join(proc, pid, "cmdline"), "rb") as f:
+            return f.read().split(b"\0")
+    except OSError:
+        return []
+
+
+def _hook_chain(pid, proc):
+    """The part of `pid`'s process chain that IS this hook: `pid` itself and
+    each ancestor up to and including the outermost one running a hook
+    script (`_HOOK_SCRIPTS`), as /proc names. Above that sit the harness and
+    whatever started it, and a shell there running a script is a real
+    runner of it."""
+    chain = []
+    while pid > 0 and str(pid) not in chain and len(chain) < 64:
+        chain.append(str(pid))
+        try:
+            with open(os.path.join(proc, str(pid), "stat"), "rb") as f:
+                raw = f.read()
+            pid = int(raw[raw.rindex(b")") + 2:].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    top = 0
+    for i, p in enumerate(chain):
+        if any(os.path.basename(a) in _HOOK_SCRIPTS
+               for a in _argv(p, proc)[1:]):
+            top = i
+    return set(chain[:top + 1])
+
+
+def _own_chain(proc):
+    """The processes running THIS hook (`_hook_chain`) from this process,
+    and, when the hook resident serves the call (helm/hookres.py sets CALLER
+    in its forked child), from the caller's process. The shells among them
+    (bin/helm-hook, bin/helm-hookres) are the hook itself, never a runner of
+    the script being edited."""
+    mine = _hook_chain(os.getpid(), proc)
+    caller = getattr(sys.modules.get("helm.hookres"), "CALLER", None)
+    if caller:
+        mine |= _hook_chain(caller, proc)
+    return mine
+
+
 def _runner_of(path, proc="/proc"):
     """A pid of a SHELL whose argv names `path`, or None. Only a shell reads a
     script as it goes, so an editor or a `tail` holding the name is not a
-    runner. A relative argument is resolved against that process's own cwd.
-    Only called for a shell script that exists, so the /proc walk is paid on
-    those edits alone."""
+    runner, and neither is a shell of this hook's own process chain
+    (`_own_chain`). A relative argument is resolved against that process's
+    own cwd. Only called for a shell script that exists, so the /proc walk is
+    paid on those edits alone."""
     real = os.path.realpath(path).encode()
     base = os.path.basename(real)
-    me = os.getpid()
     try:
         pids = [p for p in os.listdir(proc) if p.isdigit()]
     except OSError:
         return None
+    mine = _own_chain(proc)
     for pid in pids:
-        if int(pid) == me:
+        if pid in mine:
             continue
         try:
             with open(os.path.join(proc, pid, "cmdline"), "rb") as f:

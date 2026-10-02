@@ -99,7 +99,7 @@ class StandingBase(RelayBase):
         with dispatch_home(self.repo):
             row, why, _posted = dispatches.send(
                 SEAT, lane, brief, tip or self.base, repo=self.repo,
-                kind="build", sign=False, new_work=True)
+                kind="build", sign=False, new_work=True, task=self.task)
         self.assertIsNotNone(row, why)
         return row
 
@@ -177,8 +177,8 @@ class StandingTransportTest(StandingBase):
                           launch["effort"]), (SID_A, EMAIL, "high"))
         # the report is read and recorded exactly as a launched session's
         self.report(row)
-        self.assertIn("source-clean-hold", self.acted(row))
-        self.assertEqual(self.row(row["id"])["status"], "held")
+        self.assertIn("recorded APPROVE as hold", self.acted(row))
+        self.assert_no_receipt_hold(row["id"])
 
     def test_a_seat_with_no_standing_session_is_refused_plainly(self):
         self.configure(standing=())
@@ -548,15 +548,15 @@ class BuildLaneTest(StandingBase):
         self.assertIn("LANE AUTHOR", held.get("hold_reason") or "")
         self.assertIsNone(held.get("source_clean_tip"))
 
-    def test_an_approve_leaves_the_lane_for_auto_land(self):
+    def test_an_approve_holds_and_leaves_the_lane_alone(self):
         self.configure(review_seat="cloud-opus-review")
         _row, label, built, review = self.handed_back()
         self.assertEqual(review["recipient"], "cloud-opus-review")
         self.assertIn("delivered", self.acted(review))
         self.assertEqual(self.to_sessions[-1][0], SID_B)
         self.report(review, account=EMAIL_B)
-        self.assertIn("source-clean-hold", self.acted(review))
-        self.assertEqual(self.row(review["id"])["status"], "held")
+        self.assertIn("recorded APPROVE as hold", self.acted(review))
+        self.assert_no_receipt_hold(review["id"])
         self.assertFalse([r for r in self.ledger_rows(kind="build")
                           if r.get("supersedes") == review["id"]])
         self.assertEqual(run_git(self.repo, "rev-parse", self.main), self.base)

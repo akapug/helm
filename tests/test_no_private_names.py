@@ -77,6 +77,10 @@ SINGLE_LABEL_ALLOWED = {
     "room@epoch": "the pair meld's round citation grammar: `--meld "
                   "ROOM@EPOCH` binds one round (helm/review_door.py, "
                   "helm/dispatches.py)",
+    "plugin-dev@claude-plugins-official": "Anthropic's own plugin id, the key "
+                                          "an enabledPlugins entry takes "
+                                          "(helm/seat_catalog.py), not a "
+                                          "person or a private host",
 }
 
 #: A synthetic name, never a real one, for the arms that plant a list entry.

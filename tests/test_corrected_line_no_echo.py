@@ -19,12 +19,14 @@ A SEPARATE MODULE because tests/test_review_done.py is already 1,600 lines;
 the fixtures are imported from it, as that module imports its own from
 tests/test_dispatches.py.
 """
+import io
+import json
 import os
 import shlex
 import subprocess
 from unittest import mock
 
-from helm import dispatches, review_done
+from helm import dispatches, review_done, tasks
 from tests import test_review_done as trd
 
 READER = trd.READER
@@ -35,7 +37,8 @@ DOOR = "<--meld ROOM|--async-because REASON>"
 PATH, REASON, SHA = "<PATH>", "<REASON>", "<FULL_SHA>"
 #: A FIX with every answer the door owes, each a value it admits.
 FIX = ("--fix", "--measured", "--finding-count", "1", "--prior-relation",
-       "new", "--worse-than-main", "helm/x.py", "--no-patch-because", "a meld")
+       "new", "--worse-than-main", "helm/x.py", "--no-patch-because", "a meld",
+       "--finding", "the guard is inverted")
 
 
 def swap(argv, flag, value):
@@ -115,7 +118,7 @@ class AnImperfectReadWithNoCureReopensItsDirectionTest(NoEchoBase):
         a source-clean hold, which records."""
         row = self.row()
         rc, _out, err = self.dispatch("verdict", row["id"], row["tip"],
-                                      *self.ARGV, "--", "not worse")
+                                      *self.ARGV, "--", "not worse, Ran 5 tests OK")
         line = self.corrected(err)
         rc, _out, err = self.paste(line.replace(shlex.quote(REOPENED),
                                                 "--approve"))
@@ -123,7 +126,7 @@ class AnImperfectReadWithNoCureReopensItsDirectionTest(NoEchoBase):
         self.assertNotIn("IMPERFECT IS NOT A BLOCK", err)
         hold = self.corrected(err)
         self.assertEqual(hold, "helm dispatch hold %s --source-clean %s -- "
-                         "'not worse'" % (row["id"], self.b))
+                         "'not worse, Ran 5 tests OK'" % (row["id"], self.b))
         self.records(self.paste(hold), row["id"], "hold")
         self.assertEqual(self.folded(row["id"])["source_clean_tip"], self.b)
 
@@ -178,8 +181,10 @@ class AVerdictValueRefusedByItsShapeTest(NoEchoBase):
             with self.subTest(count=count):
                 row = self.row()
                 _line, paste = self.unlooped(
-                    self.verdict(row, swap(FIX, "--finding-count", count)),
-                    "finding_count needs", (("<N>", "2"),))
+                    self.verdict(row, swap(FIX, "--finding-count", count)
+                                 + ["--finding", "the second guard is inverted"]),
+                    "finding_count needs")
+                self.assertNotIn("--finding-count", _line)
                 self.assertEqual(self.records(paste, row["id"])
                                  ["finding_count"], 2)
 
@@ -370,9 +375,13 @@ class AReviewDoneOrHoldValueRefusedByItsShapeTest(NoEchoBase):
         _line, paste = self.unlooped(
             self.done(row["id"][:8], "fix", "--finding-count", "abc",
                       "--prior-relation", "new", "--worse-than-main",
-                      "helm/x.py", "--no-patch-because", "a meld", "--",
+                      "helm/x.py", "--no-patch-because", "a meld",
+                      "--finding", "the first guard is inverted",
+                      "--finding", "the second guard is inverted",
+                      "--finding", "the third guard is inverted", "--",
                       "inverted"),
-            "finding_count needs", (("<N>", "3"),))
+            "finding_count needs")
+        self.assertNotIn("--finding-count", _line)
         self.assertEqual(self.records(paste, row["id"])["finding_count"], 3)
 
     def test_a_hold_reason_on_two_lines(self):
@@ -381,10 +390,10 @@ class AReviewDoneOrHoldValueRefusedByItsShapeTest(NoEchoBase):
             self.dispatch("hold", row["id"], "--source-clean", row["tip"],
                           "--", "one\ntwo"),
             "hold reason must be one printable line",
-            (("<reason>", "'nothing found'"),))
+            (("<reason>", "'nothing found, Ran 5 tests OK'"),))
         self.records(paste, row["id"], "hold")
         self.assertEqual(self.folded(row["id"])["hold_reason"],
-                         "nothing found")
+                         "nothing found, Ran 5 tests OK")
 
 
 class ASendValueRefusedByItsShapeTest(NoEchoBase):
@@ -396,7 +405,46 @@ class ASendValueRefusedByItsShapeTest(NoEchoBase):
              repo=None, ref=None):
         return self.dispatch("send", recipient, lane, brief, "--ref",
                              ref or self.c, "--kind", kind, *arm, "--repo",
-                             repo or self.repo, *extra, author=False)
+                             repo or self.repo,
+                             *(["--task", self.review_task["id"], "--part"]
+                               if kind == "review" and "--new-work" in arm
+                               else []), *extra, author=False)
+
+    def send_stdin(self, *extra, lane="lane-echo", brief="build the parser",
+                   kind="build", arm=("--new-work",), recipient="integrator",
+                   repo=None, ref=None):
+        """A send whose brief is PIPED on stdin: argv carries no brief, so the
+        corrected line's <brief> is the stdin re-pipe form."""
+        fake = mock.Mock(name="stdin")
+        fake.isatty.return_value = False
+        fake.read.return_value = brief
+        with mock.patch("sys.stdin", fake):
+            return self.dispatch("send", recipient, lane, "--ref",
+                                 ref or self.c, "--kind", kind, *arm,
+                                 "--repo", repo or self.repo, *extra,
+                                 author=False)
+
+    def pasted_stdin(self, line, body, parent, lane):
+        """Real bash redirects a file; the fixture dispatch door records it."""
+        path = os.path.join(self.tmp, "brief.md")
+        with open(path, "w", encoding="utf-8") as stream:
+            stream.write(body + "\n")
+        filled = line.replace("<brief-file>", shlex.quote(path))
+        script = ("helm() { python3 -c 'import json,sys; "
+                  "print(json.dumps([sys.argv[1:],sys.stdin.read()]))' "
+                  '"$@"; }; ' + filled)
+        shell = subprocess.run(["bash", "-c", script], stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, check=True)
+        argv, piped = json.loads(shell.stdout)
+        self.assertEqual(argv[:4], ["dispatch", "send", "integrator", lane])
+        self.assertEqual(piped, body + "\n")
+        with mock.patch("sys.stdin", io.StringIO(piped)):
+            rc, _out, err = self.dispatch(*argv[1:], author=False)
+        self.assertEqual(rc, 0, err)
+        children = [r for r in dispatches.snapshot()[0].values()
+                    if r.get("supersedes") == parent["id"]]
+        self.assertEqual(len(children), 1)
+        self.assertIn(body, children[0]["message_body"])
 
     def minted(self, paste, lane):
         rc, _out, err = paste
@@ -452,6 +500,109 @@ class ASendValueRefusedByItsShapeTest(NoEchoBase):
                 self.minted(self.paste(line.replace(shlex.quote(hole), value)),
                             lane)
 
+    def test_direct_renderer_after_stdin_refusal_uses_argv_brief(self):
+        """A direct renderer read after a piped refusal must not inherit stdin."""
+        refused = self.send_stdin(lane="echo-stale", kind="bogus")
+        self.assertIn(" < <brief-file> ", self.corrected(refused[2]))
+        line = review_done.send_line([
+            "integrator", "echo-next", "a brief typed on argv", "--ref",
+            self.c, "--kind", "bogus", "--new-work", "--repo", self.repo])
+        line = line[0] if isinstance(line, tuple) else line
+        self.assertIn("'a brief typed on argv'", line)
+        self.assertNotIn("<brief-file>", line)
+
+    def test_exception_after_piped_brief_cannot_poison_next_argv_line(self):
+        """A failed public send clears its read brief even if a later guard raises."""
+        stream = mock.Mock(name="stdin")
+        stream.isatty.return_value = False
+        stream.read.return_value = "the piped brief"
+        with mock.patch("sys.stdin", stream), mock.patch(
+                "helm.posture.check", side_effect=RuntimeError("later guard")):
+            with self.assertRaisesRegex(RuntimeError, "later guard"):
+                self.dispatch("send", "integrator", "echo-exception", "--ref",
+                              self.c, "--kind", "build", "--new-work",
+                              "--repo", self.repo, author=False)
+        stream.read.assert_called_once()
+        line = review_done.send_line([
+            "integrator", "echo-next", "the next argv brief", "--ref",
+            self.c, "--kind", "bogus", "--new-work", "--repo", self.repo])
+        line = line[0] if isinstance(line, tuple) else line
+        self.assertIn("'the next argv brief'", line)
+        self.assertNotIn("<brief-file>", line)
+
+    def test_a_brief_on_stdin_prints_the_stdin_form(self):
+        """A brief that came on stdin leaves no brief word in argv, so the line
+        is the send with nothing where the brief was, plus a re-pipe file. No
+        argv '<brief>' word is printed, so a paste-back cannot loop on it."""
+        refused = self.send_stdin(lane="echo-stdin", kind="bogus")
+        self.assertNotEqual(refused[0], 0, refused[2])
+        self.assertIn("kind must be one of", refused[2])
+        line = self.corrected(refused[2])
+        self.assertNotIn("<brief>", line)
+        self.assertIn(" < <brief-file> --ref ", line)
+        # Filled with a path, the line splits as a shell reads it: no stray
+        # quote leaves it unterminated.
+        self.assertIn("/tmp/brief.md", shlex.split(
+            line.replace("<brief-file>", "/tmp/brief.md")))
+        self.assertIn("helm dispatch send", line)
+        self.assertIn("--kind", line)
+
+    def test_stdin_brief_keeps_its_owed_posture_answer(self):
+        """Re-piping a refused brief must not re-trigger its posture refusal."""
+        parent = self.row(lane="echo-stdin-posture")
+        body = "patch the orca pane handler"
+        refused = self.send_stdin(lane="echo-stdin-posture", brief=body,
+                                  arm=("--supersedes", parent["id"]))
+        self.assertNotEqual(refused[0], 0, refused[2])
+        self.assertIn("carries no posture", refused[2])
+        line = self.corrected(refused[2])
+        self.assertIn(" < <brief-file> ", line)
+        self.assertIn("--posture-na " + shlex.quote(REASON), line)
+        self.pasted_stdin(line.replace(shlex.quote(REASON),
+                                       shlex.quote("no seam change")), body,
+                          parent, "echo-stdin-posture")
+
+    def test_stdin_correction_shell_paste_records_superseding_row(self):
+        """The corrected redirection really pipes bytes into a linked send."""
+        parent = self.row(lane="echo-stdin-paste")
+        body = "a cure proven on this lane"
+        refused = self.send_stdin(lane="echo-stdin-paste", brief=body,
+                                  kind="bogus", arm=("--supersedes", parent["id"]))
+        self.assertNotEqual(refused[0], 0, refused[2])
+        self.assertIn("kind must be one of", refused[2])
+        line = self.corrected(refused[2]).replace(
+            shlex.quote("<build|review>"), "build")
+        self.pasted_stdin(line, body, parent, "echo-stdin-paste")
+
+    def test_both_arms_with_a_task_keep_the_choice_and_name_the_drop(self):  # noqa: VACUOUS_ASSERTION
+        """A send that named BOTH --new-work and --supersedes plus --task and
+        --part is refused as exclusive. The line binds neither arm for the
+        seat: it keeps the work placeholder and the new chain's flags, and
+        the note above it names what a --supersedes fill drops. That fill,
+        pasted, records one row superseding the parent."""
+        parent = self.row(lane="echo-both")
+        refused = self.dispatch("send", "integrator", "echo-both",
+                                "the cure is on the lane",
+                                "--ref", self.c, "--kind", "build",
+                                "--new-work", "--supersedes", parent["id"],
+                                "--task", self.review_task["id"], "--part",
+                                "--repo", self.repo, author=False)
+        self.assertNotEqual(refused[0], 0, refused[2])
+        self.assertIn("exclusive", refused[2])
+        line = self.corrected(refused[2])
+        self.assertIn(shlex.quote(review_done.WORK_PLACEHOLDER), line)
+        self.assertIn("--task", line)
+        self.assertIn("--part", line)
+        self.assertIn(review_done.BOTH_ARMS_NOTE, self.note(refused[2]))
+        filled = line.replace(shlex.quote(review_done.WORK_PLACEHOLDER),
+                              "--supersedes " + parent["id"]).replace(
+            " --task " + shlex.quote(self.review_task["id"]), "").replace(
+            " --part", "")
+        rc, _out, err = self.paste(filled)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(len([r for r in dispatches.snapshot()[0].values()
+                              if r.get("supersedes") == parent["id"]]), 1)
+
     def test_a_supersedes_that_names_no_row(self):
         sent = self.row(lane="lane-parent")
         line, paste = self.unlooped(
@@ -499,17 +650,19 @@ class ASendValueRefusedByItsShapeTest(NoEchoBase):
             repo=other, ref=other_tip, kind="review")
 
         # 4. Check refusal and corrected line
-        line, paste = self.unlooped(
-            refused, "refusing foreign chain authority")
+        self.assertIn("refusing foreign chain authority", refused[2])
+        line = self.corrected(refused[2])
 
-        # Acceptance 1: asserts the printed corrected line is NOT the refused command
+        # The foreign chain must become new work, and that new review needs its
+        # own task in the destination project; it cannot inherit the old one.
         self.assertNotIn("--supersedes", line)
         self.assertIn("--new-work", line)
         self.assertIn(parent["id"][:12], line)
-
-        # Acceptance 2: Running the printed corrected line in that fixture succeeds (rc 0)
-        # and the parent row is answered or linked (cited in the brief).
-        rc, out, err = paste
+        work, why = tasks.add("reviewed artifact", "integrator",
+                              project="projb", force_new=True)
+        self.assertIsNone(why, why)
+        rc, out, err = self.paste(line.replace(
+            "--new-work", "--new-work --task " + work["id"] + " --part", 1))
         self.assertEqual(rc, 0, err)
 
         # Verify the new row was created in repo B and links the parent row in its brief
@@ -541,11 +694,15 @@ class WhatThisLaneDoesNotChangeTest(NoEchoBase):
                                       "--fix", *FIX[2:], "--", "ev")
         self.assertEqual(rc, 2, err)
         self.assertIn("DECLARE HOW YOU KNOW", err)
-        self.assertEqual(self.corrected(err), "helm dispatch verdict %s %s "
-                         "--fix '<--measured|--inferred>' --finding-count 1 "
-                         "--prior-relation new --worse-than-main helm/x.py "
-                         "--no-patch-because 'a meld' -- ev"
-                         % (row["id"], self.b))
+        line = self.corrected(err)
+        self.assertIn("helm dispatch verdict %s %s --fix "
+                      "'<--measured|--inferred>'" % (row["id"], self.b), line)
+        for answer in ("--prior-relation new", "--finding 'the guard is inverted'",
+                       "--worse-than-main helm/x.py",
+                       "--no-patch-because 'a meld'", "-- ev"):
+            self.assertIn(answer, line)
+        self.assertNotIn("--finding-count", line,
+                         "the named finding derives its count")
 
     def test_a_hex_patch_prefix_no_commit_answers_comes_back_as_typed(self):
         """Its cause is the world, not its shape: a cure committed in the
@@ -583,3 +740,204 @@ class WhatThisLaneDoesNotChangeTest(NoEchoBase):
         for hole in ("<KEY>", "<note>", "<SECONDS>"):
             self.assertIn(shlex.quote(hole), review_done.unfilled_refusal(
                 ["--key", hole]) or "")
+
+
+class ACleanHoldOnARowNotYoursNamesTheRealPathTest(NoEchoBase):
+    """task/4026 (f), SEEN LIVE by the integrator: its `helm dispatch hold
+    <row> --source-clean <tip>` on a row it SENT was refused (only the row's
+    recipient holds it source-clean), and the corrected line under the
+    refusal was that same command, which no paste can ever record. The line
+    names the real path instead: the sender records a fresh-context run's
+    read at that tip (task/3658: its CONCUR records the hold too), and the
+    line above it names the recipient whose hold it otherwise is. A
+    recipient that wrote a round of the lane is refused the same way
+    (task/3483) and gets the same verdict line. A seat on neither end of the
+    row is sent to its own rows."""
+
+    BASIS = "<--measured|--inferred>"
+
+    def test_the_sender_is_sent_to_a_fresh_context_read(self):  # noqa: VACUOUS_ASSERTION — the line is asserted EQUAL to the verdict command and the paste refused naming each placeholder it carries
+        row = self.row()
+        rc, _out, err = self.dispatch("hold", row["id"], "--source-clean",
+                                      self.b, "--", "read it clean",
+                                      seat="integrator")
+        self.assertNotEqual(rc, 0, err)
+        self.assertIn("only this row's recipient", err)
+        line = self.corrected(err)
+        self.assertNotEqual(line, "helm dispatch hold %s --source-clean %s -- "
+                            "'read it clean'" % (row["id"], self.b))
+        self.assertEqual(line, "helm dispatch verdict %s %s --concur %s "
+                         "--reviewer-model %s --reviewer-run %s -- "
+                         "'read it clean'"
+                         % (row["id"], self.b, shlex.quote(self.BASIS),
+                            shlex.quote("<MODEL>"), shlex.quote("<RUN>")))
+        note = self.note(err)
+        self.assertIn("@%s" % READER, note)
+        self.assertIn("fresh-context", note)
+        self.paste_refused(line, row["id"], self.BASIS, "<MODEL>", "<RUN>",
+                           seat="integrator")
+
+    def test_a_seat_on_neither_end_is_sent_to_its_own_rows(self):
+        row = self.row()
+        rc, _out, err = self.dispatch("hold", row["id"], "--source-clean",
+                                      self.b, "--", "read it clean",
+                                      seat="seat-z")
+        self.assertNotEqual(rc, 0, err)
+        self.assertIn("only this row's recipient", err)
+        line = self.corrected(err)
+        self.assertEqual(line, "helm dispatch list --mine --open")
+        self.assertIn("@%s" % READER, self.note(err))
+        rc, _out, err = self.paste(line, seat="seat-z")
+        self.assertEqual(rc, 0, err)
+
+    def test_a_sender_holding_on_its_fresh_read_keeps_the_hold_line(self):
+        """The control: a sender whose fresh-context read at the tip is on
+        the row may hold it (task/3658), so a hold of its refused for another
+        cause — here the reason over its cap — still gets the hold line."""
+        row = self.row()
+        with mock.patch.object(dispatches, "holds_on_its_fresh_read",
+                               return_value=True):
+            rc, _out, err = self.dispatch("hold", row["id"], "--source-clean",
+                                          self.b, "r" * 300,
+                                          seat="integrator")
+        self.assertEqual(rc, 1, err)
+        self.assertIn("300 chars, 44 over the cap of at most 256", err)
+        self.assertEqual(self.corrected(err),
+                         "helm dispatch hold %s --source-clean %s -- "
+                         "'<reason of at most 256 chars>'" % (row["id"], self.b))
+
+    def test_a_recipient_who_wrote_a_round_is_sent_to_a_fresh_context_read(self):  # noqa: VACUOUS_ASSERTION — the line is asserted EQUAL to the verdict command and the paste refused naming each placeholder it carries
+        with self.as_seat(READER):
+            first = self.row(recipient="seat-c", ref=self.side, lane="authored",
+                             kind="review", force=True)
+        second = self.row(lane="authored", kind="review", force=True,
+                          supersedes=first["id"])
+        rc, _out, err = self.dispatch("hold", second["id"], "--source-clean",
+                                      self.b, "--", "read it clean")
+        self.assertNotEqual(rc, 0, err)
+        self.assertIn("LANE AUTHOR", err)
+        line = self.corrected(err)
+        self.assertEqual(line, "helm dispatch verdict %s %s --concur %s "
+                         "--reviewer-model %s --reviewer-run %s -- "
+                         "'read it clean'"
+                         % (second["id"], self.b, shlex.quote(self.BASIS),
+                            shlex.quote("<MODEL>"), shlex.quote("<RUN>")))
+        self.assertIn("wrote a round of lane authored", self.note(err))
+        self.paste_refused(line, second["id"], self.BASIS, "<MODEL>", "<RUN>")
+
+
+class AContinuationSendDropsNewWorkFlagsTest(NoEchoBase):
+    """A `--supersedes` send names no new chain, so its corrected line must
+    never carry back the new-work-only flags. The measured defect: sending
+    `--supersedes ROW --task task/N --whole` is refused by the task door
+    ("a --supersedes row keeps its chain's first row's task"), yet the
+    corrected line repeats `--task` and `--whole`; pasting it is refused
+    again. The fix drops them at the builder and leaves every other argument
+    byte-for-byte. The paste (with the flags gone) is admitted.
+
+    The control pins the NEW-chain arm: a `--new-work` send refused elsewhere
+    still carries its own `--task`/`--part`, unchanged."""
+
+    def send(self, *extra, lane="lane-echo", brief="build the parser",
+             kind="build", arm=("--new-work",), recipient="integrator",
+             repo=None, ref=None):
+        return self.dispatch("send", recipient, lane, brief, "--ref",
+                             ref or self.c, "--kind", kind, *arm, "--repo",
+                             repo or self.repo,
+                             *(["--task", self.review_task["id"], "--part"]
+                               if kind == "review" and "--new-work" in arm
+                               else []), *extra, author=False)
+
+    def send_continuation(self, lane, parent, brief="the cure is on the lane",
+                          task=True, whole=True, ref=None):
+        """A continuation send: `--supersedes <parent>`, with `--task` and
+        `--whole` tacked on trailing, as a seat would, on the same lane. The
+        tip is off master (`self.side`) so the task gate — not the "already on
+        master" note — is what refuses it."""
+        extra = []
+        if task:
+            extra += ["--task", self.review_task["id"]]
+        if whole:
+            extra.append("--whole")
+        return self.send(lane=lane, brief=brief,
+                         arm=("--supersedes", parent["id"]),
+                         ref=ref or self.side, *extra)
+
+    def test_continuation_line_drops_task_and_whole_and_is_admitted(self):  # noqa: VACUOUS_ASSERTION — deliberate absence (a continuation must NOT re-echo the new-work-only flags); its unconditional positive control on the same corrected-line argv is the sibling test_a_new_work_line_still_carries_its_own_task_and_part, which asserts --task/--part ARE present on a --new-work send
+        parent = self.row(lane="lane-child", recipient="integrator",
+                         new_work=True)
+        refused = self.send_continuation("lane-child", parent)
+        rc, _out, err = refused
+        self.assertNotEqual(rc, 0, err)
+        self.assertIn("keeps its chain", err)
+        line = self.corrected(err)
+        argv = shlex.split(line)
+        # THE NEW-WORK-ONLY FLAGS ARE GONE.
+        self.assertNotIn("--task", argv, line)
+        self.assertNotIn("--whole", argv, line)
+        self.assertNotIn("--part", argv, line)
+        # THE CONTINUATION'S IDENTITY AND THE REST OF THE ARGUMENTS ARE
+        # KEPT BYTE-FOR-BYTE: the supersedes row, its ref, its kind and its
+        # repo.
+        self.assertIn("--supersedes", argv, line)
+        self.assertIn("--ref", argv, line)
+        self.assertIn("--kind", argv, line)
+        # PASTED AS ARGV, THE LINE IS ADMITTED (a continuation, not a new
+        # chain, so it must not be refused again).
+        paste = self.paste(line)
+        self.assertEqual(paste[0], 0, paste[2])
+        # THE ADMITTED SEND MINTED ONE ROW ON THE LANE AND LINKED IT TO THE
+        # PARENT (a continuation carries the parent's task).
+        current, _unavail = dispatches.snapshot()
+        superseding = [r for r in current.values()
+                       if r.get("supersedes") == parent["id"]]
+        self.assertEqual(len(superseding), 1, paste[2])
+
+    def test_a_new_work_line_still_carries_its_own_task_and_part(self):
+        # CONTROL (GREEN before AND after the fix): a `--new-work` send's
+        # corrected line keeps its own `--task`/`--part`, so the drop is
+        # scoped to continuations, not all sends. A `--new-work` review send
+        # carries `--task`/`--part` by default (the helper appends them);
+        # refuse it via a foreign `--repo` — not the task door — and check the
+        # line still names both flags.
+        foreign = self.tmp + "/foreign-repo"
+        os.makedirs(foreign, exist_ok=True)
+        refused = self.send(lane="lane-new", brief="fresh work",
+                            kind="review", arm=("--new-work",),
+                            repo=foreign)
+        self.assertNotEqual(refused[0], 0, refused[2])
+        line = self.corrected(refused[2])
+        argv = shlex.split(line)
+        self.assertIn("--task", argv, line)
+        self.assertIn("--part", argv, line)
+        self.assertNotIn("--whole", argv, line)
+
+    def test_a_cross_repo_hand_back_line_still_carries_task_and_part(self):
+        # A `--supersedes` whose parent lives in ANOTHER repository is no
+        # continuation: its corrected line sends as `--new-work` citing the
+        # parent, and a new chain records its own task. So the seat's
+        # `--task`/`--part` stay on that line; a review `--new-work` line
+        # without them is refused for naming no task.
+        parent = self.row(lane="lane-child", recipient="integrator",
+                          new_work=True)
+        other = os.path.join(self.tmp, "other-repo")
+        os.makedirs(other)
+        for argv in (("init", "-q"), ("config", "user.email", "t@e.x"),
+                     ("config", "user.name", "T"),
+                     ("commit", "-q", "--allow-empty", "-m", "o")):
+            subprocess.run(["git", "-C", other, *argv], check=True,
+                           capture_output=True)
+        tip = subprocess.run(["git", "-C", other, "rev-parse", "HEAD"],
+                             check=True, capture_output=True,
+                             text=True).stdout.strip()
+        refused = self.send("--task", self.review_task["id"], "--part",
+                            lane="lane-child", kind="review",
+                            arm=("--supersedes", parent["id"]), repo=other,
+                            ref=tip)
+        self.assertNotEqual(refused[0], 0, refused[2])
+        line = self.corrected(refused[2])
+        argv = shlex.split(line)
+        self.assertIn("--new-work", argv, line)
+        self.assertNotIn("--supersedes", argv, line)
+        self.assertIn("--task", argv, line)
+        self.assertIn("--part", argv, line)

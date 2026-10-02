@@ -1,0 +1,1 @@
+rehome <sid> <new-cwd>|--reset — re-home a session (claude slug symlink)

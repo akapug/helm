@@ -62,6 +62,15 @@ import os
 from . import home, tasks, todos
 from . import pk
 
+PROJECT = tasks.OWN_PROJECT
+"""WHERE A ROW THAT RESOLVES NOWHERE IS FILED (task/3745): helm's own project.
+A mirrored row is filed under the registered project its session's recorded
+cwd resolves to, through `project_for_cwd` (the lens `helm task list` scopes
+with). A session that records no cwd, or one in a checkout no registered
+project claims, files HERE rather than homeless: this loop is helm's, and a
+row it cannot route is helm's to triage. The `project:<cwd-slug>` ref still
+records where the session ran."""
+CWD_SCAN_BYTES = 64 * 1024   # how far into a transcript the cwd is looked for
 TASKS_DIR = "tasks"          # <claude-home>/tasks/<session-id>/<task-id>.json
 PROJECTS_DIR = "projects"    # <claude-home>/projects/<cwd-slug>/<sid>.jsonl
 SOURCE = "harness-mirror"    # the tag every mirrored row carries
@@ -138,6 +147,20 @@ def sessions(root):
             if os.path.isdir(os.path.join(d, n))]
 
 
+def _transcript(root, sid):
+    """(cwd-slug, transcript path) for this session, or (None, None)."""
+    base = os.path.join(root, PROJECTS_DIR)
+    try:
+        slugs = sorted(os.listdir(base))
+    except OSError:
+        return None, None
+    for slug in slugs:
+        path = os.path.join(base, slug, "%s.jsonl" % sid)
+        if os.path.exists(path):
+            return slug, path
+    return None, None
+
+
 def project_of(root, sid):
     """The cwd-slug whose transcripts hold this session, or None.
 
@@ -145,15 +168,42 @@ def project_of(root, sid):
     `<session-id>.jsonl`. A session with no transcript anywhere routes
     NOWHERE, and that is a real state rather than an error — today's
     `probe-session` is exactly it — so the caller gets None and decides."""
-    base = os.path.join(root, PROJECTS_DIR)
+    return _transcript(root, sid)[0]
+
+
+def session_cwd(root, sid):
+    """The first cwd this session's transcript records, or None.
+
+    The slug is the cwd with every non-alphanumeric character flattened to
+    '-', which cannot be turned back into a path, so the path is read where
+    the harness wrote it: the `cwd` field of the transcript's first records.
+    The read is bounded to CWD_SCAN_BYTES, and a line cut at that bound, or
+    one that is not JSON, is passed over."""
+    _slug, path = _transcript(root, sid)
+    if not path:
+        return None
     try:
-        slugs = sorted(os.listdir(base))
+        with open(path, "rb") as fh:
+            head = fh.read(CWD_SCAN_BYTES)
     except OSError:
         return None
-    for slug in slugs:
-        if os.path.exists(os.path.join(base, slug, "%s.jsonl" % sid)):
-            return slug
+    for line in head.splitlines():
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        cwd = rec.get("cwd") if isinstance(rec, dict) else None
+        if isinstance(cwd, str) and cwd.strip():
+            return cwd
     return None
+
+
+def home_of(root, sid, projects):
+    """The registered project this session's recorded cwd resolves to, else
+    PROJECT. `projects` is the registry's project table, read once a sweep."""
+    from .inject._ledger import project_for_cwd
+    cwd = session_cwd(root, sid)
+    return (project_for_cwd(cwd, projects) if cwd else None) or PROJECT
 
 
 WORKTREE_MARK = "-wt-"       # <repo>-wt/<lane> flattens into the cwd-slug
@@ -425,6 +475,7 @@ def sweep(apply=True, path=None, live_only=True, write_cap=WRITE_CAP):
     rep = {"homes": 0, "sessions": 0, "seen": 0, "imported": [], "already": 0,
            "unreadable": [], "unrouted": [], "refused": [],
            "closed_unmirrored": 0, "dedup_unreadable": None,
+           "registry_unreadable": None,
            "finished": _finished_report()}
     # THE DEDUP SOURCE IS A PRECONDITION, NOT AN INPUT. Without it every ref
     # misses and this loop re-files rows it already filed, so a sweep that
@@ -435,7 +486,20 @@ def sweep(apply=True, path=None, live_only=True, write_cap=WRITE_CAP):
     if dedup_unreadable:
         rep["dedup_unreadable"] = dedup_unreadable
         return rep
-    sources, torn = {}, set()
+    # A MALFORMED REGISTRY IS NOT AN EMPTY ONE. The ordinary loader turns
+    # bad JSON into the empty default, and an empty table routes every row
+    # to PROJECT — a home the broken file never named (task/3994). Strict
+    # load raises instead, and this sweep imports nothing rather than
+    # guessing helm. A readable registry that names no checkout still falls
+    # through to PROJECT inside home_of.
+    from . import registry
+    try:
+        projects = (registry.load(strict=True) or {}).get("projects") or {}
+    except Exception as exc:              # noqa: BLE001 — reported, not
+        rep["registry_unreadable"] = "%s: %s" % (   # swallowed
+            exc.__class__.__name__, exc)
+        return rep
+    sources, torn, homes = {}, set(), {}
     for root in claude_homes():
         rep["homes"] += 1
         for sid, task_dir in sessions(root):
@@ -496,12 +560,19 @@ def sweep(apply=True, path=None, live_only=True, write_cap=WRITE_CAP):
                 filed = "open"
                 refs = [ref, REF_PROJECT + (slug or "none"),
                         "%s%s" % (REF_STATUS, status)]
+                # ONE TRANSCRIPT READ A SESSION, and only for a session
+                # with a row to carry. The registry was read once, strictly,
+                # before this walk.
+                if (root, sid) not in homes:
+                    homes[(root, sid)] = home_of(root, sid, projects)
+                home_name = homes[(root, sid)]
                 note = str(t.get("description") or "").strip()
                 if not apply:
                     rep["imported"].append({"ref": ref, "title": subject,
                                             "status": "open",
                                             "harness_status": status,
                                             "project": slug,
+                                            "home": home_name,
                                             "applied": False})
                     known.add(ref)
                     continue
@@ -519,7 +590,7 @@ def sweep(apply=True, path=None, live_only=True, write_cap=WRITE_CAP):
                 row, err = tasks.add(
                     subject, "", note=note or None, refs=refs,
                     source=SOURCE_KEYED + ref, status=filed, path=path,
-                    force_new=True)
+                    project=home_name, force_new=True)
                 if err:
                     rep["refused"].append({"session": sid, "id": tid,
                                            "why": err})
@@ -528,7 +599,7 @@ def sweep(apply=True, path=None, live_only=True, write_cap=WRITE_CAP):
                 rep["imported"].append({"ref": ref, "title": subject,
                                         "status": "open",
                                         "harness_status": status,
-                                        "project": slug,
+                                        "project": slug, "home": home_name,
                                         "row": row.get("id"), "applied": True})
     rep["finished"] = settle(pairs, sources, torn, apply=apply, path=path,
                              write_cap=write_cap)

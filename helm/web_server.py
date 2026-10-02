@@ -472,6 +472,19 @@ def _prewarm_board():
     return _prewarm("helm-board-prewarm", warm)
 
 
+def _prewarm_catalog():
+    """Build the session catalog ONCE in the background. The Config seat
+    detail binds its seat through it, and its first read after a restart is
+    the `cv ls` subprocess: MEASURED at 4.0 s of a 5.0 s cold
+    /api/config/injection alone, and past the page's 8 s limit when the
+    board and config walks warm beside it, so the owner's first seat open
+    read "timed out after 8s". Same law as the other prewarms."""
+    def warm():
+        from . import transcripts
+        transcripts.get_catalog()
+    return _prewarm("helm-catalog-prewarm", warm)
+
+
 def _prewarm(name, warm):
     """Run `warm` on a daemon thread named `name`, swallowing what it raises;
     the thread, or None when even the spawn failed."""
@@ -622,6 +635,7 @@ def cmd_web(args):
         return 1
     _prewarm_configs()
     _prewarm_board()
+    _prewarm_catalog()
     bound = srv.server_address[1]
     # EVERY `helm web` FOLLOWS ITS CODE, on every port: a follow thread
     # re-execs it onto the tree after a land (task/3132), so no board serves
@@ -631,6 +645,12 @@ def cmd_web(args):
     # the prewarms: daemon threads, and a failure costs stale code or stale
     # stop facts, never a server.
     stopfacts_resident.start(port=bound)
+    # THE CONSOLE ALSO KEEPS THE HOOK RESIDENT ALIVE (task/1825): one warm
+    # `helm hooks resident` beside this server answers argv-guard on every
+    # seat's tool calls without a cold interpreter each (helm/hookres.py). A
+    # daemon thread, like the legs above; it starts nothing on another port.
+    from . import hookres
+    hookres.supervise(port=bound)
     url = "http://%s:%d/" % (BIND, bound)
     print("helm web ⎈ %s  (Ctrl-C to stop)" % url)
     # SAY THAT THIS SERVER EXISTS. Without this, nothing in helm knows one is

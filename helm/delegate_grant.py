@@ -60,6 +60,9 @@ REFUSED = (
     ("dispatch", "verdict"), ("dispatch", "retract"),
     ("dispatch", "hold"), ("dispatch", "release"),
     ("dispatch", "cancel"), ("dispatch", "rebind"), ("dispatch", "retip"),
+    # AN ATTACH RE-READS WHAT THE CHAIN'S REVIEW MEANT (task/4000): the
+    # same class as retract, and refused to a delegate with it.
+    ("dispatch", "attach-task"),
     # A FRONT OVER `dispatch verdict` AND `dispatch hold --source-clean`
     # (task/3382): refused with them, or it is a way around both.
     ("review", "done"),

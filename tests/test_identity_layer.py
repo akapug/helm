@@ -1900,7 +1900,8 @@ class UsesClosureTest(unittest.TestCase):
 
     # The capability types. Naming the class is not the offence — a docstring,
     # an isinstance check and a type annotation all name it. CALLING it is.
-    MINTS = ("AdmittedActor", "StaleReleaseProof", "OnBehalfCapability")
+    MINTS = ("AdmittedActor", "StaleReleaseProof", "OnBehalfCapability",
+             "SystemRankCapability")
 
     def setUp(self):
         self.tmpdir = tempfile.mkdtemp(prefix="helm-test-forge-")

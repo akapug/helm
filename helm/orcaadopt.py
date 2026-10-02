@@ -2154,8 +2154,21 @@ def proxy_launch(seat, row, home=None):
 
 
 def resume(seat, adapter=None, force=False, note=None, title=None,
-           skip_permissions=False, session=None):
+           skip_permissions=False, session=None, defaults=False,
+           unattended=None):
     """(rc, lines) — relaunch an orca-adopted seat's pane from its transcript.
+
+    EXACTLY AS IT RAN (task/3695): the relaunch carries the seat's LAUNCH
+    RECIPE — its model, permission mode, effort, denied tools, appended
+    instructions and identity environment, on the credential home it ran on
+    (helm/seat_recipe.py) — never the home's defaults of the moment. A recipe
+    with a field no source knows REFUSES before anything is spawned and names
+    the field; `defaults` is the operator choosing the old bare
+    `claude --resume` anyway, and every field that moves is printed first.
+    `unattended` names an unattended caller (the reboot sweep): a recipe
+    whose unknown fields a defaults resume never took from the seat's past
+    run is resumed on today's defaults, in one loud line naming them, not
+    left down.
 
     `session` PINS the transcript: the post-reboot sweep classified one
     session for this seat and resumes that one or nothing — never the
@@ -2174,9 +2187,12 @@ def resume(seat, adapter=None, force=False, note=None, title=None,
     pane that no longer answers to its name.
 
     A session whose config home is a PROXY seat's resumes through that seat's
-    own launch.sh with the model it records, or is refused before anything is
-    spawned (`proxy_launch`); only a session outside the seat tree takes the
-    native claude resume.
+    own launch.sh, or is refused before anything is spawned (`proxy_launch`),
+    planned by the same rules as every other resume
+    (seat_recipe.adopted_proxy_plan: exact with the model and effort it ran,
+    or refused naming what is unknown; --defaults, or an unattended caller's
+    fallback, runs launch.sh with the model it records); only a session
+    outside the seat tree takes the native claude resume.
     """
     lines = []
     state, evidence = seat_liveness(seat)
@@ -2211,25 +2227,53 @@ def resume(seat, adapter=None, force=False, note=None, title=None,
     if refusal:
         lines.append("helm seat: refusing to resume %s — %s" % (seat, refusal))
         return 1, lines
+    from . import seat_recipe
     if launch:
-        home = None                 # the launch script pins its own home
+        # A PROXY SEAT'S SESSION resumes through its own launch script, which
+        # pins its home, proxy URL, token file and family; the claude-lead
+        # recipe below (a native claude's flags on a credential home) is not
+        # its launch, and would re-mint it as native claude. It is planned
+        # by the same rules as every other resume (task/3695).
+        plan = seat_recipe.adopted_proxy_plan(seat, row, launch,
+                                              defaults=defaults,
+                                              unattended=unattended)
+        lines.extend("  " + line for line in plan.lines)
+        if plan.refusal:
+            lines.append("helm seat: refusing to resume %s — %s"
+                         % (seat, plan.refusal))
+            return 1, lines
+        launch = plan.launch
+        home, env = None, {"HELM_CHAT_NAME": seat}
+        exact = dict({"launch": launch},
+                     **({"extra": plan.extra} if plan.extra else {}))
+    else:
+        plan = seat_recipe.adopted_plan(seat, row, home, defaults=defaults,
+                                        unattended=unattended)
+        lines.extend("  " + line for line in plan.lines)
+        if plan.refusal:
+            lines.append("helm seat: refusing to resume %s — %s"
+                         % (seat, plan.refusal))
+            return 1, lines
+        home, env = plan.home, plan.env
+        # the exact recipe's words ride only when there are any, so the
+        # defaults call is the one it always was
+        exact = {"extra": plan.extra} if plan.extra else {}
     if adapter is None:
         adapter = harness.detect()
     if adapter is None:
         lines.append("helm seat: " + harness.RECOMMENDATION)
-        lines.append("  manual paste: " + sessions.resume_command(
-            row, home=home, launch=launch))
+        lines.append("  manual paste: "
+                     + sessions.resume_command(row, home=home, **exact))
         return 1, lines
     try:
         path, handle, name = sessions.spawn_resume(
             row, title=title or seat, home=home,
-            skip_permissions=skip_permissions,
-            env={"HELM_CHAT_NAME": seat}, launch=launch)
+            skip_permissions=skip_permissions, env=env, **exact)
     except harness.HarnessError as e:
         lines.append("helm seat: %s resume via %s failed: %s"
                      % (seat, getattr(adapter, "name", "?"), e))
-        lines.append("  manual paste: " + sessions.resume_command(
-            row, home=home, launch=launch))
+        lines.append("  manual paste: "
+                     + sessions.resume_command(row, home=home, **exact))
         return 1, lines
     kind = ("orca-adopted, %s proxy seat %s" % (launch["family"],
                                                 launch["storage"])

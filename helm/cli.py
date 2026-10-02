@@ -37,7 +37,13 @@ def cmd_home(args):
 
 def cmd_sync(args):
     """sync — run the auto-map across every harness, refresh the registry,
-    scaffold project homes. Additive: never deletes a known project."""
+    scaffold project homes. Additive: never deletes a known project.
+
+    NO ARGUMENTS AND NO DRY RUN (NOARG_VERBS refuses `helm sync --apply`
+    with exit 2). A plain `helm sync` WRITES three things: the registry
+    (registry.sync), the act-owned keyword cells it retires from their store
+    entries (actsteer.retire_moved), and the doors' route cells
+    (doors.apply_routes, a store.retag of each entry in doors.ROUTED)."""
     from . import registry
     try:
         reg, report = registry.sync()
@@ -58,6 +64,13 @@ def cmd_sync(args):
     for eid, state in actsteer.retire_moved():
         if state in ("applied", "held"):
             print("  %s act-owned keywords: %s" % (state, eid))
+    # THE DOORS' STORE HALF (task/1135 E): route cells onto the entries a
+    # helm verb's door now says, and the common cells those routes replace
+    # off them, in the same pass (doors.ROUTED).
+    from . import doors
+    for eid, state in doors.apply_routes():
+        if state in ("applied", "held", "partial"):
+            print("  %s door routes: %s" % (state, eid))
     return 0
 
 
@@ -458,6 +471,7 @@ VERBS = {
     "train": _lazy("landwindow", "cmd_train"),
     "lr": _lazy("landreq", "cmd_lr"),
     "stale": _lazy("stalebot", "cmd_stale"),
+    "pile": _lazy("pile", "cmd_pile"),
     "derive": _lazy("rowworld", "cmd_derive"),
     "coach": _lazy("coach", "cmd_coach"),
     "premise-check": _lazy("premise", "cmd_premise_check"),
@@ -503,6 +517,7 @@ VERBS = {
     "offpeak": _lazy("offpeak", "cmd_offpeak"),
     "upstream-watch": _lazy("upstream_watch", "cmd_upstream_watch"),
     "pressure-watch": _lazy("pressurewatch", "cmd_pressure_watch"),
+    "slice-limits": _lazy("slicelimits", "cmd_slice_limits"),
     "env": _lazy("envtidy", "cmd_env"),
     "mcp": _lazy("envtidy", "cmd_mcp"),
     "worktree": _lazy("envtidy", "cmd_worktree"),
@@ -510,6 +525,8 @@ VERBS = {
     "rearm": _lazy("rearm", "cmd_rearm"),
     "beacons": _lazy("beacons", "cmd_beacons"),
     "ready": _lazy("ready", "cmd_ready"),
+    "office": _lazy("officeweather", "cmd_office"),
+    "weather": _lazy("officeweather", "cmd_office"),
     "reviewers": _lazy("reviewer_eligibility", "cmd_reviewers"),
     "preread": _lazy("preread", "cmd_preread"),
     "remote": _lazy("remote_relay", "cmd_remote"),
@@ -830,6 +847,7 @@ _HOOK_SPANS = {
     ("saguide", "--hook-json"): ("SubagentStart", "saguide"),
     ("chat", "join", "--hook-json"): ("SessionStart", "join"),
     ("seat", "resume-turn", "--hook-json"): ("SessionStart", "resume-turn"),
+    ("now", "show", "--hook-json"): ("SessionStart", "working-set"),
     ("chat", "stop-guard", "--hook-json"): ("Stop", "stop-guard"),
     ("chat", "argv-guard", "--hook-json"): ("PreToolUse", "argv-guard"),
     ("handoff", "check", "--hook-json"): ("PreCompact-or-SessionEnd", "handoff"),
@@ -1026,8 +1044,15 @@ def _main(argv, banner=True):
             return 0
     except Exception:
         pass                      # cannot tell -> run the verb
+    # A TIMER'S PASS IS A TICK LEG (task/4189): a timer entry that keeps
+    # failing alarms once (`tickalarm.TIMER_ENTRIES`); any other verb runs
+    # as it always did.
+    from . import tickalarm
+    leg = tickalarm.timer_leg(verb, rest)
     try:
-        return fn(rest)
+        if leg is None:
+            return fn(rest)
+        return tickalarm.watch(leg[0], lambda: fn(rest), failed=leg[1])
     except OSError as exc:
         # A DISPATCH-LEDGER WRITER PAST ITS LOCK DEADLINE (task/3562) raises
         # `LedgerLockDeadline` out of `_ledger_write`, whichever verb reached

@@ -369,6 +369,331 @@ def _record_verdict_tier(row):
             "verdict_tier_anchor": dispatches._proof_anchor("verdict-tier-v1", evidence)}, None
 
 
+def _hold_policy(repo):
+    """Read one certain policy with a verified project and policy population."""
+    from . import registry
+    from .inject._ledger import project_for_cwd
+    from .store.load import _certain_policy_from_hits, _policy_hits
+    projects = registry.load(strict=True)["projects"]
+    project = project_for_cwd(repo, projects=projects, strict=True)
+    return _certain_policy_from_hits("approval-tier", _policy_hits(
+        "approval-tier", project=project, strict=True, projects=projects))
+
+
+def _resting_run(row, actor, tip, run=None):
+    """The fresh-context read run a source-clean hold by `actor` at `tip`
+    rests on, or None: a CONCUR of exactly `tip` that `actor` recorded on
+    `row` (`landreq._fresh_instance_read`, the door's own predicate), whose
+    independence is `fresh-context`. Such a read is on the ledger only after
+    its run record passed every check on disk (`_fresh_context_read`), and
+    replay re-admits it only as an Opus read. `run`, when given, binds the
+    one run a proof names, in either spelling of its id."""
+    from . import landreq                # DEFERRED — landreq imports us.
+    key = dispatches._advisory_run_key(run) if run else None
+    reads = [r for r in (row or {}).get("advisory_reads") or ()
+             if isinstance(r, dict) and r.get("independence") == "fresh-context"
+             and (key is None
+                  or dispatches._advisory_run_key(r.get("reviewer_run")) == key)]
+    return landreq._fresh_instance_read({"advisory_reads": reads}, actor, tip) \
+        if reads else None
+
+
+def record_hold_approval(row, actor, tip, stamp):
+    """Freeze the exact-session holder and the policy that admitted this hold.
+
+    A hold that RESTS ON A FRESH-CONTEXT READ RUN the holder recorded at the
+    held tip (`_resting_run`) is judged on that run: the reader is the run,
+    and the seat only records it. The proof is version 3: the seat's
+    identity and family, the run's model as `model`, and the run id as
+    `run`. Another model in the seat's own window (an unrelated Sonnet build
+    subagent) does not void it. Where the run's model is not admitted, the
+    seat's window rule below still applies.
+
+    Otherwise a NATIVE seat whose subagents named other models in the window
+    before the hold records it only when that cannot change admission: every
+    model the seat's family and admitted by the family rule. The proof then
+    names the seat's own answer and lists every model in `window_models`
+    (v2)."""
+    from . import home, native_turn, reviewer_eligibility, verdict_tier
+    from .store.policy_history import POLICY_FIELDS
+    session = home.session_id()
+    if not session:
+        return None
+    families, evidence, anchor, why = \
+        dispatches._approval_identity_family_evidence(
+            actor, session=session, require_exact_session=True)
+    if why or not families or len(families) != 1:
+        return None
+    family = next(iter(families))
+    if not isinstance(evidence, dict) or evidence.get("v") not in (3, 5) \
+            or evidence.get("session") != session or \
+            dispatches._family_evidence_error(evidence, actor, family, anchor):
+        return None
+    try:
+        policy, why = dispatches._hold_policy(row.get("repo_root"))
+    except Exception:  # noqa: BLE001 — an unread policy cannot mint proof
+        return None
+    if why or not policy:
+        return None
+    snapshot = {key: policy.get(key) for key in POLICY_FIELDS}
+    proof = {"row": row["id"], "actor": actor, "tip": tip, "ts": stamp,
+             "family": family, "authority": evidence, "policy": snapshot}
+    read = dispatches._resting_run(row, actor, tip)
+    run_model = read.get("reviewer_model") if read else None
+    # The run's model must be the holder's family, a model that reviews,
+    # and admitted by the policy on its own.
+    if isinstance(run_model, str) and run_model \
+            and verdict_tier.window_family(run_model, family) == family \
+            and reviewer_eligibility.input_only(run_model, family)[0] is False \
+            and verdict_tier.admit_window(
+                snapshot, actor, family, [run_model])[0] == "ok":
+        proof.update(v=3, model=run_model, run=read["reviewer_run"])
+    else:
+        # The stamp or the seat's transcript answers first. Where that fails
+        # closed, a native seat's transcript names its candidates instead:
+        # its own answer and every other model a subagent named in the window.
+        model = dispatches._evidence_model(evidence, stamp)
+        got = (model, frozenset()) if model \
+            else native_turn.evidence_turn_candidates(evidence, stamp)
+        if not got:
+            return None
+        model, models = got[0], sorted({got[0]} | got[1])
+        if any(reviewer_eligibility.input_only(m, family)[0] is not False
+               for m in models):
+            return None
+        if verdict_tier.admit_window(snapshot, actor, family, models)[0] \
+                != "ok":
+            return None
+        proof.update(v=1, model=model)
+        if len(models) > 1:
+            proof.update(v=2, window_models=models)
+    proof["anchor"] = dispatches._proof_anchor(
+        "source-clean-holder-v%d" % proof["v"], proof)
+    return proof
+
+
+def hold_approval(row, repo, current=True):
+    """Judge frozen hold proof; a later owner policy may still demote it.
+
+    Three versions, each with its exact key set and anchor domain: v2 is v1
+    plus `window_models`, every model a native seat's window named
+    (`record_hold_approval`), and the whole window is judged again here. v3
+    is v1 plus `run`: the fresh-context read run the hold rests on, which
+    the row must still carry as a CONCUR of the held tip recorded by the
+    holder, with `model` as its model; that model alone is judged."""
+    from . import native_turn, reviewer_eligibility, verdict_tier
+    from .store.policy_history import POLICY_FIELDS
+    proof = row.get("hold_approval") if isinstance(row, dict) else None
+    version = proof.get("v") if isinstance(proof, dict) else None
+    keys = {"v", "row", "actor", "tip", "ts", "family", "model", "authority",
+            "policy", "anchor"}
+    extra = {1: set(), 2: {"window_models"}, 3: {"run"}}
+    if type(version) is not int or version not in extra \
+            or set(proof) != keys | extra[version]:
+        return False, "no proven approval-tier holder at the hold"
+    if proof["anchor"] != dispatches._proof_anchor(
+            "source-clean-holder-v%d" % version,
+            {k: v for k, v in proof.items() if k != "anchor"}):
+        return False, "hold approval proof does not match its anchor"
+    if (proof["row"], proof["actor"], proof["tip"], proof["ts"]) != (
+            row.get("id"), row.get("hold_actor"), row.get("source_clean_tip"),
+            row.get("hold_ts")):
+        return False, "hold approval proof belongs to another hold"
+    family, model, evidence = (proof["family"], proof["model"],
+                               proof["authority"])
+    if not isinstance(family, str) or not isinstance(model, str) or not model \
+            or not isinstance(evidence, dict) or evidence.get("v") not in (3, 5) \
+            or not evidence.get("session") or \
+            dispatches._family_evidence_error(
+                evidence, proof["actor"], family,
+                dispatches._subsumed_family_anchor(evidence)):
+        return False, "hold approval runtime is unproven"
+    if version == 3:
+        # THE READER IS THE RUN, so the seat's own runtime model is no
+        # input: the run must still be on the row, and `model` must be its.
+        read = dispatches._resting_run(row, proof["actor"], proof["tip"],
+                                       run=proof["run"]) \
+            if isinstance(proof["run"], str) and proof["run"] else None
+        if not read or read.get("reviewer_model") != model:
+            return False, ("hold approval run is not a fresh-context read "
+                           "the holder recorded at the held tip")
+        if verdict_tier.window_family(model, family) != family:
+            return False, "hold approval run model is not the holder's family"
+    else:
+        stamped = dispatches._evidence_model(evidence, proof["ts"],
+                                             stamped_only=True)
+        if stamped and stamped != model or evidence["v"] == 3 and not stamped:
+            return False, "hold approval model contradicts its runtime proof"
+    models = proof.get("window_models", [model])
+    if version == 2 and (
+            not isinstance(models, list) or len(models) < 2
+            or not all(isinstance(m, str) and m for m in models)
+            or models != sorted(set(models)) or model not in models
+            or not native_turn.reads_window(evidence)):
+        return False, "hold approval window is malformed"
+    if any(reviewer_eligibility.input_only(m, family)[0] is not False
+           for m in models):
+        return False, "hold approval model is input only or unknown"
+    if verdict_tier.admit_window(
+            proof["policy"], proof["actor"], family, models)[0] != "ok":
+        return False, "holder was not admitted at the hold"
+    if not current:
+        return True, None
+    # `repo` can be the shared Git common-dir's checkout, not the linked
+    # worktree the hold was recorded in. Policy scope belongs to that row.
+    recorded_repo = row.get("repo_root")
+    if not isinstance(recorded_repo, str) or not os.path.isabs(recorded_repo):
+        return False, "hold approval has no recorded checkout for current policy"
+    try:
+        policy, why = dispatches._hold_policy(recorded_repo)
+    except Exception as exc:  # noqa: BLE001 — unread is not admitted
+        return False, "current approval tier is unreadable (%s)" % type(exc).__name__
+    if why or not policy:
+        return False, "current approval tier is unavailable (%s)" % (why or "absent")
+    snapshot = {key: policy.get(key) for key in POLICY_FIELDS}
+    state, why = verdict_tier.admit_window(
+        snapshot, proof["actor"], family, models)
+    return (True, None) if state == "ok" else (
+        False, "holder is not admitted by the current approval tier (%s: %s)" %
+        (state, why or "unread"))
+
+
+def record_applied_approval(row, tip, stamp):
+    """Freeze the approval-tier proof an unchanged applied cure spends
+    (task/3937 cure round), built ONLY from the parent FIX's own verdict-time
+    authority — the exact-session reviewer identity, resolved family and model,
+    and the certain policy `mark_verdict` captured and RETAINED at the hold —
+    re-admitted against THAT retained snapshot, never today's roster, runtime
+    or store.
+
+    The applied event itself proves PATCH IDENTITY only (`_diff_applied_refusal`
+    measured it). What makes the recorded cure landable is that the reviewer's
+    own receipt bound the bytes AND the reviewer's hand was approval-tier at
+    the hold; both facts already sit on the parent row, frozen. This mints the
+    second onto the event so a land reader can re-judge it the way
+    `hold_approval` re-judges a source-clean hold. A pre-tier parent (no
+    verdict author proof, a tier record that did not admit the reviewer, or a
+    retained policy version that no longer resolves) mints NOTHING: the cure
+    still records, and `applied_approval` below refuses it by name. Never
+    returns a refusal — no-proof is the honest shape for a reviewer whose tier
+    the hold did not freeze."""
+    from . import reviewer_eligibility, verdict_tier
+    from .store import policy_history
+    if not isinstance(row, dict):
+        return None
+    evidence = row.get("verdict_author_runtime_evidence")
+    session = row.get("verdict_author_session")
+    anchor = row.get("verdict_author_runtime_anchor")
+    actor = row.get("recipient")
+    if not isinstance(evidence, dict) or not isinstance(session, str) \
+            or not session or not isinstance(actor, str) or not actor:
+        return None
+    if dispatches._verdict_author_runtime_error(evidence, actor, session,
+                                                anchor):
+        return None
+    authority = evidence.get("authority")
+    if not isinstance(authority, dict) or authority.get("v") not in (3, 5) \
+            or authority.get("session") != session:
+        return None
+    family = evidence.get("resolved", {}).get("family")
+    if not isinstance(family, str) or not family:
+        return None
+    model = dispatches._verdict_policy_model(evidence)
+    if not model or reviewer_eligibility.input_only(model, family)[0] is not False:
+        return None
+    tier = row.get("verdict_tier_evidence")
+    if not isinstance(tier, dict) or tier.get("state") != "ok" \
+            or not isinstance(tier.get("policy_version"), dict):
+        return None
+    # THE POLICY FROZEN AT THE HOLD, re-resolved from the retained-version
+    # store the verdict writer captured into — never today's population.
+    record, err = policy_history.resolve(tier["policy_version"],
+                                         tier.get("context"))
+    if err or not isinstance(record.get("policy"), dict):
+        return None
+    policy = record["policy"]
+    state, _why, _rule = verdict_tier.admit(policy, actor, {family}, model)
+    if state != "ok":
+        return None
+    proof = {"v": 1, "row": row["id"], "actor": actor, "tip": tip,
+             "ts": stamp, "family": family, "model": model,
+             "authority": authority, "policy": policy}
+    proof["anchor"] = dispatches._proof_anchor("diff-applied-holder-v1", proof)
+    return proof
+
+
+def applied_approval(row, repo, current=True):
+    """(ok, why) — re-judge the frozen proof `record_applied_approval` spent
+    onto a diff-applied event, the way `hold_approval` re-judges a
+    source-clean hold: the anchor must re-derive over the exact fields, the
+    proof must belong to THIS row's confirmed applied tip, the recorded
+    authority must still self-check, and the CURRENT owner policy remains a
+    separate veto over the frozen identity (task/3976's law, reused).
+
+    Absent proof is the named refusal, never a pass: a cure recorded from a
+    pre-tier parent has patch identity and nothing else."""
+    from . import reviewer_eligibility, verdict_tier
+    from .store.policy_history import POLICY_FIELDS
+    applied = row.get("diff_applied") if isinstance(row, dict) else None
+    proof = applied.get("hold_approval") if isinstance(applied, dict) else None
+    # task/4114 item 4: a RETRACTED verdict withdrew the reviewer's authority;
+    # the frozen proof is void, so both the YIELD-suppression path and the
+    # LAND-AUTHORITY path must refuse even though the proof bytes are intact.
+    # The POLARITY is the fail-safe spelling: retraction moves it off "fix",
+    # and only a live FIX ever carried this proof, so any other polarity
+    # (retracted, or a reader nobody taught this flag) authorizes nothing.
+    if not isinstance(row, dict) or row.get("verdict_retracted") \
+            or row.get("polarity") != "fix":
+        return False, ("the review that froze this proof is no longer a live "
+                       "FIX (retracted or re-polarized), so its authority is "
+                       "void")
+    if not isinstance(proof, dict) or set(proof) != {
+            "v", "row", "actor", "tip", "ts", "family", "model",
+            "authority", "policy", "anchor"} or type(proof.get("v")) is not int \
+            or proof["v"] != 1:
+        return False, ("no proven approval-tier reviewer frozen on the "
+                       "diff-applied event")
+    if proof["anchor"] != dispatches._proof_anchor(
+            "diff-applied-holder-v1", {k: v for k, v in proof.items()
+                                       if k != "anchor"}):
+        return False, "applied approval proof does not match its anchor"
+    if proof["row"] != row.get("id") \
+            or proof["tip"] != applied.get("tip"):
+        return False, "applied approval proof belongs to another row or tip"
+    family, model, evidence = (proof["family"], proof["model"],
+                               proof["authority"])
+    if not isinstance(family, str) or not isinstance(model, str) or not model \
+            or not isinstance(evidence, dict) or evidence.get("v") not in (3, 5) \
+            or not evidence.get("session") or \
+            dispatches._family_evidence_error(
+                evidence, proof["actor"], family,
+                dispatches._subsumed_family_anchor(evidence)):
+        return False, "applied approval reviewer runtime is unproven"
+    if reviewer_eligibility.input_only(model, family)[0] is not False:
+        return False, "applied approval model is input only or unknown"
+    state, _why, _rule = verdict_tier.admit(
+        proof["policy"], proof["actor"], {family}, model)
+    if state != "ok":
+        return False, "reviewer was not admitted by the policy frozen at the hold"
+    if not current:
+        return True, None
+    recorded_repo = row.get("repo_root")
+    if not isinstance(recorded_repo, str) or not os.path.isabs(recorded_repo):
+        return False, "applied approval has no recorded checkout for current policy"
+    try:
+        policy, why = dispatches._hold_policy(recorded_repo)
+    except Exception as exc:  # noqa: BLE001 — unread is not admitted
+        return False, "current approval tier is unreadable (%s)" % type(exc).__name__
+    if why or not policy:
+        return False, "current approval tier is unavailable (%s)" % (why or "absent")
+    snapshot = {key: policy.get(key) for key in POLICY_FIELDS}
+    state, why, _rule = verdict_tier.admit(
+        snapshot, proof["actor"], {family}, model)
+    return (True, None) if state == "ok" else (
+        False, "reviewer is not admitted by the current approval tier (%s: %s)" %
+        (state, why or "unread"))
+
+
 def approval_tier_for_verdict(row):
     """Read recorded authority, never today's policy or runtime.
 

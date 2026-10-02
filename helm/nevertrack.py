@@ -39,9 +39,17 @@ file itself.
 """
 import os
 import re
+import shlex
 import subprocess
 import sys
 import tempfile
+
+#: The prefix of the one line every refusal ends with (shared with review_done).
+CORRECTED = "corrected: "
+# The pathspec magic on every path the corrected line names: `literal` so a
+# glob char matches only itself, `top` so the root-relative path resolves the
+# same from any subdirectory of the work tree.
+PATHSPEC_MAGIC = ":(top,literal)"
 
 # Enumerated, not pattern-matched: a pattern would invite argument about
 # whether some new file "counts". Each entry names WHY, because a rule whose
@@ -722,16 +730,22 @@ def address_findings(by_file):
     """The commit-wide address judgement: `by_file` maps each staged path to
     the addresses it ADDS; the union across the commit is what is judged,
     so a list split over two files is refused as one list. Names every file
-    that contributed."""
+    that contributed.
+
+    -> (violations, paths). `paths` is the structured list of the offending
+    staged paths, sorted distinct; the caller builds the corrected unstage
+    command from IT, never by re-parsing the violation prose (which splits on
+    ' — ' and ',' and would tear apart a path that contains either)."""
     union = set()
     for addrs in by_file.values():
         union |= addrs
     if len(union) < BULK_ADDRESSES:
-        return []
+        return [], []
     files = sorted(rel for rel, addrs in by_file.items() if addrs)
-    return ["%s — this commit adds %d distinct e-mail addresses across %d "
-            "file(s): a subscriber or customer list, ADDED BY THIS COMMIT"
-            % (", ".join(files), len(union), len(files))]
+    return (["%s — this commit adds %d distinct e-mail addresses across %d "
+             "file(s): a subscriber or customer list, ADDED BY THIS COMMIT"
+             % (", ".join(files), len(union), len(files))],
+            files)
 
 
 
@@ -762,10 +776,12 @@ def _under_never_track(rel, table):
 
 
 def scan_staged(root):
-    """-> (violations, notes): violations BLOCK the commit; notes are reported
-    and let it through. Needle hits name the needle's POSITION in the local
-    needle file, never its value — the guard stays quiet about the thing it
-    guards.
+    """-> (violations, notes, paths): violations BLOCK the commit; notes are
+    reported and let it through; paths is the structured list of the offending
+    staged paths (order of first appearance, distinct) that `main` builds the
+    corrected unstage command from. Needle hits name the needle's POSITION in
+    the local needle file, never its value — the guard stays quiet about the
+    thing it guards.
 
     THE NEEDLE SCAN READS THE DIFF, NOT THE FILE (2026-07-30). It first scanned
     each staged file WHOLE, so one needle sitting in a file's HISTORY refused
@@ -805,6 +821,15 @@ def scan_staged(root):
     needles, needles_path = load_private_needles()
     never_track = never_track_set()
     violations, notes = [], []
+    # The offending staged paths, in order of first appearance, distinct. This
+    # is what `main` builds the corrected unstage command from: each path is
+    # a single, unbroken token, so a path containing ',' or ' — ' is never torn
+    # apart by re-parsing the violation prose (the pre-existing bug this cure
+    # closes).
+    paths = []
+    def offending(p):
+        if p not in paths:
+            paths.append(p)
     for private in (needles_path, load_local_never_track()[1]):
         loose = loose_note(private)
         if loose:
@@ -835,6 +860,7 @@ def scan_staged(root):
     for rel in staged_paths(root):
         prefix, why = _under_never_track(rel, never_track)
         if prefix:
+            offending(rel)
             violations.append("%s — under never-track path '%s': %s"
                               % (rel, prefix, why))
         new_path = not _in_parents(root, parents, rel)
@@ -845,6 +871,8 @@ def scan_staged(root):
             if needle in rel:
                 # A path that already exists in HEAD already carries whatever
                 # its name carries; only a NEW or renamed path adds it.
+                if new_path:
+                    offending(rel)
                 (violations if new_path else notes).append(
                     "%s — its PATH carries private needle #%d of %s%s"
                     % (rel, i, needles_path,
@@ -858,6 +886,8 @@ def scan_staged(root):
             root, rel, payload[0], payload[1],
             new_path if bulk_base == parents
             else not _in_parents(root, bulk_base, rel), notes, bulk_base)
+        if bulk_v:
+            offending(rel)
         violations.extend(bulk_v)
         notes.extend(bulk_n)
         addresses_by_file[rel] = addrs
@@ -870,6 +900,7 @@ def scan_staged(root):
             full, added = payload
             nb = needle.encode()
             if nb in added:
+                offending(rel)
                 violations.append(
                     "%s — its staged CONTENT carries private needle #%d of "
                     "%s, ADDED BY THIS COMMIT" % (rel, i, needles_path))
@@ -877,7 +908,10 @@ def scan_staged(root):
                 notes.append(
                     "%s — its staged CONTENT carries private needle #%d of "
                     "%s%s" % (rel, i, needles_path, pre_existing))
-    violations.extend(address_findings(addresses_by_file))
+    addr_v, addr_p = address_findings(addresses_by_file)
+    for p in addr_p:
+        offending(p)
+    violations.extend(addr_v)
     if not needles:
         notes.append("note: no private needles configured (%s) — the content "
                      "scan is a NO-OP on this estate, not a pass" % needles_path)
@@ -885,7 +919,11 @@ def scan_staged(root):
         census_note, _ = _needle_census(needles)
         if census_note:
             notes.append(census_note)
-    return violations, notes
+    # -> (violations, notes, paths). `paths` is the structured, ordered, distinct
+    # list of the offending staged paths; the caller (main) builds the corrected
+    # unstage command from it, so a path containing ',' or ' — ' is never re-
+    # parsed from the violation prose and survives whole.
+    return violations, notes, paths
 
 
 def main(argv=None):
@@ -904,7 +942,7 @@ def main(argv=None):
         return 2
     root = out.strip()
     try:
-        violations, notes = scan_staged(root)
+        violations, notes, paths = scan_staged(root)
     except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
         sys.stderr.write("[helm never-track] REFUSED: staged-set scan failed "
                          "— %s\n" % exc)
@@ -932,6 +970,18 @@ def main(argv=None):
       "scanner: helm/nevertrack.py\n")
     w("[helm never-track] false positive? that is an OWNER decision: "
       "HELM_NEVER_TRACK_SKIP=1 skips this scan for one commit.\n")
+    # The corrected line is built from the structured path list the scan
+    # returned, never re-parsed from the violation prose. Each path is a git
+    # literal pathspec, so a glob char or a leading '-' in a name cannot match
+    # other files or be read as an option; the `--` stops any path that could
+    # be mistaken for one. The paths are relative to the work-tree root and
+    # the operator runs this verbatim from wherever their shell is, so the
+    # pathspec also carries `top`: it then names the same file from any
+    # subdirectory of the work tree.
+    if paths:
+        cmd = ("git restore --staged -- "
+               + " ".join(shlex.quote(PATHSPEC_MAGIC + p) for p in paths))
+        w("%s%s\n" % (CORRECTED, cmd))
     return 1
 
 

@@ -178,6 +178,19 @@ class ExeRungTest(ProcFixture):
         self.assertTrue(procid.is_claude(4010, b"ugrep"))
         self.assertIs(procid.is_seat_process(4010, b"ugrep"), False)
 
+    def test_a_versioned_comm_whose_argv0_is_ugrep_is_not_a_seat_process(self):  # noqa: VACUOUS_ASSERTION — control is pid 4012: the same exe and comm with a versioned argv0 is a seat
+        """What the kernel really shows for `exec -a ugrep`: the comm is the
+        version, the exe is Claude, and only argv[0] says ugrep."""
+        exe = "/home/x/.local/share/claude/versions/2.1.287"
+        seat = self.plant(4012, exe=exe, comm="2.1.287")
+        with open(os.path.join(seat, "cmdline"), "wb") as f:
+            f.write(exe.encode() + b"\0--resume\0abc\0")
+        self.assertIs(procid.is_seat_process(4012, b"2.1.287"), True)
+        tool = self.plant(4013, exe=exe, comm="2.1.287")
+        with open(os.path.join(tool, "cmdline"), "wb") as f:
+            f.write(b"ugrep\0-G\0NEEDS LOOK\0")
+        self.assertIs(procid.is_seat_process(4013, b"2.1.287"), False)
+
     def test_a_node_exe_is_not_a_seat_process(self):  # noqa: VACUOUS_ASSERTION — control is pid 4111: a versioned claude exe is a seat before this node exe is refused
         self.plant(4111, exe="/home/x/.local/share/claude/versions/2.1.283",
                    comm="2.1.283")

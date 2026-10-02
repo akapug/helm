@@ -19,6 +19,15 @@ table.roster tr.ownerrow td{background:var(--accent-soft);border-bottom:1px soli
 .rdot{font-size:var(--f1)}
 .rdot.fresh{color:var(--ok)}.rdot.quiet{color:var(--warn)}.rdot.absent{color:var(--mut)}
 .rdot.unverified{color:var(--bad,#e06c50)}
+/* MOOD — one face per seat (helm seat mood): the measured state on the pulse
+   scale, dim when the seat's last sign of work is over an hour old. The face
+   is an SVG in currentColor, sized to the seat name, so these colours and the
+   dim rule paint it as they painted the dot (task/4034). */
+.rmood{margin-left:5px;cursor:default}
+.rmood svg{width:1.2em;height:1.2em;vertical-align:-.25em}
+.rmood.flowing{color:#22c55e}.rmood.grinding{color:#eab308}.rmood.stuck{color:#ef4444}
+.rmood.blocked-on-owner{color:#f97316}.rmood.walled,.rmood.idle,.rmood.unknown{color:var(--mut)}
+.rmood.dim{opacity:.45}
 .rseat{font-family:ui-monospace,monospace;font-weight:var(--w-med);cursor:pointer;border-radius:5px;padding:0 3px;margin:0 -3px}
 .rseat:hover{background:color-mix(in srgb,var(--accent) 16%,transparent);color:var(--accent)}
 .rruntime{display:block;color:var(--mut);font-size:var(--f0);line-height:1.1;margin-top:2px}

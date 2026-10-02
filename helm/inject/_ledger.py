@@ -1112,6 +1112,9 @@ def _seen_load(session):
     # only once one was said: an absent key re-says the current one.
     if isinstance(d.get("pace5h"), str):
         out["pace5h"] = d["pace5h"]
+    # AND THE DEFAULT-HOME SWITCH IT LAST HEARD (claudepace.handoff).
+    if isinstance(d.get("pacecoach"), str):
+        out["pacecoach"] = d["pacecoach"]
     return out
 
 
@@ -1201,8 +1204,8 @@ def _seen_save(session, state):
                  "lines": lines, "who": state.get("who"),
                  "subs": list(state.get("subs") or ())[-16:],
                  "posture": state.get("posture"),
-                 **({"pace5h": state["pace5h"]}
-                    if isinstance(state.get("pace5h"), str) else {})}
+                 **{k: state[k] for k in ("pace5h", "pacecoach")
+                    if isinstance(state.get(k), str)}}
         target = _seen_path(session)
         os.makedirs(_seen_dir(), exist_ok=True)
         with open(_seen_lock_path(session), "a+") as lock:

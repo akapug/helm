@@ -602,12 +602,15 @@ class SeatsRepairAxisEqualityTest(unittest.TestCase):
 
         # THE WORLD IS RICH, asserted rather than described: an equality over
         # twenty seats that all landed in one bucket would be a much smaller
-        # claim than it looks.
+        # claim than it looks. The registerless seat is identity-refused, not
+        # no-record: this world holds an unreadable register, so the rename
+        # walk is a partial census and names no owner (task/3990).
         seen = {(row["state"], row["evidence"]) for row in read_seats.values()}
         for cell in (("RUNNING", "pane-tail"), ("IDLE", "pane-tail"),
                      ("EXITED_PANE_ALIVE", "pane-tail"),
                      ("UNKNOWN", "pane-tail"), ("UNKNOWN", "stale-handle"),
-                     ("UNKNOWN", "read-failed"), ("UNKNOWN", "no-record")):
+                     ("UNKNOWN", "read-failed"),
+                     ("UNKNOWN", "identity-refused")):
             self.assertIn(cell, seen)
 
         # THE MUTATOR REALLY FIRED. The repairing walk moved exactly the

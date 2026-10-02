@@ -242,13 +242,17 @@ per-chain pair meld, for pairs that keep none.
   row's sender and its reader, and its first round is THE PLAN: the
   problem, its invariants and the acceptance checks; the split into
   genuinely independent work, and who owns the combined result.
-- **One room per chain, by construction.** The name is a pure function of
-  the chain: `meld-0-pair-<project>-task-<n>` when the chain's FIRST row
-  names exactly one task in its lane or note, else
-  `meld-0-pair-<project>-chain-<id12>`. The project is the one that owns
-  the chain's repository, so a reviewer from another project is invited
-  into the owner's room. A later round with a renamed lane stays in the
-  room its chain opened.
+- **One room per chain, by construction.** The name is a function of the
+  chain: `<project>-<n>` (for example `helm-3742`) when the chain's FIRST
+  row names exactly one task in its lane or note, else
+  `meld-0-pair-<project>-chain-<id12>`. So one task number has one room,
+  and every agent knows its name. The project is the one that owns the
+  chain's repository, so a reviewer from another project is invited into
+  the owner's room; a project name longer than 16 characters is cut and
+  given a short hash. A later round with a renamed lane stays in the room
+  its chain opened. A task whose room opened before 0.3.3, under
+  `meld-0-pair-<project>-task-<n>`, keeps that room, so no conversation
+  moves.
 - **Every later dispatch is a ROUND of it.** A FIX, the cure, the re-read,
   a rebind to a new reader, and the door's own T0, T1 and T2 melds each
   open the next round of the same room. A round is one meld epoch: the
@@ -276,6 +280,16 @@ per-chain pair meld, for pairs that keep none.
   lapses the way a door-opened meld does.
 - **One wake.** The round's invite row carries no @mention: the dispatch's
   own DM (or `add`'s mention) carries the room and the join command.
+- **A YIELD is an owed row; a HOLD keeps the round open** (task/3743). A
+  review or a cure outlasts any `recv` bound, so nobody sits in `recv`. A
+  YIELD @mentions every peer who joined the round, so the beacon's doorbell
+  counts it, the tool boundary delivers it and the stop guard blocks an
+  idle stop on it, dead beacon or not. Work that takes longer is a `[HOLD]`
+  whose text says `HOLDING: <what you are doing>`: `recv`'s timeout then
+  prints `MELD-HELD` and no close, and the peer's next YIELD continues the
+  same round. A `[DONE]` still closes it, and a YIELD after it is refused
+  (`MELD-PEER-CLOSED`), so `[DONE]` is for leaving the task, not for a
+  pause.
 - **Never a wall for the reader.** A reader who never joins gets the row as
   before, and a round that cannot open leaves the row as the conversation.
   The stop guard names a pair meld only when its floor is the stopping

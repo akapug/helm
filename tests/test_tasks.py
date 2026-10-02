@@ -719,11 +719,40 @@ class CliBase(TasksBase):
         # `self.admit()` themselves, and everyone else keeps the world they
         # were written against.
         os.environ["HELM_CHAT_NAME"] = self.SEAT
+        # A TASK MUST NAME ITS PROJECT (task/3745), so `add` refuses from a
+        # cwd no project claims. The arms here test other properties of
+        # `add`, so a placeholder project is registered at its own temp
+        # directory and `cli("add", ...)` files from inside it whenever the
+        # cwd resolves to no project. Only `add` moves: `list` and `triage`
+        # keep the unscoped view these arms were written against. A class
+        # that owns its cwd sets HOME_ADDS = False.
+        self.home_dir = os.path.realpath(
+            os.path.join(self.tmp, "%s-repo" % self.HOME_PROJECT))
+        os.makedirs(self.home_dir, exist_ok=True)
+        gdir = home.global_dir()
+        os.makedirs(gdir, exist_ok=True)
+        with open(os.path.join(gdir, "registry.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump({"version": 1, "projects": {self.HOME_PROJECT: {
+                "name": self.HOME_PROJECT, "path": self.home_dir}}}, fh)
+
+    HOME_PROJECT = "homeproj"
+    HOME_ADDS = True
 
     def cli(self, *args):
         out, err = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            rc = tasks.cmd_task(list(args))
+        prior = None
+        if (self.HOME_ADDS and args[:1] == ("add",)
+                and tasks.current_project() is None):
+            prior = os.getcwd()
+            os.chdir(self.home_dir)
+        try:
+            with contextlib.redirect_stdout(out), \
+                    contextlib.redirect_stderr(err):
+                rc = tasks.cmd_task(list(args))
+        finally:
+            if prior is not None:
+                os.chdir(prior)
         return rc, out.getvalue(), err.getvalue()
 
     def filed(self, title):
@@ -911,6 +940,60 @@ class UpdateGuardTest(TasksBase):
         self.assertEqual(len(self.lines()), 3)
         self.assertEqual(tasks.rows(path=self.path)[tid]["title"],
                          "a better title")
+
+
+class ReparentUnderAClosedParentTest(TasksBase):
+    """task/3862 L3: update() asks add()'s closed-parent question whenever
+    `continues` changes. Moving an open row under a closed parent makes the
+    orphan a close refuses to make and add() refuses to file; an update that
+    keeps the row's parent, or moves a closed row, is not that."""
+
+    def closed_story(self):
+        parent = self.file("the closed story", "seat-a")["id"]
+        _row, err = tasks.close(parent, "done", path=self.path)
+        self.assertIsNone(err, err)
+        return parent
+
+    def test_an_open_row_is_not_moved_under_a_closed_parent(self):
+        parent = self.closed_story()
+        row = self.file("an open piece of work", "seat-a")["id"]
+        got, err = tasks.update(row, path=self.path, continues=parent)
+        self.assertIsNone(got)
+        self.assertIn("%s is closed, so an open row continuing it would be "
+                      "open work under a closed parent" % parent, err)
+        self.assertIsNone(tasks.rows(path=self.path)[row].get("continues"))
+        # nor reopened into it in the same write
+        done = self.file("finished work", "seat-a")["id"]
+        _row, err = tasks.close(done, "finished", path=self.path)
+        self.assertIsNone(err, err)
+        got, err = tasks.update(done, path=self.path, continues=parent,
+                                status="open")
+        self.assertIsNone(got)
+        self.assertIn("under a closed parent", err)
+        # CONTROL: the same row moves under an open parent, and a closed row
+        # moves under the closed one (a tombstone records history)
+        story = self.file("an open story", "seat-a")["id"]
+        got, err = tasks.update(row, path=self.path, continues=story)
+        self.assertIsNone(err, err)
+        self.assertEqual(got["continues"], story)
+        got, err = tasks.update(done, path=self.path, continues=parent)
+        self.assertIsNone(err, err)
+        self.assertEqual(got["continues"], parent)
+
+    def test_an_update_that_keeps_the_parent_is_written(self):  # noqa: VACUOUS_ASSERTION — each write asserts the title and parent it stored exactly
+        parent = self.file("the story", "seat-a")["id"]
+        kid = self.file("a sub-task", "seat-a", continues=parent)["id"]
+        _row, err = tasks.close(parent, "done", path=self.path,
+                                open_children=tasks.OPEN_CHILDREN_STAY)
+        self.assertIsNone(err, err)
+        got, err = tasks.update(kid, path=self.path, title="a new title")
+        self.assertIsNone(err, err)
+        self.assertEqual((got["title"], got["continues"]),
+                         ("a new title", parent))
+        got, err = tasks.update(kid, path=self.path, continues=parent,
+                                note="the same parent, named again")
+        self.assertIsNone(err, err)
+        self.assertEqual(got["continues"], parent)
 
 
 class CitationScanTest(TasksBase):
@@ -2021,6 +2104,7 @@ class ProjectAxisBase(CliBase):
 
     PROJECT = "fixproj"
     OTHER = "otherproj"
+    HOME_ADDS = False          # these arms own their cwd
 
     def setUp(self):
         super().setUp()
@@ -2110,13 +2194,15 @@ class ProjectAxisTest(ProjectAxisBase):
         self.assertEqual(len(recs), 1)
         self.assertEqual(recs[0].get("project"), "fixproj")
 
-    def test_add_outside_any_project_files_unscoped(self):  # noqa: VACUOUS_ASSERTION — the positive polarity is the SIBLING arm test_add_stamps_the_cwd_project_and_says_so on the same observables (err note + project value); here filed() asserts the row EXISTS before its absent scope is read, so the arm cannot pass on a row that was never written
+    def test_add_outside_any_project_refuses(self):  # noqa: VACUOUS_ASSERTION — the positive polarity is the SIBLING arm test_add_stamps_the_cwd_project_and_says_so on the same observables; here the refusal sentence is asserted PRESENT and the ledger file is asserted ABSENT, which a written row would contradict
+        """A task must name its project (task/3745): a cwd no project claims
+        with no --project files nothing."""
         os.chdir(self.tmp)   # a real directory NO registry project claims
         self.assertEqual(tasks.current_project(), None)
         rc, _out, err = self.cli("add", "free", "row")
-        self.assertEqual(rc, 0, err)
-        self.assertEqual(self.filed("free row").get("project"), None)
-        self.assertFalse("scoping to project" in err, err)
+        self.assertEqual(rc, 2, err)
+        self.assertTrue("a task must name its project" in err, err)
+        self.assertFalse(os.path.exists(tasks.ledger_path()))
 
     def test_default_list_withholds_and_discloses_the_file_counts(self):  # noqa: VACUOUS_ASSERTION — unconditional positive controls in-arm: 'ours alpha'/'ours beta' asserted PRESENT in the same stdout the absences are asserted on, and the disclosure counts are pinned to non-zero literals (1, 2) before the formatted line is matched
         self.seed()
@@ -2145,8 +2231,9 @@ class ProjectAxisTest(ProjectAxisBase):
         self.assertEqual(unscoped, 1)
         self.assertEqual(foreign, 2)
         self.assertTrue(
-            ("%d unscoped legacy row(s), %d row(s) from other projects — "
-             "--all-projects shows them" % (unscoped, foreign)) in out, out)
+            ("%d homeless row(s) with no project (`helm task rehome` gives "
+             "them one), %d row(s) from other projects — --all-projects "
+             "shows them" % (unscoped, foreign)) in out, out)
 
     def test_all_projects_shows_everything_labeled(self):
         self.seed()
@@ -3919,7 +4006,7 @@ class RankIsVisibleAndSweepableTest(CliBase):
         self.assertEqual(rc, 0, err3)
         self.assertEqual("P2", self.filed("a row to rank")["priority"])
 
-    def test_an_UNRESOLVED_project_refuses_instead_of_being_a_scope(self):
+    def test_an_UNRESOLVED_project_refuses_instead_of_being_a_scope(self):  # noqa: VACUOUS_ASSERTION — the registered-scope control in the same arm asserts rc 0 and exactly one listing of the row
         """FINDING 3. With no project, `project_of_row(r) == scope` and
         `project_of_row(r) is None` select the SAME rows: the default pass
         proposed a rank for a row it simultaneously reported as NOT covered,
@@ -3928,8 +4015,14 @@ class RankIsVisibleAndSweepableTest(CliBase):
         matches the unscoped bucket.
 
         THE CONTROL IS THE REGISTERED SCOPE IN THE SAME ARM, which is also
-        what proves the refusal is about the scope and not about the ledger."""
-        self.cli("add", "a row with no project", "--owner", self.SEAT)
+        what proves the refusal is about the scope and not about the ledger.
+
+        THE HOMELESS ROW IS FILED THROUGH THE API: `helm task add` no longer
+        files a row with no project (task/3745), and rows like this one are
+        what the ledger already holds."""
+        _row, err = tasks.add("a row with no project", self.SEAT,
+                              source=self.SEAT)
+        self.assertIsNone(err, err)
         rc, out, err = self.cli("triage")
         self.assertEqual(rc, 2, "an unknown scope was accepted as a scope")
         self.assertIn("NO PROJECT", err)

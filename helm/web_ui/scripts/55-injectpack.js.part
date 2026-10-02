@@ -34,6 +34,15 @@ const IPK_OPEN = {};
 let IPK_MODEL = {state: "unknown", why: ""};
 let IPK_PACK = null;
 
+/* The exact text of a turn, fetched when the owner opens it, keyed by the
+   ledger row's ts: {open, text, why, at, loading}. */
+const IPK_TEXT = {};
+let IPK_TURNS_OPEN = false;
+
+/* What the last text or keyword edit changed, keyed by entry id, so the
+   before/after stays under the row after the reload that follows the write. */
+const IPK_DONE = {};
+
 /* How many entry rows the table shows before the tail goes behind a click. */
 const IPK_ROWS = 20;
 let IPK_ALL = false;
@@ -68,14 +77,43 @@ function ipkActs(row) {
     + esc(row.id) + '">' + esc(ipkVerb(a)) + '</button>').join("");
   if (open) {
     const rescope = open.action === "rescope";
-    h += '<input class="ipkin" data-id="' + esc(row.id) + '" placeholder="'
-      + esc(rescope ? "project name, fleet for everywhere, - to clear"
-                    : "why, in one line")
-      + '" value="' + esc(open.value || "") + '">'
+    h += (open.action === "reword"
+      ? '<textarea class="ipkin" data-id="' + esc(row.id) + '" placeholder="the line this entry fires as">'
+        + esc(open.value || "") + '</textarea>'
+      : '<input class="ipkin" data-id="' + esc(row.id) + '" placeholder="'
+        + esc(rescope ? "project name, fleet for everywhere, - to clear"
+              : open.action === "keywords" ? "words a prompt would contain, separated by commas"
+              : "why, in one line")
+        + '" value="' + esc(open.value || "") + '">')
       + '<button type="button" class="ipkact" data-go="' + esc(row.id) + '">'
-      + esc(open.action === "retire" ? "confirm retire" : "confirm") + '</button>'
+      + esc(open.action === "retire" ? "confirm retire" : open.action === "reword"
+            || open.action === "keywords" ? "save" : "confirm") + '</button>'
       + '<button type="button" class="ipkact" data-cancel="' + esc(row.id) + '">cancel</button>';
   }
+  return h + '</div>' + ipkDone(row.id);
+}
+
+/* What the last text or keyword edit changed: the fired line and its bytes,
+   and the keywords, before and after, straight from the writer's answer. */
+function ipkDone(id) {
+  const d = IPK_DONE[id];
+  if (!d) return "";
+  if (!d.changed) return '<div class="ipkdiff"><span>saved</span><i>nothing changed</i></div>';
+  const b = d.before || {}, a = d.after || {};
+  let h = '<div class="ipkdiff">';
+  if (b.line !== a.line)
+    h += '<span>was</span><del>' + esc(b.line) + '</del><span>now</span><ins>' + esc(a.line) + '</ins>'
+      + '<span>bytes</span><i>' + ipkB(b.bytes) + ' → ' + ipkB(a.bytes) + ' each time it fires</i>';
+  /* the keywords as a change, not two lists: what left, what came, and how
+     many stayed, so a one-word edit reads as one word */
+  const bk = b.keywords || [], ak = a.keywords || [];
+  const low = xs => new Set(xs.map(k => k.toLowerCase()));
+  const bl = low(bk), al = low(ak);
+  const gone = bk.filter(k => !al.has(k.toLowerCase())), came = ak.filter(k => !bl.has(k.toLowerCase()));
+  if (gone.length || came.length)
+    h += (gone.length ? '<span>no longer fired by</span><del>' + esc(gone.join(", ")) + '</del>' : '')
+      + (came.length ? '<span>now also fired by</span><ins>' + esc(came.join(", ")) + '</ins>' : '')
+      + '<span>kept</span><i>' + (ak.length - came.length) + ' of ' + bk.length + ' keywords</i>';
   return h + '</div>';
 }
 
@@ -83,6 +121,8 @@ function ipkVerb(a) {
   return a === "rescope" ? "which project is this about?"
     : a === "demote" ? "stop pinning it every turn"
     : a === "undemote" ? "pin it every turn again"
+    : a === "reword" ? "change the line it fires as"
+    : a === "keywords" ? "change what makes it fire"
     : "stop it firing";
 }
 
@@ -104,6 +144,30 @@ async function ipkLoad(seat, session, gen) {
   if (!IPK_PACK || IPK_PACK.session !== session) IPK_ALL = false;
   IPK_PACK = {seat, session, project: d.project || ""};
   IPK_MODEL = d;
+  ipkRedraw();
+}
+
+function ipkTurnText(ts) {
+  const t = IPK_TEXT[ts];
+  if (!t || !t.open) return "";
+  if (t.loading) return '<div class="empty">reading the transcript…</div>';
+  if (t.text == null) return '<div class="cfgwarn">' + esc(t.why || "not found") + '</div>';
+  return '<pre class="ipktxt">' + esc(t.text) + '</pre>';
+}
+
+async function ipkTextToggle(ts) {
+  const t = IPK_TEXT[ts] || (IPK_TEXT[ts] = {});
+  t.open = !t.open;
+  if (t.open && t.text == null && !t.loading) {
+    t.loading = true; ipkRedraw();
+    try {
+      const d = await j('/api/inject/turntext?seat=' + encodeURIComponent((IPK_PACK || {}).seat || "")
+        + '&session=' + encodeURIComponent((IPK_PACK || {}).session || "")
+        + '&ts=' + encodeURIComponent(ts), 60000);
+      t.text = d.text; t.why = d.why; t.at = d.at;
+    } catch (e) { t.text = null; t.why = e.message; }
+    t.loading = false;
+  }
   ipkRedraw();
 }
 
@@ -173,12 +237,21 @@ function ipkHtml(d) {
          + (d.entries.length - shown.length) + ' entries ('
          + ipkB(d.entries.slice(IPK_ROWS).reduce((n, r) => n + r.bytes, 0))
          + ' between them)</button>' : '');
-  const turns = '<details><summary>the last ' + d.turns.length
+  /* EACH TURN CARRIES ITS OWN TEXT, ONE CLICK AWAY. The ledger keeps ids and
+     bytes and never the words, so the toggle reads the seat's transcript for
+     the hook record of that turn: exactly what the seat received, not a
+     re-rendering of today's store. A silent turn sent nothing and offers no
+     toggle. The details element stays open across redraws because the owner
+     opened it, and a redraw closing it would hide what he was reading. */
+  const turns = '<details id="ipkturns"' + (IPK_TURNS_OPEN ? ' open' : '') + '><summary>the last ' + d.turns.length
     + ' turns, one row each</summary>' + d.turns.map(x =>
       '<div class="ipkwhy">turn ' + esc(x.turn) + ' &middot; ' + ipkB(x.bytes)
       + (x.silent ? ' &middot; silent' : '')
       + ' &middot; held back ' + x.suppressed
       + (x.fired.jit.length ? ' &middot; ' + esc(x.fired.jit.join(", ")) : '')
+      + (x.bytes && x.ts ? ' <button type="button" class="ipkact" data-txt="' + esc(x.ts) + '">'
+         + (IPK_TEXT[x.ts] && IPK_TEXT[x.ts].open ? 'hide the text' : 'show the exact text') + '</button>' : '')
+      + ipkTurnText(x.ts)
       + '</div>').join("") + '</details>';
   return '<div class="cfgsec"><h4>what this seat injects</h4>'
     + totals + held + lanes + scope
@@ -191,7 +264,7 @@ function ipkHtml(d) {
 function ipkBind(host) {
   host.querySelectorAll(".ipkact[data-act]").forEach(el => el.onclick = () => {
     const id = el.dataset.id;
-    IPK_OPEN[id] = {action: el.dataset.act, value: ipkSeed(el.dataset.act)};
+    IPK_OPEN[id] = {action: el.dataset.act, value: ipkSeed(el.dataset.act, id)};
     ipkRedraw();
   });
   host.querySelectorAll(".ipkact[data-cancel]").forEach(el => el.onclick = () => {
@@ -205,9 +278,18 @@ function ipkBind(host) {
     ipkAct(el.dataset.go));
   const more = host.querySelector("#ipkmore");
   if (more) more.onclick = () => { IPK_ALL = true; ipkRedraw(); };
+  host.querySelectorAll(".ipkact[data-txt]").forEach(el => el.onclick = () =>
+    ipkTextToggle(el.dataset.txt));
+  const det = host.querySelector("#ipkturns");
+  if (det) det.ontoggle = () => { IPK_TURNS_OPEN = det.open; };
 }
 
-function ipkSeed(action) {
+/* An edit opens on what is there now, so the owner tweaks the line he reads
+   rather than retyping it: the gloss, else the statement it fires from. */
+function ipkSeed(action, id) {
+  const row = ((IPK_MODEL || {}).entries || []).find(r => r.id === id) || {};
+  if (action === "reword") return row.draft || "";
+  if (action === "keywords") return (row.keywords || []).join(", ");
   return action === "rescope" && IPK_PACK && IPK_PACK.project
     ? IPK_PACK.project : "";
 }
@@ -215,6 +297,8 @@ function ipkSeed(action) {
 function ipkRedraw() {
   const host = $("#ipkhost");
   if (host) { host.innerHTML = ipkHtml(IPK_MODEL); ipkBind(host); }
+  /* the Loop editor's budgets read this pack's measured lanes */
+  if (typeof loopOnPack === "function") loopOnPack();
 }
 
 async function ipkAct(id) {
@@ -232,10 +316,13 @@ async function ipkAct(id) {
   const body = {action: open.action, id,
                 project: (IPK_PACK && IPK_PACK.project) || ""};
   if (open.action === "rescope") body.owner = (open.value || "").trim() || "-";
+  else if (open.action === "reword") body.text = open.value || "";
+  else if (open.action === "keywords") body.keywords = open.value || "";
   else body.reason = (open.value || "").trim();
   try {
-    await post("/api/inject/act", body);
+    const d = await post("/api/inject/act", body);
     delete IPK_OPEN[id];
+    if (d && d.before) IPK_DONE[id] = d;
     toast(open.action + " " + id, 2600);
     if (IPK_PACK) ipkLoad(IPK_PACK.seat, IPK_PACK.session, CFG_DETAIL_GEN);
   } catch (e) {

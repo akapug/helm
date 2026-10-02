@@ -125,6 +125,18 @@ class GoalBase(unittest.TestCase):
         os.chdir(self.tmp)
         pk.write_json(os.environ["HELM_BOARD"], {"owner_gated_queue": []})
         declare(self, ACCOUNTABLE)
+        # A GOAL MUST NAME ITS PROJECT (task/3745), so `goal add` refuses
+        # from a cwd no project claims. A placeholder project is registered
+        # at its own directory and `run_goal("add", ...)` files from inside
+        # it while the cwd resolves to none; every other verb keeps the
+        # unscoped cwd these arms were written against.
+        self.home_dir = os.path.realpath(os.path.join(self.tmp,
+                                                      "goalproj-repo"))
+        os.makedirs(self.home_dir)
+        pk.write_json(os.path.join(os.path.dirname(tasks.ledger_path()),
+                                   "registry.json"),
+                      {"version": 1, "projects": {"goalproj": {
+                          "name": "goalproj", "path": self.home_dir}}})
 
     def tearDown(self):
         os.chdir(self.cwd_prior)
@@ -137,16 +149,25 @@ class GoalBase(unittest.TestCase):
 
     # -- helpers -----------------------------------------------------------
 
+    HOME_ADDS = True
+
     def run_goal(self, *args, stdin=""):
         out, err = io.StringIO(), io.StringIO()
         prior = sys.stdin
         sys.stdin = io.StringIO(stdin)
+        here = None
+        if (self.HOME_ADDS and args[:1] == ("add",)
+                and tasks.current_project() is None):
+            here = os.getcwd()
+            os.chdir(self.home_dir)
         try:
             with contextlib.redirect_stdout(out), \
                     contextlib.redirect_stderr(err):
                 rc = goals.cmd_goal(list(args))
         finally:
             sys.stdin = prior
+            if here is not None:
+                os.chdir(here)
         return rc, out.getvalue(), err.getvalue()
 
     def run_task(self, *args):
@@ -236,6 +257,73 @@ class GoalBase(unittest.TestCase):
         self.assertIsNone(err, err)
         return auth
 
+
+class GoalNeedsAProjectTest(GoalBase):
+    """`helm goal add` refuses a goal with no project, the way `helm task
+    add` does: the cwd's project or --project NAME, and --project none is
+    not a way out (task/3745)."""
+
+    HOME_ADDS = False
+    GOOD = ("add", "A goal that names its home", "--owner", ACCOUNTABLE,
+            "--words-ref", "p1")
+
+    def test_a_cwd_in_no_project_refuses_and_writes_nothing(self):  # noqa: VACUOUS_ASSERTION — the same door filed from the project's checkout is the positive control: rc 0 and the stamped project equals the literal 'goalproj'
+        self.assertEqual(tasks.current_project(), None)
+        rc, out, err = self.run_goal(*self.GOOD, stdin=BODY)
+        self.assertEqual(rc, 2, err)
+        self.assertIn("a task must name its project", err)
+        self.assertIn("--project NAME", err)
+        self.assertIn("goalproj", err)
+        # THE DOOR IS NAMED ONCE. The project sentence already starts with
+        # "helm goal add:"; a second "helm goal:" in front of it is the
+        # double prefix (task/3994).
+        self.assertNotIn("helm goal: helm goal", err)
+        self.assertTrue(err.startswith("helm goal add:"), err)
+        self.assertEqual(err.count("Nothing was filed"), 1)
+        self.assertEqual(self.ledger_lines(), [])
+        self.assertEqual(ownerasks.decision_rows(), {})
+        for spelling in (("--project", "none"), ("--project=NULL",)):
+            rc, _out, err = self.run_goal(*self.GOOD + spelling, stdin=BODY)
+            self.assertEqual(rc, 2, err)
+            self.assertIn("is not a way out", err)
+        self.assertEqual(self.ledger_lines(), [])
+        os.chdir(self.home_dir)
+        rc, out, err = self.run_goal(*self.GOOD, stdin=BODY)
+        self.assertEqual(rc, 0, err)
+        row = [r for r in tasks.rows().values()
+               if r.get("title") == "A goal that names its home"][0]
+        self.assertEqual(row["project"], "goalproj")
+
+    def test_the_flag_names_the_project_from_anywhere(self):
+        rc, _out, err = self.run_goal(*self.GOOD + ("--project", "goalproj"),
+                                      stdin=BODY)
+        self.assertEqual(rc, 0, err)
+        row = [r for r in tasks.rows().values()
+               if r.get("title") == "A goal that names its home"][0]
+        self.assertEqual(row["project"], "goalproj")
+
+
+    def test_an_unknown_project_and_a_broken_registry_name_the_door_once(self):  # noqa: VACUOUS_ASSERTION — each refusal is paired with an empty ledger, so the single door prefix is a refusal that wrote nothing and not a prefix check on a success
+        rc, _out, err = self.run_goal(
+            *self.GOOD + ("--project", "not-a-project"), stdin=BODY)
+        self.assertEqual(rc, 2, err)
+        self.assertTrue(err.startswith("helm goal add:"), err)
+        self.assertNotIn("helm goal: helm goal", err)
+        self.assertIn("not a registered project", err)
+        self.assertEqual(err.count("Nothing was filed"), 1)
+        self.assertEqual(self.ledger_lines(), [])
+        reg = os.path.join(os.path.dirname(tasks.ledger_path()),
+                           "registry.json")
+        with open(reg, "w", encoding="utf-8") as fh:
+            fh.write("{ this is not registry json\n")
+        rc, _out, err = self.run_goal(
+            *self.GOOD + ("--project", "goalproj"), stdin=BODY)
+        self.assertEqual(rc, 2, err)
+        self.assertTrue(err.startswith("helm goal add:"), err)
+        self.assertNotIn("helm goal: helm goal", err)
+        self.assertIn("UNREADABLE", err)
+        self.assertEqual(err.count("Nothing was filed"), 1)
+        self.assertEqual(self.ledger_lines(), [])
 
 class DoorRefusalTest(GoalBase):
     """Each refusal at the door has its own sentence, and each writes nothing:

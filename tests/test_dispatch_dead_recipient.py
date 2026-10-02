@@ -65,6 +65,8 @@ class DeadRecipientDoorTest(DispatchBase):
     def _send(self, recipient, message=None, kind="build", **kw):
         # One lane per send: a second open row on one lane is its own refusal.
         self._lanes = getattr(self, "_lanes", 0) + 1
+        if kind == "review":
+            kw.setdefault("task", self.review_task["id"])
         with mock.patch.object(seats, "dm",
                                return_value=({"id": "post-1"}, None)):
             return dispatches.send(
@@ -263,7 +265,8 @@ class MoveDoorsTest(DispatchBase):
         seats.write_roster("demo-claude-2", presence_beat=False)
         row = dispatches.add("demo-claude-2", "rollout-client-gone-1957",
                              ref=self.a, repo=self.repo, kind="review",
-                             new_work=True, notify=False)
+                             new_work=True, notify=False,
+                             task=self.review_task["id"])
         self.assertIsNotNone(row)
         return row
 

@@ -1,0 +1,1 @@
+web [--port N] — the same, warm, in a browser; `web walk` prints the brief a fresh reader walks the whole console by, and says whether a walk is owed

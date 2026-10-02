@@ -2,7 +2,8 @@
 
 This page is for anyone who builds, reviews or lands work in a helm fleet. It
 covers the review rule, how a review is booked and answered, how a change is
-tested, how a train lands it, and what the land-request view tracks.
+tested, where its change note goes, how a train lands it, and what the
+land-request view tracks.
 [NEW_AGENT_GUIDE §3](NEW_AGENT_GUIDE.md#3-work) is the same flow from the
 seat's side, and [CONTRIBUTING](../CONTRIBUTING.md#how-a-change-is-tested)
 is the testing detail.
@@ -98,11 +99,19 @@ $ helm dispatch hold <row> --source-clean <tip> <reason>
 
 **Readers patch mechanical defects themselves.** The families are equal
 counterparts, not a writing tier and a witnessing tier. A reader who finds a
-MECHANICAL defect commits the cure off the exact reviewed tip, in its own
-room or in a `git clone --shared` clone, brings the commit into the repo with
+MECHANICAL defect commits the cure off the exact reviewed tip — in a room it
+holds, or, for a subagent with no room of its own, a `git clone --shared`
+clone — and brings the commit into the repo with
 `git -C <repo> fetch --no-write-fetch-head <clone> <sha>` (which moves no
-ref), and names it on the verdict with `--patch-tip <sha>`. The lane owner or
-integrator takes that tip, the ledger records both authors, and
+ref), and names it on the verdict with `--patch-tip <sha>`. For an explicit
+BUILD, a parent may instead assign its sole delegate a REGISTERED lane room
+(`helm work claim`); the parent owns the lease through completion or accepted
+handoff and then returns the room (`helm work release`), never unfinished work.
+This narrower build allocation is never general reviewer authority. Never an
+unregistered shared worktree, an unleased shared branch, a raw
+`git worktree add`, a protected or shared ref write, a permission bypass,
+config/canon edit, test-home leak or publication. The lane owner or integrator
+takes that tip, the ledger records both authors, and
 `helm lr close` with `--reason landed` credits each. Independence survives
 because the composed tip is re-read once, before the land gate, by a reader
 who wrote none of it.
@@ -140,6 +149,19 @@ with no person in the loop.
 [CONTRIBUTING](../CONTRIBUTING.md#how-a-change-is-tested) has the table of
 what each run can authorize, and where tests run on a host that refuses
 local suites.
+
+## A lane's change note
+
+A lane writes the note for its change as `changes/<lane>.md`: one or more
+markdown bullets, written like a `CHANGELOG.md` bullet. It never edits
+`CHANGELOG.md`. When every lane added a bullet under `## Unreleased`, any two
+lanes in one train conflicted on that hunk at compose, and the train dropped
+one of them. No two lanes write the same file under `changes/`, so their
+notes always merge. The tree-wide audit `tests/test_change_notes.py` is red
+when a lane writes a line under `## Unreleased`, and it names the line. At a
+cut, `scripts/release/release.py <version> --fold` moves every note into the
+version's section of `CHANGELOG.md` in one commit
+([CONTRIBUTING](../CONTRIBUTING.md#releasing)).
 
 ## Trains and the land gate
 

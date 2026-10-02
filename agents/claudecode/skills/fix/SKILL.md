@@ -96,7 +96,11 @@ backfill in `dev-process.md`.)
    in my fixes, including a silent-pass that violated our own #19. Per-fix xrev beats batching — it
    catches earlier and costs no more.) The refuter is an equal counterpart whatever its family:
    follow the row's REVIEW FIX MODE for a mechanical cure. PATCH commits off the exact reviewed
-   tip in its own room or a shared clone, then names `--patch-tip` on FIX for you to adopt;
+   tip — in a room it holds, or, for a subagent with no room of its own, a shared clone —
+   then names `--patch-tip` on FIX for you to adopt. Only an explicit BUILD can
+   assign a sole delegate a registered lane room, with its parent owning the
+   lease through completion or accepted handoff and returning it
+   (`helm work release`) then, never while work is unfinished;
    MELD-DIFF posts the exact diff in the pair meld for you to apply and answers FIX with
    validated `--diff-handoff ROOM/MSGID` and `--no-patch-because`. Only the typed
    receipt plus send/add proof that your advancing direct child applies its diff

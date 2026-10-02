@@ -79,6 +79,10 @@ class PostToolRunTest(unittest.TestCase):
                 raise RuntimeError("synthetic delivery crash λ")
             if self.mode == "delivery-timeout":
                 self.slow("delivery")
+            # The hook hands the multi-room pass its borrowed room listing
+            # (task/3848); the single-room deliver this routes to lists
+            # nothing, so it takes none.
+            kwargs.pop("quiet", None)
             return seats_delivery.deliver(**kwargs)
 
         def record_body(payload):

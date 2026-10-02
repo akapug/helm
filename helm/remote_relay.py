@@ -383,6 +383,77 @@ def _tick_rows(out, cfg, current, dry, now):
         except Exception as exc:         # noqa: BLE001 — one row, not the pass
             action = "error: %s: %s" % (type(exc).__name__, exc)
         out["actions"].append((row["id"], action))
+    # THE CLOSED-ROW RECONCILER: a verdict closes its row BEFORE its cleanup.
+    # If the process died between the two, the row is closed but its cleanup
+    # was starved, and this open-rows walk never sees it.
+    _reconcile_closed(out, cfg, current, dry)
+
+
+def _reconcile_closed(out, cfg, current, dry):
+    """Re-run the starved REF deletion of CLOSED dispatches addressed to a
+    configured remote seat. It never removes a checkout: that stays on the
+    record and hand-back paths, as before.
+
+    A verdict closes its row in the ledger BEFORE the recorded journal line
+    and its cleanup, so the durable marker is the closed row, not the
+    `recorded` line, which may never have been written. A cleanup that ran
+    left `branches-deleted` for its row and session, whatever it deleted, so
+    a closed row with none is a starved one, and a row is reconciled at most
+    once per session: a lease that refuses is recorded once and left alone.
+
+    The row's session is the one its latest launch or re-read names. Its refs
+    come from THIS row's own events in that session, never from every event
+    under the session id: a superseding row re-reads in its parent's session.
+    A session is skipped whole when a non-closed row reads in it, or names a
+    row that reads in it as its supersedes parent (a successor that has not
+    attached yet), or when any earlier cleanup in it refused: its branches
+    and checkout are then a live read's or evidence. A dry run reports and
+    writes nothing.
+    """
+    from . import dispatches
+    journal = rs.read_journal()
+    by_sid, by_row = rs.sessions(journal)
+    open_rows = [r for r in current.values()
+                 if r.get("status") not in dispatches.CLOSED_STATES]
+    skip = {by_row.get(r["id"]) for r in open_rows} \
+        | {by_row.get(r.get("supersedes")) for r in open_rows}
+    skip |= {e.get("sid") for e in journal if _refused(e)}
+    ran = {(e.get("row"), e.get("sid")) for e in journal
+           if e.get("event") == "branches-deleted"}
+    for row in current.values():
+        rid, sid = row["id"], by_row.get(row["id"])
+        if str(row.get("recipient") or "").casefold() not in cfg["seats"] \
+                or row.get("status") not in dispatches.CLOSED_STATES \
+                or sid is None or sid in skip or (rid, sid) in ran:
+            continue
+        launch = _launch_of(by_sid.get(sid, []))
+        workdir = launch.get("workdir")
+        if launch.get("transport") != rs.TRANSPORT_BRANCH or not workdir \
+                or not os.path.isdir(workdir):
+            continue
+        if dry:
+            out["actions"].append((rid, "would reconcile the ref cleanup of "
+                                   "closed session %s" % sid))
+            continue
+        try:
+            _cleanup(journal, sid, rid, own=True)
+            action = "reconciled: its own refs re-deleted"
+        except Exception as exc:         # noqa: BLE001 — one row, not the pass
+            action = _one_line("error: %s: %s" % (type(exc).__name__, exc), 300)
+            rs.append({"event": "reconcile-failed", "row": rid, "sid": sid,
+                       "error": action})
+        out["actions"].append((rid, action))
+
+
+def _refused(event):
+    """Whether a journal event records a cleanup that refused a ref: a
+    `branches-deleted` or hand-back delete with any reason, or a
+    `cleanup-unresolved`."""
+    kind = event.get("event")
+    result = event.get("result") if kind == "branches-deleted" else \
+        event.get("deleted") if kind == "handback" else None
+    return kind == "cleanup-unresolved" or (
+        isinstance(result, dict) and any(result.values()))
 
 
 @contextlib.contextmanager
@@ -493,9 +564,11 @@ PROBE_MIN_S = 300
 
 def probe_accounts(journal, now=None, dry=False):
     """Take one credit reading of every account a live session bills, so a
-    flat account can be told from a busy one. A dead token is not refreshed
-    for this (a refresh is a model run); that account simply gives no signal
-    this tick. Returns the accounts read."""
+    flat account can be told from a busy one. The reading goes through any
+    live copy of the account (remote_credit.readable); a dead one is not
+    refreshed for this (a refresh is a model run), and an account with no live
+    copy anywhere simply gives no signal this tick. Returns the accounts
+    read."""
     import time
     now = time.time() if now is None else now
     by_sid, _by_row = rs.sessions(journal)
@@ -513,7 +586,7 @@ def probe_accounts(journal, now=None, dry=False):
         at = pk.parse_ts_epoch((last or {}).get("at"))
         if at is not None and now - at < PROBE_MIN_S:
             continue
-        if dry or not remote_credit.token_live(claude_home):
+        if dry or not remote_credit.readable(claude_home):
             continue
         reading = remote_credit.read_credit(claude_home)
         reading["account"] = reading.get("account") or account
@@ -555,11 +628,16 @@ def _post_undelivered(row, seat_name, sid, text, journal, dry):
     if not recipient:
         return "the review row names no sender to tell"
     from . import dispatches
+    # A NOTICE BACK TO THE ROW'S OWN SENDER, ABOUT THAT ROW (task/4039):
+    # `answers_row` lets the lead-context door admit it when that sender is
+    # another project's lead, which it reads off the ledger, not this flag.
     with as_seat(seat_name):
         posted, err, _existed = dispatches.send(
             recipient, "undelivered-%s" % sid, text, row["tip"],
             repo=row.get("repo_root"), kind="review", sign=False,
-            new_work=True, key="undelivered:" + sid, force=True)
+            new_work=True, key="undelivered:" + sid, force=True,
+            answers_row=row["id"],
+            _relay_notice=dispatches._RELAY_NOTICE_MINT)
     rs.append({"event": "undelivered-posted", "row": row["id"], "sid": sid,
                "dispatch": (posted or {}).get("id"),
                "error": None if posted else err})
@@ -1102,7 +1180,7 @@ def _evidence(report, verdict, sid, comment, builder_session=False):
 
 def record(row, seat_name, seat, project, sid, report, comment, journal, dry):
     """Classify the read and record it on the row under the seat's name."""
-    from . import dispatches, vcs
+    from . import dispatches, review_findings, vcs
     tip = row["tip"]
     repo = project["repo"]
     base_ref = project.get("base") or vcs.backend(repo).trunk_ref(repo)
@@ -1175,25 +1253,59 @@ def record(row, seat_name, seat, project, sid, report, comment, journal, dry):
                          if f["severity"] == "BLOCKING"] or report["findings"]
                 basis = "measured" if rests and all(
                     f["basis"] == "MEASURED" for f in rests) else "inferred"
-                _o, err = dispatches.mark_verdict(
-                    rid, tip, evidence, polarity="fix", basis=basis,
-                    bind_author=False, finding_count=report["count"],
-                    patch_tip=cure["patch_tip"] if cure else None,
-                    no_patch_because=None if cure else no_patch,
-                    worse_than_main_paths=worse or None, imperfect=imperfect)
+                # A committed cure answers the report; only uncured work
+                # belongs to the task's finding ledger. Bound the first line
+                # for the task title; full details stay at the drop URL.
+                first = [" ".join(f["text"].split("\n", 1)[0].split())
+                         for f in report["findings"]] if not cure else []
+                cap = review_findings.TEXT_CAP
+                bases = [s if len(s) <= cap else s[:cap - 3] + "..."
+                         for s in first]
+                reserved = set(bases)
+                named = []
+                for f, base in zip(report["findings"], bases):
+                    title = base
+                    if title in named:
+                        suffix = " (finding %d)" % f["n"]
+                        title = base[:cap - len(suffix)] + suffix
+                        extra = 2
+                        while title in reserved or title in named:
+                            suffix = " (finding %d.%d)" % (f["n"], extra)
+                            title = base[:cap - len(suffix)] + suffix
+                            extra += 1
+                    named.append(title)
+                fresh, carried, err = review_findings.reported_work(row, named)
+                if not err:
+                    _o, err = dispatches.mark_verdict(
+                        rid, tip, evidence, polarity="fix", basis=basis,
+                        bind_author=False, finding_count=report["count"],
+                        patch_tip=cure["patch_tip"] if cure else None,
+                        no_patch_because=None if cure else no_patch,
+                        worse_than_main_paths=worse or None,
+                        imperfect=imperfect, findings=fresh,
+                        findings_carried=carried)
     if err:
         rs.append({"event": "record-refused", "row": rid, "seat": seat_name,
                    "sid": sid, "why": _one_line(err, 400)})
         return "record refused: " + _one_line(err, 200)
-    rs.append({"event": "recorded", "row": rid, "seat": seat_name, "sid": sid,
-               "tip": tip, "class": klass, "relation": rel,
-               "relation_why": rel_why, "lane": lane, "hits": hits[:8],
-               "arm": arm, "arm_why": arm_why, "action": action,
-               "polarity": polarity, "comment": comment.get("id"),
-               "patch_tip": (cure or {}).get("patch_tip"),
-               "cure_ref": (cure or {}).get("ref"),
-               "cure_error": None if cure or not no_patch
-               or no_patch == NO_CURE else no_patch})
+    if not rs.append({"event": "recorded", "row": rid, "seat": seat_name,
+                      "sid": sid, "tip": tip, "class": klass, "relation": rel,
+                      "relation_why": rel_why, "lane": lane, "hits": hits[:8],
+                      "arm": arm, "arm_why": arm_why, "action": action,
+                      "polarity": polarity, "comment": comment.get("id"),
+                      "patch_tip": (cure or {}).get("patch_tip"),
+                      "cure_ref": (cure or {}).get("ref"),
+                      "cure_error": None if cure or not no_patch
+                      or no_patch == NO_CURE else no_patch}):
+        # THE VERDICT IS ALREADY COMMITTED AND THE ROW IS CLOSED, so attend
+        # never retries it: record the failed write as `record-refused` (a
+        # failed append is not a success) and still run the cleanup, the
+        # author's DM, the calibration and the cure round below. The tick's
+        # closed-row reconcile covers only a process death between the
+        # verdict and the cleanup.
+        rs.append({"event": "record-refused", "row": rid, "seat": seat_name,
+                   "sid": sid, "why": "the recorded journal line for the "
+                   "verdict could not be written"})
     _cleanup(rs.read_journal(), sid, rid)
     _calibration_candidate(row, seat_name, report)
     _tell_sender(row, seat_name, report, action, klass, verdict, comment)
@@ -1251,17 +1363,25 @@ def _cure_source(report, events, tip):
     return None, NO_CURE, None
 
 
-def _cleanup(journal, sid, rid):
+def _cleanup(journal, sid, rid, own=False):
     """Delete only refs this launch owned, at exact owned/observed shas.
 
     The atomic launch/re-read claims are the ownership proof. Cure/report
     observations may advance their expected sha. A pre-existing ref never has
     a claim; a concurrently moved ref fails its remote compare-and-delete lease
-    and is preserved with the checkout.
+    and is preserved with the checkout, recorded once as `cleanup-unresolved`.
+    With `own` (the closed-row reconcile), only the refs row `rid`'s own
+    events name count, so it never folds in a successor's re-read under the
+    same session, and no checkout is ever removed.
+
+    ONE compare-and-delete pass, never a loop: a refused ref was moved (or
+    its remote was unread), and asking again at the same exact sha cannot
+    change that answer.
     """
     import shutil
     events = events_of_sid(journal, sid)
     launch = _launch_of(events)
+    events = [e for e in events if not own or e.get("row") == rid]
     workdir = launch.get("workdir")
     if launch.get("transport") == rs.TRANSPORT_BRANCH and workdir \
             and os.path.isdir(workdir):
@@ -1276,8 +1396,13 @@ def _cleanup(journal, sid, rid):
                                   launch.get("push_repo")) if expected else {}
         rs.append({"event": "branches-deleted", "row": rid, "sid": sid,
                    "result": gone})
-        if any(gone.values()):
+        refused = {name: why for name, why in gone.items() if why}
+        if refused:
+            rs.append({"event": "cleanup-unresolved", "row": rid, "sid": sid,
+                       "refused": refused})
             return              # keep evidence when any exact lease refuses
+    if own:
+        return                  # the reconcile never removes a checkout
     root = os.path.realpath(rs.work_dir())
     for e in journal:
         path = e.get("workdir") if e.get("event") == "launch" \
@@ -1418,6 +1543,23 @@ def _cure_of(journal, rid):
                  and e.get("row") == rid), None)
 
 
+def _build_launch_task(row, seat_name, journal, dry):
+    """A new cloud launch needs a task its review can inherit."""
+    from . import review_findings, tasks
+    known, bad = tasks.snapshot(strict=True)
+    if bad:
+        return _hold(row, seat_name, "task ledger unreadable: " + bad,
+                     journal, dry)
+    task, why = review_findings.chain_task(row, _ROWS, known)
+    if not task:
+        return _hold(row, seat_name,
+                     "a cloud BUILD needs its task before launch: "
+                     "%s; mint a new BUILD chain with --task task/N "
+                     "(claiming the lane after dispatch cannot repair this "
+                     "chain's review)" % (why or "no task"), journal, dry)
+    return None
+
+
 def handle_build(row, seat_name, seat, project, journal, drops, dry, now,
                  open_ids):
     """What the relay does for ONE open build row this tick."""
@@ -1431,6 +1573,9 @@ def handle_build(row, seat_name, seat, project, journal, drops, dry, now,
     by_sid, by_row = rs.sessions(journal)
     sid = by_row.get(row["id"])
     if sid is None:
+        refusal = _build_launch_task(row, seat_name, journal, dry)
+        if refusal:
+            return refusal
         return launch_build(row, seat_name, seat, project, journal, by_sid,
                             dry, now, _slots(by_row, open_ids))
     events = by_sid.get(sid, [])
@@ -1449,6 +1594,9 @@ def handle_build(row, seat_name, seat, project, journal, drops, dry, now,
                                        launch.get("round") or 0, drops, set())
                 return handback(row, seat_name, project, sid, launch, sha,
                                 found, journal, dry)
+        refusal = _build_launch_task(row, seat_name, journal, dry)
+        if refusal:
+            return refusal
         if not dry and launch.get("workdir") and launch.get("owned_refs"):
             # the new launch claims the same start branch again
             rs.delete_branches(launch["workdir"], launch["owned_refs"],

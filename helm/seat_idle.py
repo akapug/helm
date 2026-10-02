@@ -15,8 +15,8 @@ one file the recorder already keeps per session (record.py counters.json):
     call-at         every PostToolUse / PostToolUseFailure (record._record),
                     a subagent's calls included: delegated work in flight is
                     work in flight
-    turn-opened-at  every UserPromptSubmit, a beacon wake's included
-                    (record.turn_open)
+    turn-opened-at  every validated UserPromptSubmit, including a session's
+                    first turn before any tool call (record.turn_open)
     turn-ended-at   every Stop the stop-guard door answered with rc 0
                     (record.turn_closed), a re-stop after a refusal included:
                     the owed-row rung refuses every idle stop once, so an idle
@@ -34,13 +34,14 @@ THE STATES. UNKNOWN is never a guessed IDLE:
 
     IDLE     the last edge is a turn end: the seat's turn ended at `since` and
              nothing has run in its session since. `idle_s` is how long.
-    BUSY     the last edge is a call or a turn start after the last turn end,
-             or, where this session has never recorded a turn end, a call
-             inside RECENT_S. `since` is the last hook edge.
+    BUSY     the last edge is a call or a turn start after the last turn end;
+             with no recorded turn end, a call inside RECENT_S or a newly
+             opened call-free turn inside ten minutes. `since` is that edge.
     UNKNOWN  anything this cannot read: the roster, the seat's row, its
              session, the session's hook record, an edge that is not a time.
-             Also a session that has never recorded a turn end and whose last
-             call is older than RECENT_S: in flight, or ended unrecorded.
+             Also a session with no recorded turn end whose call is older
+             than RECENT_S, or whose call-free turn start is over ten minutes
+             old: in flight, or ended unrecorded.
     RESTING  the owner paused the seat (helm/seat_rest.py, task/3280). Read
              FIRST, so a resting seat is never IDLE and never IDLE-OWING; a
              rest record helm cannot read is UNKNOWN, never IDLE.
@@ -219,14 +220,25 @@ def reading(seat, now=None, rows=None, roster_why=None):
                     since=ended, why="its turn ended %s ago and nothing has "
                     "run in its session since" % _age(now - ended))
     quiet = now - active
-    if ended is None and quiet > RECENT_S:
+    # The prompt hook can open a fresh session before its first call. Give
+    # that one turn at most ten minutes of provisional BUSY; a stale call in a
+    # later turn does not extend it. After a call, the five-minute recent-call
+    # rule applies as before. The beacon proof independently enforces its bar.
+    provisional = opened is not None and (call is None or call < opened)
+    if provisional and quiet > IDLE_OWING_S:
+        return dict(out, state=UNKNOWN, idle_s=None, since=None,
+                    why="turn start for session %s was %s ago without a call "
+                    "in this turn: helm cannot prove it is still in flight"
+                    % (_sid(session), _age(quiet)))
+    if ended is None and not provisional and quiet > RECENT_S:
         return dict(out, state=UNKNOWN, idle_s=None, since=None,
                     why="no turn end is recorded for session %s and its last "
                     "call was %s ago: in flight or ended unrecorded, helm "
                     "cannot say" % (_sid(session), _age(quiet)))
     why = "its last call or turn start was %s ago, after its last turn end" \
         % _age(quiet) if ended is not None else \
-        "a call %s ago, and no turn end recorded yet" % _age(quiet)
+        "%s %s ago, and no turn end recorded yet" % (
+            "a turn started" if provisional else "a call", _age(quiet))
     if quiet > STALE_BUSY_S:
         why += ("; nothing for %s is a single very long call or a turn that "
                 "ended without a Stop helm answered" % _age(quiet))

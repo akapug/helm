@@ -1202,7 +1202,9 @@ def _cursor_rows(reading, family):
     """One family's row: the included dollars and the pool it bills. While
     on-demand is claimed off (`_on_demand_is_off`), the included window
     leaves the row whether or not bonus remains: nothing past those dollars
-    can be billed, so they are no wall. A refusal is the reach axis."""
+    can be billed, so they are no wall. The billed pool stays measured for
+    spend-down; its ceiling reads ORANGE rather than a MONEY wall. An actual
+    vendor refusal stops the family on REACH."""
     from . import seat
     rec = reading_dict(reading)
     if rec["status"] != "ok":

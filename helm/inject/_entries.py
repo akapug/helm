@@ -11,9 +11,10 @@ import os
 import re
 
 from .. import home, pk
+from ..seat_role import _ROLE_ENV
 from ._common import (FIRST_SENTENCE_MIN, FOOTER, FOOTER_GATES, JIT_LINE_CAP,
                       LINE_CAP, SA_FAMILIES, SA_LINES, WHO_CAP,
-                      _CACHE_VERSION)
+                      WHO_LONGTAIL, WHO_OWNER, _CACHE_VERSION)
 
 
 def _entry_line(e, cap=None, short=False, hard=False):
@@ -466,11 +467,42 @@ def _gate_plan(selected, entries, base_budget=None, rider_budget=None, used=0,
     return items
 
 
-def _who_lines():
+def _who_audience():
+    """WHO_LONGTAIL only for a seat a whole team read POSITIVELY names a
+    non-lead; WHO_OWNER otherwise.
+
+    ROLE, NOT ORIGIN. A lead's brief reaches a worker as keystrokes (orca
+    terminal send, a dispatch delivery, a raw `orca terminal send` from the
+    lead's own shell), so a typed turn carries no mark of who typed it; the
+    seat's role is the signal helm can read. An unnamed pane is one the
+    owner opened by hand; the launch marker HELM_SEAT_ROLE=lead is a lead
+    whatever teams say; any other seat asks `teams.settled_role`, whose None
+    (an unread roster, an unresolved integrator, no team, a team with no
+    single lead) reads OWNER, as does any trouble: the full digest is what
+    every seat got before, never a withheld one."""
+    try:
+        name = home.chat_name()
+        if not name or os.environ.get(_ROLE_ENV) == "lead":
+            return WHO_OWNER
+        from .. import teams
+        role = teams.settled_role(name)
+        return WHO_LONGTAIL if role and role != "lead" else WHO_OWNER
+    except Exception:
+        return WHO_OWNER
+
+
+def _who_lines(audience=WHO_OWNER):
     """The WHO leg (know-your-user): operator digest off whoami.load_profile()
     — technical level + top guidance, <= 2 terse lines jointly capped at
     WHO_CAP. Fail-open: no profile / garbled / raising whoami -> [] (absent,
     never a blocked turn).
+
+    TWO AUDIENCES, ONE PROFILE. The `guidance` list is how
+    to work FOR the owner (decision cards, human-only gates) and confuses a
+    worker that only hears from its lead, so a WHO_LONGTAIL seat gets the
+    operator line and the profile's `longtail_guidance` instead: answer him
+    short if he talks to you, otherwise agent-to-agent only. Both texts live
+    in the profile; none is written here.
 
     WHOLE CLAUSES, NEVER A CUT WORD (trigger design section 3). Both fields
     are `; `-separated clauses, owner-ordered. The digest was cut mid-word at
@@ -485,7 +517,9 @@ def _who_lines():
         from .. import whoami
         p = whoami.load_profile()
         level = _clauses(p["technical_level"])
-        guide = [g.strip() for g in (p["guidance"] or ()) if str(g).strip()]
+        guide = [g.strip() for g in (p["longtail_guidance" if audience
+                                       == WHO_LONGTAIL else "guidance"] or ())
+                 if str(g).strip()]
     except Exception:
         return []
     lead, glead = "WHO operator: ", "WHO guidance: "

@@ -15,6 +15,7 @@ import unittest
 from unittest import mock
 
 from helm import dispatches, doctor, harness, proxywatch, seat
+from tests import _launchrecipe
 
 
 def _orca_reply(result, ok=True):
@@ -702,7 +703,9 @@ class SeatResumeTest(unittest.TestCase):
         os.makedirs(d, exist_ok=True)
         launch = os.path.join(d, "launch.sh")
         with open(launch, "w") as f:
-            f.write("#!/bin/sh\nexec env FAKE=1 claude \"$@\"\n")
+            # a launch helm itself would mint: the resume restores the recipe
+            # a launch states and refuses a stub that states none (task/3695)
+            f.write(_launchrecipe.launch_sh(family, seat_name))
         os.chmod(launch, 0o700)
         return d, launch
 
@@ -744,7 +747,7 @@ class SeatResumeTest(unittest.TestCase):
             "Run `helm seat boot-brief --rearm` and follow it.")
         self.ensure_timer.assert_called_once()
 
-    def test_resume_preserves_recorded_lead_and_reasserts_ultracode(self):
+    def test_resume_preserves_recorded_lead_without_ultracode(self):
         d, launch = self._mint()
         self._record(d, role="lead")
         fake = FakeAdapter(rows=[{"handle": "p9", "title": "dynamic",
@@ -753,8 +756,8 @@ class SeatResumeTest(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         command, _, _ = fake.spawned[0]
         self.assertEqual(
-            command, "env HELM_SEAT_ROLE=lead %s --settings %s --continue" % (
-                shlex.quote(launch), shlex.quote('{"ultracode":true}')))
+            command, "env HELM_SEAT_ROLE=lead %s --continue"
+            % shlex.quote(launch))
         with open(os.path.join(d, "spawn.json")) as f:
             self.assertEqual(json.load(f)["role"], "lead")
         self.assertEqual(
@@ -768,7 +771,7 @@ class SeatResumeTest(unittest.TestCase):
             ["codex", "--role", "lead"], fake)
         self.assertEqual(rc, 0, err)
         self.assertIn("HELM_SEAT_ROLE=lead", fake.spawned[0][0])
-        self.assertIn("--settings", fake.spawned[0][0])
+        self.assertNotIn("--settings", fake.spawned[0][0])
 
         self._record(d, handle="pane-1", role="lead")
         fake = FakeAdapter(rows=[{"handle": "pane-1", "title": "dynamic",
@@ -952,8 +955,8 @@ class SeatResumeTest(unittest.TestCase):
         self.assertEqual(rc, 0, err)
         self.assertEqual(
             lead.spawned[0][0],
-            "env HELM_SEAT_ROLE=lead %s --settings %s --resume %s" % (
-                shlex.quote(launch), shlex.quote('{"ultracode":true}'), sid))
+            "env HELM_SEAT_ROLE=lead %s --resume %s" % (
+                shlex.quote(launch), sid))
 
     def test_resume_stops_registered_pane_first(self):
         d, _ = self._mint()
@@ -1071,7 +1074,7 @@ class SeatResumeTest(unittest.TestCase):
     def test_resume_preserves_room_homing_across_the_remint(self):
         d, launch = self._mint()
         with open(launch, "w") as f:
-            f.write("#!/bin/sh\nexec env HELM_CHAT_ROOM=team-z claude \"$@\"\n")
+            f.write(_launchrecipe.launch_sh("codex", "codex", room="team-z"))
         rc, out, err, wla = self._resume(["codex"], FakeAdapter())
         self.assertEqual(rc, 0, err)
         self.assertEqual(wla.call_args[0], ("codex", d, "team-z", "codex"))
@@ -1080,8 +1083,9 @@ class SeatResumeTest(unittest.TestCase):
     def test_resume_preserves_derived_room_provenance(self):
         d, launch = self._mint()
         with open(launch, "w") as f:
-            f.write("#!/bin/sh\nexec env HELM_CHAT_ROOM='project room' "
-                    "HELM_CHAT_ROOM_SOURCE=derived claude \"$@\"\n")
+            f.write(_launchrecipe.launch_sh("codex", "codex",
+                                            room="project room",
+                                            room_source="derived"))
         rc, out, err, wla = self._resume(["codex"], FakeAdapter())
         self.assertEqual(rc, 0, err)
         self.assertEqual(wla.call_args[0],

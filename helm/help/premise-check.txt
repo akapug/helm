@@ -1,0 +1,1 @@
+premise-check <id> [--chain] — verify digest + quote the finality tier; --chain walks the supersession chain (attested biography)

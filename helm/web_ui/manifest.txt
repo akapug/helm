@@ -6,6 +6,7 @@ styles/22-models.css.part
 styles/30-sessions.css.part
 styles/40-configs.css.part
 styles/45-injectpack.css.part
+styles/46-loop.css.part
 styles/50-chat.css.part
 styles/60-ledger.css.part
 styles/70-home.css.part
@@ -39,6 +40,7 @@ scripts/40-configs.js.part
 scripts/50-work.js.part
 scripts/52-work.js.part
 scripts/55-injectpack.js.part
+scripts/56-loop.js.part
 scripts/60-chat.js.part
 scripts/70-ledger.js.part
 scripts/80-roster.js.part

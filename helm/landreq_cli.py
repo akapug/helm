@@ -388,7 +388,8 @@ def _fold_proven(root, tip, report, gate_ref):
     return 0
 
 
-def _print_source_clean_landings(repo, head, gate_ref, apply=False):
+def _print_source_clean_landings(repo, head, gate_ref, apply=False,
+                                 train_car_ids=None):
     """After the fold's rungs, every HELD SOURCE-CLEAN row this head lands,
     judged by `close --reason source-clean-landed` (task/3053) -> rc.
 
@@ -397,9 +398,11 @@ def _print_source_clean_landings(repo, head, gate_ref, apply=False):
     NOT-IN-HEAD. `--apply` closes exactly the rows that qualify, and only a
     row that QUALIFIED and then FAILED at the write returns 1, because that is
     an apply that did not do what it listed; a row that never qualified is a
-    listing, not an error. Silent when the repository holds no such row and
-    nothing was asked of it, like the lease listing beside it; an unreadable
-    ledger or head says so in one line."""
+    listing, not an error. When a train supplies its exact car IDs, a
+    REFUSED or FAILED foreign held row is REPORTED but cannot stop that train;
+    its own failed close still does. Silent when the repository holds no such
+    row and nothing was asked of it, like the lease listing beside it; an
+    unreadable ledger or head says so in one line."""
     try:
         entries, err = landreq.source_clean_landings(repo, head, gate_ref,
                                                      apply=apply)
@@ -415,30 +418,59 @@ def _print_source_clean_landings(repo, head, gate_ref, apply=False):
             print("\nsource-clean holds: none held in this repository — "
                   "nothing to close")
         return 0
+    own_elsewhere = [e for e in entries if e["verdict"] == "NOT-IN-HEAD"
+                     and train_car_ids is not None and e["id"] in train_car_ids]
     landed = [e for e in entries if e["verdict"] != "NOT-IN-HEAD"]
-    elsewhere = [e for e in entries if e["verdict"] == "NOT-IN-HEAD"]
+    elsewhere = [e for e in entries if e["verdict"] == "NOT-IN-HEAD"
+                 and e not in own_elsewhere]
     print("\nSOURCE-CLEAN HOLDS THIS HEAD LANDS (%s, %s) — each judged by "
           "`close --reason source-clean-landed`:"
           % (gate_ref or "no gate named", "APPLY" if apply else "dry run"))
+    reported = {e["id"] for e in landed if train_car_ids is not None
+                and e["id"] not in train_car_ids
+                and e["verdict"] in ("REFUSED", "FAILED")}
     for e in landed:
         print("  %-9s %s  tip %s  held by %s — %s" % (
-            e["verdict"], e["id"][:12], e["tip"][:12],
-            e.get("holder") or "(unrecorded)", e.get("why") or ""))
-    if not landed:
+            "REPORTED" if e["id"] in reported else e["verdict"],
+            e["id"] if train_car_ids is not None else e["id"][:12],
+            e["tip"][:12], e.get("holder") or "(unrecorded)",
+            "%s: %s" % (e["verdict"], e.get("why") or "")
+            if e["id"] in reported else e.get("why") or ""))
+    for e in own_elsewhere:
+        print("  REFUSED   %s  tip %s  held by %s — own train car "
+              "NOT-IN-HEAD: %s" % (
+                  e["id"], e["tip"][:12],
+                  e.get("holder") or "(unrecorded)", e.get("why") or
+                  "ancestry unreadable"))
+    if not landed and not own_elsewhere:
         print("  (none — no held source-clean tip is in this head's history)")
     if elsewhere:
         print("  NOT-IN-HEAD %d row(s), which this land does not carry: %s"
               % (len(elsewhere), ", ".join(e["id"][:12] for e in elsewhere)))
     count = {}
     for e in landed:
-        count[e["verdict"]] = count.get(e["verdict"], 0) + 1
+        verdict = "REPORTED" if e["id"] in reported else e["verdict"]
+        count[verdict] = count.get(verdict, 0) + 1
+    # THE LAND STEP (task/3746) for each row this fold closed: its task
+    # closes or is asked, and its chain's findings close (helm/landtask.py).
+    closed_here = [e for e in landed if e["verdict"] == "CLOSED"]
+    if apply and closed_here:
+        from . import landtask
+        rc, said, _err = vcs.backend(repo).text(
+            repo, "rev-parse", "--verify", "--quiet", "%s^{commit}" % head)
+        sha = said.strip() if rc == 0 and said.strip() else head
+        for e in closed_here:
+            for line in landtask.lines(landtask.hand(e["id"], "foldcheck",
+                                                     sha)):
+                print("  the land step for %s: %s" % (e["id"][:12], line))
     print("%d landed row(s): %s%s" % (
         len(landed), ", ".join("%d %s" % (count[v], v) for v in
-                               ("CLOSED", "QUALIFIES", "FAILED", "REFUSED")
+                               ("CLOSED", "QUALIFIES", "FAILED", "REFUSED",
+                                "REPORTED")
                                if count.get(v)) or "none",
         " — dry run, nothing appended: re-run with --apply to close them"
         if count.get("QUALIFIES") and not apply else ""))
-    return 1 if count.get("FAILED") else 0
+    return 1 if count.get("FAILED") or (apply and own_elsewhere) else 0
 
 
 def _print_landed_leases(root):
@@ -456,8 +488,8 @@ def _print_landed_leases(root):
               "be read (%s)" % type(exc).__name__)
         return
     if release:
-        print("\nLEASES ON LANDED WORK — a land releases no lease; each "
-              "holder runs its line:")
+        print("\nLEASES ON LANDED WORK — a hand land releases no lease (auto-land "
+              "releases the lanes it lands); each holder runs its line:")
         for r in release:
             print("  %s (%s) — %s: %s" % (
                 r["lane"], "yours" if r.get("lease") else r.get("holder"),
@@ -962,6 +994,11 @@ def _render_show(lr):
     # got for a recorded read, and he concluded the write had failed. None
     # of these lines exists on a row that carries no read.
     out.extend("  " + line for line in dispatches.advisory_read_lines(lr))
+    # THE FINDINGS THIS ROW'S VERDICT FILED OR CARRIED, AND ITS NOTES
+    # (task/3742): each is a sub-task or a comment on the task under review,
+    # so the page names them where the verdict is read.
+    out.extend("  " + line
+               for line in dispatches.review_findings.show_lines(lr))
     # THE HAND-BACK'S CLAIMS (task/3540), read off the dispatch row itself:
     # the projection carries neither the brief nor the checkout it binds in.
     # They are THIS row's: when `lr show` of a cancelled id opened the row
@@ -1831,7 +1868,7 @@ def _cmd_lr(args):
         # announce a land.
         fc_usage = ("usage: helm lr foldcheck <tip> [--gate gate:TOKEN] "
                     "[--repo PATH] [--remote R] [--branch B] [--no-fetch] "
-                    "[--apply]")
+                    "[--apply] [--train-cars ID[,ID...]]")
         # CLOSED-SET TAIL, and the reason it is not the hand-rolled scan it
         # was: reading options by `opts.index(name) + 1` raised IndexError on
         # a trailing `--gate` and silently IGNORED `--bogus`. A rung that
@@ -1841,7 +1878,8 @@ def _cmd_lr(args):
         tip = rest[0] if rest and not rest[0].startswith("-") else None
         rc = guard_tail("helm lr foldcheck", rest[1:] if tip else rest,
                         flags=("--no-fetch", "--apply"),
-                        valued=("--gate", "--repo", "--remote", "--branch"),
+                        valued=("--gate", "--repo", "--remote", "--branch",
+                                "--train-cars"),
                         usage=fc_usage)
         if rc is not None:
             return rc
@@ -1854,6 +1892,16 @@ def _cmd_lr(args):
             return opts[opts.index(name) + 1] if name in opts else default
 
         repo = _opt("--repo", ".")
+        train_car_ids = None
+        if "--train-cars" in opts:
+            ids = _opt("--train-cars").split(",")
+            if len(set(ids)) != len(ids) or not all(
+                    len(rid) == 32 and dispatches._ID.fullmatch(rid)
+                    for rid in ids):
+                print("helm lr foldcheck: --train-cars needs distinct full "
+                      "dispatch row IDs", file=sys.stderr)
+                return 2
+            train_car_ids = set(ids)
         rungs = foldcheck.check(
             repo, tip, gate_ref=_opt("--gate"),
             remote=_opt("--remote", "origin"),
@@ -1894,7 +1942,8 @@ def _cmd_lr(args):
             finally:
                 _print_landed_leases(root)
         stage_rc = _print_source_clean_landings(
-            repo, tip, _opt("--gate"), apply="--apply" in opts)
+            repo, tip, _opt("--gate"), apply="--apply" in opts,
+            train_car_ids=train_car_ids)
         return fold_rc or stage_rc
     if verb == "stalls":
         rc = guard_tail("helm lr stalls", rest, flags=("--json",), usage=landreq.USAGE)
@@ -2754,8 +2803,17 @@ def _cmd_close(rest):
         else:
             print("helm lr close: " + contract, file=sys.stderr)
         return 1
+    # THE LAND STEP (task/3746): a land recorded by hand closes or asks the
+    # task its row served, and closes the findings its chain filed, as the
+    # auto-land LAND step does (helm/landtask.py).
+    from . import landtask
+    step = landtask.hand(
+        str(out.get("id") or rid), "close",
+        out.get("closing_trunk_sha") or out.get("reviewed_tip"), live=live,
+        restart=restart) if reason == "landed" and not dry else None
     if as_json:
-        print(json.dumps(out, ensure_ascii=False, indent=1))
+        print(json.dumps(dict(out, land_step=step) if step else out,
+                         ensure_ascii=False, indent=1))
         return 0
     # Dry-run state belongs to the caller and the normalized result contract,
     # not to any individual proof ladder.
@@ -2822,6 +2880,8 @@ def _cmd_close(rest):
     for peer in out.get("sibling_refusals") or ():
         print("  STILL OPEN %s — %s"
               % (str(peer.get("id"))[:12], peer.get("why")))
+    for line in landtask.lines(step) if step else ():
+        print("helm lr: the land step: %s" % line)
     if out.get("witness_unknown"):
         # THE OPPOSITE PRESCRIPTION FROM THE ONE BELOW, and that is the whole
         # point of the split. Below, no receipt exists and minting is the
@@ -3950,10 +4010,28 @@ def _cmd_land(rest):
         landreq._patch_id(gitdir, reviewed_tip, trunk_ref), trunk_sha, repo_id=gitdir,
         has_upstream=bool(up_ref),
         upstream=landreq._ancestry(gitdir, trunk_sha, up_ref) == landreq.ANCESTOR)
+    # THE LAND STEP (task/3746), once trunk carries the reviewed tip. This
+    # verb runs where the merge exists locally and may not be pushed yet; a
+    # land that never reaches trunk must close no task, so the step waits
+    # for the post-observation close (helm/landtask.py).
+    from . import landtask
+    step = wait = None
+    if up_ref and landreq._ancestry(gitdir, reviewed_tip,
+                                    up_ref) == landreq.ANCESTOR:
+        step = landtask.hand(lr["id"], "land", trunk_sha)
+    else:
+        wait = ("the land step waits until trunk carries %s; `helm lr close "
+                "%s --reason landed` runs it then"
+                % (reviewed_tip[:12], lr["id"][:12]))  # noqa: SILENT_CAP — sha12 and id12 name the commit and the row
     if as_json:
-        print(json.dumps({"recorded": bool(rec), "receipt": rec, "reason": why},
+        print(json.dumps({"recorded": bool(rec), "receipt": rec, "reason": why,
+                          "land_step": step, "land_step_waits": wait},
                          ensure_ascii=False, indent=1))
         return 0
+    for line in landtask.lines(step) if step else ():
+        print("helm lr land: the land step: %s" % line)
+    if wait:
+        print("helm lr land: " + wait)
     # BOTH LINES NAME THE NON-ACTION, because this verb's NAME is an
     # imperative and its job is not. `helm lr land` emits a RECEIPT; the merge
     # is the integrator's own git work, and nothing here moves a ref.

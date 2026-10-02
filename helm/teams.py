@@ -327,6 +327,34 @@ def read_all(reg=None, auth=None, world=None, keys=None):
     return out
 
 
+def settled_role(seat, reg=None):
+    """The role a WHOLE read of the teams positively gives `seat`, else None.
+
+    None is "this read cannot settle it", never "not a lead": the roster did
+    not read, the integrator did not resolve (role_for then hands its lead to
+    a `<project>-claude` by name), the seat is in no team, or a team it is in
+    names no lead or several (a lone-native lead stops leading the moment a
+    second native is placed beside it). A caller that withholds anything on
+    a role must treat None as the answer it gave before teams existed: a
+    proposal binds nothing until the owner accepts a team. `read_all`'s roles
+    are the reader, never a second opinion about what a lead is."""
+    from . import registry
+    reg = registry.load(strict=True) if reg is None else reg
+    world = placements(projects=reg.get("projects") or {})
+    if world.get("roster_unread") or not world.get("integrator"):
+        return None
+    roles = []
+    for t in read_all(reg=reg, world=world).values():
+        members = t.get("members") or ()
+        mine = [m.get("role") for m in members if m.get("seat") == seat]
+        if not mine:
+            continue
+        if sum(m.get("role") == "lead" for m in members) != 1:
+            return None
+        roles += mine
+    return "lead" if "lead" in roles else (roles[0] if roles else None)
+
+
 # ---------------------------------------------------------------------------
 # derive — the migration seed
 # ---------------------------------------------------------------------------

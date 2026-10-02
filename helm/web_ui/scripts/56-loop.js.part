@@ -1,0 +1,463 @@
+/* THE LOOP EDITOR — everything that goes into one seat's request loop, in the
+   Config seat detail: how big each request was and where Claude Code
+   compacted it (with knobs to replay that history at another window), what
+   every request re-sends no matter what, the window and budgets that bound
+   it, and (below, its own fragment) what helm injected turn by turn.
+
+   THE CHART AND THE SIMULATION ARE A PORT OF THE STANDALONE CONTEXT-LOOP PAGE
+   the owner already used (a token-mechanics review artifact), the same
+   arithmetic line for line so the two read the same numbers off the same
+   transcript. The data now comes from /api/seat/contextloop for whichever
+   seat is open, instead of being baked into a file.
+
+   READ-ONLY. Every knob here is a what-if over history; nothing a knob does
+   reaches a seat. The one setting that would (a per-seat window) does not
+   exist yet, and the window block says so plainly rather than pretending. */
+
+const LOOP = {model: null, P: null, gen: 0, view: null, sweep: null,
+  st: {W: 400000, F: 106000, G: 5, M: 10, unit: "raw", range: "all", x: "time"}};
+
+function loopK(v) {
+  v = Number(v) || 0;
+  return v >= 1e9 ? (v / 1e9).toFixed(2) + "B" : v >= 1e6 ? (v / 1e6).toFixed(1) + "M"
+    : Math.round(v / 1e3) + "k";
+}
+function loopN(v) { return (Number(v) || 0).toLocaleString("en-US"); }
+function loopCss(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+
+/* The series and the per-request growth the simulation replays. A request
+   that crossed a real compaction contributes NO growth: the drop there is
+   the compaction, not the work. A compaction is placed by its position in
+   the transcript (C[k][4], the index of the first request after it), not by
+   its clock time: the times are whole seconds, and a compaction in the same
+   second as the request before it would otherwise be missed and its drop
+   replayed as negative growth. */
+function loopPrep(d) {
+  const S = d.S || [], C = d.C || [], N = S.length;
+  const delta = new Float64Array(N);
+  let ci = 0;
+  for (let i = 1; i < N; i++) {
+    while (ci < C.length && C[ci][4] < i) ci++;
+    const crossed = ci < C.length && C[ci][4] === i;
+    delta[i] = crossed ? 0 : S[i][1] - S[i - 1][1];
+  }
+  const span = N ? Math.max((S[N - 1][0] - S[0][0]) / 86400, 1 / 1440) : 1;
+  return {S, C, N, delta, span, t0: d.t0 || 0, R: (d.facts || {}).fire_pct || 74,
+          summary: (d.facts || {}).summary_tokens || 6700, price: (d.facts || {}).price || {}};
+}
+
+/* The smallest window the simulation will run at: one that fires above the
+   floor. At or below it, every request after a compaction would already be
+   past the firing point and compact again, with no work in between. */
+function loopWMin(R, F) { return (Math.floor(F * 100 / R / 10000) + 1) * 10000; }
+
+function loopSim(P, W, R, F, G) {
+  const asked = W;
+  W = Math.max(W, loopWMin(R, F));
+  const fire = W * R / 100, out = new Float64Array(P.N), SUMM = P.summary;
+  const pr_ = P.price, cr = pr_.cache_read || 0.1, cw = pr_.cache_write || 1.25, ou = pr_.output || 5;
+  let ctx = F, raw = 0, pr = 0, n = 0, sumShare = 0;
+  for (let i = 0; i < P.N; i++) {
+    ctx += P.delta[i]; if (ctx < F * 0.6) ctx = F * 0.6;
+    let write = Math.max(P.delta[i], 0);
+    if (ctx >= fire) { raw += ctx + SUMM; pr += ctx * cr + SUMM * ou; n++; ctx = F; write = F; raw += G * F; pr += G * F * cr; }
+    out[i] = ctx; raw += ctx; pr += (ctx - write) * cr + write * cw; sumShare += SUMM / ctx;
+  }
+  return {out, raw, pr, n, fire, W, clamped: W !== asked,
+          share: n ? sumShare / P.N : 0, mean: raw / P.N};
+}
+
+function loopActual(P) {
+  const pr_ = P.price, cr = pr_.cache_read || 0.1, cw = pr_.cache_write || 1.25;
+  let raw = 0, pr = 0;
+  for (const s of P.S) { raw += s[1]; pr += s[2] * cr + s[3] * cw + s[4]; }
+  return {raw, pr, n: P.C.length, mean: raw / P.N};
+}
+
+/* How the summary size was known, in the owner's words. */
+function loopSummHow(m) {
+  m = m || {};
+  if (m.how === "estimate") return "ESTIMATE: the median of this seat's " + m.n + " summaries"
+    + (m.exact_one ? "; one of them counted exactly: " + loopN(m.exact_one.tokens) + " tokens" : "");
+  return "no summary in this transcript yet, so the measured size from the floor census";
+}
+
+async function loopLoad(seat, session, gen) {
+  const host = $("#loophost");
+  if (!host) return;
+  host.innerHTML = '<div class="empty">reading this seat\'s transcript…</div>';
+  let d;
+  try {
+    d = await j('/api/seat/contextloop?seat=' + encodeURIComponent(seat || "")
+                + '&session=' + encodeURIComponent(session || ""), 60000);
+  } catch (e) {
+    if (gen !== CFG_DETAIL_GEN) return;
+    host.innerHTML = '<div class="cfgwarn">the context loop could not be read: ' + esc(e.message) + '</div>';
+    return;
+  }
+  if (gen !== CFG_DETAIL_GEN) return;
+  const fresh = !LOOP.model || LOOP.model.session !== d.session;
+  LOOP.model = d; LOOP.gen = gen; LOOP.sweep = null;
+  LOOP.P = d.state === "observed" ? loopPrep(d) : null;
+  if (fresh && LOOP.P) {
+    /* THE KNOBS OPEN ON THIS SEAT'S OWN READINGS: the window its live process
+       runs at, and the median floor its compactions actually left. */
+    const w = (d.window || {}).window;
+    LOOP.st.W = Math.min(1000000, Math.max(120000, Math.round((w || 400000) / 10000) * 10000));
+    LOOP.st.F = Math.min(160000, Math.max(40000, Math.round((d.floor_median || 106000) / 1000) * 1000));
+  }
+  loopRender();
+}
+
+function loopRender() {
+  const host = $("#loophost");
+  if (!host) return;
+  host.innerHTML = loopHtml(LOOP.model);
+  loopBind(host);
+  if (LOOP.P) loopDraw();
+}
+
+function loopHtml(d) {
+  if (!d) return "";
+  if (d.state !== "observed") {
+    return '<div class="cfgsec"><h4>context loop</h4><div class="empty">'
+      + esc(d.why || "no transcript") + '</div></div>'
+      + '<div id="loopbudgets">' + loopBudgetsHtml() + '</div>';
+  }
+  const P = LOOP.P, S = P.S, last = S[P.N - 1];
+  const days = P.span < 1 ? (P.span * 24).toFixed(1) + " hours" : P.span.toFixed(1) + " days";
+  const ranges = {"6h": "last 6h", "24h": "last 24h", "3d": "last 3d", "all": "all " + days};
+  const chips = (attr, opts, cur) => Object.keys(opts).map(k =>
+    '<button type="button" class="chip' + (k === cur ? ' on' : '') + '" data-' + attr + '="' + k + '">'
+    + esc(opts[k]) + '</button>').join("");
+  const head = '<div class="loopline">' + loopN(P.N) + ' requests over ' + days + ', '
+    + P.C.length + ' compaction' + (P.C.length === 1 ? '' : 's')
+    + '. Right now every request re-sends <b>' + loopK(last[1]) + '</b>'
+    + (d.floor_median ? '; right after a compaction it re-sends about <b>' + loopK(d.floor_median) + '</b> (the median floor)' : '')
+    + '.</div>';
+  const chart = '<div class="looprow">' + chips("r", ranges, LOOP.st.range)
+    + '<span class="loopgap"></span>' + chips("x", {time: "x: clock time", req: "x: request count"}, LOOP.st.x) + '</div>'
+    + '<div class="looplegend"><span><i class="loopsw" style="background:var(--accent)"></i>actual context per request</span>'
+    + '<span><i class="loopsw" style="background:var(--claude)"></i>replayed at your window</span>'
+    + '<span><i class="loopsw" style="background:var(--warn)"></i>where it would fire</span>'
+    + '<span>▼ compaction (auto / <span style="color:var(--codex)">manual</span>)</span></div>'
+    + '<div class="loopchart"><canvas id="loopc"></canvas><div id="looptip" hidden></div></div>';
+  const st = LOOP.st;
+  const knob = (id, label, min, max, step, help) => '<label class="loopknob"><span class="looplab">' + label
+    + '</span><span class="loopv" id="loopv' + id + '"></span><input type="range" id="loopk' + id
+    + '" min="' + min + '" max="' + max + '" step="' + step + '" value="' + st[id] + '"><span class="looph">' + help + '</span></label>';
+  const w = d.window || {}, live = (w.live || {}).value;
+  const knobs = '<div class="loopknobs">'
+    + knob("W", "compaction window", 120000, 1000000, 10000,
+           'What-if only. ' + (live ? 'This seat runs at <b>' + loopK(live) + '</b> today.'
+             : 'This seat\'s own window could not be read: ' + esc((w.live || {}).source || 'no live process recorded') + '.'))
+    + '<div class="loopknob"><span class="looplab">where Claude Code fires</span><span class="loopv">'
+    + P.R + '% of the window</span><span class="looph">Claude Code\'s choice, not a setting: it compacts at about '
+    + esc((d.facts.fire_pct_range || [72, 76]).join("–")) + '% of the window and keeps the rest for the summary. To fire later, raise the window.</span></div>'
+    + knob("F", "floor after a compaction", 40000, 160000, 1000,
+           'Measured median for this seat: ' + (d.floor_median ? loopK(d.floor_median) : 'unknown') + ' (summary plus everything re-sent every time).')
+    + knob("G", "re-grounding after each compaction", 0, 60, 1,
+           'Extra requests spent re-reading after a compaction, each one at floor size. Measured on one lead: about ' + esc(d.facts.reground_reads) + '.')
+    + knob("M", "most compactions per day you will accept", 2, 30, 1,
+           'Each compaction is a reset: a summary replaces the detail, and slips run high for about ' + esc(d.facts.slip_calls) + ' calls after it.')
+    + '<div class="loopknob"><span class="looplab">unit</span><span class="loopv">' + esc(st.unit) + '</span>'
+    + '<span class="looprow">' + chips("u", {raw: "raw tokens", priced: "priced"}, st.unit) + '</span>'
+    + '<span class="looph">Priced weighs cache reads ×' + esc(d.facts.price.cache_read) + ', cache writes ×'
+    + esc(d.facts.price.cache_write) + ', output ×' + esc(d.facts.price.output)
+    + '. A compaction writes a ~' + loopK(d.facts.summary_tokens) + ' summary as output (' + esc(loopSummHow(d.facts.summary))
+    + '), so priced punishes many compactions harder.</span></div>'
+    + '</div>';
+  const compare = '<div class="loopcmpwrap"><table class="looptab" id="loopcmp"></table></div>'
+    + '<div class="loopline" id="loopbest"></div>'
+    + '<div><div class="loopchart small"><canvas id="loopsw"></canvas></div>'
+    + '<div class="looplegend"><span><i class="loopsw" style="background:var(--accent)"></i>re-sent, relative to 1M (left)</span>'
+    + '<span><i class="loopsw" style="background:var(--claude)"></i>compactions per day (right, clipped at 40)</span></div></div>';
+  return '<div class="cfgsec"><h4>context loop</h4>' + head + chart + knobs + compare + '</div>'
+    + loopFloorHtml(d) + '<div id="loopbudgets">' + loopBudgetsHtml() + '</div>';
+}
+
+/* WHAT EVERY REQUEST RE-SENDS. The total is MEASURED (the first request after
+   the last compaction); the cached prefix is MEASURED (that request's cache
+   read is exactly what survived the compaction: the system prompt and the
+   tool schemas); every named part is an ESTIMATE from its characters, with an
+   exact count beside it where one was taken for the same text. */
+function loopFloorHtml(d) {
+  const f = d.floor || {};
+  if (f.state !== "observed") return '<div class="cfgsec"><h4>what every request re-sends</h4><div class="empty">'
+    + esc(f.why || "not measured yet") + '</div></div>';
+  const m = f.measured, total = m.ctx;
+  const pct = v => total ? Math.round(100 * v / total) + "%" : "";
+  const label = {claude_md: "CLAUDE.md", memory: "memory index", skill: "skill restored",
+                 summary: "compaction summary", listing: "listing", hook: "hook text",
+                 restored: "restored state"};
+  const rows = [];
+  if (f.prefix) rows.push('<tr><td>system prompt and tool schemas<span class="loopsub">the prefix still cached across the compaction</span></td><td class="n">'
+    + loopN(f.prefix) + '</td><td class="n">' + pct(f.prefix) + '</td><td><span class="loopsrc ok">MEASURED</span></td></tr>');
+  for (const p of (f.parts || []).slice().sort((a, b) => b.estimate - a.estimate))
+    rows.push('<tr><td>' + esc(p.name) + '<span class="loopsub">' + esc(label[p.kind] || p.kind)
+      + ' · ' + loopN(p.chars) + ' characters</span></td><td class="n">' + loopN(p.estimate) + '</td><td class="n">'
+      + pct(p.estimate) + '</td><td><span class="loopsrc">ESTIMATE</span>'
+      + (p.exact != null ? ' <span class="loopsub">exact count of the same text: ' + loopN(p.exact) + '</span>' : '') + '</td></tr>');
+  rows.push('<tr><td>everything else<span class="loopsub">the conversation tail kept across the compaction, framing, and what the estimates missed</span></td><td class="n">'
+    + loopN(f.remainder) + '</td><td class="n">' + pct(f.remainder) + '</td><td><span class="loopsrc">ESTIMATE</span></td></tr>');
+  return '<div class="cfgsec"><h4>what every request re-sends</h4>'
+    + '<div class="loopline">The first request after the last ' + esc(f.after) + ' sent <b>' + loopN(total)
+    + ' tokens</b> (MEASURED: ' + loopN(m.input) + ' new + ' + loopN(m.cache_read) + ' cache read + '
+    + loopN(m.cache_write) + ' cache write). Every request after it re-sends at least that much.'
+    + ' Parts are sized at ' + esc(f.chars_per_token) + ' characters per token.</div>'
+    + '<table class="looptab"><thead><tr><th>part</th><th>tokens</th><th>share</th><th>how known</th></tr></thead><tbody>'
+    + rows.join("") + '</tbody></table></div>';
+}
+
+/* WINDOW AND BUDGETS. The window is the live process's own (read from its
+   environment), beside the catalog reading the backup watchdog divides by;
+   the inject budgets are the injector's configured limits beside what this
+   seat's window actually carried (from the pack below, once it has loaded). */
+function loopBudgetsHtml() {
+  const d = LOOP.model || {}, w = d.window, rows = d.budgets || [];
+  let h = '<div class="cfgsec"><h4>window and budgets</h4>';
+  if (w) {
+    const live = w.live || {}, cat = w.catalog, win = w.window;
+    const fire = win ? Math.round(win * (w.fire_pct || 74) / 100) : null;
+    const autoC = ((LOOP.P || {}).C || []).filter(c => c[3] !== "manual").slice(-5);
+    h += '<div class="loopkv">'
+      + '<span>window</span><b>' + (live.value ? loopN(live.value) + ' tokens' : 'unknown') + '</b><i>' + esc(live.source || "") + '</i>'
+      + (cat ? '<span>catalog window</span><b>' + loopN(cat.value) + '</b><i>' + esc(cat.source || "") + ' (what helm\'s watchdog divides by)</i>' : '')
+      + (w.lead_window && w.role === "lead" ? '<span>lead window</span><b>' + loopN(w.lead_window) + '</b><i>taught to a lead at launch</i>' : '')
+      + '<span>Claude Code fires near</span><b>' + (fire ? loopN(fire) : '—') + '</b><i>about ' + esc(w.fire_pct)
+      + '% of the window: Claude Code\'s choice'
+      + (autoC.length ? '; its last automatic compactions fired at ' + autoC.map(c => loopK(c[1])).join(", ") : '') + '</i>'
+      + '<span>helm\'s backup watchdog</span><b>' + esc(w.threshold_pct) + '%</b><i>compacts a seat whose own compaction did not fire</i>'
+      + '<span>context now</span><b>' + loopN(w.ctx) + '</b><i>' + (w.gauge_pct != null ? w.gauge_pct + '% of the window' : 'window unknown') + '</i>'
+      + '<span>launch role</span><b>' + esc(w.role || "not recorded") + '</b><i></i>'
+      + '<span>launch profile</span><b>' + esc(w.profile || "none") + '</b><i>'
+      + esc(Object.keys(w.profile_switches || {}).map(k => k + (w.profile_switches[k] === true ? '' : ' ' + JSON.stringify(w.profile_switches[k]))).join(" · ")) + '</i>'
+      + '</div>'
+      + '<div class="loopnote">Changing a seat\'s window is not possible from here yet: a seat\'s window is fixed when it launches, and a per-seat override is the open work in task/3593.</div>';
+  }
+  if (rows.length) {
+    const pk = (typeof IPK_MODEL !== "undefined" && IPK_MODEL && IPK_MODEL.state === "observed") ? IPK_MODEL : null;
+    const turns = pk ? pk.turns || [] : [];
+    const lane = l => turns.map(t => (t.lanes || {})[l] || 0);
+    const meas = r => {
+      if (!pk || !r.lane) return '<span class="loopsub">—</span>';
+      if (r.unit === "entries") {
+        const most = Math.max(0, ...turns.map(t => ((t.fired || {}).jit || []).length));
+        return 'at most ' + most + ' entries';
+      }
+      const xs = lane(r.lane), most = Math.max(0, ...xs);
+      const w2 = pk.window || {}, mean = w2.turns ? Math.round(((w2.lanes || {})[r.lane] || 0) / w2.turns) : 0;
+      return 'largest turn ' + loopN(most) + ' B · mean ' + loopN(mean) + ' B'
+        + (most > r.limit ? ' <span class="loopsrc bad">over</span>' : '');
+    };
+    h += '<table class="looptab"><thead><tr><th>injector limit</th><th>limit</th><th>this seat, this window</th></tr></thead><tbody>'
+      + rows.map(r => '<tr><td>' + esc(r.what) + '<span class="loopsub">' + esc(r.name) + (r.lane ? ' · ' + esc(r.lane) + ' lane' : '') + '</span></td><td class="n">'
+        + loopN(r.limit) + (r.unit === "entries" ? '' : ' B') + '</td><td>' + meas(r) + '</td></tr>').join("")
+      + '</tbody></table>'
+      + (pk ? '' : '<div class="loopnote">The measured side fills in when the injection pack below has loaded.</div>');
+  }
+  return h + '</div>';
+}
+
+/* Called by the pack fragment whenever it redraws, so the budgets' measured
+   column follows the pack without a second read of the fire ledger. */
+function loopOnPack() {
+  const host = $("#loopbudgets");
+  if (host && LOOP.model) host.innerHTML = loopBudgetsHtml();
+}
+
+function loopBind(host) {
+  host.querySelectorAll("[data-r]").forEach(b => b.onclick = () => { LOOP.st.range = b.dataset.r; loopChips(host); loopDraw(); });
+  host.querySelectorAll("[data-x]").forEach(b => b.onclick = () => { LOOP.st.x = b.dataset.x; loopChips(host); loopDraw(); });
+  host.querySelectorAll("[data-u]").forEach(b => b.onclick = () => { LOOP.st.unit = b.dataset.u; loopChips(host); loopDraw(); });
+  for (const id of ["W", "F", "G", "M"]) {
+    const el = host.querySelector("#loopk" + id);
+    if (el) el.oninput = () => { LOOP.st[id] = +el.value; loopDraw(); };
+  }
+  const c = host.querySelector("#loopc");
+  if (c) { c.onmousemove = loopTip; c.onmouseleave = () => { const t = $("#looptip"); if (t) t.hidden = true; }; }
+}
+
+function loopChips(host) {
+  const st = LOOP.st;
+  host.querySelectorAll("[data-r]").forEach(b => b.classList.toggle("on", b.dataset.r === st.range));
+  host.querySelectorAll("[data-x]").forEach(b => b.classList.toggle("on", b.dataset.x === st.x));
+  host.querySelectorAll("[data-u]").forEach(b => b.classList.toggle("on", b.dataset.u === st.unit));
+}
+
+function loopCanvas(cv) {
+  const r = cv.getBoundingClientRect(), dpr = devicePixelRatio || 1;
+  cv.width = Math.max(1, r.width * dpr); cv.height = Math.max(1, r.height * dpr);
+  const g = cv.getContext("2d"); g.scale(dpr, dpr);
+  return [g, r.width, r.height];
+}
+
+function loopDraw() {
+  const P = LOOP.P, st = LOOP.st;
+  if (!P || !$("#loopc")) return;
+  const set = (id, v) => { const el = $("#loopv" + id); if (el) el.textContent = v; };
+  LOOP.cur = loopSim(P, st.W, P.R, st.F, st.G);
+  set("W", loopWLabel(st, LOOP.cur));
+  set("F", loopK(st.F)); set("G", st.G + " requests"); set("M", st.M + " / day");
+  loopDrawMain(); loopTable(); loopDrawSweep();
+}
+
+function loopWLabel(st, cur) {
+  return cur.clamped
+    ? loopK(st.W) + " is too small: raised to " + loopK(cur.W) + " → fires at " + loopK(cur.fire)
+      + ", the smallest window that fires above the " + loopK(st.F) + " floor"
+    : loopK(cur.W) + " → fires at " + loopK(cur.fire);
+}
+
+const LOOP_RANGES = {"6h": 6 / 24, "24h": 1, "3d": 3};
+
+function loopDrawMain() {
+  const P = LOOP.P, S = P.S, N = P.N, st = LOOP.st, cur = LOOP.cur;
+  const cv = $("#loopc"), [g, w, h] = loopCanvas(cv), pl = 48, pr = 10, pt = 16, pb = 24;
+  const tEnd = S[N - 1][0], tStart = tEnd - (LOOP_RANGES[st.range] || P.span) * 86400;
+  let i0 = S.findIndex(s => s[0] >= tStart); if (i0 < 0) i0 = 0;
+  let ymax = 0; for (let i = i0; i < N; i++) ymax = Math.max(ymax, S[i][1], cur.out[i]);
+  ymax = Math.max(100000, Math.ceil(ymax * 1.08 / 100000) * 100000);
+  const idx = t => { let lo = i0, hi = N - 1; while (lo < hi) { const m = (lo + hi) >> 1; if (S[m][0] < t) lo = m + 1; else hi = m; } return lo; };
+  const X = st.x === "req" ? (t => pl + (idx(t) - i0) / ((N - 1 - i0) || 1) * (w - pl - pr))
+    : (t => pl + (t - S[i0][0]) / (tEnd - S[i0][0] || 1) * (w - pl - pr));
+  const Y = v => pt + (1 - v / ymax) * (h - pt - pb);
+  LOOP.view = {i0, X};
+  g.font = "11px " + loopCss("--mono"); g.fillStyle = loopCss("--mut"); g.strokeStyle = loopCss("--line"); g.lineWidth = 1;
+  const step = ymax > 600000 ? 200000 : ymax > 300000 ? 100000 : 50000;
+  for (let v = 0; v <= ymax; v += step) { g.beginPath(); g.moveTo(pl, Y(v)); g.lineTo(w - pr, Y(v)); g.stroke(); g.fillText(loopK(v), 4, Y(v) + 4); }
+  const long = st.range === "all" || st.range === "3d", lw = g.measureText(long ? "00-00 00:00" : "00:00Z").width;
+  const ticks = Math.max(1, Math.min(6, Math.floor((w - pl - pr) / (lw * 1.5 + 24))));
+  for (let k = 0, right = -1; k <= ticks; k++) {
+    const t = st.x === "req" ? S[Math.round(i0 + (N - 1 - i0) * k / ticks)][0] : S[i0][0] + (tEnd - S[i0][0]) * k / ticks;
+    const s = loopT(t), x = Math.min(Math.max(pl - lw / 2, X(t) - lw / 2), w - pr - lw);
+    if (x < right + 16) continue;
+    g.fillText(long ? s.slice(0, 11) : s.slice(6), x, h - 6); right = x + lw;
+  }
+  const line = (arr, col, dash) => {
+    g.strokeStyle = col; g.lineWidth = 1.4; g.setLineDash(dash || []); g.beginPath();
+    let px = -1, mn = 0, mx = 0;
+    for (let i = i0; i < N; i++) {
+      const x = Math.round(X(S[i][0])), v = arr(i);
+      if (x !== px) { if (px >= 0) { g.lineTo(px, Y(mn)); g.lineTo(px, Y(mx)); } else g.moveTo(x, Y(v)); px = x; mn = mx = v; }
+      else { mn = Math.min(mn, v); mx = Math.max(mx, v); }
+    }
+    g.lineTo(px, Y(mx)); g.stroke(); g.setLineDash([]);
+  };
+  line(i => S[i][1], loopCss("--accent"));
+  line(i => cur.out[i], loopCss("--claude"), [4, 3]);
+  g.strokeStyle = loopCss("--warn"); g.setLineDash([2, 4]); g.beginPath(); g.moveTo(pl, Y(cur.fire)); g.lineTo(w - pr, Y(cur.fire)); g.stroke(); g.setLineDash([]);
+  if (cur.fire < ymax) { g.fillStyle = loopCss("--warn"); g.fillText("fires at " + loopK(cur.fire), w - pr - 90, Y(cur.fire) - 4); }
+  for (const c of P.C) {
+    if (c[0] < S[i0][0]) continue;
+    const x = X(c[0]); g.fillStyle = c[3] === "manual" ? loopCss("--codex") : loopCss("--mut");
+    g.beginPath(); g.moveTo(x - 4, pt - 10); g.lineTo(x + 4, pt - 10); g.lineTo(x, pt - 3); g.fill();
+  }
+}
+
+function loopT(s) {
+  const d = new Date((LOOP.P.t0 + s) * 1000);
+  return d.toISOString().slice(5, 16).replace("T", " ") + "Z";
+}
+
+function loopTip(e) {
+  const v = LOOP.view, P = LOOP.P, tip = $("#looptip");
+  if (!v || !P || !tip) return;
+  const r = e.target.getBoundingClientRect(), x = e.clientX - r.left, S = P.S;
+  let lo = v.i0, hi = P.N - 1;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (v.X(S[m][0]) < x) lo = m + 1; else hi = m; }
+  const s = S[lo], near = P.C.find(c => Math.abs(v.X(c[0]) - x) < 5);
+  tip.hidden = false;
+  tip.innerHTML = esc(loopT(s[0])) + '<br>actual ' + loopK(s[1]) + ' · replayed ' + loopK(LOOP.cur.out[lo])
+    + (near ? '<br>compaction (' + esc(near[3]) + '): ' + loopK(near[1]) + ' → ' + loopK(near[2]) : '');
+  tip.style.left = Math.min(x + 12, r.width - 200) + "px"; tip.style.top = "10px";
+}
+
+function loopDrawSweep() {
+  const P = LOOP.P, st = LOOP.st, key = P.R + "/" + st.F + "/" + st.G;
+  if (!LOOP.sweep || LOOP.sweep.key !== key) {
+    const pts = [];
+    for (let W = 120000; W <= 1000000; W += 20000) { const s = loopSim(P, W, P.R, st.F, st.G); pts.push([W, s.raw, s.pr, s.n]); }
+    LOOP.sweep = {key, pts};
+  }
+  const pts = LOOP.sweep.pts, cv = $("#loopsw");
+  if (!cv) return;
+  const [g, w, h] = loopCanvas(cv), pl = 44, pr = 36, pt = 10, pb = 22;
+  const base = pts[pts.length - 1], cost = p => (st.unit === "raw" ? p[1] / base[1] : p[2] / base[2]);
+  const cmax = Math.max(...pts.map(cost)) * 1.1, nmax = 40;
+  const X = W => pl + (W - 120000) / 880000 * (w - pl - pr), Y1 = v => pt + (1 - v / cmax) * (h - pt - pb), Y2 = v => pt + (1 - v / nmax) * (h - pt - pb);
+  g.font = "11px " + loopCss("--mono"); g.strokeStyle = loopCss("--line"); g.fillStyle = loopCss("--mut");
+  for (const W of [200000, 400000, 600000, 800000, 1000000]) g.fillText(loopK(W), X(W) - 12, h - 6);
+  for (let k = 0; k <= 4; k++) {
+    const v = cmax * k / 4; g.beginPath(); g.moveTo(pl, Y1(v)); g.lineTo(w - pr, Y1(v)); g.stroke();
+    g.fillText(v.toFixed(1) + "×", 4, Y1(v) + 4); g.fillText((nmax * k / 4).toFixed(0), w - pr + 4, Y1(v) + 4);
+  }
+  const pl2 = (f, Y, col) => { g.strokeStyle = col; g.lineWidth = 1.6; g.beginPath(); pts.forEach((p, i) => { const y = Y(f(p)); i ? g.lineTo(X(p[0]), y) : g.moveTo(X(p[0]), y); }); g.stroke(); };
+  g.save(); g.beginPath(); g.rect(pl, pt, w - pl - pr, h - pt - pb); g.clip();
+  pl2(p => p[3] / P.span, Y2, loopCss("--claude")); pl2(cost, Y1, loopCss("--accent")); g.restore();
+  g.strokeStyle = loopCss("--warn"); g.setLineDash([3, 3]); g.beginPath(); g.moveTo(X(st.W), pt); g.lineTo(X(st.W), h - pb); g.stroke(); g.setLineDash([]);
+  g.fillStyle = loopCss("--warn"); g.fillText("you: " + loopK(st.W), Math.min(X(st.W) + 4, w - pr - 60), pt + 10);
+}
+
+/* THE COMPARISON AND THE BEST-WINDOW FINDER, as the standalone page computes
+   them: the 1M row is the reference (fired at 76%, which is what 1M measured),
+   and the best window is the cheapest priced one that stays under the
+   owner's compactions-per-day limit. */
+function loopBest(P, st) {
+  let best = null;
+  for (let W = 160000; W <= 1000000; W += 10000) {
+    const s = loopSim(P, W, P.R, st.F, st.G);
+    if (!s.clamped && s.n / P.span <= st.M && (!best || s.pr < best.s.pr)) best = {W, s};
+  }
+  return best;
+}
+
+/* "N% less than 1M" or "N% more than 1M": a cost above the reference is
+   never printed as a negative saving. */
+function loopVs(x, ref) {
+  const pct = Math.round((1 - x / ref) * 100);
+  if (pct === 0) return 'the same as 1M';
+  return Math.abs(pct) + '% ' + (x < ref ? 'less' : 'more') + ' than 1M';
+}
+
+function loopTable() {
+  const P = LOOP.P, st = LOOP.st, cur = LOOP.cur;
+  const pick = o => st.unit === "raw" ? o.raw : o.pr;
+  const ref = loopSim(P, 1000000, 76, st.F, st.G), act = loopActual(P);
+  const best = loopBest(P, st);
+  const bh = $("#loopbest");
+  if (bh) {
+    bh.innerHTML = best ? '<b>Best window for your limit (' + st.M + '/day), priced:</b> ' + loopK(best.W)
+      + ', firing near ' + loopK(best.s.fire) + '. That re-sends ' + loopVs(best.s.pr, ref.pr)
+      + ', at ' + (best.s.n / P.span).toFixed(1) + ' compactions a day. '
+      + '<button type="button" class="chip" id="loopuse">try it on the knobs</button>'
+      : 'No window under 1M stays under that limit.';
+    const u = $("#loopuse");
+    if (u) u.onclick = () => { LOOP.st.W = best.W; const k = $("#loopkW"); if (k) k.value = best.W; loopDraw(); };
+  }
+  const rows = [["What actually ran", pick(act), P.C.length, act.mean, null, null],
+    ["Replayed at 1M", pick(ref), ref.n, ref.mean, ref.fire - st.F, ref.share],
+    ["Replayed at your knobs", pick(cur), cur.n, cur.mean, cur.fire - st.F, cur.share]];
+  const t = $("#loopcmp");
+  if (!t) return;
+  /* a cost that rounds to the same as 1M can still compact more often: the
+     ratio is dropped only when it says nothing either (equal counts, or a
+     ratio that rounds to 1.0). When 1M never compacts there is no ratio: the
+     knobs' count is said outright, and nothing is said when neither compacts. */
+  const vs = loopVs(pick(cur), pick(ref)), ratio = (cur.n / Math.max(ref.n, 1)).toFixed(1);
+  const sameN = cur.n === ref.n || ratio === "1.0";
+  const more = !ref.n ? (cur.n ? ', with ' + cur.n + (cur.n === 1 ? ' compaction' : ' compactions') + ' where 1M has none' : '')
+    : sameN && vs === "the same as 1M" ? '' : ', with ' + ratio + '× the compactions';
+  t.innerHTML = '<thead><tr><th></th><th>' + (st.unit === "raw" ? "tokens re-sent" : "priced units")
+    + '</th><th>compactions / day</th><th>mean per request</th><th>working room</th><th>summary share</th></tr></thead><tbody>'
+    + rows.map((r, i) => '<tr><td>' + r[0] + '</td><td class="n' + (i === 2 ? (r[1] < rows[1][1] ? ' good' : ' bad') : '') + '">' + loopK(r[1])
+      + '</td><td class="n">' + (r[2] / P.span).toFixed(1) + '</td><td class="n">' + loopK(r[3]) + '</td><td class="n">'
+      + (r[4] == null ? '—' : loopK(r[4])) + '</td><td class="n">' + (r[5] == null ? '—' : Math.round(r[5] * 100) + '%') + '</td></tr>').join("")
+    + '<tr><td colspan="6" class="loopfoot">At your knobs: ' + vs + more + '.</td></tr></tbody>';
+}
+
+/* The console's theme toggle sets data-theme and fires nothing, so the canvas
+   (which reads the colour tokens when it draws) redraws on the attribute. */
+new MutationObserver(() => { if (LOOP.P && $("#loopc")) loopDraw(); })
+  .observe(document.documentElement, {attributes: true, attributeFilter: ["data-theme"]});
+addEventListener("resize", () => { if (LOOP.P && $("#loopc")) loopDraw(); });

@@ -194,6 +194,10 @@ CHAIN_ABSENT = "no-home-refresh-token"
 # same absent field, and should: it refuses a LAUNCH, where an unproven chain
 # bricks a live session's successor. Here the blast radius is a sentence.)
 REFRESHABLE_CHAINS = (CHAIN_LIVE, CHAIN_UNPROVEN)
+# The `source` a cred row names when Orca's copy, or Orca's own measurement,
+# was read (livecred's spellings; the rest are "credhome" and "default").
+_ORCA = "orca"
+_ORCA_READING = "orca-reading"
 
 
 def refresh_chain(oauth, now=None):
@@ -278,10 +282,11 @@ def _token_live(oauth):
         exp is not None and exp / 1000 < time.time())
 
 
-def _orca_refill_status(home_path):
-    """The sync sentence for a credhome whose own copy holds no access token
-    while Orca holds a fresher copy of the same account, or None. Never
-    raises: a status sentence may not be taken down by Orca's store."""
+def _orca_refill_status(home_path, mine="holds no access token"):
+    """The sync sentence for a credhome whose own copy is dead (`mine` says
+    how) while Orca holds a fresher copy of the same account and the home's
+    own chain is proven spent, or None. Never raises: a status sentence may
+    not be taken down by Orca's store."""
     try:
         from .cred import orca
         fresh = orca.freshness(home_path)
@@ -289,10 +294,10 @@ def _orca_refill_status(home_path):
             return None
     except Exception:                      # noqa: BLE001 — a clause never raises
         return None
-    return ("sync due (helm's copy holds no access token; Orca holds a fresher "
-            "copy of this account, %s) — `helm cred sync-orca --home %s --apply` "
-            "refills it, no login needed"
-            % (fresh.get("chain") or "home chain spent",
+    return ("sync due (helm's copy %s; Orca holds a fresher copy of this "
+            "account, %s) — `helm cred sync-orca --home %s --apply` refills "
+            "it, no login needed"
+            % (mine, fresh.get("chain") or "home chain spent",
                os.path.basename(home_path)))
 
 
@@ -479,7 +484,13 @@ class NativeQuotaProvider:
         when a directory name lies."""
         from . import cred
         oa = (_read_json(os.path.join(home, ".claude.json")) or {}).get("oauthAccount") or {}
-        email = cred.account_of(home)["email"]
+        return cred.account_of(home)["email"], NativeQuotaProvider._tier(oa)
+
+    @staticmethod
+    def _tier(oa):
+        """The human plan tier an oauthAccount block (a home's .claude.json,
+        or Orca's oauth-account.json, which has the same shape) names."""
+        oa = oa if isinstance(oa, dict) else {}
         org = oa.get("organizationType") or ""
         rl = oa.get("organizationRateLimitTier") or oa.get("userRateLimitTier") or ""
         if org == "claude_team" or (oa.get("seatTier") or "").startswith("team"):
@@ -496,7 +507,7 @@ class NativeQuotaProvider:
             tier = "Enterprise"
         else:
             tier = None
-        return email, tier
+        return tier
 
     def accounts(self):
         active = self._active_homes()
@@ -505,7 +516,8 @@ class NativeQuotaProvider:
         def add(name, provider, home, tier=None, usable=False, email=None,
                 login_unknown=None):
             if name in names:  # two distinct homes, same identity — keep both, unambiguous
-                name = f"{name}#{os.path.basename(home)}"
+                # an account only Orca holds has no home to name it by
+                name = f"{name}#{os.path.basename(home) if home else 'orca'}"
             names.add(name)
             rows.append({"name": name, "provider": provider, "home": home,
                          "active": home in active, "tier": tier,
@@ -549,7 +561,31 @@ class NativeQuotaProvider:
                 email = None if why else _jwt_email(tokens["id_token"])
             add(name, provider, real, tier, usable=True, email=email,
                 login_unknown=why)
+        # EVERY CLAUDE ACCOUNT ORCA KEEPS IS AN ACCOUNT THE FLEET DRAWS ON
+        # (task/2283). Orca's baseline account had no helm home and read
+        # "declared, not measured". It is listed, measured through Orca's
+        # copy by cred_state, and never usable: no helm home holds it, and
+        # helm never launches a seat on Orca's own dir (a second refresher
+        # on Orca's chain), so allocate and launch_cmd pass it by.
+        held = {(r.get("email") or "").casefold() for r in rows
+                if r["provider"] == "anthropic"}
+        for o in self._orca_accounts():
+            if o["email"].casefold() in held:
+                continue
+            add(o["email"], "anthropic", None, self._tier(o["oauth_account"]),
+                usable=False, email=o["email"])
+            rows[-1]["source"] = "orca"
         return rows
+
+    @staticmethod
+    def _orca_accounts():
+        """livecred.orca_accounts(), or [] — Orca's store never takes the
+        census down."""
+        try:
+            from . import livecred
+            return livecred.orca_accounts()
+        except Exception:                  # noqa: BLE001 — a census never raises
+            return []
 
     # -- usage probing -------------------------------------------------------
 
@@ -686,34 +722,41 @@ class NativeQuotaProvider:
                     _expires_ms(oauth) or 0)
         return max(members, key=rank)
 
+    def _row_pair(self, acct, state, status, gauges=(), tier=None, note=None,
+                  source_at=None, binding=None, windows=None):
+        """(cred_state row, history row) for one account's reading."""
+        gauges = list(gauges)
+        # THE BINDING GAUGE IS THE CALLER'S WHEN IT HANDS ONE OVER.
+        # `_primary` prefers the account-wide SESSION window, which is
+        # right for anthropic and was exactly the codex weekly-pacing bug
+        # (task/2480): a 7d window at 100% sitting under a 5h window at
+        # 52% reported 48% headroom, and the fleet kept routing into a
+        # wall. codex now hands the FULLEST account-wide gauge.
+        primary = binding or self._primary(gauges)
+        cred = {"account": acct["name"], "provider": acct["provider"], "cred_state": state,
+                "headroom_pct": self._headroom(primary),
+                "status": status,
+                "resets_at_ms": primary["reset"] * 1000 if primary and primary["reset"] else None,
+                "tier": tier or acct.get("tier"), "home": acct["home"], "source_at": source_at}
+        if note:
+            cred["note"] = note
+        if windows:
+            # EVERY WINDOW, not just the binding one. The owner could not
+            # see the weekly filling because the row carried one number.
+            cred["windows"] = list(windows)
+        hist = {"provider": acct["provider"], "account": acct["name"], "probed_at": _iso_z(),
+                "status": status, "primary": primary["label"] if primary else None,
+                "gauges": gauges, "source_at": None,
+                # THE PLAN, so the pace reader knows the watcher's switch
+                # pool (Max accounts only) from the history alone.
+                "tier": cred["tier"]}
+        return cred, hist
+
     def _probe_one(self, acct):
         """-> (cred_state row, history row). Never raises; failure degrades the row."""
 
-        def rows(state, status, gauges=(), tier=None, note=None, source_at=None,
-                 binding=None, windows=None):
-            gauges = list(gauges)
-            # THE BINDING GAUGE IS THE CALLER'S WHEN IT HANDS ONE OVER.
-            # `_primary` prefers the account-wide SESSION window, which is
-            # right for anthropic and was exactly the codex weekly-pacing bug
-            # (task/2480): a 7d window at 100% sitting under a 5h window at
-            # 52% reported 48% headroom, and the fleet kept routing into a
-            # wall. codex now hands the FULLEST account-wide gauge.
-            primary = binding or self._primary(gauges)
-            cred = {"account": acct["name"], "provider": acct["provider"], "cred_state": state,
-                    "headroom_pct": self._headroom(primary),
-                    "status": status,
-                    "resets_at_ms": primary["reset"] * 1000 if primary and primary["reset"] else None,
-                    "tier": tier or acct.get("tier"), "home": acct["home"], "source_at": source_at}
-            if note:
-                cred["note"] = note
-            if windows:
-                # EVERY WINDOW, not just the binding one. The owner could not
-                # see the weekly filling because the row carried one number.
-                cred["windows"] = list(windows)
-            hist = {"provider": acct["provider"], "account": acct["name"], "probed_at": _iso_z(),
-                    "status": status, "primary": primary["label"] if primary else None,
-                    "gauges": gauges, "source_at": None}
-            return cred, hist
+        def rows(*args, **kw):
+            return self._row_pair(acct, *args, **kw)
 
         if acct["provider"] == "anthropic":
             oauth = _claude_oauth(acct["home"])
@@ -767,6 +810,13 @@ class NativeQuotaProvider:
             # expiresAt is a number in the past.
             if not _token_live(oauth):
                 dead_s = time.time() - _expires_ms(oauth) / 1000
+                # A HOME ORCA CAN REFILL OWES NO LOGIN: its own chain is
+                # proven spent (keepalive's recorded refusals among the
+                # proofs) and Orca holds the account's fresher copy.
+                refill = _orca_refill_status(
+                    acct["home"], "token expired %s ago" % _ago(dead_s))
+                if refill:
+                    return rows("due-refresh", refill)
                 chain = refresh_chain(oauth)
                 # THE SENTENCE NEVER CONTRADICTS KEEPALIVE'S OWN LAST DECISION.
                 # The chain is read from the file alone; keepalive also asked
@@ -936,20 +986,77 @@ class NativeQuotaProvider:
         # calls and trip the endpoint's rate limit (observed http_429).
         groups = {}
         for a in self.accounts():
-            if a["usable"]:
+            # An account only Orca holds is MEASURED here though it is not
+            # usable for a launch (accounts()): it has no helm home, so its
+            # read is Orca's copy below.
+            if a["usable"] or a.get("source") == "orca":
                 groups.setdefault((a["provider"], a.get("email") or a["name"]), []).append(a)
         if not groups:
             return []
         members = list(groups.values())
-        reads = [self._best_copy(g) for g in members]
+        # THE ACCOUNT IS READ THROUGH A LIVE COPY OF IT, AND ORCA'S IS ONE
+        # (task/2283). Orca refreshes its managed copy of every account it
+        # keeps; helm's homes are refreshed only while a seat runs in them or
+        # keepalive grants on their own chain. When no helm home holds a live
+        # copy, Orca's copy is read instead, so an account is never read
+        # "due-refresh" through a helm copy nobody maintains while Orca holds
+        # it live. A live helm home still reads first: its row then carries
+        # the account, exactly as before. Orca's copy is READ: its access
+        # token goes to one GET, nothing refreshes or writes it.
+        # AN ACCOUNT HELM HOLDS meets Orca's copy by identity (email, and the
+        # organization and account uuids wherever both sides carry them);
+        # an account ONLY Orca holds is Orca's own listing.
+        only_orca = {o["email"].casefold(): o for o in (
+            self._orca_accounts() if any(
+                a.get("source") == "orca" for g in members for a in g) else [])}
+        reads, orca_of = [], []
+        for g in members:
+            cands = [a for a in g if a.get("home")]
+            o = None
+            if g[0]["provider"] == "anthropic":
+                o = self._orca_copy_for(g[0].get("email"), [a["home"] for a in cands]) \
+                    if cands else only_orca.get((g[0].get("email") or "").casefold())
+            orca_cand = [{
+                "name": g[0]["name"], "provider": "anthropic",
+                "home": o["path"], "email": o["email"],
+                "tier": g[0].get("tier"), "source": _ORCA}] if o else []
+            all_cands = cands + orca_cand
+            best = self._best_copy(all_cands) if all_cands else None
+            reads.append(best)
+            orca_of.append(o)
+        # NO LIVE COPY OF AN ACCOUNT ORCA KEEPS: Orca's own last measurement
+        # stands in (asked once per cycle, and only when needed; it is answered
+        # from Orca's memory with no provider call and no refresh).
+        # A GROUP WITH NO COPY AT ALL: an account only Orca holds whose copy
+        # was gone by the time it was looked for. It is a row, not a raise.
+        unread = {i for i, read in enumerate(reads) if read is None}
+        from_orca = {i for i, (read, o) in enumerate(zip(reads, orca_of))
+                     if read and o and not _token_live(_claude_oauth(read["home"]))}
+        readings, reading_why = self._orca_readings() if from_orca else ({}, None)
         # STAGGERED probes, 2 lanes max: tonight's 429s came from bursting all
         # identities at the vendor simultaneously (two predecessor lanes compounding it).
         # A ~0.7s stagger per submit keeps a full roster under any sane rate limit
         # while still overlapping network waits.
         results = [None] * len(members)
+        for i in from_orca:
+            results[i] = self._orca_reading_rows(
+                members[i], reads[i], orca_of[i], readings, reading_why)
+        for i in unread:
+            g = members[i]
+            reads[i] = {"name": g[0]["name"], "provider": g[0]["provider"],
+                        "home": None, "tier": g[0].get("tier"), "source": _ORCA}
+            cred, _ = self._row_pair(
+                reads[i], "unknown", "no-live-copy",
+                note="no copy of %s could be read: Orca listed it and its copy "
+                     "was not found when it was looked for"
+                     % (g[0].get("email") or g[0]["name"]))
+            cred["source"] = _ORCA
+            results[i] = (cred, None)
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as ex:
             futs = {}
             for i, g in enumerate(members):
+                if i in from_orca or i in unread:
+                    continue
                 # THE IDENTITY IS READ THROUGH ITS BEST COPY, NOT ITS FIRST
                 # HOME. When two homes carry one account and the one that
                 # sorts first holds a blanked stub, probing it copied
@@ -962,6 +1069,8 @@ class NativeQuotaProvider:
                 results[futs[f]] = f.result()
         creds, hists = [], []
         for accts, read, (cred, hist) in zip(members, reads, results):
+            if read["provider"] == "anthropic":
+                cred.setdefault("source", self._source_of(read))
             # `due-refresh` and `expired-token` are deliberately OUTSIDE this
             # door: both are read off the home's own file, not off a vendor
             # reply, so there is no throttle to look through and no older
@@ -982,7 +1091,17 @@ class NativeQuotaProvider:
                     hist = None  # not a new observation; don't fake a history point
             if hist is not None:
                 hists.append(hist)
+            # THE ACCOUNT WAS READ THROUGH NO HOME OF THIS GROUP: Orca's copy,
+            # Orca's own measurement, or Orca's word that no copy is live. No
+            # member row would carry the account then, so each carries it and
+            # a dead home copy becomes that HOME's fact beside it.
+            account_read = cred.get("source") in (_ORCA, _ORCA_READING)
             for a in accts:
+                if not a.get("home"):
+                    # an account only Orca holds: its row IS the account's
+                    creds.append(dict(cred, account=a["name"], home=None,
+                                      tier=cred["tier"] or a.get("tier")))
+                    continue
                 # A SHARED READING NEVER VOUCHES FOR A HOME'S OWN DEAD COPY.
                 # The row is per HOME, and allocate() places seats by it: a
                 # stub that inherited its sibling's `ok` ranked ahead of the
@@ -993,15 +1112,48 @@ class NativeQuotaProvider:
                 # probe (both branches return before any vendor call). Its
                 # history row is dropped: the identity keeps one key, and
                 # this home may carry that very name.
+                # THE HOME'S OWN STATE IS SET WHENEVER THE READING DID NOT COME
+                # FROM THIS HOME: a sibling's copy, Orca's copy, or Orca's own
+                # measurement. A dead home can still RANK as the read (its
+                # token expired after Orca's dead copy did) while Orca's
+                # reading answers for the account; without this it inherited
+                # that `ok` and allocate() seated it.
                 own = _claude_oauth(a["home"]) if a["provider"] == "anthropic" else {}
-                if (a["home"] != read["home"] and a["provider"] == "anthropic"
+                if ((a["home"] != read["home"] or account_read)
+                        and a["provider"] == "anthropic"
                         and not _token_live(own)):
-                    row, _ = self._probe_one(a)
+                    mine_row, _ = self._probe_one(a)
+                    mine = ("has expired" if own.get("accessToken")
+                            else "holds no access token")
+                    via = ("Orca's copy" if read.get("source") == _ORCA
+                           else os.path.basename(read["home"]))
+                    if account_read:
+                        # THE ROW NAMES THE ACCOUNT, AND THE HOME'S OWN STATE
+                        # RIDES BESIDE IT (task/2283). The owner reads this
+                        # table as his accounts; a home copy nobody maintains
+                        # printed "due-refresh" as the account's state while
+                        # Orca held it live. `home_state` keeps the home's
+                        # fact, and allocate() blocks on it exactly as it
+                        # blocked on the state before.
+                        # The account's note stays the row's note; the
+                        # home's own sentence (its cure is the home's, never
+                        # the account's) rides as home_note.
+                        row = dict(cred, account=a["name"], home=a["home"],
+                                   tier=cred["tier"] or a.get("tier"),
+                                   home_state=mine_row["cred_state"],
+                                   home_status=mine_row["status"],
+                                   home_note="home %s cannot take a seat: its own "
+                                             "copy %s — %s"
+                                             % (os.path.basename(a["home"]), mine,
+                                                mine_row["status"]))
+                        if cred["cred_state"] in ("ok", "exhausted") \
+                                and cred.get("source") == _ORCA:
+                            row["note"] = "the account reads through Orca's copy"
+                        creds.append(row)
+                        continue
+                    row = mine_row
                     theirs = _claude_oauth(read["home"])
                     if theirs.get("accessToken"):
-                        mine = ("has expired" if own.get("accessToken")
-                                else "holds no access token")
-                        via = os.path.basename(read["home"])
                         # THE NOTE CLAIMS A READ-THROUGH ONLY WHEN THERE IS
                         # ONE. _best_copy ranks a live copy above every dead
                         # one, so a read copy that is not live means no copy
@@ -1023,6 +1175,73 @@ class NativeQuotaProvider:
         with self._lock:
             self._cred_cache = (time.monotonic(), creds)
         return [dict(r) for r in creds]
+
+    @staticmethod
+    def _source_of(read):
+        """Which kind of copy an anthropic reading went through."""
+        if read.get("source") == _ORCA:
+            return _ORCA
+        default = os.path.realpath(os.path.expanduser("~/.claude"))
+        return "default" if os.path.realpath(read["home"] or "") == default \
+            else "credhome"
+
+    @staticmethod
+    def _orca_readings():
+        """livecred.orca_readings(), or ({}, why) — never a raise."""
+        try:
+            from . import livecred
+            return livecred.orca_readings()
+        except Exception as e:             # noqa: BLE001 — a reading never raises
+            return {}, "Orca's readings could not be read (%s)" % type(e).__name__
+
+    @staticmethod
+    def _orca_copy_for(email, paths):
+        """livecred.orca_copy_for(), or None — never a raise."""
+        try:
+            from . import livecred
+            return livecred.orca_copy_for(email, paths) if email else None
+        except Exception:                  # noqa: BLE001 — a lookup never raises
+            return None
+
+    def _orca_reading_rows(self, group, read, held, readings, reading_why):
+        """(cred row, None) for an account Orca keeps and no copy of which is
+        live: Orca's own last measurement when it holds one, else an honest
+        `unknown` that names every dead copy and blames none on helm. No
+        history row: a reading Orca took earlier is not a new observation."""
+        from . import livecred
+        acct = dict(read, name=group[0]["name"])
+        email = group[0].get("email") or group[0]["name"]
+        dead = livecred.no_live_copy(email, [a["home"] for a in group
+                                             if a.get("home")], held)
+        tail = ("Orca refreshes its own copy when it next measures the account "
+                "(its accounts pane), and helm never refreshes Orca's chain")
+        r = readings.get(email.casefold())
+        if r and r.get("status") == "ok" and r.get("gauges"):
+            state, status = self._read_state(r["gauges"])
+            now = time.time()
+            # EVERY WINDOW ORCA MEASURED, in the shape the codex rows carry,
+            # so the weekly shows beside a 5h window that has since ended.
+            windows = [{"label": g["label"],
+                        "used_percent": round(self._util(g) * 100, 1),
+                        "reset_after_seconds": max(0, int(g["reset"] - now))
+                        if g.get("reset") else None}
+                       for g in r["gauges"] if self._util(g) is not None]
+            cred, _ = self._row_pair(
+                acct, state, status, r["gauges"], source_at=_iso_z(r["at"]),
+                windows=windows,
+                note="Orca's own reading, %s old: %s; %s"
+                     % (_ago(now - r["at"]), dead, tail))
+            cred["source"] = _ORCA_READING
+            return cred, None
+        why = ("Orca's last reading of it failed (%s)" % r["error"]
+               if r and r.get("error") else
+               "Orca holds no reading of it from the last %dh%s"
+               % (livecred.READING_MAX_AGE_S // 3600,
+                  " (%s)" % reading_why if reading_why else ""))
+        cred, _ = self._row_pair(acct, "unknown", "no-live-copy",
+                                 note="%s, and %s; %s" % (dead, why, tail))
+        cred["source"] = _ORCA
+        return cred, None
 
     # -- history persistence ---------------------------------------------------
 
@@ -1240,6 +1459,11 @@ class NativeQuotaProvider:
                 blocked.append("due-refresh")
             elif state in ("api-error", "expired-token"):
                 blocked.append(s.get("status") or state)
+            elif s.get("home_state") in ("due-refresh", "expired-token", "api-error"):
+                # THE ACCOUNT READS LIVE ELSEWHERE, THIS HOME DOES NOT: its own
+                # copy still opens a "Not logged in" pane (task/2283 moved the
+                # home's state beside the account's, not away from here).
+                blocked.append(s["home_state"])
             # codex "unknown" stays eligible: the CLI self-refreshes creds on launch
             out.append({"account": a["name"], "eligible": not blocked,
                         "headroom_pct": headroom, "tier": s.get("tier") or a.get("tier"),
@@ -1349,6 +1573,13 @@ class NativeQuotaProvider:
         if not acct:
             raise ProviderError(f"unknown account: {account}")
         if not acct["usable"]:
+            if acct.get("source") == "orca":
+                # Orca's own dir is Orca's chain: a seat launched there is a
+                # second refresher on it (task/2283)
+                raise ProviderError(
+                    f"{account} is held by Orca and by no helm home; helm never "
+                    "launches a seat on Orca's own copy (`helm homes prepare` "
+                    "makes a home for it)")
             raise ProviderError(f"{account} has no credentials in {acct['home']}")
         if acct["provider"] == "codex":
             return f"CODEX_HOME={shlex.quote(acct['home'])} codex resume {shlex.quote(sid)}"

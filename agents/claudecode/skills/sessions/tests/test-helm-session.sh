@@ -9,11 +9,13 @@ SUT="$REPO/scripts/helm-session.sh"
 fails=0
 tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
 
-# a fake cv: logs its args, fakes show (stable cwd) + port/convert (new id)
+# a fake cv: logs its args, fakes show (stable cwd) + port/convert (new id). It reports cv 0.10.0 unless
+# CV_STUB_VERSION names another release, so each grammar the wrapper speaks is driven.
 STUB="$tmp/cv"; cat > "$STUB" <<STUBEOF
 #!/usr/bin/env bash
 echo "\$@" >> "$tmp/cvlog"
 case "\$1" in
+  --version) echo "cv \${CV_STUB_VERSION:-0.10.0} (stub)" ;;
   show) echo '{"cwd":"/orig/cwd"}' ;;
   port|convert) echo "wrote /tmp/x/deadbeef.jsonl (deadbeef)" ;;
   export) echo "# exported" ;;
@@ -39,6 +41,22 @@ grep -qi 'original .* intact' "$tmp/err" || fail "apply must assert original-unt
 # 3. port-harness (convert) dry-run also uses --out
 rc="$(run port-harness sess123 --to codex)"
 grep -q '^convert sess123 .*--out' "$tmp/cvlog" || fail "port-harness dry-run must pass --out"
+
+grep -q '^show sess123 --json --range 0-0$' "$tmp/cvlog" || fail "cv 0.10: the cwd read spells its window 0-0"
+
+# 3b. cv 0.11+ grammar (cv 0.13): port takes --cwd/--harness, convert is folded into port --harness, and
+#     a window is A..B — every old spelling exits 2 on that cv.
+export CV_STUB_VERSION=0.13.0
+rc="$(run rehome sess123 --to-dir /new/cwd)"
+[ "$rc" = 0 ] || fail "cv 0.13 dry-run rehome should exit 0 (got $rc)"
+grep -q '^port sess123 --cwd /new/cwd --out' "$tmp/cvlog" || fail "cv 0.13: rehome must port with --cwd and --out"
+if grep -q -- '--to-dir' "$tmp/cvlog"; then fail "cv 0.13: --to-dir is not a 0.13 port flag"; fi
+grep -q '^show sess123 --json --range 0\.\.0$' "$tmp/cvlog" || fail "cv 0.13: the cwd read spells its window 0..0"
+rc="$(run port-harness sess123 --to codex --cwd /c)"
+[ "$rc" = 0 ] || fail "cv 0.13 port-harness should exit 0 (got $rc)"
+grep -q '^port sess123 --cwd /c --harness codex --out' "$tmp/cvlog" || fail "cv 0.13: port-harness must be port --harness"
+if grep -q '^convert' "$tmp/cvlog"; then fail "cv 0.13 has no convert"; fi
+unset CV_STUB_VERSION
 
 # 4. arg validation (no cv needed)
 val() { HELM_SESSION_CV_BIN="$STUB" "$SUT" "$@" >/dev/null 2>&1; echo $?; }
@@ -86,8 +104,9 @@ RSTUB="$tmp/cvr"; cat > "$RSTUB" <<'RS'
 verb="$1"; shift
 echo "$verb $*" >> "$HELM_SESSION_CVLOG"
 todir=""; out=""
-while [ $# -gt 0 ]; do case "$1" in --to-dir) todir="$2"; shift 2;; --out) out="$2"; shift 2;; *) shift;; esac; done
+while [ $# -gt 0 ]; do case "$1" in --to-dir|--cwd) todir="$2"; shift 2;; --out) out="$2"; shift 2;; *) shift;; esac; done
 case "$verb" in
+  --version) echo "cv ${CV_STUB_VERSION:-0.10.0} (stub)" ;;
   show) echo '{"cwd":"/orig/cwd"}' ;;
   port)
     slug="$(printf '%s' "$todir" | sed 's#[/.]#-#g')"
@@ -125,6 +144,11 @@ rc="$(rrun resurrect sess123 --project-dir "$WTREE")"
 [ "$rc" = 0 ] || fail "resurrect dry-run into a worktree -> exit 0 (got $rc)"
 grep -q '^port sess123 .*--to-dir '"$WTREE"'.*--out' "$tmp/cvlog" || fail "resurrect dry-run must cv-port into the worktree with --out"
 [ ! -e "$WTREE/.remember" ] || fail "resurrect dry-run must NOT create .remember (apply-only)"
+export CV_STUB_VERSION=0.13.0
+rc="$(rrun resurrect sess123 --project-dir "$WTREE")"
+[ "$rc" = 0 ] || fail "cv 0.13 resurrect dry-run into a worktree -> exit 0 (got $rc)"
+grep -q '^port sess123 --cwd '"$WTREE"'.*--out' "$tmp/cvlog" || fail "cv 0.13: resurrect must cv-port with --cwd"
+unset CV_STUB_VERSION
 rc="$(rrun resurrect sess123 --project-dir "$WTREE" --apply)"
 [ "$rc" = 0 ] || fail "resurrect --apply into a clean worktree -> exit 0 (got $rc)"
 [ -d "$WTREE/.remember" ] || fail "resurrect --apply must pre-create .remember (mv-steal defuse)"

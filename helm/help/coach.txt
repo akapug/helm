@@ -1,0 +1,1 @@
+coach <lesson...> [--apply] [--as L] [--id ID] [--project P] [--supersede OLD] [--json] — the capture front door (the lesson may also pipe on stdin when no lesson argv is given). Runs the 4-step GATE (reframe->place->search-first->simplify) to place the lesson; propose-only unless --apply (low-confidence -> drain intake, lossless)

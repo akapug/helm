@@ -23,6 +23,9 @@ from helm import dispatches, seats
 from tests import test_dispatches as td
 
 
+_ENV_KEYS = ("HELM_CHAT_NAME",)  # DispatchBase.tearDown restores it; satisfies test_env_hygiene
+
+
 class BriefTravelsWholeByReferenceTest(td.DispatchBase):
     """THE ROW IS BOUNDED; THE BRIEF IS WHOLE. Two facts, two places.
 
@@ -106,11 +109,8 @@ class BriefTravelsWholeByReferenceTest(td.DispatchBase):
         super().setUp()
         for seat_name in ("source-seat", "target-seat"):
             seats.write_roster(seat_name, presence_beat=False)
-        # RESTORED HERE AND NOT ONLY BY THE BASE CLASS. `DispatchBase.tearDown`
-        # does put every ENV_KEY back, but `tests/test_env_hygiene.py` reads
-        # the MODULE, statically, and cannot follow a cross-module base class —
-        # so the module that sets a var registers its own removal.
-        self.addCleanup(os.environ.pop, "HELM_CHAT_NAME", None)
+        # DispatchBase.tearDown puts every ENV_KEY back, including HELM_CHAT_NAME.
+        # An addCleanup here popped after tearDown and deleted the caller's value.
         os.environ["HELM_CHAT_NAME"] = "author-seat"
 
     def _plant(self, row):
@@ -296,7 +296,8 @@ class BriefTravelsWholeByReferenceTest(td.DispatchBase):
         with dispatch_home(self.repo):
             ok, why, _sent = dispatches.send(
                 "source-seat", "ceiling-lane-ok", under, self.a,
-                repo=self.repo, sign=False, new_work=True)
+                repo=self.repo, sign=False, new_work=True,
+                task=self.review_task["id"])
         self.assertIsNone(why, why)
         whole, _why, problem = dispatches.brief_of(dispatches.rows()[ok["id"]])
         self.assertIsNone(problem, problem)
@@ -314,7 +315,8 @@ class BriefTravelsWholeByReferenceTest(td.DispatchBase):
                 rc = dispatches.cmd_dispatch(
                     ["send", "source-seat", "size-lane-%s" % expect_over,
                      brief, "--ref", self.a, "--kind", "review",
-                     "--new-work", "--repo", self.repo])
+                     "--new-work", "--repo", self.repo,
+                     "--task", self.review_task["id"], "--part"])
             self.assertEqual(rc, 0, err.getvalue())
             text = out.getvalue()
             self.assertIn("brief %d bytes" % len(brief.encode("utf-8")), text,
@@ -405,7 +407,7 @@ class BriefTravelsWholeByReferenceTest(td.DispatchBase):
                                   return_value=(None, "killed here", False)):
             row, why, _sent = dispatches.send(
                 "source-seat", "order-lane", brief, self.a, repo=self.repo,
-                sign=False, new_work=True)
+                sign=False, new_work=True, task=self.review_task["id"])
         self.assertIsNone(row)
         self.assertEqual(why, "killed here")
         self.assertTrue(os.path.exists(dispatches.brief_file_path(digest)),

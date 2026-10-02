@@ -1,0 +1,1 @@
+saguide [--hook-json|--show] — the SubagentStart initial-physics seam: the ONE canonical block CONFIGURED for a fresh subagent (arrival unobserved) (hookEventName minted as SubagentStart, never inherited); --show prints the long form that block points at, for the guide/help

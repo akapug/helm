@@ -180,9 +180,9 @@ def patch_note(row):
     if not isinstance(row, dict) or not dispatches._FULL_TIP.fullmatch(tip):
         return None
     return ("  REVIEWER PATCH %s by @%s — a committed cure off the reviewed "
-            "tip; rebase the lane onto it or cherry-pick it, and credit both "
-            "authors" % (tip[:12],
-                         row.get("patch_author") or row.get("recipient") or "?"))
+            "tip; merge that exact tip into a new composition commit, keeping "
+            "both reviewed shas reachable, and credit both authors" % (
+                tip[:12], row.get("patch_author") or row.get("recipient") or "?"))
 
 
 UNPLACEABLE_SCOPE_CLASSES = ("origin_unknown", "project_unresolved")
@@ -203,6 +203,21 @@ def _unplaceable_classes(scope_project):
     A row with NO repository at all is unplaceable either way, because absence
     of a repository is not evidence of the reader's."""
     return UNPLACEABLE_SCOPE_CLASSES if scope_project else ("origin_unknown",)
+
+
+def _holdings_set_aside(rows, owed_ids):
+    """The part of a `--to SEAT` listing's rows that `--open` sets aside and
+    `helm seat reassign` counts as holdings, by kind (task/3881)."""
+    from . import query
+    held = sum(1 for r in rows if r.get("id") not in owed_ids
+               and query.query_is_held(r))
+    carried = sum(1 for r in rows if r.get("id") not in owed_ids
+                  and not query.query_is_held(r) and dispatches._open(r))
+    parts = [text for n, text in ((held, "%d held" % held),
+                                  (carried, "%d carried by a successor"
+                                   % carried)) if n]
+    return ("; of this seat's holdings it sets aside %s (`helm seat "
+            "reassign` counts both)" % " and ".join(parts)) if parts else ""
 
 
 def _scope_class(scope_repo, scope_project):
@@ -475,6 +490,19 @@ def _hold_holder_nudge(row):
             "read — %s." % (rid12, lane, rehold["why"]),
             "%s: SOURCE-CLEAN at %s — no land can close this hold; re-hold it"
             % (lane, str(tip)[:12]))
+    # A CAR AUTO-LAND TAKES BY ITSELF WAKES NOBODY (task/4215). With the
+    # switch ON, `helm train auto` composes, gates, lands and folds every car
+    # its planner admits, so a DM naming the land as the integrator's move
+    # cost a wake turn for a move nobody had to make (~15 a day, measured).
+    # Such a hold is said once as a retained, non-waking row in auto-land's
+    # room instead. When the switch is OFF the DM is today's; when it is ON
+    # and the planner turns the car away, the DM names the planner's reason,
+    # because then the integrator really must act.
+    car, excluded = _auto_land_admission(row)
+    if car:
+        return _auto_land_notice(row, car)
+    stays = (" AUTO-LAND IS ON BUT WILL NOT TAKE THIS CAR: %s." % excluded
+             if excluded else "")
     return dispatches._nudge(
         dispatches._default_lander(),
         "SOURCE-CLEAN HOLD on %s (%s) — @%s read the delta and found nothing, "
@@ -483,9 +511,46 @@ def _hold_holder_nudge(row):
         "whole-suite gate, then `helm lr foldcheck <head> --gate gate:<id> "
         "--apply`, naming a verified whole-suite receipt on a commit "
         "containing the tip, closes this row (--reason source-clean-landed) — "
-        "no approve is needed." % (rid12, lane, reviewer, str(tip)[:12]),
+        "no approve is needed.%s" % (rid12, lane, reviewer, str(tip)[:12],
+                                     stays),
         "%s: SOURCE-CLEAN at %s — review complete, awaiting your whole-suite "
-        "gate" % (lane, str(tip)[:12]))
+        "gate%s" % (lane, str(tip)[:12],
+                    " (auto-land will not take it)" if excluded else ""))
+
+
+def _auto_land_admission(row):
+    """(car, excluded) for a source-clean hold, asked of auto-land and the
+    train planner, never re-derived: `car` is the tip `helm train auto` will
+    take by itself (the switch is ON and `landwindow.car_admission` admits
+    it); `excluded` is the planner's reason it will not, with the switch ON.
+    (None, None) when the switch is OFF or anything cannot be read: the hold
+    then wakes its integrator exactly as before. Never raises."""
+    try:
+        from . import autoland, landwindow
+        root, car, why = landwindow.car_admission(row["id"])
+        if root is None or autoland.off_reason(root):
+            return None, None
+        return (car, None) if car else (None, why)
+    except Exception:                                   # noqa: BLE001
+        return None, None
+
+
+def _auto_land_notice(row, tip):
+    """Say a hold auto-land will land as a RETAINED, NON-WAKING row in
+    auto-land's room -> False (no DM was sent). `ambient` is the chat class
+    for a line a reader pulls and no seat is woken by. It is signed as every
+    `dispatches` row is (machine_senders). Never raises."""
+    from . import autoland, chat
+    text = ("SOURCE-CLEAN HOLD on %s (%s) at %s: FYI, nothing to do. "
+            "Auto-land is ON and its planner admits this car, so `helm train "
+            "auto` composes, gates and lands it, and its fold closes the row "
+            "source-clean-landed." % (row["id"][:12], row.get("lane") or "?",
+                                      str(tip)[:12]))  # noqa: SILENT_CAP — short ids for the reader, as every hold line prints them
+    try:
+        chat.post(text, room=autoland.ROOM, who="dispatches", ambient=True)
+    except Exception:                                   # noqa: BLE001
+        pass                  # a notice must never block the hold it reports
+    return False
 
 
 def _rc(why):
@@ -554,9 +619,13 @@ def send_names(verb):
     and by the corrected send line (task/3382 F3), so the two can never
     disagree about which word of an argv is an option."""
     names = {"--ref", "--note", "--deadline", "--repo", "--kind",
-             "--supersedes"}
+             "--supersedes", "--review-mode"}
     # THE TASK A NEW CHAIN SERVES (task/3643): recorded on its first row.
     names.add("--task")
+    # --part is the new counterpart of --whole (task/3938): a chain naming a
+    # task must pick exactly one path to that task's ask, and the one that
+    # does not is the other flag, never both and never neither.
+    names.add("--part")
     names.add("--posture-na")
     names.add("--read-only-because")
     names.add("--no-owner-surface-because")
@@ -570,6 +639,9 @@ def send_names(verb):
     # THE PATCHES A SUPERSEDING REF DECLINES BY NAME, and the recorded reason
     # (task/3288, dispatches._undelivered_patch).
     names.add(dispatches.DECLINE_PATCH_FLAG)
+    # THE REASONS A FIRST ROW GOES AHEAD OF A BIGGER LEVER OR OF STARTED
+    # WORK SITTING UNLANDED (task/3821).
+    names.update(("--because", "--start-anyway"))
     if verb == "send":
         names.add("--key")
     return names
@@ -587,7 +659,10 @@ def _parse_send(rest, names=None, lenient=False):
     partition: never a second grammar.
     """
     names = send_names("send") if names is None else names
-    bare = {"--new-work", "--force"}
+    # --part (task/3938) is a bare flag beside --whole and --force; like them
+    # it is authority over which path a chain's task takes and only the trailing
+    # option block may carry it, not an earlier token in the prose.
+    bare = {"--new-work", "--force", "--whole", "--part"}
     cut = len(rest)
     while cut:
         if rest[cut - 1] in bare:
@@ -599,14 +674,69 @@ def _parse_send(rest, names=None, lenient=False):
             continue
         break
     force_at = {i for i in range(cut, len(rest)) if rest[i] == "--force"}
+    # `--whole` (task/3746) is authority over the task's close, so like
+    # `--force` only the trailing option block may carry it; `--part` is the
+    # new counterpart (task/3938) and obeys the same rule.
+    whole_at = {i for i in range(cut, len(rest)) if rest[i] == "--whole"}
+    part_at = {i for i in range(cut, len(rest)) if rest[i] == "--part"}
     flags = {"--new-work"} if "--new-work" in rest else set()
     if force_at:
         flags.add("--force")
+    if whole_at:
+        flags.add("--whole")
+    if part_at:
+        flags.add("--part")
     parsed = [a for i, a in enumerate(rest)
-              if a != "--new-work" and i not in force_at]
-    pos, opts, err = dispatches._parse(parsed, names, positional_flags=("--force",),
+              if a != "--new-work" and i not in force_at | whole_at | part_at]
+    pos, opts, err = dispatches._parse(parsed, names,
+                                       positional_flags=("--force", "--whole",
+                                                         "--part"),
                                        lenient=lenient)
     return pos, opts, flags, err
+
+
+def _steer_lines(steer):
+    """Print the two first-row checks' steer lines. The check marks a line
+    said once per session, task and lever when it makes it, so this runs
+    before a refusal returns: a refusal after the check must not swallow the
+    one time the line is said."""
+    for line in steer:
+        print("helm dispatch: " + line, file=sys.stderr)
+
+
+def _lever_lines(row):
+    """Say what the two first-row checks recorded on a written row: that one
+    could not run, or what the row went ahead of and the reason given; and
+    put a reason the seat gave on the chosen task as one comment
+    (`taskkey.choice_comment`; a row that took its reasons from its lane
+    leaves that to the lane's claim). Their steer lines are `_steer_lines`'s."""
+    from . import taskkey, tasks
+    for unknown, mark in (("lever_unknown", tasks.LEVER_UNKNOWN_MARK),
+                          ("finish_unknown", taskkey.FINISH_UNKNOWN_MARK)):
+        if row.get(unknown):
+            print("helm dispatch: %s: %s — the check did not run, so this "
+                  "went ahead" % (mark, row[unknown]), file=sys.stderr)
+    for over, reason in (("lever_skipped", "lever_because"),
+                         ("start_anyway_over", "start_anyway")):
+        if row.get(over) and row.get(reason) != tasks.NO_REASON:
+            print('helm dispatch: %s went ahead of %s: "%s" (recorded on the '
+                  'row%s)' % (row.get("task") or "this row",
+                              tasks.named(row[over]), row.get(reason) or "",
+                              ", from " + row["reasons_from"]
+                              if row.get("reasons_from") else ""),
+                  file=sys.stderr)
+    if row.get("reasons_from"):
+        return
+    _written, why = taskkey.choice_comment(
+        row.get("task"), "dispatch %s" % str(row.get("id") or "")[:12],
+        lever=(row["lever_skipped"], row.get("lever_because"))
+        if row.get("lever_skipped") else None,
+        start=(row["start_anyway_over"], row.get("start_anyway"))
+        if row.get("start_anyway_over") else None, by=row.get("sender"))
+    if why:
+        print("helm dispatch: WARNING: the row records the reason, but it was "
+              "NOT added to %s as a comment: %s" % (row.get("task"), why),
+              file=sys.stderr)
 
 
 def _findings_lines(row):
@@ -956,6 +1086,8 @@ def _cmd_retract(rest):
              row.get("retract_seat") or "?", row.get("retract_role") or "?",
              str(row.get("retract_reads") or "?").upper(),
              row.get("retract_basis") or "?"))
+    for line in dispatches.review_findings.closed_lines(row):
+        print("helm dispatch: " + line)
     if successor:
         print("helm dispatch: successor %s carries the review (@%s)"
               % (successor, row.get("recipient") or "?"))
@@ -1023,6 +1155,8 @@ def _cmd_dispatch(args):
     if not args or args[0] in ("-h", "--help"):
         print(dispatches.USAGE, file=sys.stderr)
         return 2
+    from . import review_done
+    review_done._stdin_brief = None
     verb, rest = args[0], args[1:]
     if verb in TRIAGE_ALIASES:
         # A ROW, NAMED: the bulk re-measure behind a bare `triage` is not
@@ -1046,11 +1180,51 @@ def _cmd_dispatch(args):
             pos, opts, flags, err = _parse_send(rest, names)
             new_work = "--new-work" in flags
             force = "--force" in flags
+            whole = "--whole" in flags
+            part = "--part" in flags
         else:
             new_work = "--new-work" in rest
             force = "--force" in rest
-            rest = [a for a in rest if a not in ("--new-work", "--force")]
+            whole = "--whole" in rest
+            part = "--part" in rest
+            rest = [a for a in rest
+                    if a not in ("--new-work", "--force", "--whole",
+                                  "--part")]
             pos, opts, err = dispatches._parse(rest, names)
+        # THE ASK'S PATH (task/3938): a chain that names a task picks EXACTLY
+        # ONE of --whole / --part — the whole ask (its land leaves the task
+        # owing a seen-working check, helm/observed.py)
+        # or a piece of it. Neither says which path is meant, both do, so a
+        # chain with --task and no flag is refused, as is one with both. The
+        # refusal names the two flags and the exact retry, and it is the door
+        # every seat meets at `work claim` and `dispatch send` alike.
+        # AN ORPHAN --part (a path with no task) is refused at the send door
+        # too: --part names the path to the task that --task names, and
+        # nothing downstream records it, so without --task it picks a path
+        # for no ask. An orphan --whole is the row writer's to judge (below).
+        # A parse error leaves opts None, so both path gates (which read opts)
+        # run only after a successful parse; on error the usage gate below
+        # owns the reply. `not err` first: _parse returns pos=None and opts
+        # None on an unknown option or a value-less one.
+        if not err:
+            # --part ONLY: an orphan --whole reaches the row writer, which
+            # resolves the task from the lane's record and refuses only when
+            # there is none (`_base`'s "WHOLE ask" sentence).
+            if part and not opts.get("--task"):
+                print("helm dispatch %s: REFUSED — --part names the path to "
+                      "the task that --task names; give --task task/N with it"
+                      % verb, file=sys.stderr)
+                return 1
+            if opts.get("--task") and not (whole ^ part):
+                state = ("both --whole and --part were given"
+                         if (whole and part)
+                         else "neither --whole nor --part was given")
+                print("helm dispatch %s: REFUSED — --task names a task's ask, and "
+                      "it must pick one path to it. %s. add --whole if this "
+                      "chain finishes the task, or --part if it does a piece of "
+                      "it; give exactly one of --whole or --part"
+                      % (verb, state), file=sys.stderr)
+                return 1
         # STDIN BODY — literal when piped or fed by a quoted-delimiter heredoc,
         # times in one evening across two different model families.
         #
@@ -1103,6 +1277,9 @@ def _cmd_dispatch(args):
                     piped = sys.stdin.read().strip()
                     if piped:
                         pos = list(pos) + [piped]
+                        # The brief is in no argv word: the corrected line
+                        # re-pipes it and can ask the answers its text owes.
+                        review_done._stdin_brief = piped
             elif dispatches._stdin_has_a_body_fd(sys.stdin, unselectable=False) \
                     and sys.stdin.read(1):
                 # TWO BODIES, ONE MESSAGE: REFUSE RATHER THAN CHOOSE, the law
@@ -1124,7 +1301,7 @@ def _cmd_dispatch(args):
         if not opts.get("--ref"):
             print("helm dispatch: %s requires --ref TIP" % verb, file=sys.stderr)
             return 2
-        # An ABSENT --deadline stays None all the way to `_base`, which is the
+        # An ABSENT --deadline stays None all the way to `_base3`, which is the
         # only place that knows the row's KIND. Substituting the review default
         # here is what put 2700s on every build row ever dispatched from the
         # CLI: the flag was optional, so the omission was silent and universal.
@@ -1180,6 +1357,17 @@ def _cmd_dispatch(args):
         if refused:
             print(refused, file=sys.stderr)
             return 2
+        review_mode = opts.get("--review-mode")
+        if review_mode is not None:
+            clean_mode = review_mode.strip().upper()
+            if clean_mode not in ("PATCH", "MELD-DIFF"):
+                print("helm dispatch: --review-mode must be PATCH or MELD-DIFF (got %s)"
+                      % review_mode, file=sys.stderr)
+                return 2
+            if kind != "review":
+                print("helm dispatch: --review-mode requires --kind review", file=sys.stderr)
+                return 2
+            review_mode = clean_mode
         for w in dispatches._ref_sanity(opts["--ref"], pos[1], opts.get("--repo"),
                              kind=kind):
             print("helm dispatch: " + w, file=sys.stderr)
@@ -1213,6 +1401,9 @@ def _cmd_dispatch(args):
                 door["lines"].append(
                     "helm dispatch: the BAR did not fit in this brief; send "
                     "it to the reader yourself:\n" + door["brief"])
+        # THE LINES THE FIRST-ROW CHECKS SAY (task/3821): they steer and
+        # never refuse, and each is said once per session, task and lever.
+        steer = []
         if verb == "send":
             # THE CANONICAL FROM THE CAPABILITY, never raw argv. The gate
             # proved membership for cap["canonical"]; handing the writer
@@ -1234,10 +1425,16 @@ def _cmd_dispatch(args):
                                   door=door["row"], pair_meld=door["pair"],
                                   decline_patch=opts.get(
                                       dispatches.DECLINE_PATCH_FLAG),
-                                  task=opts.get("--task"))
+                                  task=opts.get("--task"),
+                                  lever_because=opts.get("--because"),
+                                  start_anyway=opts.get("--start-anyway"),
+                                  weigh=True, steer=steer, whole=whole,
+                                  review_mode=review_mode)
+            _steer_lines(steer)
             if row is None:
                 print("helm dispatch: " + why, file=sys.stderr)
                 return _rc(why)
+            _lever_lines(row)
             for note in row.get(dispatches._ADMISSION_NOTES, ()):
                 print("helm dispatch: RECIPIENT: " + note, file=sys.stderr)
             for warning in row.get(dispatches._WRITE_WARNINGS, ()):
@@ -1344,11 +1541,15 @@ def _cmd_dispatch(args):
             owner_surface_because=opts.get("--no-owner-surface-because"),
             door=door["row"], pair_meld=door["pair"],
             decline_patch=opts.get(dispatches.DECLINE_PATCH_FLAG),
-            task=opts.get("--task"))
+            task=opts.get("--task"), lever_because=opts.get("--because"),
+            start_anyway=opts.get("--start-anyway"), weigh=True, steer=steer,
+            whole=whole, review_mode=review_mode)
+        _steer_lines(steer)
         if row is None:
             print("helm dispatch: " + (why or "dispatch NOT recorded"),
                   file=sys.stderr)
             return _rc(why)
+        _lever_lines(row)
         for note in row.get(dispatches._ADMISSION_NOTES, ()):
             print("helm dispatch: RECIPIENT: " + note, file=sys.stderr)
         for warning in row.get(dispatches._WRITE_WARNINGS, ()):
@@ -1496,6 +1697,9 @@ def _cmd_dispatch(args):
         patch = []
         no_patch = []
         diff_handoff = []
+        # THE REVIEW'S FINDINGS, CARRIED FINDINGS AND NOTES, each repeatable
+        # (helm/review_findings.py); mark_verdict owns every rule about them.
+        review = {flag: [] for flag in dispatches.review_findings.FLAGS}
         # A MODEL RUN'S READ, recorded by this seat on its behalf (task/2948):
         # one value each, once. mark_verdict owns every rule about them.
         behalf = {}
@@ -1553,8 +1757,8 @@ def _cmd_dispatch(args):
                 if i + 1 >= len(flags) or flags[i + 1].startswith("--") \
                         or patch:
                     print("helm dispatch verdict: --patch-tip needs one full "
-                          "commit id, once — the cure YOU committed on a "
-                          "branch off the reviewed tip", file=sys.stderr)
+                          "commit id, once — the cure YOU committed off the "
+                          "reviewed tip", file=sys.stderr)
                     return 2
                 patch.append(flags[i + 1])
                 i += 1
@@ -1589,6 +1793,14 @@ def _cmd_dispatch(args):
                           "exact pair meld ROOM/MSGID, once", file=sys.stderr)
                     return 2
                 diff_handoff.append(flags[i + 1])
+                i += 1
+            elif flag in review:
+                if i + 1 >= len(flags) or flags[i + 1].startswith("--"):
+                    print("helm dispatch verdict: %s needs its value, ONE "
+                          "quoted argv token each time" % flag,
+                          file=sys.stderr)
+                    return 2
+                review[flag].append(flags[i + 1])
                 i += 1
             else:
                 unknown.append(flag)
@@ -1717,8 +1929,10 @@ def _cmd_dispatch(args):
         # bound for a meld is one of them and is recorded like any other.
         if polarity == "fix" and not patch and not no_patch:
             print("helm dispatch verdict: A READER FIXES WHAT IT FINDS.\n"
-                  "  Commit your cure on a branch off %s — the exact tip you "
-                  "read — do not push, and name it "
+                  "  Commit your cure off %s — the exact tip you read (a "
+                  "subagent reviewer has no room of its own by default: use a "
+                  "scratch clone unless your parent assigned its sole delegate "
+                  "a registered BUILD room) — do not push, and name it "
                   "with --patch-tip SHA; the row then carries two authors and "
                   "the author reviews your patch.\n"
                   "  If this finding is not yours to patch — a DESIGN "
@@ -1735,6 +1949,21 @@ def _cmd_dispatch(args):
         # chain as UNKNOWN. UNKNOWN is still an answer; silence is not. A
         # model run's ADVISORY read records no observations, so it is not
         # asked for them.
+        # A FIX THAT NAMES ITS FINDINGS HAS COUNTED THEM (task/3742): the
+        # count is derived, and a typed one that disagrees refuses here.
+        findings = review[dispatches.review_findings.FINDING_FLAG]
+        carried = review[dispatches.review_findings.CARRIED_FLAG]
+        counted, why = dispatches.review_findings.derive_count(
+            observations.get("finding_count"), declared,
+            {"findings": findings, "findings_carried": carried})
+        if why:
+            print("helm dispatch verdict: " + why, file=sys.stderr)
+            return 2
+        if counted is not None:
+            observations["finding_count"] = counted
+        # NO COUNT-ONLY FIX GUARD HERE: mark_verdict owns it, and runs it only
+        # after an exact retry of a standing verdict has reconciled. A copy at
+        # this door refused that retry before mark_verdict could see it.
         if polarity == "fix" and not behalf:
             missing = [flag for flag, key in zip(dispatches._FINDING_FLAGS,
                                                  dispatches._FINDING_FIELDS)
@@ -1781,7 +2010,10 @@ def _cmd_dispatch(args):
                                    if declared else {}),
                                 **({"meld_room": meld[0]} if meld else {}),
                                 **({"design_findings": design} if design
-                                   else {}))
+                                   else {}),
+                                findings=findings, findings_carried=carried,
+                                notes=review[
+                                    dispatches.review_findings.NOTE_FLAG])
         if why:
             print("helm dispatch: " + why + _unnamed_tip_hint(rest[0], reviewed),
                   file=sys.stderr)
@@ -1843,8 +2075,8 @@ def _cmd_dispatch(args):
         # it can repeat.
         if row.get("patch_tip"):
             print("helm dispatch: reviewer patch: %s by @%s — this row now has "
-                  "TWO authors; the lane owner or integrator rebases onto that "
-                  "tip or cherry-picks it" % (
+                  "TWO authors; merge that exact tip as a parent of a new "
+                  "composition commit" % (
                       row["patch_tip"][:12],
                       row.get("patch_author") or row.get("recipient") or "?"))
         # SAID BACK FOR THE SAME REASON THE PATCH IS: a recorded answer nobody
@@ -1868,6 +2100,9 @@ def _cmd_dispatch(args):
                 print("helm dispatch: " + standing)
         print("helm dispatch: gate: %s" % dispatches.gate_state(row))
         print("helm dispatch: attestation: %s" % row.get("announce", "n/a"))
+        # THE REVIEW'S FINDINGS AND NOTES, where they were filed (task/3742).
+        for line in dispatches.review_findings.verdict_lines(row):
+            print("helm dispatch: " + line)
         # THE qwen27 FINDINGS NOTE, said back to the reviewer who just
         # verdicted: a note is for them to adjudicate, and it authorized
         # nothing about the verdict above.
@@ -1915,6 +2150,26 @@ def _cmd_dispatch(args):
                      out["tip"][:12], out["identity"],
                      ", BASE REPLACED — rebase work in progress"
                      if hop.get("base_replaced") else "", hop["reason"]))
+        return 0
+    if verb == "attach-task":
+        # ONE append-only event on the chain's FIRST row (task/4000): the
+        # chain now serves --task, and a later round files and carries its
+        # findings under it. The library door owns every refusal.
+        pos, opts, err = dispatches._parse(rest, ("--task",))
+        if err or len(pos) != 1 or not opts.get("--task"):
+            print("usage: helm dispatch attach-task <id-or-unique-prefix> "
+                  "--task task/N", file=sys.stderr)
+            return 2
+        out, why = dispatches.attach_task(pos[0], opts["--task"])
+        if why:
+            print("helm dispatch: " + why, file=sys.stderr)
+            return 1
+        print("helm dispatch: chain %s ATTACHED to %s by @%s (%s) — later "
+              "rounds file and carry their findings under it; the chain's "
+              "history, findings and pair room are unchanged"
+              % (out["id"][:12], out["attached_task"],
+                 out.get("attached_task_by") or "?",
+                 out.get("attach_role") or "?"))
         return 0
     if verb == "rebind":
         # --force/--json are bare booleans; --to/--reason/--repo carry values
@@ -2170,6 +2425,8 @@ def _cmd_dispatch(args):
         if row.get("pin_warning"):
             print("helm dispatch: warning: " + row["pin_warning"],
                   file=sys.stderr)
+        for line in dispatches.review_findings.closed_lines(row):
+            print("helm dispatch: " + line)
         _meld_said_back(row)
         # THE HOLD THAT MOVES THE PLATE WAKES ITS NEW HOLDER. Only the
         # source-clean one does: the owner reaches his asks through the
@@ -2186,6 +2443,41 @@ def _cmd_dispatch(args):
             print("helm dispatch: the row was dispatched at %s; this hold "
                   "declares %s clean" % (row.get("tip") or "an unknown tip",
                                          row["source_clean_tip"]))
+        return 0
+    if verb == "applied":
+        fab_receipt = None
+        if "--fab-receipt" in rest:
+            at = rest.index("--fab-receipt")
+            if at + 1 >= len(rest):
+                print("helm dispatch applied: --fab-receipt needs the OK "
+                      "focused fab receipt on the applied tip",
+                      file=sys.stderr)
+                return 2
+            fab_receipt = rest[at + 1]
+            del rest[at:at + 2]
+        if len(rest) != 2:
+            print("usage: helm dispatch applied <parent-id-or-unique-prefix> "
+                  "<tip> [--fab-receipt R]  (record the author's UNCHANGED "
+                  "applied MELD-DIFF cure on the ORIGINAL row: the applied "
+                  "diff's verbatim patch-id must equal the posted diff's, tip^ "
+                  "must be the reviewed tip, and an OK focused fab receipt "
+                  "must bind at the tip. ONE diff-applied event, no child "
+                  "row, no reviewer wake. A CHANGED cure refuses and prints "
+                  "the delta child send with `git range-diff` for the "
+                  "reviewer instead)",
+                  file=sys.stderr)
+            return 2
+        row, why = dispatches.mark_applied(rest[0], rest[1],
+                                           fab_receipt=fab_receipt)
+        if why:
+            print("helm dispatch: " + why, file=sys.stderr)
+            return 1
+        proof = row.get("diff_applied") or {}
+        print("helm dispatch: %s — DIFF-APPLIED at %s (patch-id %s, receipt "
+              "%s) on the original row; no child minted, the reviewer is "
+              "not woken" % (row["id"], str(proof.get("tip"))[:12],
+                             str(proof.get("patch_id"))[:12],
+                             str(proof.get("receipt_sha256"))[:12]))
         return 0
     if verb == "release":
         if not rest:
@@ -2977,12 +3269,17 @@ def _cmd_dispatch(args):
             # empty answer as "no such row exists" instead of "every one of
             # them is accounted for somewhere else", which is a different fact
             # and a different next move.
+            # `--to SEAT` ALSO NAMES WHAT IT SET ASIDE BY KIND (task/3881):
+            # `seat reassign` counts a held row and a carried one as that
+            # seat's holdings, so a bare count left the two answers apart.
             selected = _narrow(
                 selected,
                 "OPEN AND STILL OWED only — a HELD, cancelled or verdicted "
                 "row is not open, and an open row whose chain a successor "
                 "holds or a discharging one ended is accounted for "
-                "elsewhere; both are outside this listing",
+                "elsewhere; both are outside this listing"
+                + (_holdings_set_aside(selected, owed_ids)
+                   if to_seat is not None else ""),
                 lambda r: r.get("id") in owed_ids)
         elif "--overdue" in flags:
             # OWED FIRST, THEN LATE. Filtering raw rows by age alone resurrected

@@ -1,0 +1,15 @@
+[
+  {
+    "harness": "claude",
+    "id": "11111111-2222-4333-8444-555555555555",
+    "cwd": "/work/project",
+    "title": "example session",
+    "score": 3.0,
+    "snippet": "the needle in the snippet",
+    "createdAt": "2026-09-01T10:00:00+00:00",
+    "updatedAt": "2026-09-02T11:30:00+00:00",
+    "agentId": null,
+    "parentId": null,
+    "workflow": null
+  }
+]

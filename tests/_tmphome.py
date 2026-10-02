@@ -30,6 +30,20 @@ import subprocess
 import tempfile
 
 
+def review_task(case, title="synthetic review fixture", owner="fixture",
+                project=None):
+    """Mint a real, open task in the caller's scratch HELM_HOME for a review.
+
+    A review's first dispatch cannot be taskless. This is fixture work, not
+    a guard bypass: the normal task writer and dispatch task validation run.
+    """
+    from helm import tasks
+    row, why = tasks.add(title, owner, project=project)
+    case.assertIsNone(why, why)
+    case.assertIsNotNone(row)
+    return row["id"]
+
+
 def home(prefix="helm-test-home-", var="HELM_HOME"):
     """The process's temp home for `var`, created ONCE and cleaned at exit.
     Returns the existing value untouched when the caller (or a parent
@@ -278,7 +292,31 @@ def pin_dispatch_home(case, repo):
     home = dispatches._repo_info(repo)["repo_id"]
     dispatches.home_repo_id = lambda: (home, None)
     case.addCleanup(setattr, dispatches, "home_repo_id", real)
+    pin_lead_context(case)
     return real
+
+
+def pin_lead_context(case):
+    """Stand the lead-context door (`dispatches._lead_context_refusal`,
+    task/4039) in with an admission, for one case.
+
+    A FIXTURE THAT DECLARES ITS REPO HOME DECLARES A ONE-PROJECT WORLD. Its
+    seats are bare names with no family, home or register, in a repository no
+    registry places, and the door reads every such seat as UNKNOWN and
+    refuses it, which is right for a fleet and says nothing about what those
+    arms test. So `pin_dispatch_home` calls this, and an arm that measures the
+    door puts the real one back from `case._real_lead_context_refusal`
+    (tests/test_lead_context_guard.py). The production predicate is never
+    edited."""
+    from helm import dispatches
+    # a second pin in one case must not record the first stand-in as real
+    real = getattr(dispatches._lead_context_refusal, "_real",
+                   dispatches._lead_context_refusal)
+    stand_in = lambda recipient, repo_id, **_kw: None  # noqa: E731
+    stand_in._real = real
+    dispatches._lead_context_refusal = stand_in
+    case._real_lead_context_refusal = real
+    case.addCleanup(setattr, dispatches, "_lead_context_refusal", real)
 
 
 def _measured_empty_fleet():

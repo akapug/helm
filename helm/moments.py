@@ -291,6 +291,10 @@ Route = collections.namedtuple("Route", "id family event detector form status "
                                "needs", defaults=(False,))
 
 LIVE = "live"
+#: Built and detected, logged, never said: the report prints its would-fire
+#: rate instead of a verdict. The same word is the ledger OUTCOME a shadow
+#: route writes (helm/momentledger.py).
+SHADOW = "shadow"
 
 
 def _kind_is(kind):
@@ -331,16 +335,39 @@ ROUTES = (
           "nothing (fast path)", LIVE),
     Route("arrival.canon-changed", "arrival", "UserPromptSubmit", None,
           "the new ruling's gloss, first", "planned: lane 4"),
-    Route("act.review.dispatch", "act", "PreToolUse", None,
-          "ROUTING, from the one routing premise", "planned: lane 4"),
+    # THE DOORS (task/1135, lane 4). An act route's detector is
+    # helm/doors.py, run by argv-guard at PreToolUse on the tool call's argv:
+    # `act.helm.<verb>[.<sub>|.<flag>|.<value>]` for a helm verb, act.spawn
+    # for an Agent call. Its content is every store entry with a matching
+    # `route:` cell and every `signal: act` reflex with a matching `route:`,
+    # said once per context under doors.LINE_CAP. A door nobody bound is
+    # silent by design, so these rows do not `need` content: a detection
+    # with no rule is SILENT, not a missed moment.
+    Route("act.helm.launch.home", "act", "PreToolUse", None,
+          "the account rules at `helm launch --home`", LIVE),
+    Route("act.helm.seat.rehome", "act", "PreToolUse", None,
+          "the account and autoswitch rules at `helm seat rehome`", LIVE),
+    Route("act.helm.seat.spawn", "act", "PreToolUse", None,
+          "the team rules at `helm seat spawn`", LIVE),
+    Route("act.helm.task.priority", "act", "PreToolUse", None,
+          "friction-tax at `helm task add|update --priority` (the verb "
+          "prints the owner-asked numbers itself)", LIVE),
+    Route("act.helm.dispatch.review", "act", "PreToolUse", None,
+          "ROUTING at `helm dispatch send|add --kind review`", LIVE),
+    Route("act.helm.creds", "act", "PreToolUse", None,
+          "the one-year login rule at `helm creds`", LIVE),
     Route("act.review.enter", "act", "PreToolUse", None,
           "gate tree equals commit tree", "planned: lane 4"),
     Route("act.verdict", "act", "PreToolUse", None,
           "--cl asked by the verb", "planned: lane 5"),
     Route("act.land.compose", "act", "PreToolUse", None,
           "merge-base age, installed build, one whole gate", "planned: lane 4"),
+    # An Agent call. The Workflow tool is not in argv-guard's matcher
+    # (hooks.py), so a Workflow's spawns are not this moment. The Agent rung
+    # stays a key lookup until a rule is bound here (doors.spawn_bound), so
+    # an unbound spawn writes no row.
     Route("act.spawn", "act", "PreToolUse", None,
-          "brief in the row; model ruling", "planned: lane 4"),
+          "brief in the row; model ruling (an Agent call)", LIVE),
     # LIVE WITH NO ARRIVAL DETECTOR, like stop.beacon-missing below: the
     # hook code that detects it is named in its form (task/1775).
     Route("act.spawn.nested", "act", "PreToolUse", None,
@@ -358,6 +385,12 @@ ROUTES = (
           "few, short, rare keys", "planned: lane 4"),
     Route("act.owner-message", "act", "PreToolUse", None,
           "a channel he uses; inline summary first", "planned: lane 4"),
+    # THE AGENT'S OWN POST, IN SHADOW (task/1135 D), when HELM_DOOR_SHADOW=1
+    # (off by default): a `helm chat post|reply|dm` body matched on the
+    # store's phrase probes, one rule, once per context, LOGGED and never
+    # said until its would-fire rate is judged (the report's SHADOW line).
+    Route("act.chat.post", "act", "PreToolUse", None,
+          "the one rule a post's phrases reach, logged not said", SHADOW),
     Route("act.push.public", "act", "PreToolUse", None,
           "publication boundary", "planned: lane 5"),
     Route("result.merge-conflict", "result", "PostToolUseFailure", None,
@@ -544,6 +577,72 @@ def replay_arms(detectors=None, now=None):
     return out
 
 
+#: MUST-HIT ARMS FOR THE DOORS (task/1135): the measured misses and one
+#: plain spelling per named act route, as the (tool, input) argv-guard
+#: receives them. Replayed through the LIVE door detector
+#: (doors.detect_payload) by every report, so a detector that stops reading
+#: a verb reads RED the same day.
+ACT_ARMS = {
+    "act.helm.launch.home": [
+        ("Bash", "helm launch --seat helm-reviewer --home cto -- --model opus")],
+    "act.helm.seat.rehome": [
+        ("Bash", "helm seat rehome helm-codex --home cto")],
+    "act.helm.seat.spawn": [
+        ("Bash", "helm seat spawn helm-reviewer --room helm")],
+    "act.helm.task.priority": [
+        ("Bash", "helm task add --owner-asked --priority P1 'helm routes the "
+                 "highest-priority, biggest-impact work first'"),
+        ("Bash", "cd /x && ./bin/helm task update 3821 --priority P1")],
+    "act.helm.dispatch.review": [
+        ("Bash", "helm dispatch send codex lane-x --ref abc --kind review "
+                 "--new-work")],
+    "act.helm.creds": [("Bash", "helm creds")],
+    "act.spawn": [("Agent", {"description": "reviewer",
+                             "prompt": "review the lane"})],
+}
+
+#: MUST-MISS: the same verbs without the moment, and the moment's words as
+#: data (a quoted post, a grep pattern, a heredoc body). No named act route
+#: may fire on any of them.
+ACT_CONTROLS = (
+    ("Bash", "helm task add 'tidy the web console footer'"),
+    ("Bash", "helm launch --seat helm-reviewer -- --model opus"),
+    ("Bash", "helm chat post --room helm 'next: helm launch --seat x --home "
+             "cto, then helm task update 1 --priority P0'"),
+    ("Bash", "git log --oneline --grep 'helm task update 1 --priority P0'"),
+    ("Bash", "helm dispatch send codex lane-x --ref abc --kind build "
+             "--new-work"),
+    ("Bash", "cat <<'EOF' > notes.md\nhelm creds\nEOF"),
+)
+
+
+def replay_act_arms(detect=None):
+    """{route: (expected, detected, control fires)} for ACT_ARMS through the
+    live door detector, or `detect(tool, tool_input) -> route ids` (a test
+    planting a broken one). A control fire is the route firing on an
+    ACT_CONTROLS input or on another act route's arm."""
+    if detect is None:
+        from . import doors
+
+        def detect(tool, tin):
+            return [rid for rid, _l in doors.detect_payload(tool, tin)]
+
+    def ids(tool, x):
+        try:
+            return set(detect(tool, x if isinstance(x, dict)
+                              else {"command": x}))
+        except Exception:                      # noqa: BLE001
+            return set()
+    out = {}
+    for rid, arms in ACT_ARMS.items():
+        hits = sum(1 for t, x in arms if rid in ids(t, x))
+        controls = sum(1 for t, x in ACT_CONTROLS if rid in ids(t, x))
+        controls += sum(1 for other, oarms in ACT_ARMS.items() if other != rid
+                        for t, x in oarms if rid in ids(t, x))
+        out[rid] = (len(arms), hits, controls)
+    return out
+
+
 def _exclusive(rid, other):
     """Two arrival KIND routes exclude each other; first-context overlaps
     every working kind by design, so it has no must-miss arms."""
@@ -561,43 +660,32 @@ def _safe(fn, a):
 # the moment ledger
 # ---------------------------------------------------------------------------
 
-LEDGER_MAX = 5 * 1024 * 1024
-DELIVERED = "delivered"      # the route's content reached the seat
-IN_CONTEXT = "in-context"    # already delivered this context (cooled)
-APPLIED = "applied"          # a budget-only route: its policy governed
-DEFERRED = "deferred"        # the contract waited for a reader
-SILENT = "silent"            # a zero-byte route: nothing is the right answer
-OVER_CAP = "over-cap"        # applied, but the turn ran past its cap
-NO_CONTENT = "no-content"    # MISSED: a content route found nothing to send
-TIMED_OUT = "timed-out"      # MISSED: the hook's deadline took the turn
-OUTCOMES = (DELIVERED, IN_CONTEXT, APPLIED, DEFERRED, SILENT, OVER_CAP,
-            NO_CONTENT, TIMED_OUT)
-MISSED = frozenset((NO_CONTENT, TIMED_OUT))
+# The writer and its outcome words live in helm/momentledger.py, which
+# imports nothing else, so the PreToolUse door can append a row without
+# loading this module; these names are the same objects, kept here for
+# every reader of the moment ledger.
+from . import momentledger as _ml  # noqa: E402
+
+LEDGER_MAX = _ml.LEDGER_MAX
+DELIVERED = _ml.DELIVERED        # the route's content reached the seat
+IN_CONTEXT = _ml.IN_CONTEXT      # already delivered this context (cooled)
+APPLIED = _ml.APPLIED            # a budget-only route: its policy governed
+DEFERRED = _ml.DEFERRED          # the contract waited for a reader
+SILENT = _ml.SILENT              # a zero-byte route: nothing is the answer
+OVER_CAP = _ml.OVER_CAP          # applied, but the turn ran past its cap
+NO_CONTENT = _ml.NO_CONTENT      # MISSED: a content route found nothing
+TIMED_OUT = _ml.TIMED_OUT        # MISSED: the hook's deadline took the turn
+OUTCOMES = _ml.OUTCOMES
+MISSED = _ml.MISSED
 
 
 def ledger_path():
-    return os.path.join(home.global_dir(), ".state", "moment-ledger.jsonl")
+    return _ml.ledger_path()
 
 
 def record(rows):
-    """Append moment rows (one per detected route). Fail-open, never raises;
-    rotates at LEDGER_MAX with one .1 generation, the inject ledger's shape."""
-    if not rows:
-        return
-    path = ledger_path()
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        try:
-            if os.path.getsize(path) > LEDGER_MAX:
-                os.replace(path, path + ".1")
-        except OSError:
-            pass
-        with open(path, "a", encoding="utf-8") as f:
-            for r in rows:
-                f.write(json.dumps(r, ensure_ascii=False,
-                                   separators=(",", ":")) + "\n")
-    except Exception:                          # noqa: BLE001
-        pass
+    """Append moment rows (helm/momentledger.py's writer). Never raises."""
+    _ml.record(rows)
 
 
 def moment_rows(row, detected, outcomes, ids):
@@ -822,10 +910,13 @@ def _pct(values, q):
 
 
 def report(days=7, now=None, inject_rows=None, moment_rows_=None,
-           detectors=None):
+           detectors=None, act_detect=None, bound=None):
     """The per-route verdicts and the hook's latency/timeout bars over the
     last `days` -> dict. Rows may be handed in (tests); otherwise the inject
-    ledger and the moment ledger are read."""
+    ledger and the moment ledger are read. `act_detect` replaces the door
+    detector (replay_act_arms); `bound(route) -> [rule ids]`, when given,
+    names what each act route would say today (the CLI passes the live
+    store's)."""
     now = time.time() if now is None else now
     since = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - days * 86400))
     if inject_rows is None:
@@ -836,7 +927,14 @@ def report(days=7, now=None, inject_rows=None, moment_rows_=None,
     inj = [r for r in inject_rows if str(r.get("ts") or "") >= since]
     mom = [r for r in moment_rows_ if str(r.get("ts") or "") >= since]
     arms = replay_arms(detectors)
+    arms.update(replay_act_arms(act_detect))
     live = collections.Counter(r.get("route") for r in mom)
+    nbytes = collections.Counter()
+    for r in mom:
+        try:
+            nbytes[r.get("route")] += int(r.get("bytes") or 0)
+        except (TypeError, ValueError):
+            continue
     delivered = collections.Counter(r.get("route") for r in mom
                                     if r.get("outcome") in (
                                         DELIVERED, IN_CONTEXT, APPLIED,
@@ -856,7 +954,16 @@ def report(days=7, now=None, inject_rows=None, moment_rows_=None,
                     and r.id in (x.get("moments") or ()))
         expected, detected = a_exp + s_exp, a_hit + s_hit
         why = []
-        if r.status != LIVE:
+        if r.status == SHADOW:
+            posts = [x for x in mom if x.get("route") == r.id]
+            would = sum(1 for x in posts if x.get("outcome") == SHADOW)
+            held = sum(1 for x in posts if x.get("outcome") == IN_CONTEXT)
+            verdict = "SHADOW"
+            why.append("%d post(s), %d would fire (%s), %d already in context"
+                       % (len(posts), would, ("%.1f%%" % (100.0 * would /
+                                                          len(posts)))
+                          if posts else "n/a", held))
+        elif r.status != LIVE:
             verdict = "UNBUILT"
         else:
             if detected < expected:
@@ -866,7 +973,11 @@ def report(days=7, now=None, inject_rows=None, moment_rows_=None,
             if s_exp and not live[r.id]:
                 why.append("0 live detections in a window with %d moment(s)"
                            % s_exp)
-            elif a_exp and not live[r.id] and measured >= MIN_MEASURED:
+            elif a_exp and not live[r.id] and measured >= MIN_MEASURED \
+                    and r.family != "act":
+                # An ACT is rare by nature (a week with no `--home` is a
+                # quiet week, not a dead detector); its arms carry the
+                # detector's proof instead.
                 why.append("0 live detections in %d measured turns" % measured)
             n_missed = sum(missed[r.id].values())
             if live[r.id] and n_missed > MISSED_BAR * live[r.id]:
@@ -880,10 +991,24 @@ def report(days=7, now=None, inject_rows=None, moment_rows_=None,
                        "expected": expected, "detected": detected,
                        "live": live[r.id], "delivered": delivered[r.id],
                        "missed": dict(missed[r.id]), "verdict": verdict,
-                       "why": why})
+                       "why": why, "bytes": nbytes[r.id]})
+        if bound is not None and r.family == "act":
+            try:
+                routes[-1]["bound"] = list(bound(r.id))
+            except Exception:                  # noqa: BLE001
+                routes[-1]["bound"] = None
     hook = hook_health(inj)
+    act = [x for x in mom if x.get("hook") == "PreToolUse"
+           and x.get("route") != "act.chat.post"]
+    said = sum(1 for x in act if x.get("outcome") == DELIVERED)
+    act_bytes = sum(nbytes[x] for x in nbytes if x != "act.chat.post"
+                    and BY_ID.get(x) is not None
+                    and BY_ID[x].family == "act")
+    doors = {"detections": len(act), "delivered": said, "bytes": act_bytes,
+             "bytes_per_turn": round(act_bytes / float(len(inj)), 1)
+             if inj else None}
     return {"days": days, "since": since, "routes": routes,
-            "red": red + len(hook["bars"]), "hook": hook}
+            "red": red + len(hook["bars"]), "hook": hook, "doors": doors}
 
 
 def hook_health(rows):
@@ -942,12 +1067,16 @@ def render_report(rep):
     out = ["moments over %dd (since %s): %d RED" % (rep["days"], rep["since"],
                                                     rep["red"])]
     for r in rep["routes"]:
-        if r["status"] != LIVE and not r["expected"]:
+        if r["status"] not in (LIVE, SHADOW) and not r["expected"]:
             continue
         out.append("  %-7s %-26s arms %d/%d  sig %d/%d  live %d  delivered %d%s"
                    % (r["verdict"], r["id"], r["arms_hit"], r["arms"],
                       r["sig_hit"], r["sig"], r["live"], r["delivered"],
                       ("  — " + "; ".join(r["why"])) if r["why"] else ""))
+        if "bound" in r:
+            out.append("          bound: %s" % (
+                "UNKNOWN" if r["bound"] is None else
+                ", ".join(r["bound"]) or "nothing (silent by design)"))
     unbuilt = [r["id"] for r in rep["routes"] if r["verdict"] == "UNBUILT"]
     if unbuilt:
         out.append("  UNBUILT (%d, detectors owed by later lanes): %s"
@@ -964,6 +1093,12 @@ def render_report(rep):
                % (h["wall_p50_ms"], h["wall_p95_ms"], h["typed_wall_p95_ms"],
                   h["mean_bytes"], h["median_bytes"], h["mean_jit_bytes"],
                   h["jit_lines_per_turn"], h["silent_share"]))
+    d = rep.get("doors")
+    if d:
+        out.append("doors (PreToolUse): %d act detection(s), %d rule line(s) "
+                   "said, %d bytes (%s B per inject turn)"
+                   % (d["detections"], d["delivered"], d["bytes"],
+                      d["bytes_per_turn"]))
     for b in h["bars"]:
         out.append("  RED %s" % b)
     return out

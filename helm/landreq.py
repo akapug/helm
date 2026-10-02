@@ -6177,6 +6177,10 @@ def _lr(row, events, taken, cache, now, attest, receipts=None, index=None,
             "reviewer_model": dispatches.verdict_resolved_model(row),
             "kind": row.get("kind"),
             "lane": row.get("lane"), "branch": row.get("ref"),
+            # THE BRANCH THE DISPATCH BOUND. The lane label is not a branch
+            # name. landwindow's one-car rule reads this and does not invent
+            # a ref from the label (task/3991).
+            "ref_branch": row.get("ref_branch"),
             "chain_root": row.get("chain_root"),
             "supersedes": row.get("supersedes"),
             # THE ROW'S OWN PINNED TIP, under ONE name whatever the kind.

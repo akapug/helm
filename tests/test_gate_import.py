@@ -1707,7 +1707,29 @@ class CanonicalBindingTest(ImportBase):
         row["id"] = gateimport._binding_id(row)
         return (json.dumps(row, sort_keys=True) + "\n").encode("utf-8")
 
-    def test_a_same_size_rewrite_with_a_restored_mtime_moves_the_key(self):
+    def _after_the_ctime_tick(self, tmp, ctime_ns):
+        """Return once a write in `tmp` stamps a ctime later than `ctime_ns`.
+
+        A file system stamps ctime from a clock with ITS OWN granularity: a
+        kernel without fine-grained timestamps uses the coarse clock (one
+        scheduler tick), so a rewrite inside the same tick as the first write
+        keeps the same ctime. Measured on a build host on Linux 6.8: 87 of
+        100 back-to-back rewrites kept it, where a 6.17 host kept none. The
+        arms below rewrite AFTER the clock has moved, so the ctime they
+        exercise must move on any file system, at any granularity.
+        """
+        probe = os.path.join(tmp, "ctime-tick")
+        deadline = time.monotonic() + 10
+        while True:
+            with open(probe, "wb") as fh:
+                fh.write(b"x")
+            if os.stat(probe).st_ctime_ns > ctime_ns:
+                return
+            if time.monotonic() > deadline:
+                self.fail("the file system's ctime did not move in 10s")
+            time.sleep(0.001)
+
+    def test_a_same_size_rewrite_with_a_restored_mtime_moves_the_key(self):  # noqa: VACUOUS_ASSERTION — the inequality follows unconditional positive controls on the same fixture: both identities read non-None, size and mtime equal, ctime moved
         """THE REWRITE mtime CANNOT SEE, AND ctime CAN.
 
         (dev, ino, size, mtime_ns, mode, nlink) is IDENTICAL before and after
@@ -1740,6 +1762,7 @@ class CanonicalBindingTest(ImportBase):
         first = eventledger.ledger_identity(path)
         self.assertIsNotNone(first, "the fixture ledger was not readable")
 
+        self._after_the_ctime_tick(tmp, st.st_ctime_ns)
         with open(path, "wb") as fh:
             fh.write(after_bytes)
         os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))   # put mtime back
@@ -1755,12 +1778,16 @@ class CanonicalBindingTest(ImportBase):
             "MUST-HIT: the rewrite moved size or mtime, so a key WITHOUT "
             "ctime would also have moved and this arm cannot see the cure")
         self.assertNotEqual(
+            after_st.st_ctime_ns, st.st_ctime_ns,
+            "MUST-HIT: the rewrite left ctime where it was, so no stat key "
+            "could see it and this arm would blame the key for the fixture")
+        self.assertNotEqual(
             first, second,
             "a same-size rewrite with a restored mtime produced the SAME "
             "identity, so a memo keyed on it serves the old rows for the new "
             "file and no later append dislodges them")
 
-    def test_the_warm_memo_serves_the_new_rows_after_that_rewrite(self):
+    def test_the_warm_memo_serves_the_new_rows_after_that_rewrite(self):  # noqa: VACUOUS_ASSERTION — the served rows are asserted EQUAL to the new receipt after a warmth control proves the memo held the old one
         """THE KEY MOVING IS THE MECHANISM; THE MEMO NOT LYING IS THE POINT.
 
         The arm above proves `ledger_identity` produces a different tuple
@@ -1811,6 +1838,7 @@ class CanonicalBindingTest(ImportBase):
                 "this arm cannot distinguish an invalidated memo from an "
                 "absent one")
 
+            self._after_the_ctime_tick(tmp, st.st_ctime_ns)
             with open(path, "wb") as fh:
                 fh.write(after)
             os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))

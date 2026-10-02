@@ -1850,5 +1850,44 @@ class CureWordsAndTimesTest(unittest.TestCase):
                          "land it")
 
 
+class StoryRollupTest(unittest.TestCase):
+    """0.3.3 gate 5, criterion 5.1: a story rooted at one task with children
+    below it reads "N of M done" on the card, and the Work page counts the
+    open stories with the ONE count the CLI's `task list` uses, so the two
+    cannot disagree (one number per noun)."""
+
+    def test_a_story_root_reads_done_of_total_and_the_page_counts_open_stories(self):
+        # task/1 is the story root; task/2, task/3 and task/4 continue it,
+        # one of them closed: one open story holding three children.
+        ledger = {
+            "task/1": _task(1, status="open"),
+            "task/2": _task(2, status="open", continues="task/1"),
+            "task/3": _task(3, status="closed", continues="task/1"),
+            "task/4": _task(4, status="open", continues="task/1")}
+        tasks = {"rows": ledger,
+                 "history": {k: [dict(r)] for k, r in ledger.items()},
+                 "unavailable": None}
+        snap = _build(_board([]), tasks=tasks)
+        # a task with no board row is its own card, keyed by its id
+        root = snap["cards"]["task/1"]
+        # the CARD FACE: "1 of 3 done" over its children, the root intact
+        self.assertEqual(root["story"]["root"], "task/1")
+        self.assertEqual(root["story"]["done"], 1)
+        self.assertEqual(root["story"]["total"], 3)
+        self.assertEqual(len(root["story"]["children"]), 3)
+        # THE PAGE'S ONE COUNT: the same call `task list` makes over the shown
+        # (open) rows and the whole ledger, so the number cannot drift.
+        from helm import tasks as store
+        facts = store.story_facts(ledger)
+        shown = [r for r in ledger.values()
+                 if r.get("status") in store.OPEN_STATUSES]
+        expected = store.open_story_count(store.board_order(shown), ledger,
+                                          facts)
+        body = _wm().view(snap, NOW)
+        self.assertIn("stories_open", body["counts"])
+        self.assertEqual(body["counts"]["stories_open"], expected)
+        self.assertEqual(body["counts"]["stories_open"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()

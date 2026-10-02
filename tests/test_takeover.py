@@ -964,10 +964,11 @@ class ARefusalNamesEveryDoorThatOpensItTest(unittest.TestCase):
                       detail)
 
     def test_the_refusal_names_the_holders_own_path(self):
-        """EVERY DOOR IN THE TABLE IS A TRANSFER SOMEBODY ELSE PERFORMS, so a
-        live holder who simply agrees the work belongs elsewhere reaches none
-        of them by itself. The refusal says which act each door waits on, and
-        then points at the ask, which needs no capability at all.
+        """EVERY DOOR BUT THE HOLDER'S OWN IS A TRANSFER SOMEBODY ELSE
+        PERFORMS, so for those the refusal says which act each door waits on,
+        and then points at the ask, which needs no capability at all. The
+        holder's own door (task/2309) is named as the holder's, and its
+        render is pinned by the handoff arms and the table-shape arm below.
 
         EVERY PHRASE THIS ARM LOOKS FOR IS READ FROM THE TABLE — each door's
         ask, and the verb that opens it — so rewording a door carries its own
@@ -989,14 +990,17 @@ class ARefusalNamesEveryDoorThatOpensItTest(unittest.TestCase):
         facts = takeover.task_owner_door_facts("seat-a")
         self.assertTrue(facts, "the doors table is empty, so every assertion "
                                "below would hold over nothing")
-        # SCOPE, ASSERTED RATHER THAN ASSUMED. This arm reads the advice given
-        # to a holder who can open NOTHING. A table offering the holder a door
-        # of its own renders a different clause, and this arm would go quiet
-        # about it instead of failing.
+        # SCOPE, ASSERTED RATHER THAN ASSUMED. This arm reads the advice
+        # about the doors somebody ELSE opens; the table's one holder door is
+        # the hand-off, and it is NAMED here as the holder's own. A second
+        # holder door would change the clause this arm does not read, so it
+        # fails rather than going quiet.
         self.assertEqual([d.cls.__name__ for d in facts if d.holder_may_open],
-                         [], "a door in the table is now the holder's own to "
-                             "open, so the advice this arm reads is no longer "
-                             "the advice that table produces")
+                         ["HolderHandoffAuthorization"],
+                         "the table's holder-openable doors changed, so the "
+                         "advice this arm reads is no longer the advice that "
+                         "table produces")
+        self.assertIn("1 of them IS yours to open", detail)
         for door in facts:
             # THE OFFER FOLLOWS REACHABILITY, MEASURED FOR THIS FIXTURE'S
             # INCUMBENT RATHER THAN ASSUMED. A door this environment cannot
@@ -1020,6 +1024,8 @@ class ARefusalNamesEveryDoorThatOpensItTest(unittest.TestCase):
                               "the refusal offers no ask for the %s door, so "
                               "a holder reading it learns only that it is "
                               "stuck" % door.cls.__name__)
+            if door.holder_may_open:
+                continue
             self.assertIn(door.opened_by, detail,
                           "the refusal never says the %s door is %s, so the "
                           "holder cannot tell whose act it waits on"
@@ -1413,12 +1419,14 @@ class ARefusalNamesEveryDoorThatOpensItTest(unittest.TestCase):
         # them registers "seat-a". Reachability has its own arms; a row with
         # no probe reads UNMEASURED and stays in the offer, which is exactly
         # the neutral input this arm wants.
-        build, reassign = (d._replace(reach=None)
-                           for d in takeover._TASK_OWNER_DOORS)
+        build, reassign, _handoff = (d._replace(reach=None)
+                                     for d in takeover._TASK_OWNER_DOORS)
         third = takeover._Door(object, "some future door", "BOUGHT", False,
                                "ask the market")
         offerable = takeover._Door(object, "the hand-off verb", "OFFERED",
                                    True, "run the hand-off yourself")
+        offerable2 = takeover._Door(object, "the park verb", "OFFERED",
+                                    True, "park it yourself")
         row, err = tasks.add("claims", "seat-a", path=self.p, project="doors",
                              origin="agent", posture_na="arm")
         self.assertIsNone(err, err)
@@ -1426,7 +1434,7 @@ class ARefusalNamesEveryDoorThatOpensItTest(unittest.TestCase):
         # all. Every assertion below is inside an iteration, so a loop that
         # stopped iterating would take the whole arm quiet with it.
         _r0, live = tasks.update(row["id"], path=self.p, owner="seat-b")
-        self.assertIn("NONE of them is yours to open", live)
+        self.assertIn("1 of them IS yours to open", live)
         for doors, wants, forbids in (
                 ((), ["NONE of them is yours to open",
                       "there is no capability here to ask for"],
@@ -1443,8 +1451,21 @@ class ARefusalNamesEveryDoorThatOpensItTest(unittest.TestCase):
                                       "FORCED or TAKEN"]),
                 ((build, reassign, offerable),
                  ["1 of them IS yours to open", "the hand-off verb",
-                  "run the hand-off yourself"],
+                  "As seat-a, run the hand-off yourself",
+                  "To have somebody else move it, say it on the row"],
                  ["NONE of them is yours to open"]),
+                # task/2026's two remainders: the verb follows the count, and
+                # a door the holder RUNS never sits under "say it on the row".
+                ((build, reassign, offerable, offerable2),
+                 ["2 of them ARE yours to open",
+                  "the hand-off verb; and the park verb",
+                  "As seat-a, run the hand-off yourself",
+                  "park it yourself"],
+                 ["2 of them IS", "So say it on the row"]),
+                ((offerable, offerable2),
+                 ["2 of them ARE yours to open",
+                  "As seat-a, run the hand-off yourself"],
+                 ["say it on the row", "by somebody else"]),
         ):
             with mock.patch.object(takeover, "_TASK_OWNER_DOORS", doors):
                 _r, detail = tasks.update(row["id"], path=self.p,

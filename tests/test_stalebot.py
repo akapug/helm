@@ -68,6 +68,8 @@ pre-cure code:
       -> the family is resolved through family_for with the roster's VERIFIED
          runtime metadata, and an unverified row arrives as unverified
 """
+import contextlib
+import io
 import os
 import shlex
 import subprocess
@@ -81,7 +83,7 @@ from tests._tmphome import home as _tmp_home  # noqa: E402
 _tmp_home(prefix="helm-test-stalebot-", var="HELM_HOME")
 
 from helm import chat, dispatches, landreq, meld, review_door  # noqa: E402
-from helm import seats_integrator, stalebot  # noqa: E402
+from helm import seats, seats_integrator, stalebot  # noqa: E402
 
 
 def _integrator():
@@ -548,7 +550,8 @@ class _SweepHarness(unittest.TestCase):
 
     def run_sweep(self, items, classify=None, post=True, post_ok=True,
                   now=None):
-        classify = classify or (lambda row, lr=None, repo=None, trunk=None:
+        classify = classify or (lambda row, lr=None, repo=None, trunk=None,
+                                successor=None:
                                 (stalebot.KEEP, "evidence line", ""))
         def fake_post(_owner, text):
             self.posts.append(text)
@@ -615,7 +618,8 @@ class LatchTest(_SweepHarness):
         citation rotted becomes REANCHOR and is news the owner has not heard."""
         self.run_sweep([_item(ID_A1, "alpha")])
         self.run_sweep([_item(ID_A1, "alpha")],
-                       classify=lambda row, lr=None, repo=None, trunk=None:
+                       classify=lambda row, lr=None, repo=None, trunk=None,
+                       successor=None:
                        (stalebot.REANCHOR, "re-anchor f.py:1", ""))
         self.assertEqual(len(self.posts), 2)
         self.assertIn(ID_A1[:12], self.posts[1])
@@ -1358,9 +1362,18 @@ class RunnableDoorTest(_RepoFixture):
         for patch in patches:
             patch.start()
             self.addCleanup(patch.stop)
+        # A ONE-PROJECT WORLD of bare fixture seats: the lead-context door
+        # (task/4039) is measured in tests/test_lead_context_guard.py.
+        from tests._tmphome import pin_lead_context
+        pin_lead_context(self)
+        from helm import tasks
+        work, why = tasks.add("review UI cleanup", "operator",
+                              project="helm-test", force_new=True)
+        self.assertIsNone(why, why)
         parent = dispatches.add(
             "seat-c", "UI cleanup $(false); review", ref=self.ca,
-            repo=self.repo, kind="review", new_work=True, notify=False)
+            repo=self.repo, kind="review", new_work=True, notify=False,
+            task=work["id"])
         self.assertIsNotNone(parent)
         fixed, err = dispatches.mark_verdict(
             parent["id"], self.ca, "findings", polarity="fix", basis="measured")
@@ -2334,6 +2347,391 @@ class TheIntegratorIsResolvedNotSpelledTest(_CuredSweepHarness):
                                return_value=("seat-b-integrator", None)):
             self.assertEqual(stalebot._fingerprint(unowned), key)
 
+
+
+class _NativeWallHarness(_SweepHarness):
+    """sweep() that drives the REAL `stalebot._post`/`_author_walled` wall
+    reader (NEITHER is mocked). A native claude seat must post; a proxy seat
+    whose family cannot be read must stay refused. The leaf calls (roster read,
+    live-set, beacon, chat legs, wall snapshot) are mocked, so the assertion
+    is on the wall verdict the code under test emits.
+
+    The native seat carries the runtime a launch stamps for a non-proxy claude
+    seat (family=claude, backend=native, runtime_verified=True) — a runtime
+    `family_for` refuses (claude is not a proxy family), which is precisely the
+    input that today refuses the post as "family resolution unavailable"."""
+
+    def _sweep_with_roster(self, items, roster, wall_snapshot=None):
+        import time
+        def fake_roster():
+            return roster, False
+
+        def fake_live(_roster):
+            return {"alpha"}
+
+        def fake_beacon(target, strict=True):
+            return ([123], None)
+
+        def fake_chat(_text, **kw):
+            self.posts.append(_text)
+            return {"id": "p"}
+
+        patches = (
+            mock.patch.object(stalebot, "collect", return_value=(items, [], 0)),
+            mock.patch.object(stalebot, "_live_roster_seats",
+                              side_effect=fake_live),
+            mock.patch.object(seats, "roster_checked", side_effect=fake_roster),
+            mock.patch.object(seats, "beacon_procs", side_effect=fake_beacon),
+            mock.patch.object(chat, "post", side_effect=fake_chat),
+        )
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        return stalebot.sweep(now=time.time(), post=True,
+                              state_path=self.state)
+
+    def test_native_seat_not_walled_posts(self):
+        """The real _post must deliver to a native claude addressee — the wall
+        reader must say "not walled", not refuse it as "family resolution
+        unavailable". Today _author_walled returns (None, ...) for a native
+        seat, so _post refuses and this is the MUST-HIT."""
+        roster = {
+            "alpha": {"session": "sid", "last_seen": time.time(),
+                      "runtime": {"agent_harness": "claude",
+                                  "family": "claude", "backend": "native"},
+                      "runtime_verified": True},
+        }
+        rep = self._sweep_with_roster([_item(ID_A1, "alpha")], roster)
+        self.assertEqual(rep["posted"], ["alpha"])
+        self.assertEqual(rep["failed"], [])
+        # A real delivery is the room append PLUS the DM to the addressee —
+        # two `chat.post` legs — which only happens if _post passed the wall.
+        self.assertEqual(len(self.posts), 2)
+
+    def test_proxy_unknown_wall_still_rides_integrator_not_author(self):
+        """A proxy seat whose family genuinely cannot be read keeps its UNKNOWN
+        refusal — the wall reader must NOT treat it as a native seat and post to
+        it. Same seed shape as the walled-author arms (A12): one post to the
+        integrator, never the author."""
+        roster = {
+            "alpha": {"session": "sid", "last_seen": time.time(),
+                      "runtime": {"agent_harness": "codex",
+                                  "family": "codex", "backend": "proxy"},
+                      "runtime_verified": False},
+        }
+        rep = self._sweep_with_roster([_item(ID_A1, "alpha")], roster)
+        self.assertEqual(rep["posted"], [])
+        self.assertEqual(rep["failed"], ["alpha"])
+
+
+class _SummaryHarness(unittest.TestCase):
+    """`cmd_stale`'s printed summary over a controlled sweep receipt.
+
+    The summary line is printed by `cmd_stale`, not `sweep`, so the arms mock
+    the sweep receipt and capture the command's stdout. They assert the honest
+    counts, which only the fix supplies. (F2 MUST-HIT: today the line advertises
+    'N proposal digest(s) posted' when ANY one posted, hiding the failures.)"""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="summary-state-")
+        self.addCleanup(__import__("shutil").rmtree, self.tmp,
+                        ignore_errors=True)
+
+    def _capture_summary(self, posted, digests, failed):
+        rep = {
+            "swept": 5, "no_deadline": 0,
+            "items": [], "alerts": [], "unavailable": [],
+            "digests": digests,
+            "posted": posted, "failed": failed,
+            "latched": 2,
+            "oldest_unproposed_s": 3 * 86400 + 3600,
+        }
+        with mock.patch.object(stalebot, "sweep", return_value=rep), \
+             mock.patch.object(stalebot, "_task_hygiene", return_value={}):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                stalebot.cmd_stale(["sweep", "--apply"])
+            return buf.getvalue()
+
+    def test_summary_names_posted_and_failed_counts(self):
+        """With 2 digests, 1 posted and 1 FAILED, the summary must name the
+        honest split — never the bare '2 proposal digest(s) posted' that today
+        prints whenever ANY one posted."""
+        out = self._capture_summary(["a"], {"a": "text-a", "b": "text-b"},
+                                    ["b"])
+        self.assertIn("1 of 2 posted", out)
+        self.assertIn("1 FAILED", out)
+        # Today's shape advertises the whole population as posted.
+        self.assertNotIn("2 proposal digest(s) posted", out)
+
+    def test_summary_all_failed_names_all_failed(self):
+        """When no digest posted, the summary names zero posted and every
+        digest FAILED, not a bare 'posted'."""
+        out = self._capture_summary([], {"a": "text-a", "b": "text-b"},
+                                    ["a", "b"])
+        self.assertIn("0 of 2 posted", out)
+        self.assertIn("2 FAILED", out)
+
+
+class _SummaryAllPostedHarness(unittest.TestCase):
+    """All-digests-posted control arm: the fix must still say 'posted' when
+    there are no failures, so the new wording is not a false alarm."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp(prefix="summary-all-")
+        self.addCleanup(__import__("shutil").rmtree, self.tmp,
+                        ignore_errors=True)
+
+    def _capture_summary(self, posted, digests, failed):
+        rep = {
+            "swept": 5, "no_deadline": 0,
+            "items": [], "alerts": [], "unavailable": [],
+            "digests": digests,
+            "posted": posted, "failed": failed,
+            "latched": 2,
+            "oldest_unproposed_s": 3 * 86400 + 3600,
+        }
+        with mock.patch.object(stalebot, "sweep", return_value=rep), \
+             mock.patch.object(stalebot, "_task_hygiene", return_value={}):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                stalebot.cmd_stale(["sweep", "--apply"])
+            return buf.getvalue()
+
+    def test_all_posted_stays_a_clean_post(self):
+        out = self._capture_summary(["a", "b"], {"a": "text-a",
+                                                "b": "text-b"}, [])
+        # A clean post must still be honest: '2 of 2 posted'.
+        self.assertIn("2 of 2 posted", out)
+
+
+class StaleSupersededPredecessorTest(unittest.TestCase):
+    """An owed predecessor that a STANDING CONCUR answers is not proposed as
+    "no visible progress"; unknown-landing and qualified-closure stay separate
+    dispositions (task/4022).
+
+    EVERY FIXTURE IS THE SNAPSHOT SHAPE. `dispatches.snapshot()` replays a
+    verdict as status/polarity/basis/verdict_ref/reviewed_tip on the row and
+    sets NO attestation field; `chain_root` comes from the add. A fixture that
+    hand-writes `attest_state` tests a row the sweep never reads. The
+    `_PROJECTED` arms add those fields on purpose, to pin that they change
+    nothing."""
+
+    NOW = 1800000000                       # pinned; every ts is relative to it
+    _PROJECTED = {"attest_state": "attested", "attest_source": "dispatch"}
+
+    def ts(self, age_s):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                             time.gmtime(self.NOW - age_s))
+
+    def pred(self, pid, sid=None, **kw):
+        row = {"id": pid, "status": "open", "kind": "review",
+               "recipient": "seat-reader", "lane": "lane-one",
+               "ref": "a" * 40, "repo_id": "/nowhere/.git",
+               "deadline_s": 2700, "ts": self.ts(4 * 3600),
+               "chain_root": pid}
+        if sid:
+            row["superseded_by"] = sid
+        row.update(kw)
+        return row
+
+    def verdict(self, sid, parent, root, polarity="concur", **kw):
+        row = {"id": sid, "status": "verdict", "kind": "review",
+               "recipient": "seat-reader", "lane": "lane-one",
+               "ref": "b" * 40, "reviewed_tip": "b" * 40,
+               "repo_id": "/nowhere/.git", "deadline_s": 2700,
+               "ts": self.ts(3 * 3600), "supersedes": parent,
+               "chain_root": root, "polarity": polarity,
+               "basis": "inferred", "verdict_ref": "chat:helm/42"}
+        row.update(kw)
+        return row
+
+    def collect(self, snap, live=None):
+        with mock.patch.object(stalebot.dispatches, "snapshot",
+                               return_value=(snap, None)), \
+             mock.patch.object(stalebot.dispatches, "rows", return_value={}), \
+             mock.patch.object(stalebot.dispatches, "live_claims",
+                               return_value={} if live is None else live), \
+             mock.patch.object(stalebot.landreq, "stalls",
+                               return_value=([], None)), \
+             mock.patch.object(stalebot.tasks, "open_rows", return_value=[]), \
+             mock.patch.object(stalebot, "_cured_population",
+                               return_value=([], [])):
+            items, unavailable, _nd = stalebot.collect(self.NOW)
+        self.assertEqual(unavailable, [])
+        return {it["id"]: it for it in items}
+
+    def classify(self, row, successor, proof="absent", claims=None, lr=None):
+        with mock.patch.object(stalebot, "_landing_state",
+                               return_value=(proof, "a" * 40, None, None)), \
+             mock.patch.object(stalebot.clearspan, "re_measure",
+                               return_value=claims or (
+                                   "no-measurable-claims", "unrotted")):
+            return stalebot.classify_dispatch(row, lr, successor=successor)
+
+    def test_wire_constants_pin_tokens(self):  # noqa: VACUOUS_ASSERTION — wire constants pinned against concrete literals
+        self.assertEqual(stalebot.UNKNOWN_LANDING, "unknown-landing")
+        self.assertEqual(stalebot.QUALIFIED_CLOSURE, "qualified-closure")
+        self.assertNotEqual(stalebot.UNKNOWN_LANDING, stalebot.QUALIFIED_CLOSURE)
+
+    def test_a_replayed_standing_concur_names_the_reason_not_no_progress(self):
+        """THE SHIELD READS THE REPLAY. No attestation field is on either row,
+        which is what snapshot() hands the sweep."""
+        p, s = "a1" * 16, "b1" * 16
+        got = self.collect({p: self.pred(p, s), s: self.verdict(s, p, p)})
+        self.assertEqual(list(got), [p])
+        self.assertEqual(got[p]["successor"]["id"], s)
+        self.assertIn("standing CONCUR (INFERRED)", got[p]["why_aged"])
+        self.assertIn(s[:12], got[p]["why_aged"])
+        self.assertNotIn("no visible progress", got[p]["why_aged"])  # noqa: VACUOUS_ASSERTION — positive control: the CONCUR clause above
+
+    def test_absent_landing_is_QUALIFIED_CLOSURE_unknown_is_UNKNOWN_LANDING(self):
+        p, s = "a2" * 16, "b2" * 16
+        succ = self.verdict(s, p, p)
+        term, ev, door = self.classify(self.pred(p, s), succ, proof="absent")
+        self.assertEqual((term, door), (stalebot.QUALIFIED_CLOSURE, ""))
+        self.assertIn("landing absent", ev)
+        self.assertIn("standing CONCUR/INFERRED", ev)
+        term, ev, door = self.classify(self.pred(p, s), succ, proof="unknown")
+        self.assertEqual((term, door), (stalebot.UNKNOWN_LANDING, ""))
+        self.assertIn("landing unknown", ev)
+        self.assertIn("standing CONCUR/INFERRED", ev)
+        term, _ev, _door = self.classify(self.pred(p, s), None,
+                                         proof="absent")
+        self.assertEqual(term, stalebot.KEEP)    # no answer: main's reading
+
+    def test_only_a_standing_same_chain_concur_answers_never_the_pointer(self):  # noqa: VACUOUS_ASSERTION — the corpse-pointer arm proposes the same predecessor unconditionally first
+        """Finding 3. The FROZEN pointer may name a cancelled corpse while a
+        sibling holds the concur: that sibling answers. A withdrawn,
+        retracted, expired, foreign-chain or unverified concur answers
+        nothing, with or without projection fields on it. A later FIX holds
+        the chain, so main's `owed` never yields the predecessor at all."""
+        p, dead, s = "a3" * 16, "c3" * 16, "b3" * 16
+        corpse = dict(self.pred(dead, chain_root=p, supersedes=p),
+                      status="cancelled")
+        got = self.collect({p: self.pred(p, dead), dead: corpse,
+                            s: self.verdict(s, p, p)})
+        self.assertEqual(got[p]["successor"]["id"], s)
+        self.assertIn("standing CONCUR", got[p]["why_aged"])
+
+        refused = {
+            "withdrawn": {"withdrawn": True},
+            "retracted": {"verdict_retracted": True},
+            "expired": {"close_reason": "expired"},
+            "foreign-chain": {"chain_root": "f" * 32},
+            "unverified": {"basis": "unverified"},
+        }
+        for shape in ({}, self._PROJECTED):
+            for name, over in refused.items():
+                with self.subTest(refused=name, projected=bool(shape)):
+                    succ = dict(self.verdict(s, p, p), **over)
+                    succ.update(shape)
+                    got = self.collect({p: self.pred(p, s), s: succ})
+                    self.assertEqual(list(got), [p])
+                    self.assertIsNone(got[p]["successor"])
+                    self.assertIn("no visible progress", got[p]["why_aged"])
+
+            with self.subTest(later_fix=True, projected=bool(shape)):
+                f = "d3" * 16
+                succ = dict(self.verdict(s, p, p), superseded_by=f, **shape)
+                fix = self.verdict(f, s, p, polarity="fix",
+                                   ts=self.ts(2 * 3600))
+                got = self.collect({p: self.pred(p, s), s: succ, f: fix})
+                self.assertNotIn(p, got)
+
+    def test_live_progress_stays_unproposed_under_a_standing_concur(self):  # noqa: VACUOUS_ASSERTION — each subtest proposes the same ledger without the claim
+        """Finding 4, collect half. The shield runs only on a row main
+        proposes: the recipient's live claim on THIS row keeps it out, and
+        the same ledger without the claim is proposed (the control)."""
+        p, s = "a4" * 16, "b4" * 16
+        claim = {dispatches.autoclaim_resource(p): {"holder": "seat-reader"}}
+        for shape in ({}, self._PROJECTED):
+            with self.subTest(projected=bool(shape)):
+                snap = {p: self.pred(p, s),
+                        s: dict(self.verdict(s, p, p), **shape)}
+                self.assertEqual(self.collect(snap, live=claim), {})
+                got = self.collect(snap)
+                self.assertEqual(got[p]["successor"]["id"], s)
+
+    def test_every_runnable_door_outranks_the_standing_concur(self):
+        """Finding 4, classify half. CANCEL, RETIP and the off-chain
+        SUPERSEDE probe each keep their door when a concur answers the row;
+        the concur replaces KEEP and nothing else."""
+        p, s = "a5" * 16, "b5" * 16
+        row = self.pred(p, s)
+        for shape in ({}, self._PROJECTED):
+            succ = dict(self.verdict(s, p, p), **shape)
+            with self.subTest(rung="cancel", projected=bool(shape)):
+                term, _ev, door = self.classify(
+                    row, succ, proof="absent",
+                    claims=(stalebot.clearspan.STALE, "rotted"))
+                self.assertEqual(term, stalebot.CANCEL)
+                self.assertIn("helm dispatch cancel %s" % p[:12], door)
+            with self.subTest(rung="retip", projected=bool(shape)):
+                term, _ev, door = self.classify(
+                    row, succ, proof="absent",
+                    lr={"base_behind": landreq.STALE_BASE_BEHIND})
+                self.assertEqual(term, stalebot.RETIP)
+                self.assertIn("helm dispatch retip %s" % p[:12], door)
+            with self.subTest(rung="off-chain", projected=bool(shape)), \
+                    mock.patch.object(landreq, "_close_repo",
+                                      return_value=("/g", None)), \
+                    mock.patch.object(landreq, "_close_trunk",
+                                      return_value=("main", "e" * 40,
+                                                    None, None)), \
+                    mock.patch.object(landreq, "offchain_landing",
+                                      return_value=("c" * 40, "lane-one",
+                                                    True)):
+                term, _ev, door = self.classify(row, succ, proof="unknown")
+                self.assertEqual(term, stalebot.SUPERSEDE)
+                self.assertIn("--reason superseded", door)
+
+    def test_a_sweep_separates_unknown_landing_from_qualified_closure(self):
+        """Five answered predecessors through the whole sweep: the one whose
+        landing is unmeasured reads unknown-landing, the four measured absent
+        read qualified-closure, and none reads "no visible progress"."""
+        snap, landings = {}, {}
+        for n, proof in enumerate(("unknown", "absent", "absent",
+                                   "absent", "absent"), 1):
+            p, s = ("e%d" % n) * 16, ("f%d" % n) * 16
+            snap[p] = self.pred(p, s, lane="lane-%d" % n)
+            snap[s] = self.verdict(s, p, p, lane="lane-%d" % n)
+            landings[p] = proof
+        import shutil
+        import tempfile
+        tmp = tempfile.mkdtemp(prefix="stalebot-4022-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        state = os.path.join(tmp, "stale.json")
+
+        def landing(row, _repo=None, _trunk=None):
+            return (landings[row["id"]], "a" * 40, None, None)
+
+        with mock.patch.object(stalebot.dispatches, "snapshot",
+                               return_value=(snap, None)), \
+             mock.patch.object(stalebot.dispatches, "rows", return_value={}), \
+             mock.patch.object(stalebot.dispatches, "live_claims",
+                               return_value={}), \
+             mock.patch.object(stalebot.landreq, "stalls",
+                               return_value=([], None)), \
+             mock.patch.object(stalebot.tasks, "open_rows", return_value=[]), \
+             mock.patch.object(stalebot, "_cured_population",
+                               return_value=([], [])), \
+             mock.patch.object(stalebot, "_landing_state",
+                               side_effect=landing):
+            rep = stalebot.sweep(now=self.NOW, post=False, quiet=True,
+                                 state_path=state)
+        by_id = {it["id"]: it for it in rep.get("items") or []}
+        self.assertEqual(sorted(by_id), sorted(landings))
+        self.assertEqual(
+            {rid: it["terminal"] for rid, it in by_id.items()},
+            {rid: stalebot.UNKNOWN_LANDING if proof == "unknown"
+             else stalebot.QUALIFIED_CLOSURE
+             for rid, proof in landings.items()})
+        whys = [it["why_aged"] for it in by_id.values()]
+        self.assertEqual(len([w for w in whys if "standing CONCUR" in w]), 5)
+        self.assertEqual([w for w in whys if "no visible progress" in w], [])
 
 
 def setUpModule():

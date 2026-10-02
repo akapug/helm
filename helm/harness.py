@@ -445,6 +445,27 @@ SUBMIT_VERIFY_INTERVAL_S = 0.8
 SUBMIT_READ_LIMIT = 200          # lines; the composer is at the BOTTOM
 SUBMIT_READ_TIMEOUT_S = 5        # each CLI read; count bounds alone are not time bounds
 
+#: THE KEY THAT TAKES HELM'S OWN TEXT BACK OUT OF A COMPOSER: Ctrl+U, the
+#: readline kill-to-line-start. MEASURED in the Claude Code 2.1.285 binary: its
+#: prompt input maps ctrl+u to `deleteToLineStart`, and the killed text goes to
+#: its kill ring, so Ctrl+Y puts it back. Codex's composer and bash's readline
+#: bind the same key the same way, and `seat_resume_all.disarm_line` already
+#: types it ahead of a shell line. Helm's nudges are one line and Helm leaves
+#: the cursor at their end, so one Ctrl+U removes the whole nudge.
+#:
+#: A cursor INSIDE Helm's line is the trap: Ctrl+U deletes only what is to its
+#: left, leaving the rest, which the read-back then reads as NOT_OURS and drops
+#: the record without clearing the rest. So the line is first scrolled to its
+#: end, then cleared, so one Ctrl+U removes the whole nudge from a cursor that
+#: is now at its end.
+CLEAR_LINE = "\x15"
+END_OF_LINE = "\x05"
+
+#: The answers of `_CLIAdapter.clear_placed`. UNKNOWN is shared with submit.
+CLEARED = "cleared"      # the composer held exactly Helm's text; it is empty now
+GONE = "gone"            # the composer does not hold it (empty or placeholder)
+NOT_OURS = "not-ours"    # the composer holds other text; it is not Helm's
+
 
 def _env_float(name, default):
     try:
@@ -518,6 +539,84 @@ def composer_is_placeholder(body):
     body = body or ""
     return (body.lower() in _COMPOSER_PLACEHOLDERS
             or _COMPOSER_HINT.fullmatch(body) is not None)
+
+
+# task/4001 — a Claude Code SUGGESTION is drawn dim or greyed. The stripped
+# composer read (the locator strips every SGR before `composer_body` runs)
+# could not see that styling, so resume-turn read a per-turn suggestion as a
+# human draft and kept a compacted seat down for hours. `composer_is_suggestion`
+# is consulted on the STYLED twin of the same row: every visible char must sit
+# under a suggestion signal (faint SGR 2 or a grey foreground) for the row to
+# read as a suggestion. A person's text arrives with no SGR at all, and a
+# mixed row — a styled run beside a plain one — is exactly the case that must
+# stay held, so the proof is positive: every visible char under a signal, and
+# at least one of them.
+_COMPOSER_SGR = re.compile(r"(\x1b\[[0-9;]*m)")
+_SGR_GREY_256 = range(232, 256)          # the 256-colour grey ramp
+_SGR_FG_NONGREY = frozenset(
+    ("31", "32", "33", "34", "35", "36", "37", "91", "92", "93", "94",
+     "95", "96", "97"))
+
+
+def _suggestion_state(dim, fg_grey, params):
+    """One SGR sequence -> (dim, fg_grey). Faint (2) and its reset (22) drive
+    the dim signal; a grey foreground is 30/90 or a 256/24-bit grey; a named
+    non-grey foreground or 39 clears the grey; reset (0) clears both. A `38`
+    that names a colour must be PROVEN grey or it fails closed to non-grey —
+    a suggestion proof is never the mere absence of a contradiction. The other
+    parameters (background, bold, underline, blink, reverse) leave both alone."""
+    i = 0
+    while i < len(params):
+        p = params[i]
+        if p == "0":
+            dim, fg_grey = False, False
+        elif p == "2":
+            dim = True
+        elif p == "22":
+            dim = False
+        elif p in ("30", "90"):
+            fg_grey = True
+        elif p == "38":
+            fg_grey = False
+            if i + 2 < len(params) and params[i + 1] == "5":
+                fg_grey = int(params[i + 2]) in _SGR_GREY_256
+                i += 2
+            elif i + 4 < len(params) and params[i + 1] == "2":
+                r, g, b = (int(params[i + 2]), int(params[i + 3]),
+                         int(params[i + 4]))
+                fg_grey = r == g == b
+                i += 4
+        elif p in _SGR_FG_NONGREY:
+            fg_grey = False
+        elif p == "39":
+            fg_grey = False
+        i += 1
+    return dim, fg_grey
+
+
+def composer_is_suggestion(raw_line):
+    """True iff EVERY visible char of a styled composer body is drawn as a
+    Claude Code suggestion — faint (SGR 2) or a grey foreground — else False.
+    `raw_line` is the styled twin of the composer row (SGR kept); None or empty
+    is unreadable and answers False. Whitespace carries no signal and is
+    skipped; a run is judged under the SGR state its codes left behind."""
+    if not raw_line:
+        return False
+    dim = fg_grey = False
+    seen = False
+    ok = True
+    for i, part in enumerate(_COMPOSER_SGR.split(raw_line)):
+        if i % 2:
+            params = part[2:-1].split(";")      # strip the leading ESC[ and m
+            dim, fg_grey = _suggestion_state(dim, fg_grey, params)
+        else:
+            for ch in part:
+                if ch.isspace():
+                    continue
+                seen = True
+                if not (dim or fg_grey):
+                    ok = False
+    return seen and ok
 
 
 HOLDS = "HOLDS"
@@ -1373,6 +1472,101 @@ class _CLIAdapter:
             return e
         return None
 
+    def _own_text(self, handle, text):
+        """(state, what) for ONE read of the composer against Helm's `text`:
+        HOLDS (exactly `text`), GONE (empty or placeholder chrome), NOT_OURS
+        (other text), or UNKNOWN (unreadable, no composer, a paste chip, a
+        strict prefix of `text`, or a multi-line `text` that one composer line
+        cannot prove whole)."""
+        try:
+            tail = self.read(handle, limit=SUBMIT_READ_LIMIT,
+                             timeout=SUBMIT_READ_TIMEOUT_S)
+        except (HarnessError, OSError) as e:
+            return UNKNOWN, "pane %s could not be read: %s" % (handle, e)
+        line = _prompt_line(tail)
+        if line is None:
+            return UNKNOWN, "pane %s shows no composer" % handle
+        body = composer_body(line)
+        if not body or composer_is_placeholder(body):
+            return GONE, "pane %s composer does not hold Helm's text" % handle
+        want = composer_first_line(text)
+        if not want or want != " ".join((text or "").split()):
+            return UNKNOWN, ("Helm's text is not one line, so one composer "
+                             "line cannot prove it whole")
+        if read_paste_chip(body)[0] is not CHIP_NONE:
+            return UNKNOWN, ("pane %s composer shows a paste chip, which "
+                             "hides whose text it is" % handle)
+        if body == want:
+            return HOLDS, ""
+        if want.startswith(body):
+            # A PREFIX IS UNDECIDABLE: our line still painting, or someone
+            # deleting back into it (`observe_composer`'s REPAINTING).
+            return UNKNOWN, ("pane %s composer shows only part of Helm's "
+                             "line" % handle)
+        return NOT_OURS, ("pane %s composer holds text that is not exactly "
+                          "Helm's" % handle)
+
+    def clear_placed(self, handle, text, reads=None, interval=None):
+        """Take Helm's OWN placed `text` back out of a composer -> (state,
+        detail): CLEARED, GONE, NOT_OURS or UNKNOWN.
+
+        THE OTHER HALF OF A NUDGE. Helm types a line into a seat's composer
+        and then presses Enter. When the Enter is not pressed, or does not
+        take, the line must not stay there: the owner finds it later in the
+        composer of a pane he walks into. Submitting it needs an
+        authorization; removing it needs only proof that it is Helm's.
+
+        THE PROOF IS THE LIVE COMPOSER, read immediately before the key: it
+        must hold EXACTLY Helm's text. A human's append, a paste chip, or a
+        pane that cannot be read gets no key at all. The read-back then
+        decides: an empty composer is CLEARED; Helm's text still there means
+        the key did not take (UNKNOWN); anything else is NOT_OURS."""
+        reads = SUBMIT_VERIFY_READS if reads is None else reads
+        interval = SUBMIT_VERIFY_INTERVAL_S if interval is None else interval
+
+        def window(until):
+            state, what = UNKNOWN, "no read was taken"
+            for n in range(max(1, reads)):
+                if n and interval > 0:
+                    time.sleep(interval)
+                state, what = self._own_text(handle, text)
+                if state in until:
+                    break
+            return state, what
+        state, what = window((HOLDS, GONE, NOT_OURS))
+        if state != HOLDS:
+            return state, "%s; no key was sent" % what
+        try:
+            # A cursor INSIDE the line makes Ctrl+U delete only its left, so
+            # the rest survives the read-back as NOT_OURS and the record is
+            # dropped without the text clearing. Scroll to the line's end first,
+            # then clear: one Ctrl+U now removes the whole nudge.
+            self.send(handle, END_OF_LINE, enter=False,
+                      **self._send_bound(SUBMIT_READ_TIMEOUT_S))
+        except HarnessError as e:
+            return UNKNOWN, ("pane %s: cursor move failed (%s); no clear key "
+                             "was sent" % (handle, e))
+        state, seen = self._own_text(handle, text)
+        if state != HOLDS:
+            return state, ("%s after the cursor move; no clear key was sent"
+                           % seen)
+        try:
+            self.send(handle, CLEAR_LINE, enter=False,
+                      **self._send_bound(SUBMIT_READ_TIMEOUT_S))
+        except HarnessError as e:
+            what = "the clear key failed (%s); " % e
+        else:
+            what = ""
+        # A REPAINT CAN STILL SHOW THE TEXT, so the read-back waits for the
+        # composer to empty and stops early only on an answer.
+        after, seen = window((GONE, NOT_OURS))
+        if after == GONE:
+            return CLEARED, "%spane %s: Helm's text cleared" % (what, handle)
+        if after == HOLDS:
+            return UNKNOWN, ("%spane %s still holds Helm's text after the "
+                             "clear key" % (what, handle))
+        return after, "%s%s after the clear key" % (what, seen)
+
     def _held_window(self, handle, text, reads, interval):
         """(HOLDS, None) or (the settled state, its graded refusal) across ONE
         bounded read window after typing."""
@@ -1762,6 +1956,17 @@ class _CLIAdapter:
                 continue
             body = composer_body(line)
             if body and not composer_is_placeholder(body):
+                # The stripped read saw text and cannot tell a Claude Code
+                # suggestion from a person's draft — that is the task/4001
+                # false refusal. Consult the STYLED twin of the same row: a
+                # body drawn entirely faint/greyed is a suggestion and reads
+                # clean; anything that is not (no SGR, mixed, unreadable)
+                # keeps the draft refusal. The existing stripped read is
+                # untouched; this is the one extra read, taken only here.
+                from .seat_lifecycle import _current_prompt_body_raw
+                raw_body = _current_prompt_body_raw(tail)
+                if composer_is_suggestion(raw_body):
+                    return False, None
                 detail = ("pane %s composer holds %r — refusing to type or "
                           "spend Enter because it may be a human draft"
                           % (handle, body))
@@ -2091,9 +2296,9 @@ def report_home_drift(repo_root, seat, base="main"):
     print("helm seat: NOTE %s's home worktree is %d commit%s BEHIND %s%s — "
           "DO NOT rebase speculatively as the author. Work from the recorded "
           "base; the reviewer binds that exact tip, then the integrator chooses "
-          "landing order, rebases the chain, and runs the final exact-tree gate "
-          "once. An author-side freshness check can become stale before it is "
-          "reported."
+          "landing order, MERGES the chain at those exact shas, and runs the "
+          "final exact-tree gate once. An author-side freshness check can "
+          "become stale before it is reported."
           % (seat, behind, "" if behind == 1 else "s", base,
              " (and %d ahead)" % ahead if ahead else ""), file=sys.stderr)
     return drift

@@ -262,14 +262,18 @@ class ResumeGuardTest(unittest.TestCase):
                 mock.patch("helm.sessions.spawn_resume",
                            return_value=("/p.sh", "h9", "orca")) as spawn, \
                 mock.patch.object(harness, "detect", return_value=object()):
-            rc, lines = orcaadopt.resume("s", force=True)
+            # --force is this arm's subject; the fixture row carries no
+            # transcript, so the exact resume (task/3695) would refuse first
+            rc, lines = orcaadopt.resume("s", force=True, defaults=True)
         self.assertEqual(rc, 0)
         self.assertIn("--force: proceeding despite LIVE", " ".join(lines))
         self.assertEqual(spawn.call_args[1]["env"], {"HELM_CHAT_NAME": "s"})
 
     def test_a_dead_seat_resumes_carrying_its_seat_identity(self):
         """The resumed pane must come back AS the seat: without HELM_CHAT_NAME it
-        rejoins chat as an anonymous pane that no longer answers to its name."""
+        rejoins chat as an anonymous pane that no longer answers to its name.
+        Driven on --defaults (the row has no transcript to read a recipe
+        from); AdoptedExactResumeTest pins the same name on the exact path."""
         row = {"i": "sid-1234abcd", "h": "claude", "cwd": "/w", "mt": 1}
         with mock.patch.object(orcaadopt, "seat_liveness",
                                return_value=(orcaadopt.DEAD, "nothing holds it")), \
@@ -281,7 +285,7 @@ class ResumeGuardTest(unittest.TestCase):
                 mock.patch("helm.sessions.spawn_resume",
                            return_value=("/p.sh", "h9", "orca")) as spawn, \
                 mock.patch.object(harness, "detect", return_value=object()):
-            rc, lines = orcaadopt.resume("console-design")
+            rc, lines = orcaadopt.resume("console-design", defaults=True)
         self.assertEqual(rc, 0)
         self.assertEqual(spawn.call_args[1]["env"],
                          {"HELM_CHAT_NAME": "console-design"})
@@ -298,6 +302,816 @@ class ResumeGuardTest(unittest.TestCase):
         self.assertEqual(rc, 1)
         spawn.assert_not_called()
         self.assertIn("no transcript", " ".join(lines))
+
+
+class _SpawnAd(object):
+    """The one metaharness the adopted resume talks to: `spawn` records the
+    command (the minted script's path), `send` takes the resume kick."""
+    name = "orca"
+
+    def __init__(self):
+        self.spawned, self.sent = [], []
+
+    def spawn(self, command, title=None, cwd=None):
+        self.spawned.append((command, title, cwd))
+        return "pane-9"
+
+    def send(self, handle, text, enter=True):
+        self.sent.append((handle, text))
+
+
+class AdoptedExactResumeTest(unittest.TestCase):
+    """task/3695: an orca-adopted claude lead resumes EXACTLY as it ran.
+
+    The measured meta-claude case: its process was started with `--model
+    fable` and the skip-permissions flag, then a `/model` moved it to
+    claude-opus-5-5[1m], and the old resume passed neither a model nor a
+    permission flag. The recipe is read from the session's own transcript
+    (model, permission mode, effort) and from the capture the reboot sweep
+    keeps of its live process (argv and an allow-listed environ). These arms
+    run the REAL mint and read the SCRIPT the pane would execute."""
+
+    SEAT = "lead-seat"
+    SID = "33333333-3333-4333-8333-333333333333"
+    BOOT = "44444444-4444-4444-8444-444444444444"
+    MODEL = "claude-opus-5-5[1m]"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-exact-resume-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        env = mock.patch.dict(os.environ,
+                              {"HELM_HOME": os.path.join(self.tmp, "helm")})
+        env.start()
+        self.addCleanup(env.stop)
+        self.cwd = os.path.join(self.tmp, "work")
+        # a REGISTERED credhome: a captured CLAUDE_CONFIG_DIR is kept only
+        # when it is a home helm knows (seat_recipe.is_home_path), so the
+        # registry's root is this fixture's own
+        from helm import homes
+        roots = mock.patch.dict(homes.ROOTS, {
+            "claude": os.path.join(self.tmp, "claude-homes")})
+        roots.start()
+        self.addCleanup(roots.stop)
+        self.cred = os.path.join(self.tmp, "claude-homes", "lead")
+        os.makedirs(self.cwd)
+        os.makedirs(self.cred)
+        self.transcript = os.path.join(self.tmp, self.SID + ".jsonl")
+        rows = [
+            {"type": "permission-mode", "permissionMode": "bypassPermissions",
+             "sessionId": self.SID},
+            {"type": "attachment", "sessionId": self.SID, "cwd": self.cwd,
+             "attachment": {"type": "model",
+                            "identity": {"modelId": self.MODEL}}},
+            {"type": "assistant", "sessionId": self.SID, "cwd": self.cwd,
+             "version": "2.1.280", "effort": "xhigh",
+             "message": {"model": "claude-opus-5-5", "role": "assistant",
+                         "content": [{"type": "text", "text": "ok"}]}}]
+        with open(self.transcript, "w") as f:
+            f.write("".join(json.dumps(r) + "\n" for r in rows))
+        self.row = {"i": self.SID, "h": "claude", "cwd": self.cwd, "mt": 1,
+                    "p": self.transcript}
+
+    def _capture(self, account=None, withheld=None, config=True,
+                 captured="2026-09-29T00:00:00Z"):
+        """What the reboot sweep keeps of the lead's live process: its argv
+        (the stale --model fable it was STARTED with) and its environ, cut
+        to the allow-listed names, `account`, the key of the account its
+        home held then, and `withheld`, the fields it could not keep.
+        `config` False: it ran with CLAUDE_CONFIG_DIR unset (the default
+        home). `captured`: when the sweep took it."""
+        from helm import seat_resume_all
+        d = seat_resume_all.live_set_dir()
+        os.makedirs(d, exist_ok=True)
+        env = {"HELM_CHAT_NAME": self.SEAT, "HELM_CELL_PROFILE": "owner-profile"}
+        if config:
+            env["CLAUDE_CONFIG_DIR"] = self.cred
+        rec = {"binary": "/opt/claude/versions/2.1.280",
+               "argv": ["--dangerously-skip-permissions", "--model", "fable"],
+               "env": env,
+               "pid": 4321, "start": "77", "sessions": [self.SID],
+               "captured": captured}
+        if account:
+            rec["account"] = account
+        if withheld:
+            rec["withheld"] = list(withheld)
+        doc = {"v": 1, "boot_id": self.BOOT, "btime": 1, "written": "x",
+               "seats": {}, "recipes": {self.SEAT: rec}}
+        with open(os.path.join(d, self.BOOT + ".json"), "w") as f:
+            json.dump(doc, f)
+
+    def _resume(self, ad=None, **kw):
+        from helm import sessions
+        ad = ad or _SpawnAd()
+        with mock.patch.object(orcaadopt, "seat_liveness",
+                               return_value=(orcaadopt.DEAD, "dead")), \
+                mock.patch.object(orcaadopt, "newest_session_row",
+                                  return_value=(dict(self.row), None)), \
+                mock.patch("helm.sessions.resume_warnings", return_value=[]), \
+                mock.patch("helm.sessions.credhome_for",
+                           return_value=self.cred), \
+                mock.patch("helm.cred.launch_sync", return_value=True), \
+                mock.patch.object(sessions, "RESUME_DIR",
+                                  os.path.join(self.tmp, "resumes")), \
+                mock.patch.object(harness, "detect", return_value=ad):
+            rc, lines = orcaadopt.resume(self.SEAT, **kw)
+        script = None
+        if ad.spawned:
+            with open(ad.spawned[-1][0]) as f:
+                script = f.read()
+        return rc, lines, script
+
+    def test_a_claude_lead_resumes_with_its_model_and_permission_mode(self):
+        """MUTATION: the old `claude --resume <sid>` — no --model, no
+        permission flag, so the lead comes back on its home's default model
+        and permission mode. The transcript's model outranks the stale argv
+        (the /model moved it), so `fable` must NOT ride the line."""
+        self._capture()
+        rc, lines, script = self._resume()
+        self.assertEqual(rc, 0, lines)
+        self.assertIsNotNone(script, lines)
+        self.assertIn("--model 'claude-opus-5-5[1m]'", script)
+        self.assertIn("--dangerously-skip-permissions", script)
+        self.assertIn("--effort xhigh", script)
+        self.assertNotIn("fable", script)
+        self.assertIn("CLAUDE_CONFIG_DIR=%s" % self.cred, script)
+        self.assertIn("export HELM_CELL_PROFILE=owner-profile", script)
+        self.assertIn("export HELM_CHAT_NAME=%s" % self.SEAT, script)
+        self.assertTrue(any("EXACTLY" in l for l in lines), lines)
+
+    def test_an_incomplete_recipe_refuses_and_names_the_missing_fields(self):  # noqa: VACUOUS_ASSERTION — rc 1 and the named fields are the positive controls; the absent script is the no-spawn contract, proven non-vacuous by the sibling arm on the same fixture with a capture
+        """With no capture, the transcript alone cannot say which tools were
+        denied, what instructions were appended, or the signing identity.
+        MUTATION: fill the unknown fields with defaults silently — the pane
+        is spawned and this arm's refusal never prints."""
+        rc, lines, script = self._resume()
+        text = " ".join(lines)
+        self.assertEqual(rc, 1, lines)
+        self.assertIsNone(script, "a pane was spawned on an incomplete recipe")
+        self.assertIn("saved only", text)
+        for field in ("disallowed_tools", "append_system_prompt",
+                      "identity_env"):
+            self.assertIn(field, text)
+        self.assertIn("--defaults", text)
+
+    def _home_pays(self, uuid, email):
+        """The credential home's own record of the account it holds now."""
+        with open(os.path.join(self.cred, ".claude.json"), "w") as f:
+            json.dump({"oauthAccount": {"emailAddress": email,
+                                        "accountUuid": uuid}}, f)
+
+    def _home_model(self, model):
+        """The model the credential home's settings.json names: the one a
+        defaults resume (no --model) launches."""
+        with open(os.path.join(self.cred, "settings.json"), "w") as f:
+            json.dump({"model": model}, f)
+
+    def test_a_home_that_now_holds_another_account_refuses(self):  # noqa: VACUOUS_ASSERTION — rc 1 and the named swap are the positive controls; the absent script is the no-spawn contract, and the same fixture with the home holding the captured account spawns in this arm
+        """Both sides are one kind of id: the measured key of the account
+        email the home held when the lead's process was captured, and the
+        key of the one it holds now. The transcript's bridge-session id is
+        another kind, so it decides nothing here: it equals the home's
+        accountUuid while the account behind it is another. MUTATION:
+        compare the bridge-session id with the home's accountUuid — the
+        lead is resumed on an account it never ran on."""
+        from helm import accounts
+        paid = "aaaaaaaa-0000-4000-8000-000000000001"
+        self._capture(account=accounts.measured_key("lead-account@example.com"))
+        with open(self.transcript, "a") as f:
+            f.write(json.dumps({"type": "bridge-session",
+                                "sessionId": self.SID,
+                                "ownerAccountUuid": paid}) + "\n")
+        self._home_pays(paid, "another@example.com")
+        rc, lines, script = self._resume()
+        self.assertEqual(rc, 1, lines)
+        self.assertIsNone(script, "a pane was spawned on a swapped account")
+        text = " ".join(lines)
+        self.assertIn("swap", text)
+        self.assertNotIn("another@example.com", text)
+        self._home_pays(paid, "lead-account@example.com")
+        rc, lines, script = self._resume()
+        self.assertEqual(rc, 0, lines)
+        self.assertIsNotNone(script, lines)
+
+    def _known_other_account(self):
+        """A capture that bound the lead's session and recorded the account
+        its home held, a field it could not keep (so its recipe is
+        incomplete and an unattended caller would fall back), and a home
+        that now holds ANOTHER account."""
+        from helm import accounts
+        self._capture(account=accounts.measured_key("lead-account@example.com"),
+                      withheld=["append_system_prompt"])
+        self._home_pays("aaaaaaaa-0000-4000-8000-000000000001",
+                        "another@example.com")
+
+    def test_a_known_account_mismatch_refuses_on_every_path(self):  # noqa: VACUOUS_ASSERTION — rc 1 and the named swap are the positive controls; the absent scripts are the refusal's contract, and the control arm on the same fixture with the captured account spawns on both paths
+        """A known account mismatch refuses on EVERY path: the unattended
+        sweep's defaults fallback (which then leaves the lead down, saying
+        why in one line) and the operator's --defaults alike. MUTATION: take
+        the fallback or --defaults before the account check — the lead
+        resumes on an account it never ran on and nobody sees it."""
+        from helm import seat_resume_all
+        self._known_other_account()
+        rc, text, script = self._seat_resume(
+            reboot_dead=True, reboot_sid=self.SID,
+            unattended=seat_resume_all.SWEEP)
+        self.assertEqual(rc, 1, text)
+        self.assertIsNone(script, text)
+        why = [l for l in text.splitlines() if "refusing to resume" in l]
+        self.assertEqual(len(why), 1, text)
+        self.assertIn("swap the account", why[0])
+        self.assertNotIn("another@example.com", text)
+        rc, lines, script = self._resume(defaults=True)
+        self.assertEqual(rc, 1, lines)
+        self.assertIsNone(script, lines)
+        self.assertIn("swap the account", " ".join(lines))
+
+    def test_a_capture_a_later_adopted_resume_followed_binds_nothing(self):  # noqa: VACUOUS_ASSERTION — rc 1 and the note naming the later launch are the positive controls; the absent script is the refusal's contract, and test_a_claude_lead_resumes_with_its_model_and_permission_mode resumes the same capture
+        """codex's input on an adopted lead: the same session was launched
+        again after the capture (helm's adopted resume minted its script a
+        minute later, with whatever deny set it then had) and exited before
+        the next sweep. The capture no longer describes the last launch, so
+        it binds nothing. MUTATION: bind by seat and session alone — the old
+        capture restores the old permissions and calls it EXACT."""
+        from helm import pk
+        self._capture()
+        os.makedirs(os.path.join(self.tmp, "resumes"), exist_ok=True)
+        script = os.path.join(self.tmp, "resumes", self.SID + ".sh")
+        with open(script, "w") as f:
+            f.write("#!/bin/sh\n")
+        later = pk.parse_ts_epoch("2026-09-29T00:00:00Z") + 60
+        os.utime(script, (later, later))
+        rc, lines, spawned = self._resume()   # RESUME_DIR is tmp/resumes
+        text = " ".join(lines)
+        self.assertEqual(rc, 1, lines)
+        self.assertIsNone(spawned, lines)
+        self.assertIn("binds nothing: a later launch of the seat followed it",
+                      text)
+
+    def test_the_captured_account_resumes_on_both_paths(self):
+        """The control: the home holds the account the capture recorded, so
+        the sweep's fallback and the operator's --defaults both resume."""
+        from helm import accounts, seat_resume_all
+        self._capture(account=accounts.measured_key("lead-account@example.com"),
+                      withheld=["append_system_prompt"])
+        self._home_pays("aaaaaaaa-0000-4000-8000-000000000001",
+                        "lead-account@example.com")
+        self._home_model(self.MODEL)       # the sweep keeps the model it ran
+        rc, lines, script = self._resume(defaults=True)
+        self.assertEqual(rc, 0, lines)
+        self.assertIsNotNone(script, lines)
+        rc, text, script = self._seat_resume(
+            reboot_dead=True, reboot_sid=self.SID,
+            unattended=seat_resume_all.SWEEP)
+        self.assertEqual(rc, 0, text)
+        self.assertIsNotNone(script, text)
+
+    def test_an_unreadable_account_check_says_so_and_does_not_refuse(self):
+        """No capture recorded the account and the home holds no readable
+        one: the check is UNKNOWN, printed with why, and the resume goes on.
+        MUTATION: pass silently — nothing says the account was never
+        compared."""
+        self._capture()
+        rc, lines, script = self._resume()
+        self.assertEqual(rc, 0, lines)
+        self.assertIsNotNone(script, lines)
+        unknown = [l for l in lines if l.strip().startswith(
+            "account: UNKNOWN (")]
+        self.assertEqual(len(unknown), 1, lines)
+
+    def test_the_exact_resume_prints_what_todays_defaults_would_change(self):
+        """The adopted exact path prints the same diff against today's
+        defaults the proxy path does. MUTATION: print it on the proxy path
+        only — the operator never sees that the home's default model would
+        have replaced the one the lead ran."""
+        self._capture()
+        rc, lines, script = self._resume()
+        self.assertEqual(rc, 0, lines)
+        text = "\n".join(lines)
+        self.assertIn("(today's defaults would change: ", text)
+        self.assertRegex(text, r"model claude-opus-5-5\[1m\] -> "
+                               r"\(home default")
+
+    SID2 = "33333333-3333-4333-8333-333333333334"
+
+    def _cleared(self):
+        """The lead's session after a /clear (or a cv-pruned copy): a new
+        id, its own transcript, and no capture yet names it."""
+        path = os.path.join(self.tmp, self.SID2 + ".jsonl")
+        with open(self.transcript) as f:
+            rows = [dict(json.loads(line), sessionId=self.SID2) for line in f]
+        with open(path, "w") as f:
+            f.write("".join(json.dumps(r) + "\n" for r in rows))
+        self.row = {"i": self.SID2, "h": "claude", "cwd": self.cwd, "mt": 1,
+                    "p": path}
+
+    def _seat_resume(self, **kw):
+        """The seat verb's resume of the lead: the reboot sweep's call
+        (`reboot_dead`, `reboot_sid`, `unattended`) or, with no kw, the
+        operator's."""
+        from helm import seat, sessions
+        ad = _SpawnAd()
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(orcaadopt, "resolve",
+                               return_value={"seat": self.SEAT}), \
+                mock.patch.object(orcaadopt, "seat_liveness",
+                                  return_value=(orcaadopt.DEAD, "dead")), \
+                mock.patch.object(orcaadopt, "newest_session_row",
+                                  return_value=(dict(self.row), None)), \
+                mock.patch("helm.sessions.resume_warnings", return_value=[]), \
+                mock.patch("helm.sessions.credhome_for",
+                           return_value=self.cred), \
+                mock.patch("helm.cred.launch_sync", return_value=True), \
+                mock.patch.object(sessions, "RESUME_DIR",
+                                  os.path.join(self.tmp, "resumes")), \
+                mock.patch.object(harness, "detect", return_value=ad), \
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            if kw:
+                rc = seat._resume(self.SEAT, [], **kw)
+            else:
+                rc = seat.cmd_seat(["resume", self.SEAT])
+        script = None
+        if ad.spawned:
+            with open(ad.spawned[-1][0]) as f:
+                script = f.read()
+        return rc, out.getvalue() + err.getvalue(), script
+
+    def test_the_reboot_sweep_resumes_a_cleared_session_on_todays_defaults(self):
+        """A capture binds by session id, so the session a /clear (or a cv
+        prune) moved the lead to has none yet, and its recipe does not know
+        the denied tools, the appended instructions or the identity. Each is
+        a field the defaults resume never took from the lead's past run, so
+        the unattended sweep resumes it on today's defaults, saying so in
+        one line naming them. MUTATION: refuse as the interactive resume
+        does — the sweep leaves the lead down."""
+        self._capture()
+        self._cleared()
+        self._home_model(self.MODEL)       # the defaults launch the model it ran
+        from helm import seat_resume_all
+        rc, text, script = self._seat_resume(
+            reboot_dead=True, reboot_sid=self.SID2,
+            unattended=seat_resume_all.SWEEP)       # `act`'s own call
+        self.assertEqual(rc, 0, text)
+        self.assertIsNotNone(script, text)
+        self.assertIn("claude --resume %s" % self.SID2, script)
+        self.assertNotIn("--model", script)
+        loud = [l for l in text.splitlines()
+                if "reboot sweep" in l and "TODAY'S defaults" in l]
+        self.assertEqual(len(loud), 1, text)
+        for field in ("disallowed_tools", "append_system_prompt",
+                      "identity_env"):
+            self.assertIn(field, loud[0])
+
+    def test_the_sweep_leaves_a_lead_down_when_its_home_names_no_model(self):  # noqa: VACUOUS_ASSERTION — rc 1 and the one line naming the model's source are the positive controls; the absent script is the leave-down contract, and test_the_reboot_sweep_resumes_a_cleared_session_on_todays_defaults spawns on the same fixture once the home names the model it ran
+        """The recipe knows the model the lead ran and its home's
+        settings name none, so a defaults resume (no --model) runs whatever
+        claude picks: that cannot be shown to be the model it ran, so the
+        unattended sweep leaves the lead down and says why. MUTATION: read
+        a home that names no model as 'no change' — the lead comes back on
+        claude's own default, not the 1M model it ran."""
+        self._capture()
+        self._cleared()
+        from helm import seat_resume_all
+        rc, text, script = self._seat_resume(
+            reboot_dead=True, reboot_sid=self.SID2,
+            unattended=seat_resume_all.SWEEP)
+        self.assertEqual(rc, 1, text)
+        self.assertIsNone(script, text)
+        why = [l for l in text.splitlines() if "refusing to resume" in l]
+        self.assertEqual(len(why), 1, text)
+        self.assertIn("the reboot sweep leaves it down", why[0])
+        self.assertIn("they name none", why[0])
+
+    def test_a_capture_a_later_rehome_followed_binds_nothing(self):  # noqa: VACUOUS_ASSERTION — rc 1 and the note naming the later launch are the positive controls; the absent script is the refusal's contract, and test_a_claude_lead_resumes_with_its_model_and_permission_mode resumes the same capture
+        """`seat rehome` relaunched the lead's session on another home
+        after the capture (its ledger row), through `helm launch`, which
+        mints no resume script, and the rehomed process went down before a
+        sweep captured it. The capture is not the session's last launch, so
+        it binds nothing. MUTATION: read only the resume script's mtime —
+        the pre-rehome capture binds and the lead resumes EXACTLY on the
+        home it was moved off, a payer swap."""
+        from helm import seat_rehome
+        self._capture()
+        ok, why = seat_rehome.record({
+            "seat": self.SEAT, "home": "another", "session": self.SID,
+            "model": self.MODEL, "ts": "2026-09-29T01:00:00Z"})
+        self.assertTrue(ok, why)
+        rc, lines, spawned = self._resume()
+        text = " ".join(lines)
+        self.assertEqual(rc, 1, lines)
+        self.assertIsNone(spawned, lines)
+        self.assertIn("binds nothing: a later launch of the seat followed it",
+                      text)
+
+    def _helm_launch(self, home_name, *claude_args):
+        """The operator's hand move of the lead: `helm launch --seat <seat>
+        --home <home_name> -- <claude_args>`, through the real verb up to
+        its exec (stopped here). -> the home's path."""
+        from helm import launch
+        where = os.path.join(self.tmp, "claude-homes", home_name)
+        os.makedirs(where, exist_ok=True)
+        err = io.StringIO()
+        with mock.patch.object(launch.hooks, "_select_homes",
+                               return_value=([(home_name, where)], None)), \
+                mock.patch.object(launch, "home_note"), \
+                mock.patch.object(launch, "link_skills"), \
+                mock.patch("helm.cred.launch_sync", return_value=True), \
+                mock.patch.object(launch.homes, "reconcile_seat_home",
+                                  return_value=[]), \
+                mock.patch.object(launch.seats, "join"), \
+                mock.patch.object(launch.seat_launch_owner, "exec_attached",
+                                  return_value=0), \
+                contextlib.redirect_stderr(err):
+            rc = launch.cmd_launch(["--no-install", "--seat", self.SEAT,
+                                    "--home", home_name, "--"]
+                                   + list(claude_args))
+        self.assertEqual(rc, 0, err.getvalue())
+        return where
+
+    def _session_start(self, home_name, readable=False, pid=6262, sid=None):
+        """What helm's SessionStart hook records when the lead's session is
+        started again on another home (`--continue`, `/resume`, Orca's own
+        relaunch, a hand `claude --resume` among the ways): its row, with
+        the capture of the process when `readable`. -> the home's path."""
+        from helm import seat_recipe
+        where = os.path.join(self.tmp, "claude-homes", home_name)
+        os.makedirs(where, exist_ok=True)
+        proc = os.path.join(self.tmp, "proc")
+        pin = mock.patch.dict(os.environ, {"HELM_PROC": proc})
+        pin.start()
+        self.addCleanup(pin.stop)
+        if readable:
+            d = os.path.join(proc, str(pid))
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "cmdline"), "wb") as f:
+                f.write(b"\0".join(w.encode() for w in (
+                    "/opt/claude/versions/2.1.285",
+                    "--dangerously-skip-permissions",
+                    "--model", self.MODEL)) + b"\0")
+            with open(os.path.join(d, "environ"), "wb") as f:
+                f.write(("HELM_CHAT_NAME=%s\0HELM_CELL_PROFILE=owner-profile"
+                         "\0CLAUDE_CONFIG_DIR=%s\0" % (self.SEAT, where)
+                         ).encode())
+            with open(os.path.join(d, "stat"), "w") as f:
+                f.write("%d (claude) S %s 300 0 0\n" % (pid, " ".join(
+                    ["0"] * 18)))
+        sid = sid or self.SID
+        why = seat_recipe.record_session_start(
+            {"hook_event_name": "SessionStart", "source": "resume",
+             "session_id": sid, "cwd": self.cwd,
+             "transcript_path": self.transcript},
+            environ={"CLAUDE_PID": str(pid), "CLAUDE_CODE_SESSION_ID": sid,
+                     "CLAUDE_CONFIG_DIR": where, "HELM_CHAT_NAME": self.SEAT})
+        self.assertIsNone(why)
+        return where
+
+    def _launch_rows(self):
+        from helm import eventledger, home
+        rows, unread = eventledger.checked_events(
+            os.path.join(home.global_dir(), "seat-launches.jsonl"))
+        self.assertIsNone(unread)
+        return rows
+
+    def test_a_capture_a_later_session_start_followed_binds_nothing(self):  # noqa: VACUOUS_ASSERTION — rc 1 and the note naming the later launch are the positive controls; the absent script is the refusal's contract, and test_a_claude_lead_resumes_with_its_model_and_permission_mode resumes the same capture
+        """The lead's session was started again on another home by a
+        launch that names no session id (`helm launch --seat S --home B --
+        --continue` among them), and its process could not be read: the
+        capture taken on the old home is not the session's last launch, so
+        it binds nothing. MUTATION: a record only helm's own launch lines
+        write — the capture binds, the lead resumes EXACTLY on the home it
+        was moved off, and the account that pays moves unprinted."""
+        self._capture()
+        self._session_start("other")
+        rc, lines, spawned = self._resume()
+        text = " ".join(lines)
+        self.assertEqual(rc, 1, lines)
+        self.assertIsNone(spawned, lines)
+        self.assertIn("SessionStart resume", text)
+
+    def test_a_session_start_on_another_home_resumes_exactly_there(self):
+        """The row carries the capture of the process that started, so the
+        lead resumes EXACTLY as that launch ran, on the home it ran on.
+        MUTATION: bind the sweep's older capture — the lead resumes on the
+        home it was moved off."""
+        self._capture()
+        other = self._session_start("other", readable=True)
+        rc, lines, script = self._resume()
+        self.assertEqual(rc, 0, lines)
+        self.assertIsNotNone(script, lines)
+        self.assertIn("CLAUDE_CONFIG_DIR=%s" % os.path.realpath(other), script)
+        self.assertTrue(any("EXACTLY" in l for l in lines), lines)
+
+    def test_the_sweep_leaves_a_lead_down_whose_last_launch_ran_elsewhere(self):  # noqa: VACUOUS_ASSERTION — rc 1 and the one line naming the other home are the positive controls; the absent script is the leave-down contract, and test_the_reboot_sweep_resumes_a_cleared_session_on_todays_defaults spawns on the same fixture
+        """After a move to another home whose process could not be read,
+        the session-creds index still names the home it was moved off. The
+        last recorded launch names the home it ran on last, and an
+        unattended resume never moves the home a seat is paid by, so the
+        sweep leaves the lead down naming that home. MUTATION: fall back on
+        the index's home — the lead comes back on the old home, printing
+        only the defaults WARNING."""
+        from helm import seat_resume_all
+        self._capture()
+        self._home_model(self.MODEL)       # no model change on the old home
+        other = self._session_start("other")
+        rc, text, script = self._seat_resume(
+            reboot_dead=True, reboot_sid=self.SID,
+            unattended=seat_resume_all.SWEEP)
+        self.assertEqual(rc, 1, text)
+        self.assertIsNone(script, text)
+        why = [l for l in text.splitlines() if "refusing to resume" in l]
+        self.assertEqual(len(why), 1, text)
+        self.assertIn("the reboot sweep leaves it down", why[0])
+        self.assertIn(os.path.realpath(other), why[0])
+
+    def test_defaults_prints_the_move_off_the_home_it_last_ran_on(self):
+        """The control: the operator's --defaults resumes on the index's
+        home, and prints the move from the home the last launch ran on."""
+        self._capture()
+        other = self._session_start("other")
+        rc, lines, script = self._resume(defaults=True)
+        self.assertEqual(rc, 0, lines)
+        self.assertIsNotNone(script, lines)
+        moved = [l for l in lines if l.strip().startswith("config_dir")]
+        self.assertEqual(len(moved), 1, lines)
+        self.assertIn("%s -> %s" % (os.path.realpath(other),
+                                    os.path.realpath(self.cred)), moved[0])
+
+    def test_a_resume_whose_pane_never_started_writes_no_row_and_binds_nothing(self):  # noqa: VACUOUS_ASSERTION — the second resume's rc 1 and the note naming the script are the positive controls; the unchanged record is the contract for a launch that never started
+        """A row exists only for a launch that really started, so a resume
+        whose pane the metaharness never created (Orca still booting)
+        writes none; the resume script it minted is still a launch that may
+        have started, after the record's first row too, so the capture is
+        demoted to uncaptured and never binds. MUTATION: drop the script
+        once the record holds any row — a spawn that raised after a
+        capture could bind it."""
+        self._capture()
+        # the record is live: another session's launch was recorded first
+        self._session_start("elsewhere", sid=self.SID2)
+        before = self._launch_rows()
+
+        class Booting(_SpawnAd):
+            def spawn(self, command, title=None, cwd=None):
+                raise harness.HarnessError("orca is still booting")
+        rc, lines, spawned = self._resume(ad=Booting())
+        self.assertEqual(rc, 1, lines)
+        self.assertEqual(self._launch_rows(), before)
+        rc, lines, script = self._resume()
+        self.assertEqual(rc, 1, lines)
+        self.assertIsNone(script, lines)
+        self.assertIn("the adopted resume's script", " ".join(lines))
+
+    def _later(self, seconds=60):
+        """A stamp this many seconds after now, in the record's own form."""
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                             time.gmtime(time.time() + seconds))
+
+    def test_a_sweep_capture_after_the_newest_row_binds_that_later_launch(self):
+        """The lead's newest row was written on one home; it was then started
+        on another by a start whose hook wrote nothing (killed at its
+        timeout, or a home without helm's hook), and the sweep captured that
+        process. The capture taken after the newest row is the LATER launch
+        and binds. MUTATION: let any row outrank the sweep — the lead
+        resumes EXACTLY on the home it was moved off, a payer move."""
+        self._session_start("first", readable=True)
+        self._capture(captured=self._later())
+        rc, lines, script = self._resume()
+        self.assertEqual(rc, 0, lines)
+        self.assertIn("CLAUDE_CONFIG_DIR=%s" % self.cred, script)
+        self.assertTrue(any("EXACTLY" in l for l in lines), lines)
+
+    def test_a_capture_less_row_followed_by_a_sweep_capture_binds_it(self):
+        """A row whose process did not read binds nothing only when no sweep
+        capture follows it."""
+        self._session_start("first")
+        self._capture(captured=self._later())
+        rc, lines, script = self._resume()
+        self.assertEqual(rc, 0, lines)
+        self.assertIn("CLAUDE_CONFIG_DIR=%s" % self.cred, script)
+
+    def test_a_rehome_after_the_newest_row_unbinds_it(self):  # noqa: VACUOUS_ASSERTION — rc 1 and the note naming the rehome ledger are the positive controls; the absent script is the refusal's contract, and test_a_session_start_on_another_home_resumes_exactly_there binds the same row
+        """A `seat rehome` ledger row newer than the session's newest launch
+        row is a later launch: it can only unbind. MUTATION: read the
+        rehome ledger only for a session no row names — the row binds over
+        the move."""
+        from helm import seat_rehome
+        self._session_start("first", readable=True)
+        ok, why = seat_rehome.record({
+            "seat": self.SEAT, "home": "another", "session": self.SID,
+            "model": self.MODEL, "ts": self._later()})
+        self.assertTrue(ok, why)
+        rc, lines, spawned = self._resume()
+        self.assertEqual(rc, 1, lines)
+        self.assertIsNone(spawned, lines)
+        self.assertIn("the seat rehome ledger", " ".join(lines))
+
+    def test_a_rehome_row_naming_the_rows_own_process_is_that_launch(self):
+        """The control: a rehome writes its ledger row after it PROVES the
+        relaunched process, so a row naming the very process the newest
+        launch row captured is that launch, not a later one, and the row
+        still binds."""
+        from helm import seat_rehome
+        self._session_start("first", readable=True)
+        ok, why = seat_rehome.record({
+            "seat": self.SEAT, "home": "first", "session": self.SID,
+            "model": self.MODEL, "ts": self._later(),
+            "process": [6262, "300"]})
+        self.assertTrue(ok, why)
+        rc, lines, script = self._resume()
+        self.assertEqual(rc, 0, lines)
+        self.assertTrue(any("EXACTLY" in l for l in lines), lines)
+
+    def test_a_resume_script_after_the_newest_row_unbinds_it(self):  # noqa: VACUOUS_ASSERTION — rc 1 and the note naming the script are the positive controls; the absent script is the refusal's contract, and test_a_session_start_on_another_home_resumes_exactly_there binds the same row
+        """A resume script newer than the newest row is a launch that may
+        have started (a spawn that raised demotes, never binds)."""
+        self._session_start("first", readable=True)
+        os.makedirs(os.path.join(self.tmp, "resumes"), exist_ok=True)
+        script = os.path.join(self.tmp, "resumes", self.SID + ".sh")
+        with open(script, "w") as f:
+            f.write("#!/bin/sh\n")
+        later = time.time() + 60
+        os.utime(script, (later, later))
+        rc, lines, spawned = self._resume()   # RESUME_DIR is tmp/resumes
+        self.assertEqual(rc, 1, lines)
+        self.assertIsNone(spawned, lines)
+        self.assertIn("the adopted resume's script", " ".join(lines))
+
+    def test_a_fork_launch_leaves_the_forked_sessions_capture_binding(self):  # noqa: VACUOUS_ASSERTION — rc 0 and the EXACTLY line of the resume after the fork are the unconditional positive controls
+        """`helm launch -- --resume <sid> --fork-session` starts a NEW
+        session: the session it names is not relaunched, so its capture
+        still binds. MUTATION: record the session the argv names — a fork
+        unbinds the capture of the session it copied."""
+        from helm import launch
+        self._capture()
+        where = os.path.join(self.tmp, "claude-homes", "other")
+        os.makedirs(where, exist_ok=True)
+        with mock.patch.object(launch.hooks, "_select_homes",
+                               return_value=([("other", where)], None)), \
+                mock.patch.object(launch, "home_note"), \
+                mock.patch.object(launch, "link_skills"), \
+                mock.patch("helm.cred.launch_sync", return_value=True), \
+                mock.patch.object(launch.homes, "reconcile_seat_home",
+                                  return_value=[]), \
+                mock.patch.object(launch.seats, "join"), \
+                mock.patch.object(launch.seat_launch_owner, "exec_attached",
+                                  return_value=0), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(launch.cmd_launch(
+                ["--no-install", "--seat", self.SEAT, "--home", "other", "--",
+                 "--resume", self.SID, "--fork-session"]), 0)
+        rc, lines, script = self._resume()
+        self.assertEqual(rc, 0, lines)
+        self.assertTrue(any("EXACTLY" in l for l in lines), lines)
+
+    def test_defaults_never_moves_a_named_home_lead_onto_the_default(self):  # noqa: VACUOUS_ASSERTION — rc 1 and the named swap are the positive controls; the absent script is the refusal's contract, and test_a_default_home_lead_resumes_across_orcas_account_switch resumes a lead whose capture ran on the default home
+        """The default home's exception is for a lead that RAN there: a lead
+        captured on a named home whose session-creds index names the
+        default home (the session was made there, then moved) still
+        refuses an account that differs. MUTATION: check only the home it
+        resumes on — the payer moves off the named home, worded as an Orca
+        switch."""
+        from helm import accounts, seat_recipe
+        default = os.path.join(self.tmp, "dot-claude")
+        os.makedirs(default)
+        self._capture(account=accounts.measured_key("lead-account@example.com"))
+        with open(os.path.join(self.tmp, ".claude.json"), "w") as f:
+            json.dump({"oauthAccount": {
+                "emailAddress": "orca-switched@example.com",
+                "accountUuid": "aaaaaaaa-0000-4000-8000-000000000002"}}, f)
+        pin = mock.patch.object(seat_recipe, "default_home",
+                                return_value=os.path.realpath(default))
+        pin.start()
+        self.addCleanup(pin.stop)
+        with mock.patch("helm.sessions.credhome_for",
+                        return_value=os.path.realpath(default)):
+            plan = seat_recipe.adopted_plan(self.SEAT, dict(self.row),
+                                            os.path.realpath(default),
+                                            defaults=True)
+        self.assertIsNotNone(plan.refusal, plan.lines)
+        self.assertIn("swap the account", plan.refusal)
+
+    def test_an_unreadable_rehome_ledger_is_named_not_called_a_later_launch(self):  # noqa: VACUOUS_ASSERTION — rc 1 and the note naming the unread ledger are the positive controls; the absent script and the absent false reason are the contract
+        """A ledger that does not read may hold a later launch, so the
+        capture binds nothing, and the note says the ledger did not read.
+        MUTATION: fail closed with the later-launch reason — the note
+        states a launch nobody recorded."""
+        from helm import seat_rehome
+        self._capture()
+        os.makedirs(seat_rehome.ledger_path())    # a directory: unreadable
+        rc, lines, spawned = self._resume()
+        text = " ".join(lines)
+        self.assertEqual(rc, 1, lines)
+        self.assertIsNone(spawned, lines)
+        self.assertIn("did not read", text)
+        self.assertIn(seat_rehome.ledger_path(), text)
+        self.assertNotIn("a later launch of the seat followed it", text)
+
+    def test_an_unreadable_launch_record_is_named_not_called_a_later_launch(self):  # noqa: VACUOUS_ASSERTION — rc 1 and the note naming the unread record are the positive controls; the absent script and the absent false reason are the contract
+        """The same for the launch record itself. MUTATION: skip a record
+        that does not read — the capture binds over a launch it may hold."""
+        from helm import home
+        path = os.path.join(home.global_dir(), "seat-launches.jsonl")
+        self._capture()
+        os.makedirs(path)                          # a directory: unreadable
+        rc, lines, spawned = self._resume()
+        text = " ".join(lines)
+        self.assertEqual(rc, 1, lines)
+        self.assertIsNone(spawned, lines)
+        self.assertIn("did not read", text)
+        self.assertIn(path, text)
+        self.assertNotIn("a later launch of the seat followed it", text)
+
+    def _default_home_switched(self):
+        """A default-home lead (CLAUDE_CONFIG_DIR unset) captured on one
+        account, and Orca has since switched the default home to another
+        (~/.claude.json, one level up). -> (the key it ran on, the key now)."""
+        from helm import accounts, seat_recipe
+        default = os.path.join(self.tmp, "dot-claude")
+        os.makedirs(default)
+        ran = accounts.measured_key("lead-account@example.com")
+        self._capture(account=ran, config=False)
+        with open(os.path.join(self.tmp, ".claude.json"), "w") as f:
+            json.dump({"oauthAccount": {
+                "emailAddress": "orca-switched@example.com",
+                "accountUuid": "aaaaaaaa-0000-4000-8000-000000000002"}}, f)
+        self.cred = default                  # the index names the default
+        pin = mock.patch.object(seat_recipe, "default_home",
+                                return_value=os.path.realpath(default))
+        pin.start()
+        self.addCleanup(pin.stop)
+        return ran, accounts.measured_key("orca-switched@example.com")
+
+    def test_a_default_home_lead_resumes_across_orcas_account_switch(self):
+        """The default home's payer is whichever account Orca holds, and
+        Orca switching it is the fleet's designed wall handling, so the
+        switch is printed and the resume goes on. MUTATION: refuse as for a
+        named home — no helm verb can ever resume the lead again."""
+        ran, now = self._default_home_switched()
+        rc, lines, script = self._resume()
+        self.assertEqual(rc, 0, lines)
+        self.assertIsNotNone(script, lines)
+        self.assertIn("account: %s now; it ran on %s" % (now, ran),
+                      "\n".join(lines))
+        self.assertNotIn("swap", " ".join(lines))
+
+    def test_defaults_on_a_default_home_prints_orcas_account_switch(self):
+        """--defaults takes the same check and prints the same switch."""
+        ran, now = self._default_home_switched()
+        rc, lines, script = self._resume(defaults=True)
+        self.assertEqual(rc, 0, lines)
+        self.assertIsNotNone(script, lines)
+        self.assertIn("account: %s now; it ran on %s" % (now, ran),
+                      "\n".join(lines))
+
+    def test_the_operator_resume_of_a_cleared_session_still_refuses(self):  # noqa: VACUOUS_ASSERTION — rc 1 and the named fields are the positive controls; the absent script is the no-spawn contract, and the sweep arm on the same fixture spawns
+        """The control: only the unattended sweep takes today's defaults;
+        `helm seat resume` refuses the same session and names the fields."""
+        self._capture()
+        self._cleared()
+        rc, text, script = self._seat_resume()
+        self.assertEqual(rc, 1, text)
+        self.assertIsNone(script, text)
+        for field in ("disallowed_tools", "append_system_prompt",
+                      "identity_env"):
+            self.assertIn(field, text)
+
+    def test_a_mode_or_effort_claude_does_not_take_refuses(self):  # noqa: VACUOUS_ASSERTION — rc 1 and the named field are the positive controls; the absent script is the no-spawn contract, proven non-vacuous by test_a_claude_lead_resumes_with_its_model_and_permission_mode on the same fixture
+        """A recorded value claude's own flag does not take would start a
+        pane that exits at once (seat_rehome.PERMISSION_MODES draws the same
+        line for a settings mode), so the resume refuses before any spawn. It
+        names the FIELD, never the value: the transcript is a source like any
+        other, and a value outside its list is never printed (task/3695).
+        MUTATION: pass the recorded words through unchecked — the pane is
+        spawned on `--permission-mode warp`."""
+        self._capture()
+        with open(self.transcript) as f:
+            rows = [json.loads(line) for line in f]
+        for key, value in (("permissionMode", "warp"), ("effort", "turbo")):
+            with self.subTest(key=key):
+                with open(self.transcript, "w") as f:
+                    f.write("".join(json.dumps(dict(r, **{key: value})
+                                               if key in r else r) + "\n"
+                                    for r in rows))
+                rc, lines, script = self._resume()
+                self.assertEqual(rc, 1, lines)
+                self.assertIsNone(script, lines)
+                field = "permission" if key == "permissionMode" else "effort"
+                self.assertIn(field, " ".join(lines))
+                self.assertNotIn(value, " ".join(lines))
+
+    def test_defaults_resumes_as_before_and_prints_each_change(self):  # noqa: VACUOUS_ASSERTION — the absent flags ARE the old bare resume; `claude --resume <sid>` asserted on the same script is the positive control
+        """The explicit choice of today's defaults: the old bare resume,
+        after a line per field that moves."""
+        self._capture()
+        rc, lines, script = self._resume(defaults=True)
+        text = "\n".join(lines)
+        self.assertEqual(rc, 0, lines)
+        self.assertIn("claude --resume %s" % self.SID, script)
+        self.assertNotIn("--model", script)
+        self.assertNotIn("--dangerously-skip-permissions", script)
+        self.assertRegex(text, r"model\s+claude-opus-5-5\[1m\] -> "
+                               r"\(home default")
+        self.assertRegex(text, r"permission\s+bypassPermissions -> "
+                               r"\(home default")
 
 
 class ProvenanceTest(unittest.TestCase):
@@ -1170,6 +1984,11 @@ _SEND_AUTHORITIES = {
         "own /exit (plus the seat's presence record) as its witness. `handle` "
         "is a PARAMETER, the one its caller (seat rehome's operation inside "
         "send_to_pane) already proved"),
+    ("harness.py", "clear_placed"): (
+        "delegated", "THE TAKE-BACK: Ctrl+E moves to the end, a fresh exact "
+        "read proves the line still belongs to Helm, then Ctrl+U clears it; "
+        "neither key presses Enter. The caller already proved the handle "
+        "(the child's own delivery, or a listed pane's recorded handle)"),
     ("harness.py", "answer_dialog"): (
         "delegated", "THE DIALOG DOOR (task/3209): ONE digit, never Enter, "
         "into a dialog proven to await input now — the kind's shape standing "
@@ -1275,7 +2094,9 @@ def _is_non_pane_send(fn):
 # `choose_in_modal` stops sending its own digit and calls the door instead (a
 # site that moves, not a new one); and `submit_exit` answers its dialog through
 # the door rather than `_press_enter`, which is one more `answer_dialog` site.
-_SEND_SITES = 21
+# 21 -> 23 (task/1818): `clear_placed`, the take-back door, moves the cursor
+# with Ctrl+E, re-proves Helm's exact line, then clears it with Ctrl+U.
+_SEND_SITES = 23
 
 
 def _helm_sources(root):
@@ -2853,19 +3674,6 @@ def _p_native_registered(blind):
     return "TYPO-VERDICT" if not recognized else "SUPPRESSED"
 
 
-def _p_recovery_owner(blind):
-    from helm import resumeturn, seats as seatsmod, seats_work_offer
-    with mock.patch.object(seats_work_offer, "_live_seats",
-                           return_value={"peer"}), \
-            mock.patch.object(seatsmod, "owner_names", return_value=set()), \
-            mock.patch.object(seatsmod, "roster_checked",
-                              return_value=({"peer": {}}, blind)), \
-            mock.patch.object(seatsmod, "beacon_procs",
-                              return_value=([4242], None)):
-        owner, _detail = resumeturn._recovery_owner("subject")
-    return "ASSIGNED" if owner else "UNKNOWN"
-
-
 def _p_retitle(blind):
     """`helm seat retitle` supplies its OWN census to `pane_rows`, which makes
     the blindness this verb's to report — pane_rows' stated law. A blind
@@ -2965,11 +3773,6 @@ _CENSUS_CONSUMERS = {
         "a title table that does not name the unidentified pids presents its "
         "own coverage as complete — every pane helm could not name reads as "
         "'not a seat' rather than 'helm could not look'"),
-    ("resumeturn.py", "_recovery_owner"): (
-        "gate", "ASSIGNED", _p_recovery_owner,
-        "an assignee is authority to DM and mark the durable recovery task in "
-        "progress; an unreadable checked roster must leave the task unowned "
-        "rather than guess a canonical non-owner identity"),
 }
 
 
@@ -3898,7 +4701,7 @@ class AdoptedProxySeatResumeTest(unittest.TestCase):
         return {"i": self.SID, "h": "claude", "cwd": self.cwd, "mt": 1,
                 "p": transcript}
 
-    def _proxy_seat(self, storage, identity, launch=True):
+    def _proxy_seat(self, storage, identity, launch=True, model=None):
         """A codex proxy seat's tree as adoption leaves it: its config home
         holding the session's transcript, a register with NO family and NO
         project, and (unless `launch` is False) its token file and a launch.sh
@@ -3919,7 +4722,8 @@ class AdoptedProxySeatResumeTest(unittest.TestCase):
                                   + seat._token_export("codex", storage)
                                   + _launch_owner(seat.launch_line(
                                       "codex", seat=storage,
-                                      identity=identity, model=self.MODEL)))
+                                      identity=identity,
+                                      model=model or self.MODEL)))
         return cfg, transcript, launch_sh
 
     def _project_port(self, storage):
@@ -3937,7 +4741,7 @@ class AdoptedProxySeatResumeTest(unittest.TestCase):
         self._roster({name: {"session": self.SID,
                              "seat_keys": [seats_common._seat_key(storage)]}})
 
-    def _resume(self, name, row, home):
+    def _resume(self, name, row, home, *flags):
         from helm import seat
         ad = _SpawnRecorder()
         out, err = io.StringIO(), io.StringIO()
@@ -3954,7 +4758,7 @@ class AdoptedProxySeatResumeTest(unittest.TestCase):
                 mock.patch.object(harness, "detect", return_value=ad), \
                 contextlib.redirect_stdout(out), \
                 contextlib.redirect_stderr(err):
-            rc = seat.cmd_seat(["resume", name])
+            rc = seat.cmd_seat(["resume", name] + list(flags))
         return rc, out.getvalue(), err.getvalue(), ad
 
     def _script(self, ad):
@@ -4004,10 +4808,20 @@ class AdoptedProxySeatResumeTest(unittest.TestCase):
 
     # -- A ---------------------------------------------------------------------
     def test_A_a_native_lead_mints_the_same_script_byte_for_byte(self):
+        """A native lead never reaches the proxy launch: its `--defaults`
+        resume (the bare `claude --resume` on its credential home) mints the
+        same script as before, byte for byte, and its default resume is the
+        exact one, which refuses a transcript that states no recipe."""
         from helm import seat
         home = os.path.join(self.tmp, "homes", "acct-a")
         transcript = self._transcript(home)
-        rc, out, err, ad = self._resume("seat-a", self._row(transcript), home)
+        rc, _out, err, ad = self._resume("seat-a", self._row(transcript), home)
+        self.assertEqual(rc, 1, err)
+        self.assertIn("helm seat: refusing to resume seat-a — its launch "
+                      "recipe is incomplete", err)
+        self.assertEqual((ad.spawned, os.listdir(self.resumes)), ([], []))
+        rc, out, err, ad = self._resume("seat-a", self._row(transcript), home,
+                                        "--defaults")
         self.assertEqual(rc, 0, err)
         self.assertEqual(self._script(ad), (
             "#!/bin/sh\n"
@@ -4051,8 +4865,11 @@ class AdoptedProxySeatResumeTest(unittest.TestCase):
         family, why = seat._seat_family("seat-a-codex")
         self.assertIsNone(family)
         self.assertIn("missing family and project", why)
+        # --defaults: its transcript states no recipe and no capture binds
+        # it, so this is the launch.sh resume with the model it records (the
+        # exact path is the captured arm below)
         rc, out, err, ad = self._resume("seat-a-codex", self._row(transcript),
-                                        cfg)
+                                        cfg, "--defaults")
         self.assertEqual(rc, 0, err)
         text = self._script(ad)
         self.assertIn("exec %s --model %s --resume %s\n"
@@ -4071,7 +4888,8 @@ class AdoptedProxySeatResumeTest(unittest.TestCase):
         # control: the roster's lineage is what ties the storage to the seat
         self.assertEqual(seats_lineage.seat_lineage("codex-97")[:2],
                          ("seat-b", seats_lineage.SEAT_RENAMED))
-        rc, out, err, ad = self._resume("seat-b", self._row(transcript), cfg)
+        rc, out, err, ad = self._resume("seat-b", self._row(transcript), cfg,
+                                        "--defaults")
         self.assertEqual(rc, 0, err)
         text = self._script(ad)
         self.assertIn("exec %s --model %s --resume %s\n"
@@ -4093,7 +4911,8 @@ class AdoptedProxySeatResumeTest(unittest.TestCase):
         from helm import seat
         cfg, transcript, _launch = self._proxy_seat("codex-97", "seat-b")
         self._renamed("codex-97", "seat-b")
-        rc, _out, err, ad = self._resume("seat-b", self._row(transcript), cfg)
+        rc, _out, err, ad = self._resume("seat-b", self._row(transcript), cfg,
+                                         "--defaults")
         self.assertEqual(rc, 0, err)
         seen = self._run(ad.spawned[0][0])
         self.assertEqual(seen["BASEURL"], "http://127.0.0.1:%d"
@@ -4108,6 +4927,106 @@ class AdoptedProxySeatResumeTest(unittest.TestCase):
         last = len(argv) - 1 - argv[::-1].index("--model")
         self.assertEqual(argv[last + 1], self.MODEL)
         self.assertEqual(argv[argv.index("--resume") + 1], self.SID)
+
+    # -- the same planner as every other resume --------------------------------
+    def _ran_on(self, transcript, model):
+        """The adopted proxy seat's session as a real one reads: its mode,
+        Claude Code's model attachment and a reply at xhigh effort."""
+        rows = [{"type": "permission-mode", "sessionId": self.SID,
+                 "permissionMode": "bypassPermissions"},
+                {"type": "attachment", "sessionId": self.SID, "cwd": self.cwd,
+                 "attachment": {"type": "model",
+                                "identity": {"modelId": model}}},
+                {"type": "assistant", "sessionId": self.SID, "cwd": self.cwd,
+                 "effort": "xhigh", "message": {"model": model,
+                                                "role": "assistant",
+                                                "content": "ok"}}]
+        with open(transcript, "w") as f:
+            f.write("".join(json.dumps(r) + "\n" for r in rows))
+
+    def _adopted_proxy(self):
+        from helm import seat
+        model = seat.FAMILIES["codex"]["model"]
+        self._project_port("seat-a-codex")
+        cfg, transcript, launch_sh = self._proxy_seat(
+            "seat-a-codex", "seat-a-codex", model=model)
+        self._roster({"seat-a-codex": {"session": self.SID}})
+        self._ran_on(transcript, model)
+        return cfg, transcript, launch_sh, model
+
+    def test_an_adopted_proxy_seat_is_planned_like_every_other_resume(self):
+        """No capture binds the session, so the model its transcript states
+        and the window launch.sh states are two launches' recipe, and the
+        resume refuses as every other one does, naming each field's source.
+        MUTATION: resume through launch.sh with no plan — the pane comes
+        back on whatever launch.sh says today while nothing says so."""
+        cfg, transcript, _launch, _model = self._adopted_proxy()
+        rc, _out, err, ad = self._resume("seat-a-codex", self._row(transcript),
+                                         cfg)
+        self._refused(rc, err, ad, "seat-a-codex")
+        self.assertIn("window [last launch (launch.sh)]", err)
+        self.assertIn("--defaults", err)
+
+    def _captured(self, launch_sh):
+        from helm import seat_recipe, seat_resume_all
+        with open(launch_sh) as f:
+            ran = seat_recipe.launch_capture(f.read())
+        line, failed = seat_resume_all.record_live_set(
+            [], True, False, "boot-a", 1, recipes={
+                "seat-a-codex": seat_recipe.capture_record(
+                    ran["argv"], ran["env"], pid=4242, start="100",
+                    sessions=[self.SID], captured="2026-09-29T00:00:00Z")})
+        self.assertFalse(failed, line)
+
+    def test_a_remint_after_the_capture_is_refused_exact_and_diffed_on_defaults(self):
+        """codex's input: launch.sh was re-minted after the process ran (a
+        catalog move: another model and window). Exact refuses naming what
+        launch.sh can no longer carry; --defaults runs the re-minted script
+        and prints each field that moves. MUTATION: resume through launch.sh
+        unplanned — the pane comes back on the new model and window with
+        neither a refusal nor a diff."""
+        from helm import seat, seat_catalog
+        cfg, transcript, launch_sh, model = self._adopted_proxy()
+        self._captured(launch_sh)
+        fam = seat.FAMILIES["codex"]
+        other = next(m for m in seat_catalog.family_catalogued_models(fam)
+                     if seat_catalog.launch_window(fam, m)
+                     != seat_catalog.launch_window(fam, model))
+        self._proxy_seat("seat-a-codex", "seat-a-codex", model=other)
+        self._ran_on(transcript, model)
+        rc, _out, err, ad = self._resume("seat-a-codex", self._row(transcript),
+                                         cfg)
+        self._refused(rc, err, ad, "seat-a-codex")
+        self.assertIn("cannot carry the", err)
+        self.assertIn("window", err)
+        rc, out, err, ad = self._resume("seat-a-codex", self._row(transcript),
+                                        cfg, "--defaults")
+        self.assertEqual(rc, 0, out + err)
+        self.assertRegex(out, r"window\s+%d -> %d" % (
+            seat_catalog.launch_window(fam, model),
+            seat_catalog.launch_window(fam, other)))
+
+    def test_a_captured_adopted_proxy_seat_resumes_through_its_launch_script(self):
+        """The control: a capture of the seat's process for this session
+        binds it, and the resume runs the seat's own launch.sh with the
+        model it ran."""
+        from helm import seat_recipe, seat_resume_all
+        cfg, transcript, launch_sh, model = self._adopted_proxy()
+        with open(launch_sh) as f:
+            ran = seat_recipe.launch_capture(f.read())
+        line, failed = seat_resume_all.record_live_set(
+            [], True, False, "boot-a", 1, recipes={
+                "seat-a-codex": seat_recipe.capture_record(
+                    ran["argv"], ran["env"], pid=4242, start="100",
+                    sessions=[self.SID], captured="2026-09-29T00:00:00Z")})
+        self.assertFalse(failed, line)
+        rc, out, err, ad = self._resume("seat-a-codex", self._row(transcript),
+                                        cfg)
+        self.assertEqual(rc, 0, out + err)
+        text = self._script(ad)
+        self.assertIn("exec %s --model %s " % (shlex.quote(launch_sh), model),
+                      text)
+        self.assertIn("--resume %s\n" % self.SID, text)
 
     # -- E ---------------------------------------------------------------------
     def test_E_a_seat_tree_session_with_no_launch_script_is_refused(self):

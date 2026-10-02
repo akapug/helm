@@ -1437,6 +1437,7 @@ def _record_injection(key, session, handle, text, adapter=None, pids=None,
             "digest": _injection_digest(text), "adapter": adapter or "",
             "pids": list(pids or []), "recorded_at": now,
             "expires_at": now + injection_ttl_s(), "held_at": None,
+            "deliverer": _self_ident(),
         }
         if account_key:
             entry["injection"].update(account_key=account_key, room=room)
@@ -1449,6 +1450,199 @@ def _record_injection(key, session, handle, text, adapter=None, pids=None,
     except Exception as e:              # noqa: BLE001 — never block Enter
         _say("helm seat resume-turn: injection provenance write failed (%s)" % e)
         return False
+
+
+def _self_ident():
+    """`<pid>:<starttime>` of THIS process: the deliverer a recorded injection
+    names, so a later pass can tell a live deliverer from a dead one."""
+    from . import orcaadopt
+    pid = os.getpid()
+    return orcaadopt.ident_token(
+        orcaadopt.ProcIdent(pid, orcaadopt.proc_start(pid)))
+
+
+#: How long a detached deliverer can take, from its launch to its last read:
+#: the settle, the admission census, placement, Enter and its read-back, the
+#: persistence wait before its own recovery, the recovery's Enters and their
+#: backoff, and the clear. Each of those is a few seconds except the
+#: persistence wait (RECOVERY_PERSIST_S), so four minutes is a wide margin.
+#: The pass that forked the deliverer waits this long for it (`await_children`),
+#: and a record with no deliverer stamp counts as orphaned only past it.
+DELIVERER_S = 240
+
+
+def _deliverer_alive(inj, now=None):
+    """Is the process that typed `inj` still running? A record that names no
+    deliverer (written before the stamp existed) is presumed alive only while
+    it is younger than DELIVERER_S."""
+    from . import orcaadopt
+    ident = orcaadopt.parse_ident((inj or {}).get("deliverer") or "")
+    if ident is None or not ident.start:
+        recorded = (inj or {}).get("recorded_at")
+        stamp = time.time() if now is None else now
+        return (isinstance(recorded, (int, float))
+                and stamp - recorded < DELIVERER_S)
+    return orcaadopt.proc_start(int(ident)) == ident.start
+
+
+CLEARED_REASON = "Helm cleared its own text from the composer"
+
+
+def _drop_injection(key, handle, text, generation, reason=CLEARED_REASON):
+    """Forget ONE injection record, matched exactly, once its text has left
+    the composer; close the recovery row an older helm filed for it, if one
+    is still open. -> True when the record was dropped."""
+    from . import tasks
+
+    def change(entry):
+        inj = entry.get("injection") or {}
+        if not _valid_injection(inj, handle=handle, text=text,
+                                generation=generation):
+            return False, False
+        entry.pop("injection", None)
+        return True, True
+    try:
+        dropped = _mutate_entry(key, change)
+    except Exception as e:              # noqa: BLE001 — the next pass retries
+        _say("helm seat resume-turn: injection record drop failed (%s)" % e)
+        return False
+    identity = _recovery_task_identity(handle, generation)
+    try:
+        rows, _unavailable = tasks.snapshot(strict=True)
+        row = (rows or {}).get(identity["id"]) if identity else None
+        if row and row.get("status") in tasks.OPEN_STATUSES:
+            tasks.update(identity["id"], status="closed", closed_reason=reason)
+    except Exception as e:              # noqa: BLE001 — the row is a mirror
+        _say("helm seat resume-turn: recovery row close failed (%s)" % e)
+    return dropped
+
+
+def clear_injection(injection, adapter=None):
+    """Take ONE recorded injection's text back out of its composer ->
+    (state, detail), state one of harness CLEARED / GONE / NOT_OURS / UNKNOWN.
+
+    The record is the provenance and the live composer is the proof: the key
+    is sent only while the composer holds exactly the recorded text
+    (`_CLIAdapter.clear_placed`). CLEARED, GONE and NOT_OURS each end the
+    record, because in each the text is no longer Helm's to act on; UNKNOWN
+    keeps it for the next pass."""
+    from . import harness
+    ad = adapter if adapter is not None else harness.detect()
+    if ad is None:
+        return harness.UNKNOWN, harness.RECOMMENDATION
+    handle, text = injection.get("handle"), injection.get("text")
+    state, detail = ad.clear_placed(handle, text)
+    reason = {harness.CLEARED: CLEARED_REASON,
+              harness.GONE: "its text is no longer in the composer",
+              harness.NOT_OURS: "its composer holds other text now"}.get(state)
+    if reason:
+        _drop_injection(injection.get("key"), handle, text,
+                        injection.get("generation"), reason=reason)
+    return state, detail
+
+
+def sweep_stranded(adapter=None, now=None):
+    """Clear every nudge whose deliverer died before it finished ->
+    ([(handle, state, detail)], error).
+
+    A deliverer that is killed after typing and before its Enter leaves Helm's
+    line in the seat's composer, and no other process knows it is there. The
+    measured case: `helm beacons` forks the deliverer from a systemd oneshot
+    unit, systemd kills the unit's whole control group when the pass exits,
+    and the deliverer died between placement and Enter, so the owner found
+    `Run helm seat resume-turn --show ...` in a seat's composer. This sweep is
+    the backstop for any such death (a kill, an OOM, a reboot): a record
+    whose deliverer is gone is cleared if its composer still holds exactly
+    its text, and forgotten if its pane is gone. A record another
+    metaharness wrote is left to a pass that runs on that one."""
+    from . import harness
+    stamp = time.time() if now is None else now
+    orphans = [inj for inj in recorded_injections(
+        now=stamp, include_expired=True).values()
+        if not _deliverer_alive(inj, now=stamp)]
+    ambiguous = [inj for key, inj in recorded_injection_ambiguities(
+        now=stamp, include_expired=True)
+        if not _deliverer_alive(inj, now=stamp)]
+    if not orphans and not ambiguous:
+        _, error = _close_stale_recovery_rows(
+            inj for _, inj in _iter_injection_records(stamp))
+        return [], error
+    ad = adapter if adapter is not None else harness.detect()
+    if ad is None:
+        return [], harness.RECOMMENDATION
+    try:
+        listed = {p.get("handle") for p in ad.list()}
+    except (harness.HarnessError, OSError) as e:
+        return [], "metaharness pane list unavailable: %s" % e
+    out = []
+    handled = set()
+    for inj in orphans + ambiguous:
+        key, handle = inj.get("key"), inj.get("handle")
+        if (key, handle) in handled:
+            continue
+        handled.add((key, handle))
+        if inj.get("adapter") not in ("", None, getattr(ad, "name", None)):
+            continue                     # another metaharness's pane
+        if handle not in listed:
+            _drop_injection(key, handle, inj.get("text"), inj.get("generation"),
+                            reason="its pane is gone")
+            out.append((handle, harness.GONE, "pane %s is gone" % handle))
+            continue
+        state, detail = clear_injection(inj, adapter=ad)
+        out.append((handle, state, detail))
+    # A nudge on a key only files ONE record; a later one overwrites the
+    # earlier, and the earlier's recovery row (an older generation) has no
+    # record left to be dropped by, so the current sweep never closed it.
+    # Close only rows with no valid record at all. Expired records and
+    # ambiguous handles still prove ownership even when the sweep could not
+    # clear their composer this pass.
+    _, error = _close_stale_recovery_rows(
+        inj for _, inj in _iter_injection_records(stamp))
+    return out, error
+
+
+def _close_stale_recovery_rows(live_injections):
+    """Close every still-open recovery row whose identity no longer matches a
+    live injection record (an older generation, overwritten by a later nudge
+    on the same key). -> (count, error).
+
+    Each recovery row records its identity in its `refs` as
+    `resume-turn-injection:<handle>:<generation>`; a row whose (handle,
+    generation) no longer appears in a live record is the stale one. This is
+    the task row only, never the pane: nothing here clears a composer, so a
+    live record's own clear is left to its own sweep."""
+    from . import tasks
+    live = {
+        (inj.get("handle"), inj.get("generation"))
+        for inj in live_injections
+        if _valid_injection(inj, handle=None, text=None, generation=None)
+    }
+    try:
+        rows, unavailable = tasks.snapshot(strict=True)
+    except Exception as e:              # noqa: BLE001
+        return 0, "recovery task ledger unreadable (%s)" % e
+    if unavailable:
+        return 0, "recovery task ledger unreadable (%s)" % unavailable
+    closed = 0
+    for row in rows.values():
+        if (row.get("source") or "") != "resume-turn/recovery":
+            continue
+        if row.get("status") not in tasks.OPEN_STATUSES:
+            continue
+        if any(_recovery_ref_parts(r)[:2] in live
+               for r in (row.get("refs") or ())):
+            continue
+        closed += 1
+        tasks.update(row["id"], status="closed",
+                     closed_reason="recovery rows are no longer filed; no "
+                                   "live injection record")
+    return closed, None
+
+
+def _recovery_ref_parts(ref):
+    """The (handle, generation) a recovery ref names, or (None, None)."""
+    parts = str(ref).split(":")
+    return (parts[1], parts[2]) if len(parts) > 2 else (None, None)
 
 
 def _wire_text(key, session, text):
@@ -1708,25 +1902,54 @@ def recorded_injections(now=None, include_expired=False):
     from . import pk
     stamp = time.time() if now is None else now
     found, ambiguous = {}, set()
-    for key, entry in (pk.read_json(state_path(), {}) or {}).items():
-        inj = (entry or {}).get("injection") or {}
-        if not _valid_injection(inj, handle=None, text=None, generation=None):
-            continue
-        # THE ONE FRESHNESS GATE. This reader is where "is this still the
-        # current intent" is asked, and it is asked HERE rather than inside
-        # the provenance predicate so that the lifecycle owners below cannot
-        # inherit it by accident.
-        expired = stamp > (inj.get("expires_at") or 0)
-        if expired and not include_expired:
+    for key, inj in _iter_injection_records(stamp):
+        if inj.get("expired") and not include_expired:
             continue
         handle = inj.get("handle")
         if handle in found:
             ambiguous.add(handle)
             continue
-        found[handle] = dict(inj, key=key, expired=expired)
+        found[handle] = inj
     for handle in ambiguous:
         found.pop(handle, None)
     return found
+
+
+def recorded_injection_ambiguities(now=None, include_expired=False):
+    """The records `recorded_injections` drops as ambiguous, each paired with
+    the key that filed it -> [(key, inj)].
+
+    A handle claimed by two or more state entries is ambiguous for a SINGLE
+    authority: `recorded_injections` omits it because a single take_back or a
+    single Enter cannot choose whose text to act on. The sweep decides per
+    pane, so it decides each ambiguous record on its own key — this is where
+    it sees them."""
+    from . import pk
+    stamp = time.time() if now is None else now
+    records = [(key, inj) for key, inj in _iter_injection_records(stamp)
+               if not inj.get("expired") or include_expired]
+    counts = {}
+    for key, inj in records:
+        counts[inj.get("handle")] = counts.get(inj.get("handle"), 0) + 1
+    return [(key, inj) for key, inj in records
+            if counts[inj.get("handle")] > 1]
+
+
+def _iter_injection_records(stamp):
+    """Each valid record with the key that filed it, in state order.
+
+    `expired` is stamped ABSOLUTELY at record time, so a record past its
+    horizon is still Helm's; the caller's `include_expired` decides whether to
+    offer it. The single authoritative `recorded_injections` still decides
+    ambiguous handles; the sweep decides each ambiguous record on its own key,
+    so this reader is where it sees them."""
+    from . import pk
+    for key, entry in (pk.read_json(state_path(), {}) or {}).items():
+        inj = (entry or {}).get("injection") or {}
+        if not _valid_injection(inj, handle=None, text=None, generation=None):
+            continue
+        expired = stamp > (inj.get("expires_at") or 0)
+        yield key, dict(inj, key=key, expired=expired)
 
 
 def _claim_injection_recovery(injection):
@@ -3169,8 +3392,9 @@ def rearm_text(seat_name, owes=""):
     from .seats_advice import BEACON_TIMEOUT_MS, beacon_monitor
     return ("[helm] %s, and your inbox beacon is not running, so helm cannot "
             "wake you. helm types this only after a beacon that reached its "
-            "%d-minute lease has had a %d-minute re-arm grace, or when the "
-            "beacon ended before its lease. Re-arm it now: %s"
+            "%d-minute lease, or a one-shot beacon that delivered its wake, "
+            "has had a %d-minute re-arm grace, or when the beacon ended "
+            "before its lease. Re-arm it now: %s"
             % (owes or "you owe work", BEACON_TIMEOUT_MS // 60000,
                REARM_GRACE_S // 60, beacon_monitor(seat_name)))
 
@@ -4105,6 +4329,8 @@ _SETTLED_INTENTS = set()
 # data a test unit leaves behind; these names are process-wide by design.
 _GATESLICE_MUTABLE = {
     "_SETTLED_INTENTS": "intents settled by nonce, and a nonce never recurs",
+    "_CHILDREN": "deliverers this process forked; await_children drops "
+                 "the finished ones",
 }
 
 #: How many act intents and obsolete records one resume-state entry keeps.
@@ -4355,6 +4581,37 @@ def spawn_child(argv, pass_fds=()):
                              pass_fds=tuple(pass_fds))
         threading.Thread(target=p.wait, name="resume-turn-reaper",
                          daemon=True).start()
+    _CHILDREN.append(p)
+
+
+#: Every deliverer this process forked, for `await_children`.
+_CHILDREN = []
+
+
+def await_children(bound=None):
+    """Wait, at most `bound` seconds in all, for every deliverer this process
+    forked -> how many are still running when it returns.
+
+    A NEW SESSION IS NOT A NEW CONTROL GROUP. `start_new_session` detaches the
+    child from the parent's terminal and process group, and systemd still kills
+    it: `helm beacons --post` runs as a Type=oneshot unit whose KillMode is
+    control-group, and when the pass exits systemd kills every process left in
+    the unit, the deliverer included. MEASURED: one deliverer recorded its
+    Enter intent 0.64s before its helm-beacons.service pass finished, another
+    in the same second as its pass, and neither recorded an Enter; both lines
+    stayed in their composers. A Popen'd child with start_new_session=True, run
+    from a oneshot unit, is killed the moment the unit's main process exits
+    (a probe of exactly that). So a pass that forked deliverers waits for them
+    before it exits. The compaction hook forks from inside the seat's own
+    process tree and never calls this."""
+    end = time.monotonic() + (DELIVERER_S if bound is None else bound)
+    for p in list(_CHILDREN):
+        try:
+            p.wait(timeout=max(0.0, end - time.monotonic()))
+        except Exception:                    # noqa: BLE001 — TimeoutExpired
+            pass
+    _CHILDREN[:] = [p for p in _CHILDREN if p.poll() is None]
+    return len(_CHILDREN)
 
 
 def _child_argv(seat_name, session, text_path, delay, pids=None,
@@ -4642,170 +4899,6 @@ def _recovery_task_identity(handle, generation):
             "source": "resume-turn/recovery"}
 
 
-def _recovery_owner(seat_name):
-    """Best non-owner task assignee plus honest degraded-probe detail."""
-    from . import beacons, dispatches, seats, seats_work_offer
-    trouble = []
-    try:
-        exclude = {str(seat_name or "").casefold()}
-        exclude.update(str(s).casefold() for s in seats.owner_names())
-    except Exception as e:               # noqa: BLE001
-        return None, "owner identity unreadable (%s)" % e
-
-    try:
-        live = seats_work_offer._live_seats()
-    except Exception as e:               # noqa: BLE001
-        live = None
-        trouble.append("live-seat probe failed (%s)" % e)
-    if live is None and not trouble:
-        trouble.append("live-seat probe is unreadable")
-    try:
-        roster, failed = seats.roster_checked()
-    except Exception as e:               # noqa: BLE001
-        roster, failed = {}, True
-        trouble.append("checked roster failed (%s)" % e)
-    if failed:
-        trouble.append("checked roster is unreadable")
-        return None, "; ".join(trouble)
-    canonical = {str(name).casefold(): name for name in roster}
-
-    for key in sorted(live or ()):
-        folded = str(key).casefold()
-        peer = canonical.get(folded)
-        if peer is None or folded in exclude:
-            continue
-        try:
-            pids, issue = seats.beacon_procs(peer, strict=True)
-        except Exception as e:           # noqa: BLE001
-            trouble.append("beacon probe for %s failed (%s)" % (peer, e))
-            continue
-        if issue:
-            trouble.append("beacon probe for %s is unreadable (%s)" %
-                           (peer, issue))
-            continue
-        if pids:
-            return peer, "; ".join(trouble) or None
-
-    try:
-        lander = dispatches._default_lander()
-    except Exception as e:               # noqa: BLE001
-        lander = None
-        trouble.append("default lander probe failed (%s)" % e)
-    key = str(lander or "").casefold()
-    if key in canonical and key not in exclude:
-        return canonical[key], "; ".join(trouble) or None
-
-    try:
-        quiet = beacons.roll()
-    except Exception as e:               # noqa: BLE001
-        quiet = ()
-        trouble.append("quiet-roster probe failed (%s)" % e)
-    for peer in quiet:
-        key = str(peer).casefold()
-        if key in canonical and key not in exclude:
-            return canonical[key], "; ".join(trouble) or None
-    return None, "; ".join(trouble) or None
-
-
-#: refusal kind -> (why `helm seat composers --submit` refuses the recovery,
-#: for how long). Every other kind leaves the pane to a later census.
-_SUBMIT_WILL_REFUSE = {
-    "obsolete": ("The act that typed it was accounted OBSOLETE-AUTHORIZATION",
-                 ""),
-    "stale": ("The repair attempt that typed it may no longer act, and an "
-              "attempt its episode retired or its horizon passed never acts "
-              "again", ""),
-    "paused": ("Delivery to its seat is paused", " while the pause holds"),
-    "drained": ("Nothing addressed to its seat is waiting any more",
-                " while nothing is owed"),
-}
-
-
-def _route_recovery_inner(seat_name, injection, detail):
-    """Persist one idempotent non-owner recovery task; DM is best-effort."""
-    from . import seats, tasks
-    handle = str((injection or {}).get("handle") or "")
-    generation = str((injection or {}).get("generation") or "")
-    identity = _recovery_task_identity(handle, generation)
-    if not identity:
-        return None, "recorded injection identity is incomplete"
-    tid, ref = identity["id"], identity["ref"]
-    title, source = identity["title"], identity["source"]
-    owner, route_detail = _recovery_owner(seat_name)
-    wait = max(0.0, recovery_persist_s())
-    # A NOTE MUST NOT POINT AT A DOOR THAT WILL REFUSE. `refused` is the kind
-    # the act door refused this recovery with, and `helm seat composers
-    # --submit` meets the same door: it refuses an obsolete repeat or a stale
-    # attempt for good, and a pause or a drain for as long as it holds.
-    why = _SUBMIT_WILL_REFUSE.get((injection or {}).get("refused"))
-    if why:
-        note = ("Recorded Helm injection %s for pane %s remains unresolved "
-                "(%s). %s, so `helm seat composers --submit %s` will refuse "
-                "it%s. Read the pane and resolve the held text by hand; the "
-                "repair mints a fresh attempt on its next pass."
-                % (generation, handle, _one_line(detail), why[0], handle,
-                   why[1]))
-    else:
-        note = ("Recorded Helm injection %s for pane %s remains unresolved "
-                "(%s). Run `helm seat composers` to establish an exact "
-                "observation; wait at least %.1fs, then run the scan again. "
-                "Only if that later reading reports helm-stranded run `helm "
-                "seat composers --submit %s`. Never submit held, "
-                "helm-pending, or cannot-tell text."
-                % (generation, handle, _one_line(detail), wait, handle))
-    if route_detail:
-        note += " Candidate routing degraded: %s." % _one_line(route_detail)
-    try:
-        # force_new BECAUSE THIS ROW IS KEYED BY ITS OWN ID, NOT BY ITS TITLE.
-        # The recovery row is minted at a computed `tid` and the branch below
-        # handles "already exists" as the idempotent case — so identity here
-        # is the id, and the title is a generated sentence that is MEANT to
-        # read like the last generation's. `tasks.add`'s title-similarity
-        # refusal would turn every repeat recovery into a refusal with no
-        # recovery row at all, on the path whose whole job is to leave one
-        # behind. Explicit and named rather than inherited by accident.
-        row, err = tasks.add(
-            title, owner, note=note, refs=[ref], source=source,
-            tid=tid, status="in_progress" if owner else "open", origin="agent",
-            project=tasks.current_project(), force_new=True)
-    except Exception as e:               # noqa: BLE001 — stay UNKNOWN, never alert
-        return None, "recovery task write failed: %s" % e
-    created = row is not None
-    if err and "already exists" in err:
-        try:
-            rows, unavailable = tasks.snapshot(strict=True)
-        except Exception as e:           # noqa: BLE001
-            return None, "recovery task ledger unreadable (%s)" % e
-        if unavailable:
-            return None, "recovery task ledger unreadable (%s)" % unavailable
-        row = rows.get(tid)
-        if (not row or row.get("id") != tid or row.get("title") != title
-                or row.get("source") != source
-                or ref not in (row.get("refs") or [])
-                or row.get("status") not in tasks.OPEN_STATUSES):
-            return None, "recovery task identity collision or closed task %s" % tid
-        err = None
-    if err:
-        return None, "recovery task write failed: %s" % err
-    if owner and created:
-        text = ("Recovery task %s: pane %s has an unresolved recorded Helm "
-                "injection. Start with `helm seat composers`; wait %.1fs and "
-                "scan again before any `--submit`." % (row["id"], handle, wait))
-        try:
-            seats.dm(owner, text, who="resume-turn/recovery")
-        except Exception:
-            pass                         # the task, not the nudge, is delivery
-    return row, route_detail
-
-
-def _route_recovery(seat_name, injection, detail):
-    """Total routing boundary: no probe or ledger failure escapes the child."""
-    try:
-        return _route_recovery_inner(seat_name, injection, detail)
-    except Exception as e:               # noqa: BLE001
-        return None, "recovery routing failed: %s" % e
-
-
 def _close_recovery_task(handle, generation, ensure_terminal=False):
     """Close, or mint when needed, this exact delivered terminal task."""
     from . import tasks
@@ -4824,16 +4917,37 @@ def _close_recovery_task(handle, generation, ensure_terminal=False):
         if not ensure_terminal:
             return True, None            # initial delivery needed no task
         try:
+            # THE FALLBACK STILL FILES. When the cwd names no project the
+            # row is helm's, even if that name is not registered: a terminal
+            # recovery row with no project is the homeless row this path
+            # exists to avoid (task/3745). The warning is how a lead learns
+            # the row was filed under a name no list selects (task/3994).
+            # A cwd that resolved, or a registry that does contain helm,
+            # says nothing.
+            project = tasks.current_project() or tasks.OWN_PROJECT
+            warning = None
+            if tasks.current_project() is None:
+                known, reg_err = tasks.registered_projects()
+                if known is None:
+                    warning = ("recovery row filed under %s, and whether %s "
+                               "is a registered project is UNKNOWN (%s)"
+                               % (project, project, reg_err))
+                elif project not in known:
+                    warning = ("recovery row filed under %s, and %s is not a "
+                               "registered project" % (project, project))
             row, err = tasks.add(
                 identity["title"], None,
                 note="Terminal authority after provenance clear failed.",
                 refs=[identity["ref"]], source=identity["source"],
                 tid=identity["id"], status="closed", origin="agent",
-                closed_reason=reason, project=tasks.current_project())
+                closed_reason=reason,
+                project=project)
         except Exception as e:           # noqa: BLE001
             return False, "recovery terminal task write failed: %s" % e
         if err:
             return False, "recovery terminal task write failed: %s" % err
+        if row and warning:
+            _say(warning)
         return bool(row), None if row else "recovery terminal task returned no row"
     if (row.get("id") != identity["id"]
             or row.get("title") != identity["title"]
@@ -5125,14 +5239,27 @@ def child(seat_name, session, text, delay, adapter=None, pids=None,
     if isinstance(door, harness.DoorRefusal) and door.door == "placement" \
             and not submitted.get("generation"):
         return refused(_outcome_of(door.kind), detail)
-    # Once Helm successfully typed into a composer, every non-delivery is OUR
-    # unresolved injection. UNKNOWN still refuses automatic Enter, but it earns
-    # a durable non-owner task rather than falling through to owner alert rails.
-    # A dirty/unreadable PRE-read has no generation because Helm typed nothing,
-    # so it remains the ordinary alert case rather than a false stranded claim.
-    recovery_unresolved = bool(
-        mode != "resumed" and submitted.get("generation"))
-    recovery = None                          # the persistent recovery's answer
+    def take_back():
+        """HELM TYPED A LINE THIS CHILD WILL NOT SUBMIT, SO IT TAKES THE LINE
+        BACK OUT. A nudge is either submitted or removed; left in the composer
+        it waits for whoever walks into the pane next, which is the owner.
+        The clear is sent only while the composer holds exactly the typed
+        line (`_CLIAdapter.clear_placed`), so a human's draft is never touched.
+        -> (the door's state, what became of the line), or (None, "") when
+        nothing was typed or the line was delivered."""
+        ad = submitted.get("adapter")
+        if ad is None or submitted.get("generation") is None \
+                or submitted.get("state") == harness.DELIVERED:
+            return None, ""
+        handle = submitted.get("handle")
+        state, what = ad.clear_placed(handle, delivery_text)
+        inj = recorded_injections(include_expired=True).get(handle) or {}
+        if state != harness.UNKNOWN \
+                and inj.get("generation") == submitted.get("generation"):
+            _drop_injection(inj.get("key"), handle, delivery_text,
+                            inj.get("generation"))
+        return state, "Helm's own line %s: %s" % (state, what)
+
     if mode != "resumed" and submitted.get("state") == harness.NOT_DELIVERED:
         inj = _matching_injection(key, submitted["handle"], delivery_text,
                                    submitted.get("generation"))
@@ -5150,57 +5277,38 @@ def child(seat_name, session, text, delay, adapter=None, pids=None,
             stop = pre("recovery")
             if stop:
                 # A REFUSAL AFTER PLACEMENT IS NOT A REFUSAL BEFORE IT. The
-                # text is already IN the composer and its record persists, so
-                # withholding the unauthorized Enter is right and walking away
-                # from the obligation is not: the typed directive is handed
-                # to a durable owner.
+                # Enter is withheld, and the line Helm typed comes back out of
+                # the composer. Nothing owed is dropped with it: the refusal
+                # is recorded, and an episode it does not settle is re-derived
+                # on the next pass, which mints a fresh attempt.
                 outcome, not_due = stop
-                task, route_err = _route_recovery(
-                    seat_name, {"handle": submitted.get("handle"),
-                                "generation": submitted.get("generation"),
-                                "refused": getattr(not_due, "kind", "")},
-                    not_due)
-                if task:
-                    not_due = "%s; recovery task %s persisted%s" % (
-                        not_due, task["id"],
-                        " (%s)" % route_err if route_err else "")
-                else:
-                    not_due = "%s; recovery routing UNKNOWN: %s" % (
-                        not_due, route_err)
-                    _say("helm seat resume-turn: %s" % not_due)
-                return refused(outcome, not_due)
+                _state, took = take_back()
+                return refused(outcome, _joined(not_due, took) if took
+                               else not_due)
             state, recovery = recover_injection(
                 inj, adapter=submitted["adapter"], admit=admit)
             detail = "%s; persistent recovery: %s" % (detail, recovery)
             if state == harness.DELIVERED:
                 mode = "resumed"
-            else:
-                recovery_unresolved = True
-                if state == harness.UNKNOWN:
-                    mode = "unverified"
+            elif state == harness.UNKNOWN:
+                mode = "unverified"
     settle("typed" if mode == "resumed" else mode, detail)
     proof = submitted.get("proof")
     safe = getattr(proof, "alert_detail", None)
     if safe and str(proof) in detail:
         detail = detail.replace(str(proof), safe)
     if mode != "resumed":
-        if recovery_unresolved:
-            # A recovery its act door refused names the kind, so the task
-            # does not send the owner to a --submit that meets the same door.
-            injection = dict({"handle": submitted.get("handle"),
-                              "generation": submitted.get("generation")},
-                             **({"refused": recovery.kind} if isinstance(
-                                 recovery, harness.DoorRefusal) else {}))
-            task, route_err = _route_recovery(seat_name, injection, detail)
-            if task:
-                detail = "%s; recovery task %s persisted%s" % (
-                    detail, task["id"],
-                    " (%s)" % route_err if route_err else "")
-            else:
-                detail = "%s; recovery routing UNKNOWN: %s" % (
-                    detail, route_err)
-                _say("helm seat resume-turn: %s" % detail)
-        else:
+        took_state, took = take_back()
+        if took:
+            detail = "%s; %s" % (detail, took)
+        # WHO HEARS OF A LINE THAT DID NOT LAND. A repair leg's episode stays
+        # open and the census alarm is its loud surface, so a repair that
+        # typed says nothing more. A compaction resume alerts when the seat
+        # may be parked: nothing was typed, Helm took its line back, or the
+        # pane cannot be read. It does not when the line already left the
+        # composer (an Enter can land late) or a person is typing over it.
+        if took_state is None or not deaf and took_state in (
+                harness.CLEARED, harness.UNKNOWN):
             from . import orcaadopt
             _alert(_display_name(seat_name, session), detail,
                    dm_seat=seat_name, dm_session=session,
@@ -5210,8 +5318,8 @@ def child(seat_name, session, text, delay, adapter=None, pids=None,
         pk.event("seat.resume-turn", _display_name(seat_name, session), detail)
     # count_it=False: the hook already counted this episode. Counting again
     # here would halve the effective cap and make the spiral guard fire on the
-    # NEXT legitimate compaction. Record after routing so task ids and durable
-    # write failures stay visible in the state surface.
+    # NEXT legitimate compaction. Record last, so what became of the typed
+    # line stays visible in the state surface.
     _record(key, session, mode, detail, count_it=False)
     return mode, detail
 
@@ -5384,6 +5492,21 @@ def _opt(rest, flag):
         return rest[i + 1] if i + 1 < len(rest) else None
 
 
+def _record_launch(payload):
+    """THE LAUNCH RECORD (task/3695, helm/seat_recipe.py): every process
+    start of a session passes this hook, on every helm home and in every
+    project, so the launch row is written here, with the capture of the
+    process that started. A session start is never failed by its record:
+    what did not get written is one stderr line."""
+    try:
+        from . import seat_recipe
+        unrecorded = seat_recipe.record_session_start(payload)
+    except Exception as e:      # noqa: BLE001 — the record never fails a session start
+        unrecorded = "the launch record raised %s: %s" % (type(e).__name__, e)
+    if unrecorded:
+        _say("helm seat resume-turn: " + unrecorded)
+
+
 def cmd_resume_turn(args):
     """seat resume-turn --hook-json | --deliver — the post-compaction leg."""
     args = list(args)
@@ -5553,6 +5676,8 @@ def cmd_resume_turn(args):
             payload = {}
         if not isinstance(payload, dict):
             payload = {}
+        if "--dry-run" not in args:
+            _record_launch(payload)
         res = hook(payload, dry="--dry-run" in args)
         # A CHILD HEARS NOTHING. What this hook prints is read by the thread
         # that compacted, and a subagent's compaction owes it no resume: the

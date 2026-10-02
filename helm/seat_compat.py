@@ -128,8 +128,8 @@ _USAGE = """usage: helm seat <verb> [args]
                                       project, unknown family or wrong-project
                                       workspace is REFUSED, naming the registry
                                       and the admitted forms.
-                                      An explicit lead starts Claude Code
-                                      in ultracode mode; reap a stale same-name
+                                      An explicit lead carries
+                                      HELM_SEAT_ROLE=lead; reap a stale same-name
                                       seat only
                                       with explicit --replace, launch via the
                                       detected metaharness (orca/herdr pane +
@@ -183,6 +183,14 @@ _USAGE = """usage: helm seat <verb> [args]
                                       itself or the integrator records them
                                       (helm/seat_rest.py). --until takes an
                                       ISO instant or NNs/NNm/NNh/NNd
+  mood [SEAT] [--json]                each live seat's MOOD (flowing,
+  mood set <word> [--why W]           grinding, stuck, blocked-on-owner,
+        [--rating 1-5] [--blocker B]  walled, idle), a 0-100 frustration
+        [--win W]                     score and its top reason; `set` records
+  mood rank [--days N] [--json]       the calling seat's check-in (a
+                                      --blocker is posted once to #seats for
+                                      its steward); `rank` ranks helm's own
+                                      friction across seats (helm/seatmood.py)
   reassign <seat-or-session> --to <seat>   move EVERY holding of a dead or
         [--reason R] [--force]        renamed seat in ONE verb and ONE ledger
         [--apply] [--json]            event: open/held dispatch rows (both the

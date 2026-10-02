@@ -1,0 +1,1 @@
+transcript <sid> [--find T] [--limit N] — windowed role-tagged transcript read

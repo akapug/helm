@@ -13,8 +13,9 @@ the tests the change reaches, beside the tree-wide audits that
 `helm gate audits` prints) -> a cross-family
 reviewer reads it and, on a clean read, HOLDS it source-clean (`helm dispatch
 hold --source-clean`), or, on a MECHANICAL finding, commits the cure off the
-exact reviewed tip in their own room, or in a `git clone --shared` clone whose
-commit they fetch into the repo, and records that tip on a
+exact reviewed tip — in a room it holds, or, for a subagent reviewer with no
+room of its own, in a `git clone --shared` clone whose
+commit they fetch into the repo — and records that tip on a
 FIX verdict (`--patch-tip`) for the lane owner or integrator to rebase onto ->
 the integrator composes the train, runs its ONE serial whole suite (the
 land gate) on the tree that lands, the approve binds that suite's token, and
@@ -26,9 +27,13 @@ none of it, not a rule that one family may only look. A DESIGN finding is
 never patched under review — it goes to a meld.
 
 NOTE WHAT DID NOT CHANGE: every one of those authors writes INSIDE A LANE. A
-reviewer's cure is a commit off the reviewed tip in the reviewer's own room or
-shared clone; it is never a commit on the shared checkout's base branch, which
-is the exact act this rung refuses.
+reviewer's cure is a commit off the reviewed tip, in a room the reviewer
+holds or a subagent's scratch clone. Only an explicit BUILD can allocate a
+sole delegate a registered parent-owned lane room, retained through completion
+or accepted handoff and returned thereafter, never while unfinished. No
+reviewer creates an unregistered shared worktree or unleased shared branch;
+the cure is never a commit on the shared checkout's base branch, which is the
+exact act this rung refuses.
 
 THE COST WAS NOT THE COMMIT, IT WAS THE INHERITANCE. Two OTHER seats then cut
 their lanes from that local main and silently carried the unreviewed change.
@@ -294,8 +299,9 @@ def _refusal(root, detail):
         "    cd <the room it prints> && git add <files> && git commit",
         "no lane holds this change, so no gate ran on it and no cross-family "
         "verdict covers it — a reviewer's own cure is welcome, but it belongs "
-        "off the tip they reviewed, in their own room or in a `git clone "
-        "--shared` clone fetched back with `git -C <repo> fetch "
+        "off the tip they reviewed: in a room the reviewer holds, or, for a "
+        "subagent with no room of its own, a `git clone --shared` clone "
+        "fetched back with `git -C <repo> fetch "
         "--no-write-fetch-head <clone> <sha>`, named on the verdict; this is the shared checkout's base "
         "branch. And that "
         "is not the worst of it: every lane cut "

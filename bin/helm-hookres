@@ -1,0 +1,204 @@
+#!/bin/bash
+# helm's hook-resident CLIENT (task/1825): ask the warm resident
+# (helm/hookres.py) to run this hook, and run it cold when it cannot.
+#
+# RUN BY bin/helm-hook ONLY, under the hook's own budget, as
+#   bash -p helm-hookres NAME PYTHON CHILD ARGS...
+# where `PYTHON -S -- CHILD ARGS...` is exactly the cold command the wrapper
+# would have run. `-p` keeps BASH_ENV, SHELLOPTS and exported functions from
+# the caller's environment out of this shell: none of them may run code here
+# or change what it prints.
+#
+# IT STARTS NO PYTHON ON THE WARM PATH: builtins, one TCP connection, and the
+# exit status the resident reports. It never reads stdin or writes stdout:
+# the resident's child takes this process's own stdin, stdout and stderr (it
+# is sent this pid) and the hook writes to them itself, so what the harness
+# reads is what a cold run writes.
+#
+# THE RESIDENT PROVES ITSELF. The endpoint file (0600, in a 0700 directory)
+# holds two secrets: the TOKEN this shell sends, which proves the caller to
+# the resident, and the PROOF the resident sends back (`ready PROOF`,
+# `refuse PROOF WHY`), which proves the resident to this shell. An endpoint
+# outlives a resident killed without cleanup (SIGKILL, OOM, a reboot), and
+# any local user may then listen on its port. An answer without the proof
+# is never trusted and its text is never printed: the call runs cold without
+# a word. The comparison is a `case` pattern, a builtin.
+#
+# FAIL OPEN, NAMED. Every state where the resident did not take the call —
+# down, stopped, not beating, slow, refused — prints one line on stderr, in
+# this shell's own words or a proven resident's, and execs the cold command
+# on the untouched stdin. No endpoint file means no resident serves this checkout for this
+# helm home, and an unproven answer means no resident answered: those two run
+# cold in silence.
+#
+# EXACTLY ONCE. Once this shell has said `go` the resident owns the call. It
+# answers `rc N` (the hook ran), or `refuse PROOF WHY` (it failed before the
+# hook read stdin, so the cold command runs here, on the untouched stdin). If
+# it says nothing, the outcome is unknown: this says so and exits 70, which
+# bin/helm-hook reports as a guard that failed (the call is unchecked).
+#
+# THE CONVERSATION: request (NUL-separated fields) ->; <- `refuse PROOF WHY`
+# (or `refuse WHY` without the proof, to a caller whose token did not
+# match) or `ready PROOF`; `go` ->; <- `rc N` or `refuse PROOF WHY`.
+
+# `bash -p` still honours TMOUT from the environment, and the read after
+# `go` has no -t of its own (the hook's budget bounds it): a caller's TMOUT
+# would end that read early and report an UNKNOWN outcome while the resident
+# is still running the hook.
+unset TMOUT
+
+name=$1
+py=$2
+shift 2
+argv=("$@")
+bin=${1%/*}
+ep=${HELM_HOME:-$HOME/.helm}/_global/.state/hookres/${bin//\//_}
+
+# SIGPIPE from a resident that hung up must not kill this shell: a write to a
+# closed socket is an ordinary refusal here. `trap -` restores whatever the
+# caller gave (a signal ignored on entry stays ignored either way) before the
+# cold command is exec'd.
+trap '' PIPE
+
+cold() {
+    if [ -n "$1" ]; then
+        printf '[helm %s] hook resident %s; this call runs cold\n' \
+            "$name" "$1" >&2
+    fi
+    exec 3>&-
+    trap - PIPE
+    exec "$py" -S -- "${argv[@]}"
+}
+
+if ! [ -f "$ep" ] \
+        || ! IFS=' ' read -r port token pid start proof _ 2>/dev/null <"$ep"
+then
+    cold ""
+fi
+for v in "$port" "$pid" "$start"; do
+    case $v in
+    ''|*[!0-9]*) cold "wrote an unreadable endpoint ($ep)" ;;
+    esac
+done
+case $proof in
+''|*[!0-9a-f]*) cold "wrote an unreadable endpoint ($ep)" ;;
+esac
+wait=${HELM_HOOK_RESIDENT_WAIT_S:-0.5}
+case $wait in
+''|.|*[!0-9.]*|*.*.*) wait=0.5 ;;
+esac
+
+# IS IT THERE, AND RUNNING? Read before any connect, with builtins (no
+# connection exists yet, so the redirection moves nothing the resident
+# takes). A resident that is gone (no /proc entry, a zombie, or a pid that
+# now names another process: its start time differs) or stopped (SIGSTOP,
+# state T) cannot answer, and a connect to a stopped resident whose backlog
+# is full would block for the whole budget and end as a timeout, unchecked.
+stat=
+IFS= read -r stat 2>/dev/null <"/proc/$pid/stat"
+rest=${stat##*") "}
+f=($rest)
+case ${f[0]} in
+T|t) cold "is stopped (pid $pid is in state ${f[0]}); it cannot answer" ;;
+''|Z|X|x) cold "is down: its pid $pid is gone (endpoint $ep)" ;;
+esac
+if [ "$start" != 0 ] && [ "${f[19]}" != "$start" ]; then
+    cold "is down: its pid $pid is gone (endpoint $ep)"
+fi
+
+# IS IT ACCEPTING? A resident can be alive and read as running (a frozen
+# cgroup, a serve loop stuck in the kernel: state S or D) and still not
+# accept. Its accept queue fills, a connect then blocks until the wrapper's
+# budget, and a gate's timeout ALLOWS the call unchecked. Its poll writes the
+# epoch second to <endpoint>.beat once a second: a beat that is missing, or
+# more than 3 s from now, means that loop is not running, so the call runs
+# cold, named, and nothing connects. Builtins only (printf's %(%s)T is the
+# clock).
+beat=
+IFS= read -r beat 2>/dev/null <"$ep.beat"
+case $beat in
+''|*[!0-9]*) cold "has no heartbeat ($ep.beat); it may not be accepting" ;;
+esac
+printf -v now '%(%s)T' -1
+age=$((10#$now - 10#$beat))
+if [ "$age" -gt 3 ] || [ "$age" -lt -3 ]; then
+    cold "missed its heartbeat (last beat ${age}s ago); it may be frozen and not accepting"
+fi
+
+# A fresh heartbeat is not proof of an accept: the listener can still be
+# alive, keep beating from another thread, and leave its backlog full. Bash's
+# /dev/tcp open has no timeout of its own. Interrupt ONLY the pre-commit
+# connect, while stdin remains untouched; after `go` the hook keeps the whole
+# wrapper budget. Use a separate deadline from the response read's -t below.
+# The background timer closes the harness's pipes and is reaped before either
+# path runs; even its sleep child cannot keep stdout open after this exits.
+connect_timed_out=
+trap 'connect_timed_out=1' USR1
+( sleep "$wait"; kill -USR1 "$$" 2>/dev/null ) </dev/null >/dev/null 2>&1 &
+watchdog=$!
+if { exec 3<>"/dev/tcp/127.0.0.1/$port"; } 2>/dev/null; then
+    connected=1
+else
+    connected=
+fi
+kill "$watchdog" 2>/dev/null
+wait "$watchdog" 2>/dev/null
+trap - USR1
+if [ -n "$connect_timed_out" ]; then
+    cold "could not connect within ${wait}s"
+fi
+if [ -z "$connected" ]; then
+    cold "is down: nothing answers on 127.0.0.1:$port (endpoint $ep)"
+fi
+# EVERY READ IS `read -u 3`, never `<&3`: a redirection moves this shell's
+# own fd 0, 1 or 2 for the length of the builtin, and those are the fds the
+# resident takes. The two writes below cannot avoid redirecting fd 1 (a bash
+# builtin writes only there) and fork nothing to avoid it. The resident takes
+# fds 0 and 1 while it admits the call (it waits out this socket on fd 1) and
+# keeps them; it takes fd 2, which the `go` write leaves alone, after `go`.
+if ! printf '%s\0' helm-hookres/1 "$token" "$$" "$bin" "$py" "$#" "$@" \
+        >&3 2>/dev/null; then
+    cold "hung up before the call was sent"
+fi
+
+line=
+IFS= read -r -u 3 -t "$wait" line
+got=$?
+case $line in
+"ready $proof") ;;
+"refuse $proof "*) cold "refused this call: ${line#"refuse $proof "}" ;;
+'')
+    if [ "$got" -gt 128 ]; then
+        cold "did not answer within ${wait}s"
+    fi
+    cold "hung up without an answer"
+    ;;
+*) cold "" ;;
+esac
+
+# THE COMMIT: `go` hands the call over, and the resident reads or writes
+# this process's stdin, stdout and stderr only after reading it. Until then
+# a resident that is merely slow can never run the hook beside the cold path
+# this shell falls back to. No `2>/dev/null` here: the resident may take
+# fd 2 the moment `go` arrives, so this write must leave fd 2 where it is.
+if ! printf 'go\n' >&3; then
+    cold "hung up before it took the call"
+fi
+
+# THE RESIDENT OWNS THE CALL NOW. No -t: the wrapper's budget bounds it, and
+# its `timeout` ending this process is what ends the resident's child.
+line=
+IFS= read -r -u 3 line
+case $line in
+"rc "*[0-9])
+    rc=${line#rc }
+    case $rc in
+    *[!0-9]*) ;;
+    *) exit "$rc" ;;
+    esac
+    ;;
+"refuse $proof "*) cold "refused this call: ${line#"refuse $proof "}" ;;
+esac
+printf '[helm %s] hook resident took this call and returned no exit status; its outcome is UNKNOWN\n' \
+    "$name" >&2
+exit 70

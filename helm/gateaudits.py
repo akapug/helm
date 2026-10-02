@@ -117,6 +117,10 @@ RUNG_ARMS = ("test_wiring", "test_registry", "test_verb_sweep",
 #:   test_burnflags         local certification reads the family catalog
 #:                          through a function-local import the static closure
 #:                          cannot see: train282 (1188398218c)
+#:   test_change_notes      the lines under CHANGELOG.md's '## Unreleased',
+#:                          which every lane wrote until change notes moved to
+#:                          changes/: train512 and train514 each dropped two
+#:                          cars that conflicted on that one hunk
 #: Listing a check catches a lane whose own tree already carries it. When the
 #: check and the violation arrive in different lanes, neither lane carries
 #: both, and only the audits run on the COMPOSED tree catch it. The measured
@@ -124,7 +128,7 @@ RUNG_ARMS = ("test_wiring", "test_registry", "test_verb_sweep",
 COMPOSITION_CHECKS = ("test_world_literals", "test_assertion_hygiene",
                       "test_no_private_names", "test_delivery_truth",
                       "test_chat_reply", "test_trailer_rung",
-                      "test_burnflags")
+                      "test_burnflags", "test_change_notes")
 #: The tree readers `scan` finds that no list above names for a reason of its
 #: own. A lane adding a test module that walks the tree adds it here, or to
 #: `EXEMPT` with the reason no other lane's change can redden it. The last
@@ -134,6 +138,9 @@ COMPOSITION_CHECKS = ("test_world_literals", "test_assertion_hygiene",
 #: its walk finds every module that renders a [Timer], and its other unit-drift
 #: arms render all of those modules' templates, so a lane that adds a timer or
 #: an input to one reddens it without touching it (task/3405).
+#: test_landing_protocol walks every module under helm/ for an instruction to
+#: rebase reviewed work, so any lane adding such a sentence reddens it without
+#: importing it (task/4050).
 TREE_READERS = ("test_autocompact", "test_codexresets",
                 "test_lock_fails_closed",
                 "test_identity_path_env", "test_nonpane_session",
@@ -143,7 +150,8 @@ TREE_READERS = ("test_autocompact", "test_codexresets",
                 "test_seats_catchup_promise", "test_site_stage_precondition",
                 "test_module_patch_resets",
                 "test_goals", "test_no_seat_attribution",
-                "test_systemctl_timeouts", "test_timerhealth")
+                "test_systemctl_timeouts", "test_timerhealth",
+                "test_verb_help_files", "test_landing_protocol")
 AUDITS = ENUMERATORS + RUNG_ARMS + COMPOSITION_CHECKS + TREE_READERS
 
 #: LISTED, AND INVISIBLE TO `scan`: each reads the tree through a helm table,

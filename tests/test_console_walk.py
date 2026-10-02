@@ -229,8 +229,169 @@ class Brief(Base):
         self.assertIn("no walk on record", out.getvalue())
 
 
-class Surface(Base):
-    def test_the_line_appears_once_per_owed_state(self):
+class Checks(Base):
+    """The release-gate check block the confirm walk runs (task/3938): each
+    named check is listed under "CHECK THESE (release gate)", and a
+    --release flag reads those checks from the design doc's Acceptance
+    section console line."""
+
+    def test_brief_lists_named_checks_in_the_release_gate_block(self):
+        """Explicit --check lines are enumerated in the block, in order, and
+        the never-open-Chat line still prints below them."""
+        text = console_walk.brief(self.root, now=T0, checks=(
+            "stories with N of M",
+            "one health line per project",
+            "a task's meld thread under it",
+        ))
+        self.assertIn("CHECK THESE (release gate)", text)
+        block = text.split("CHECK THESE (release gate)")[1]
+        before_method = block.split("CONSOLE WALK")[0]
+        self.assertIn("  1. stories with N of M", before_method)
+        self.assertIn("  2. one health line per project", before_method)
+        self.assertIn("  3. a task's meld thread under it", before_method)
+        self.assertNotIn("CHECK THESE", before_method.split("\n\n")[-1])
+        self.assertIn("Never open Chat", text)
+
+    def test_brief_with_no_checks_prints_no_block(self):
+        text = console_walk.brief(self.root, now=T0)
+        self.assertNotIn("CHECK THESE", text)
+        self.assertIn("Never open Chat", text)
+
+    def test_brief_ignores_blank_checks(self):
+        text = console_walk.brief(self.root, now=T0, checks=("  ", ""))
+        self.assertNotIn("CHECK THESE", text)
+
+    def test_cmd_walk_accepts_repeatable_check_flag(self):
+        import io
+        from contextlib import redirect_stdout
+        from helm import web_server
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = web_server.cmd_web([
+                "walk", "--repo", self.root,
+                "--check", "check A", "--check", "check B"])
+        self.assertEqual(rc, 0)
+        text = out.getvalue()
+        self.assertIn("CHECK THESE (release gate)", text)
+        self.assertIn("  1. check A", text)
+        self.assertIn("  2. check B", text)
+
+    def test_cmd_walk_rejects_unknown_flag(self):
+        import io
+        from contextlib import redirect_stdout, redirect_stderr
+        from helm import web_server
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = web_server.cmd_web(
+                ["walk", "--repo", self.root, "--bogus"])
+        self.assertEqual(rc, 2)
+        self.assertIn("usage: helm web walk", err.getvalue())
+
+
+class ReleaseChecks(Base):
+    """A --release flag reads its checks from the design doc's Acceptance
+    section console line (task/3748: 0.3.3)."""
+
+    def _write_design_doc(self, release="0.3.3"):
+        """Drop a design doc named <date>-<release>-design.md under the
+        project's reviews dir, with an Acceptance section whose console line
+        is the 0.3.3 console check."""
+        d = console_walk.reviews_dir(self.root)
+        os.makedirs(d, exist_ok=True)
+        text = ("# helm %s — one number, one story\n\n"
+                "## Acceptance (release gate)\n"
+                "5. On the owner's console: stories with N of M, one health "
+                "line per project, and a task's meld thread under it. The "
+                "0.3.3 confirm walk checks these, with a reader who never "
+                "opens Chat.\n"
+                "\n## Tasks\n"
+                "helm#3742\n"
+                ) % release
+        path = os.path.join(d, "%s-%s-design.md" % (T0, release))
+        with open(path, "w") as fh:
+            fh.write(text)
+        return path
+
+    def test_release_flag_reads_acceptance_console_line(self):
+        import io
+        from contextlib import redirect_stdout
+        from helm import web_server
+        path = self._write_design_doc()
+        os.path.exists(path)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = web_server.cmd_web([
+                "walk", "--repo", self.root, "--release", "0.3.3"])
+        self.assertEqual(rc, 0)
+        text = out.getvalue()
+        self.assertIn("CHECK THESE (release gate)", text)
+        self.assertIn("stories with N of M", text)
+        self.assertIn("one health line", text)
+        self.assertIn("a task's meld thread under it", text)
+        self.assertNotIn("0.3.3 confirm walk checks these", text)
+
+    def test_release_and_check_show_release_checks_then_explicit(self):
+        # (task/3938 round 3) an explicit --check must not HIDE the release
+        # checks: --release reads the doc's checks and --check adds its own,
+        # both in the block, release checks first.
+        import io
+        from contextlib import redirect_stdout
+        from helm import web_server
+        self._write_design_doc("0.3.3")
+        self._write_design_doc("0.3.30")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            rc = web_server.cmd_web([
+                "walk", "--repo", self.root,
+                "--release", "0.3.3", "--check", "explicit A"])
+        self.assertEqual(rc, 0)
+        text = out.getvalue()
+        # the release check AND the explicit one, in order
+        rel = "stories with N of M"
+        self.assertIn("CHECK THESE (release gate)", text)
+        self.assertIn(rel, text)
+        self.assertIn("explicit A", text)
+        self.assertLess(text.index(rel), text.index("explicit A"), text)
+
+    def test_release_checks_empty_when_no_doc(self):
+        self.assertEqual(console_walk.release_checks(self.root, "0.3.3"), [])
+
+    def test_release_flag_does_not_take_a_prefix_match(self):
+        # (task/3938 round 3) --release 0.3.3 must read the 0.3.3 doc, not
+        # the sibling whose name CONTAINS "0.3.3" (the 0.3.30 doc). The
+        # 0.3.30 doc carries an EARLIER date, so it sorts first and is what
+        # the substring test picks — the whole defect the cure closes. Each
+        # doc's check line is distinct (and dot-free up to its period, the
+        # way the acceptance parser reads the console clause).
+        d = console_walk.reviews_dir(self.root)
+        os.makedirs(d, exist_ok=True)
+        for date, release, checks in (
+                (T0 - DAY, "0.3.30", "zeta check, omega check, delta under it"),
+                (T0, "0.3.3", "alpha check, beta check, gamma under it"),
+                ):
+            text = ("# helm %s — one number, one story\n\n"
+                    "## Acceptance (release gate)\n"
+                    "5. On the owner's console: %s. The %s confirm walk "
+                    "checks these, with a reader who never opens Chat.\n"
+                    "\n## Tasks\n"
+                    "helm#3742\n" % (release, checks, release))
+            with open(os.path.join(d,
+                                   "%s-%s-design.md" % (date, release)), "w") \
+                    as fh:
+                fh.write(text)
+        self.assertEqual(
+            console_walk.release_checks(self.root, "0.3.3"),
+            ["alpha check", "beta check", "gamma under it"])
+        self.assertEqual(
+            console_walk.release_checks(self.root, "0.3.30"),
+            ["zeta check", "omega check", "delta under it"])
+
+    def test_release_checks_empty_when_no_acceptance_console_line(self):
+        d = console_walk.reviews_dir(self.root)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "2026-09-30-0.3.3-design.md"), "w") as fh:
+            fh.write("# design\n\n## Acceptance\n1. other check.\n")
+        self.assertEqual(console_walk.release_checks(self.root, "0.3.3"), [])
         self.report(1, T0 - 5 * DAY)
         self.commit("helm/web_ui/views/home.html.part",
                     "train9: merge lane home-tabs", T0 - 2 * DAY)

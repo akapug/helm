@@ -322,23 +322,27 @@ class WindowFromCatalogTest(unittest.TestCase):
     # --- a family that declares no window -------------------------------
 
     def test_a_family_with_no_window_falls_back_to_the_cc_default_and_warns(self):
-        """ds4flash pins no window, on purpose (the catalog records why: its
-        route publishes none). Its Claude Code seats would run under Claude
-        Code's own 200k default, so the pi arm is told the same number, named
-        in the file and warned on stderr, never a silent 400000."""
-        from helm.seat_catalog import FAMILIES, _CC_ASSUMED_WINDOW_MIRROR
-        fam = FAMILIES["ds4flash"]  # noqa: SEAT_NAME — the catalog FAMILY key whose window is this arm's subject
-        self.assertIn("model", fam, "the warning names the model it read")
-        self.assertFalse(fam.get("max_context"))
-        self.assertFalse(fam.get("model_context"))
-        text, warnings, err = self.write("ds4flash")  # noqa: SEAT_NAME — the catalog FAMILY key whose window is this arm's subject
+        """A family that pins no window has its Claude Code seats run under
+        Claude Code's own 200k default, so the pi arm is told the same number,
+        named in the file and warned on stderr, never a silent 400000. Every
+        live family pins now (ds4flash took its Go route's published window),
+        so the family is planted."""
+        from helm.seat_catalog import _CC_ASSUMED_WINDOW_MIRROR
+        with self.planted(), mock.patch.object(seat, "_seat_family",
+                                               return_value=("pifake", None)):
+            text, warnings, err = self.write("pifake")
         self.assertIsNone(err)
         self.assertIn("contextWindow: %d," % _CC_ASSUMED_WINDOW_MIRROR, text)
         self.assertEqual(len(warnings), 1, warnings)
-        self.assertIn("ds4flash", warnings[0])  # noqa: SEAT_NAME — the catalog FAMILY key whose window is this arm's subject
+        self.assertIn("pifake", warnings[0])
         self.assertIn("pins no context window", warnings[0])
         self.assertIn("pins no context window", text)
         self.assertNotIn("400000", text)
+        # CONTROL: ds4flash is told its pinned window, with no warning
+        from helm.seat_catalog import FAMILIES
+        window, _max, warned = self.declared("ds4flash")  # noqa: SEAT_NAME — the catalog FAMILY key that now pins its window
+        self.assertEqual(window, FAMILIES["ds4flash"]["max_context"])  # noqa: SEAT_NAME — the catalog FAMILY key that now pins its window
+        self.assertEqual(warned, [])
 
     def test_a_planted_unpinned_family_warns_too(self):
         from helm.seat_catalog import _CC_ASSUMED_WINDOW_MIRROR
@@ -447,10 +451,13 @@ class WindowFromCatalogTest(unittest.TestCase):
     def test_the_verb_warns_on_stderr_for_an_unpinned_family(self):
         import io
         err = io.StringIO()
-        with mock.patch.object(pi, "seat_port", return_value=(8330, None)), \
+        with self.planted(), \
+                mock.patch.object(seat, "_seat_family",
+                                  return_value=("pifake", None)), \
+                mock.patch.object(pi, "seat_port", return_value=(8999, None)), \
                 mock.patch("sys.stdout", new_callable=io.StringIO), \
                 mock.patch("sys.stderr", err):
-            rc = pi.cmd_pi(["extension", "--seat", "ds4flash"])  # noqa: SEAT_NAME — the catalog FAMILY key of the one unpinned family
+            rc = pi.cmd_pi(["extension", "--seat", "pifake"])
         self.assertEqual(rc, 0)
         self.assertIn("warning", err.getvalue())
         self.assertIn("pins no context window", err.getvalue())

@@ -307,9 +307,11 @@ class MoverBase(tsh.BrokenSeatDoorBase):
         super().setUp()
         self.posts = []
         from helm import chat
-        # THE MOVER'S OWN LINES ONLY: a send DMs its recipient too.
+        # THE MOVER'S OWN LINES ONLY: a send DMs its recipient too. Its lines
+        # are the #helm notices and, since task/3881, the #seats row.
         patch = mock.patch.object(chat, "post", lambda text, **kw: (
-            self.posts.append(text) if kw.get("who") == "idle-dispatch"
+            self.posts.append(text)
+            if kw.get("who") in ("idle-dispatch", "seat-events")
             else None) or {"id": "x"})
         patch.start()
         self.addCleanup(patch.stop)
@@ -343,7 +345,7 @@ class TheDarkSeatMoverTest(MoverBase):
         self.assertEqual(dispatches.rows()[row["id"]]["status"], "open")
         self.assertEqual(self.posts, [])
 
-    def test_apply_rebinds_the_row_records_it_and_posts_one_line(self):
+    def test_apply_rebinds_the_row_records_it_and_posts_one_line(self):  # noqa: VACUOUS_ASSERTION — the one moved row, its cancelled parent, its kimi child and the one posted line are the positive controls before the next tick moves nothing
         row, why, _ = self.send()
         self.assertIsNotNone(row, why)
         lines, moves = self.tick(apply=True)
@@ -355,7 +357,8 @@ class TheDarkSeatMoverTest(MoverBase):
                 if r.get("supersedes") == row["id"]]
         self.assertEqual([k["recipient"] for k in kids], ["kimi"])
         self.assertEqual(len(self.posts), 1)
-        self.assertIn("from @grok to @kimi", self.posts[0])
+        self.assertIn("@grok", self.posts[0])
+        self.assertIn("moved 1 build row to @kimi", self.posts[0])
         # NEVER TWICE: the next tick finds nothing owed on grok.
         _lines, moves = self.tick(apply=True)
         self.assertEqual(moves, [])
@@ -431,7 +434,10 @@ class TheDarkSeatMoverTest(MoverBase):
         self.assertEqual(len(self.posts), 1)
         self.assertEqual(dispatches.rows()[row["id"]]["status"], "open")
 
-    def test_an_owned_unclaimed_task_moves_and_a_claimed_one_stays(self):
+    def test_an_owned_task_moves_claimed_or_not(self):
+        """task/3881's remainder: an in_progress task is STARTED work, and
+        with no room holding uncommitted changes it moves too, keeping its
+        status (the capability moves the owner only)."""
         from helm import seat_reassign
         # THIS HELM'S OWN PROJECT: a task's lanes are read in its repository.
         project = os.path.basename(self.repo)
@@ -448,10 +454,13 @@ class TheDarkSeatMoverTest(MoverBase):
                                return_value=(seat_reassign.SOURCE_DEAD,
                                              "pane gone")):
             lines, moves = self.tick(apply=True)
-        self.assertEqual([(m["id"], m["moved"]) for m in moves],
-                         [(owed["id"], True)], lines)
+        self.assertEqual(sorted((m["id"], m["moved"]) for m in moves),
+                         sorted([(owed["id"], True), (started["id"], True)]),
+                         lines)
         self.assertEqual(tasks.rows()[owed["id"]]["owner"], "kimi")
-        self.assertEqual(tasks.rows()[started["id"]]["owner"], "grok")
+        self.assertEqual((tasks.rows()[started["id"]]["owner"],
+                          tasks.rows()[started["id"]]["status"]),
+                         ("kimi", "in_progress"))
 
     def unreachable(self, pane):
         """grok, as the usability join measures a seat with no armed beacon:
@@ -471,7 +480,8 @@ class TheDarkSeatMoverTest(MoverBase):
         row, why, _ = self.send()
         self.assertIsNotNone(row, why)
         self.unreachable(pane=False)
-        with self.dark(GREEN_ALL):
+        with self.dark(GREEN_ALL), \
+                mock.patch.dict(os.environ, {"HELM_DARK_MOVE_PANE_S": "0"}):
             lines, moves = darkmove.run(apply=True)
         self.assertEqual([(m["id"], m["to"], m["moved"]) for m in moves],
                          [(row["id"], "kimi", True)], lines)
@@ -521,7 +531,7 @@ class TheDarkSeatMoverTest(MoverBase):
             self.assertEqual(moves, [])
         self.assertEqual(dispatches.rows()[row["id"]]["status"], "open")
 
-    def test_the_idle_dispatch_tick_runs_the_mover_dry(self):
+    def test_the_idle_dispatch_tick_runs_the_mover(self):
         from helm import idle_dispatch
         row, why, _ = self.send()
         self.assertIsNotNone(row, why)
@@ -531,7 +541,7 @@ class TheDarkSeatMoverTest(MoverBase):
         with self.dark(), \
                 mock.patch.object(idle_dispatch, "check", return_value=res), \
                 contextlib.redirect_stdout(buf):
-            rc = idle_dispatch.cmd_idle_dispatch([])
+            rc = idle_dispatch.cmd_idle_dispatch(["--dry-run"])
         self.assertEqual(rc, 0)
         self.assertIn("would move dispatch %s" % row["id"][:12],
                       buf.getvalue())
@@ -726,24 +736,32 @@ class TheMoverRefusesStartedWorkTest(MoverBase):
                                  return_value=(state or seat_reassign.SOURCE_DEAD,
                                                "pane measured"))
 
-    def test_a_task_whose_owner_holds_its_lane_lease_stays(self):
+    # STARTED WORK MOVES WITH ITS HOLDING (task/3881's remainder). These
+    # arms pin what is READ as started, on a dry pass: the line names the
+    # lease or the lane that moves with the task.
+
+    def test_a_task_whose_owner_holds_its_lane_lease_is_started_work(self):
         task = self.owed_task()
         n = task["id"].split("/")[-1]
         with self.reassign_live(), mock.patch.object(
                 dispatches, "live_claims", return_value={
                     "worktree:repo:task-%s" % n: {"holder": "grok"}}):
-            lines, moves = self.tick(apply=True)
-        self.assertEqual(moves, [], lines)
-        self.assertIn("stays on @grok", "\n".join(lines))
+            lines, moves = self.tick()
+        self.assertEqual([(m["id"], m.get("started")) for m in moves],
+                         [(task["id"], True)], lines)
+        self.assertIn("would move started task", "\n".join(lines))
+        self.assertIn("lease worktree:repo:task-%s" % n, "\n".join(lines))
         self.assertEqual(tasks.rows()[task["id"]]["owner"], "grok")
 
-    def test_a_task_whose_lane_has_commits_off_trunk_stays(self):
+    def test_a_task_whose_lane_has_commits_off_trunk_is_started_work(self):
         task = self.owed_task()
-        self.lane_commit("lane/task-%s" % task["id"].split("/")[-1])
+        n = task["id"].split("/")[-1]
+        sha = self.lane_commit("lane/task-%s" % n)
         with self.reassign_live():
-            lines, moves = self.tick(apply=True)
-        self.assertEqual(moves, [], lines)
-        self.assertIn("not on trunk", "\n".join(lines))
+            lines, moves = self.tick()
+        self.assertEqual([(m["id"], m.get("started")) for m in moves],
+                         [(task["id"], True)], lines)
+        self.assertIn("lane/task-%s at %s" % (n, sha[:12]), "\n".join(lines))
         self.assertEqual(tasks.rows()[task["id"]]["owner"], "grok")
 
     def test_a_task_moves_nothing_when_leases_or_lanes_do_not_read(self):
@@ -866,18 +884,20 @@ class TheDoorFaultsTest(MoverBase):
                 dispatches, "live_claims", return_value={
                     "worktree:repo:balance-top-up-%s" % self.n(task):
                         {"holder": "grok"}}):
-            lines, moves = self.tick(apply=True)
-        self.assertEqual(moves, [], lines)
-        self.assertIn("holds the live lease", "\n".join(lines))
+            lines, moves = self.tick()
+        self.assertEqual([m.get("started") for m in moves], [True], lines)
+        self.assertIn("lease worktree:repo:balance-top-up-%s" % self.n(task),
+                      "\n".join(lines))
         self.assertEqual(tasks.rows()[task["id"]]["owner"], "grok")
 
     def test_a_slug_N_lane_with_commits_off_trunk_is_started_work(self):
         task = self.owed_task()
         self.lane_commit("lane/balance-top-up-%s" % self.n(task))
         with self.reassign_live():
-            lines, moves = self.tick(apply=True)
-        self.assertEqual(moves, [], lines)
-        self.assertIn("not on trunk", "\n".join(lines))
+            lines, moves = self.tick()
+        self.assertEqual([m.get("started") for m in moves], [True], lines)
+        self.assertIn("lane/balance-top-up-%s at" % self.n(task),
+                      "\n".join(lines))
 
     def test_the_tasks_recorded_lane_is_read_too(self):
         """A lane whose name carries no number is the task's when the task
@@ -888,8 +908,9 @@ class TheDoorFaultsTest(MoverBase):
         self.assertIsNone(err, err)
         self.lane_commit("lane/balance-top-up")
         with self.reassign_live():
-            lines, moves = self.tick(apply=True)
-        self.assertEqual(moves, [], lines)
+            lines, moves = self.tick()
+        self.assertEqual([m.get("started") for m in moves], [True], lines)
+        self.assertIn("lane/balance-top-up at", "\n".join(lines))
         self.assertEqual(tasks.rows()[row["id"]]["owner"], "grok")
 
     def test_force_never_overrides_a_LIVE_owner(self):

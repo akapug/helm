@@ -43,6 +43,7 @@ from helm import seatname_guard, work                          # noqa: E402
 from helm.work import _guard                                   # noqa: E402
 
 RUNG = os.path.abspath(seatname_guard.__file__)
+CORRECTED = "corrected: "
 A, B = "zz-synthetic-seat", "zz-synthetic-seat-2"
 ENV_KEYS = ("HELM_SEAT_NAMES", "MELD_SEAT_NAMES", "HELM_SEATNAME_SKIP",
             "HELM_SEATNAME_REPO", "HELM_HOME", "HELM_ADOPTED_DIR",
@@ -304,6 +305,62 @@ class SeatNameBypassesAreClosedTest(RungBase):
         self.sh("git", "commit", "-q", "--no-verify", "-m", "seed")
         self.sh("git", "mv", "tests/test_old.py", "tests/test_new.py")
         self.assertAllowed(self.rung())
+
+
+class SeatNameRefusalPrintsItsCureTest(RungBase):
+    """Each refused line ends in a `corrected:` line naming the literal, its
+    line and the fixture that replaces it, so one edit clears the rung."""
+
+    def _corrected(self, err):
+        return [l for l in err.splitlines() if l.startswith(CORRECTED)]
+
+    def test_each_refused_literal_names_its_line_and_its_fixture(self):
+        self.write("tests/test_x.py",
+                   'ONE = "%s"\nTWO = "%s"\nAGAIN = "%s"\n' % (A, B, A))
+        r = self.rung()
+        self.assertRefused(r)
+        self.assertEqual(self._corrected(r.stderr), [
+            "corrected: tests/test_x.py:1: %r -> 'seat-a'" % A,
+            "corrected: tests/test_x.py:2: %r -> 'seat-b'" % B,
+            "corrected: tests/test_x.py:3: %r -> 'seat-a'" % A])
+
+    def test_a_case_variant_takes_the_same_fixture(self):
+        self.write("tests/test_x.py",
+                   'ONE = "%s"\nTWO = "%s"\n' % (A, A.upper()))
+        r = self.rung()
+        self.assertRefused(r)
+        self.assertEqual(self._corrected(r.stderr), [
+            "corrected: tests/test_x.py:1: %r -> 'seat-a'" % A,
+            "corrected: tests/test_x.py:2: %r -> 'seat-a'" % A.upper()])
+
+    def test_the_refusal_names_the_reasoned_noqa_form(self):  # noqa: VACUOUS_ASSERTION — assertRefused pins rc==1 and the noqa text inside a helper
+        self.write("tests/test_x.py", 'ONE = "%s"\n' % A)
+        r = self.rung()
+        self.assertRefused(r, "# noqa: SEAT_NAME — <reason>")
+
+    def test_applying_every_corrected_line_clears_the_rung(self):  # noqa: VACUOUS_ASSERTION — assertRefused pins rc==1 before the rewrite and assertAllowed pins rc==0 after it, inside helpers
+        body = 'ONE = "%s"\nTWO = "%s"\n' % (A, B)
+        self.write("tests/test_x.py", body)
+        r = self.rung()
+        self.assertRefused(r)
+        for line in self._corrected(r.stderr):
+            _where, swap = line[len(CORRECTED):].split(": ", 1)
+            old, new = (ast.literal_eval(v) for v in swap.split(" -> "))
+            body = body.replace('"%s"' % old, '"%s"' % new)
+        self.write("tests/test_x.py", body)
+        self.assertAllowed(self.rung())
+
+    def test_more_seats_than_fixtures_keep_lettering(self):
+        self.assertEqual(seatname_guard.fixture_for(
+            ["one", "two", "ONE", "three", "four", "five"]),
+            {"one": "seat-a", "two": "seat-b", "three": "seat-c",
+             "four": "seat-d", "five": "seat-e"})
+
+    def test_an_advisory_line_prints_no_corrected_line(self):  # noqa: VACUOUS_ASSERTION — assertAdvisory pins the ADVISORY text, the positive control on the same stderr
+        self.write("tests/test_x.py", 'S = "%s,%s".split(",")\n' % (A, B))
+        r = self.rung()
+        self.assertAdvisory(r)
+        self.assertEqual(self._corrected(r.stderr), [])
 
 
 class SeatNameStructuredBoundaryTest(RungBase):

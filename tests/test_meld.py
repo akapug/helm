@@ -23,8 +23,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from helm import council
 from helm import chat, meld, pk, seats  # noqa: E402
 
-ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
-            "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_CHAT_NODE_URL",
+ENV_KEYS = ("HELM_HOME", "HELM_ADOPTED_DIR", "MELD_HOME",
+            "HELM_CHAT_DIR", "MELD_CHAT_DIR", "HELM_CHAT_NAME",
+            "MELD_CHAT_NAME", "HELM_CHAT_NODE_URL",
             "MELD_CHAT_NODE_URL", "HELM_CHAT_LOG", "MELD_CHAT_LOG",
             "HELM_CHAT_ROOM", "MELD_CHAT_ROOM", "HELM_CHAT_OWNER_NAMES",
             "HELM_CHAT_DELIVER", "HELM_MELD_CAP", "HELM_MELD_RECV_TIMEOUT_S",
@@ -48,6 +49,7 @@ class MeldBase(unittest.TestCase):
         for k in ENV_KEYS:
             os.environ.pop(k, None)
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
+        os.environ["HELM_ADOPTED_DIR"] = os.path.join(self.tmp, "adopted")
         os.environ["HELM_CHAT_DIR"] = os.path.join(self.tmp, "chat")
         os.environ["HELM_CHAT_NODE_URL"] = ""
         os.environ["HELM_CHAT_OWNER_NAMES"] = "daria"
@@ -365,6 +367,36 @@ class TestRecv(MeldBase):
 
 
 class TestSay(MeldBase):
+    def test_a_meld_yield_with_no_40_hex_sha_never_reads_the_dispatch_ledger(self):  # noqa: VACUOUS_ASSERTION — the YIELD naming a sha still snapshots (control) proves the no-sha case skips the read
+        """task/4073 item 5: `_applied_confirmed_tips` (a pair-meld YIELD's
+        note-to-reviewer scan) only needs `dispatches.snapshot()` when the
+        text names a 40-hex sha. A mention-free YIELD naming no sha returns
+        BEFORE the cold snapshot; the named-sha scan is the cheap gate.
+
+        RED CONTROL: a YIELD naming a 40-hex sha still calls snapshot, so the
+        no-sha case above is a measured skip, not a `say` that never scans."""
+        room, _ = self.open_meld_pair()
+        with mock.patch("helm.dispatches.snapshot",
+                        return_value=({}, None)) as snap:
+            meld.say(room, "YIELD", "converge the wire format", seat="seat-a")
+            snap.assert_not_called()
+        with mock.patch("helm.dispatches.snapshot",
+                        return_value=({}, None)) as snap:
+            meld.say(room, "YIELD",
+                     "cure 1234567890abcdef1234567890abcdef12345678",
+                     seat="seat-a")
+            snap.assert_called()
+
+    def open_meld_pair(self):
+        """A task's pair meld (the room `_applied_confirmed_tips` scans), so
+        the pair-meld YIELD path runs."""
+        room, _ = meld.invite("seat-b",
+                              "converge the wire format (chain abcdef123456)",
+                              seat="seat-a",
+                              room="meld-0-pair-helm-4073-fixup")
+        meld.join(room, seat="seat-b")
+        return room, meld.state(room, "seat-a")["epoch"]
+
     def test_act_moment_mentions_only(self):
         """YIELD/HOLD chunks never pollute the peer's delivery cursor;
         DONE/ABORT must land (the closing wake)."""

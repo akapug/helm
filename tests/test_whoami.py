@@ -76,6 +76,19 @@ class TestMergeScaffold(WhoamiBase):
         # clobbered a derived profile's provenance note with "merged-from-scaffold"
         self.assertEqual(p["source"], "fresh")
 
+    def test_longtail_guidance_is_imported_normalized_and_kept(self):
+        """task/4071: the WHO line for seats the owner rarely talks to lives
+        in the profile beside `guidance`, merged and normalized the same way."""
+        path = self.write_scaffold({"technical_level": "expert",
+                                    "guidance": ["short replies"],
+                                    "longtail_guidance": ["  agent-to-agent only ", ""]})
+        p = whoami.merge_scaffold(scaffold_path=path)
+        self.assertEqual(p["longtail_guidance"], ["agent-to-agent only"])
+        self.assertEqual(p["guidance"], ["short replies"])        # control
+        self.assertEqual(whoami.load_profile()["longtail_guidance"],
+                         ["agent-to-agent only"])
+        self.assertEqual(whoami._empty_profile()["longtail_guidance"], [])
+
     def test_no_scaffold_profile_is_fresh(self):
         p = whoami.merge_scaffold(scaffold_path=os.path.join(self.tmp.name, "nope.json"))
         self.assertEqual(p["source"], "fresh")
@@ -243,7 +256,8 @@ class TestInterviewConfirm(WhoamiBase):
         self.assertTrue(p["updated_at"])
         raw = pk.read_json(whoami.profile_path())
         self.assertEqual(set(raw), {"schema_version", "technical_level", "guidance",
-                                    "interview_status", "updated_at", "source"})
+                                    "longtail_guidance", "interview_status",
+                                    "updated_at", "source"})
         self.assertEqual(raw["schema_version"], 2)
 
     def test_edit_drop_direct_correction_and_add(self):

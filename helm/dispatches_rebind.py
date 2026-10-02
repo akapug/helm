@@ -183,9 +183,9 @@ def _successor_finished(kid, cache, parent=_PARENT_REQUIRED):
     PATCH IDENTITY COUNTS HERE, unlike the `resolved` door's ancestry-only
     rung, and the difference is the QUESTION. There it was "did this exact
     object reach trunk"; here it is "is the work finished" — and the
-    integrator rebases every chain, so what lands is patch-identical and
-    object-different. Ancestry-only would skip most genuinely-finished
-    parents, which is precisely the miss `vcs.landed_state` exists to end.
+    historical rebases and cherry-picks carried patch-identical work under
+    different objects. Today's exact-sha merges instead preserve ancestry;
+    patch identity still recognises older finished chains that ancestry misses.
 
     POLARITY IS DELIBERATELY NOT A RUNG. The fact being annotated — that this
     parent was superseded — was declared by the successor's author at write

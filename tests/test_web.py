@@ -290,6 +290,11 @@ class TestWeb(unittest.TestCase):
         self.assertIn(b'HELM_DEFAULT_ROOM = chatSlug("', body)
 
 
+#: A task's pair meld (`<scope>-<N>`, helm-3742), as the sidebar reads it:
+#: `meld-` and `dm-` names are typed before this test runs.
+TASK_MELD = r"^[a-z0-9](?:[a-z0-9-]{0,14}[a-z0-9])?-[1-9][0-9]{0,8}$"
+
+
 class RoomTypeTest(unittest.TestCase):
     """The sidebar's room TYPING is read from the name, so it is testable
     without a browser — the classifier is the load-bearing half of 'melds
@@ -303,9 +308,11 @@ class RoomTypeTest(unittest.TestCase):
             return "meld"
         if _re.match(r"^dm-", name):
             return "dm"
+        if _re.match(TASK_MELD, name):
+            return "meld"
         return "project"
 
-    def test_the_live_room_inventory_types_correctly(self):
+    def test_the_live_room_inventory_types_correctly(self):  # noqa: VACUOUS_ASSERTION — a fixed tuple of names, each asserted EQUAL to its room type
         for name, want in (
                 ("meld-1785274962-mute-backlog-asymmetry", "meld"),
                 ("council-forge-model", "meld"),   # a council IS a meld
@@ -317,6 +324,13 @@ class RoomTypeTest(unittest.TestCase):
                 # artifact — caught by test_never_track's fixture-label guard.
                 ("example-platform", "project"),
                 ("meldrooms", "project"),          # prefix, not substring
+                # a task's pair meld is `<scope>-<N>`, and it is a meld
+                ("helm-3742", "meld"), ("example-3669", "meld"),
+                ("meld-0-pair-helm-task-3112", "meld"),
+                # a hyphenated project that does not end in a number, and a
+                # scope longer than a task room's, stay projects
+                ("example-platform-v", "project"),
+                ("abcdefghijklmnopq-12", "project"),
         ):
             self.assertEqual(self._classify(name), want, name)
 
@@ -326,6 +340,7 @@ class RoomTypeTest(unittest.TestCase):
         src = web_ui_loader.read_text()
         self.assertIn('/^(meld|council)-/.test(name)', src)
         self.assertIn('/^dm-/.test(name)', src)
+        self.assertIn('/%s/.test(name)' % TASK_MELD, src)
         # melds still render as their own labeled, collapsible section, with
         # the quiet-fold group rows beneath each section (owner 2026-08-01)
         self.assertIn('id="crmeldhead"', src)
@@ -717,6 +732,9 @@ BOARD_ROW_FNS = ("age", "ago", "light", "pkey", "lineageN", "lightset", "dmsg",
                  "boardTeam", "boardCount", "boardLanes", "boardLaneWord",
                  "boardProgress", "boardRepoBadge", "boardRepos",
                  "boardLand", "boardWide", "boardDetail", "projTab", "boardRowHTML",
+                 # the project's health line under its name (task/3935), which
+                 # the row composes; with no reading it draws nothing
+                 "boardHealth",
                  # the row's one count is its share of the Work page's read
                  # (task/3643); with no read it says "reading…" on every row
                  "wkProjectCount",

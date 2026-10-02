@@ -224,20 +224,22 @@ class OnePhonePathTest(NotifyBase):
         push.assert_called_once()
         self.assertIn("x-law", push.call_args[0][0])
 
-    def test_beacons_reachability_alarm_goes_through_the_shared_push(self):
+    def test_isolated_beacon_edge_never_uses_the_owners_phone(self):  # noqa: VACUOUS_ASSERTION — the chat leg posting is the unconditional positive control on the same escalate call; the silent phone is the claim
         from helm import beacons
         att = {"state": beacons.DEAF, "alarm": True, "alarmed": False,
-               "pushed": False, "covered": None, "seen": None, "why": "x"}
+               "covered": None, "seen": None, "why": "x"}
         rep = {"seats": [], "covered": [], "deaf": [], "deaf_in_effect": [],
-               "vacant": [],
-               "unproven": [], "ghosts": [], "beacons": 0, "surplus": 0}
+               "vacant": [], "unproven": [], "ghosts": [], "beacons": 0,
+               "surplus": 0}
         with mock.patch("helm.notify.owner_push", return_value=True) as push, \
                 mock.patch("helm.chat.post"), \
                 mock.patch.object(beacons, "_ack_alerts"):
             out = beacons.escalate([("alpha", att, {})], rep)
-        self.assertTrue(out["push"])
-        push.assert_called_once()
-        self.assertIn("alpha", push.call_args[0][0])
+        self.assertTrue(out["chat"])
+        # The fleet-down pager leg is dormant (task/3939): the weather owns
+        # the owner's phone, and this isolated edge never pages the owner.
+        self.assertEqual(out["phone"]["phase"], "dormant")
+        push.assert_not_called()
 
     # The two spellings of "resolve the owner's push endpoint". Prose naming
     # the env var does not match either — only code that actually resolves it.
@@ -271,6 +273,30 @@ class OnePhonePathTest(NotifyBase):
                       "broken, and its empty result would read as a clean bill")
         self.assertEqual(hits, ["notify.py"],
                          "a SECOND owner-push path exists")
+
+    def test_neither_beacons_nor_beacon_phone_can_reach_the_owners_phone(self):
+        """ONE WRITER OF THE FLEET-DOWN PAGE (task/3939): the office weather
+        pages fleet-down, so no code in beacons.py or beacon_phone.py calls
+        `owner_push` or imports notify. Read as code (ast), never as prose,
+        and the same scan MUST HIT the weather's own push, or it measures
+        nothing."""
+        import ast
+        root = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "helm")
+
+        def reaches(name):
+            with open(os.path.join(root, name), encoding="utf-8") as f:
+                tree = ast.parse(f.read())
+            return sorted({n.lineno for n in ast.walk(tree)
+                           if (isinstance(n, ast.Attribute)
+                               and n.attr == "owner_push")
+                           or (isinstance(n, ast.ImportFrom)
+                               and any(a.name == "notify" for a in n.names))})
+        self.assertTrue(reaches("officeweather.py"),
+                        "the scan found no phone path at all — it is broken")
+        for name in ("beacons.py", "beacon_phone.py"):
+            self.assertEqual(reaches(name), [],
+                             "%s can still reach the owner's phone" % name)
 
     def test_only_notify_may_reach_the_telegram_transport(self):
         """The canon is COMPOSE, DON'T PARALLEL, and adding a transport is

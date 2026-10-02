@@ -297,7 +297,21 @@ that by audit).
   [How a change is tested](#how-a-change-is-tested));
 - the touched verb was actually run against real (or realistic temp) stores;
 - for web changes, the affected view was exercised in a browser;
-- docs that state the changed behavior were updated in the same change.
+- docs that state the changed behavior were updated in the same change;
+- the change note is its own file, `changes/<lane>.md`, and the lane did not
+  edit `CHANGELOG.md` (see [A change note](#a-change-note)).
+
+## A change note
+
+Write the note for your change as `changes/<lane>.md`: one or more markdown
+bullets, written like a `CHANGELOG.md` bullet. Never edit `CHANGELOG.md` in a
+lane. When every lane added a bullet under its `## Unreleased` heading, any
+two lanes in one train conflicted on that hunk at compose, and the train
+dropped one of them. No two lanes write the same file under `changes/`, so
+their notes always merge. The tree-wide audit `tests/test_change_notes.py`
+is red when a lane writes a line under `## Unreleased`, and names the line;
+move that line to your note. The release's fold (below) is the one writer of
+change notes into `CHANGELOG.md`.
 
 ## Repo hygiene
 
@@ -315,6 +329,7 @@ for a leak already in history (untracking is not a scrub).
 A release is one command. It is a dry run unless you pass `--publish`.
 
 ```console
+$ python3 scripts/release/release.py 0.3.2 --fold       # the notes commit: CHANGELOG.md gets the 0.3.2 section
 $ python3 scripts/release/release.py 0.3.2              # dry run: every step except the network writes
 $ python3 scripts/release/release.py 0.3.2 --publish    # stage, push, tag, create the GitHub release
 ```
@@ -329,11 +344,18 @@ development history stays in the private repository.
 Before you run it:
 
 - `CHANGELOG.md` has a `## <version>` section. That section is the release
-  notes.
+  notes. `--fold` makes it, first at a cut: the notes under `## Unreleased`,
+  then each change note in `changes/` in path order (`changes/README.md`
+  excepted), become the new section, and one commit in your checkout adds
+  it and removes the folded note files. It pushes nothing. It refuses a
+  version that has a section, nothing to fold, and uncommitted changes in
+  `CHANGELOG.md`, `changes/` or the index. Edit the section it makes, then
+  run the dry run.
 - `helm/__init__.py` declares that `__version__`.
 - The trunk commit passed the land gate. The command does not run the whole
   suite again: it proves that the release tree is the trunk tree minus the
-  omit list, byte for byte.
+  omit list and minus each change note (`changes/README.md` ships), byte
+  for byte.
 
 What it does, in order:
 
@@ -351,7 +373,7 @@ What it does, in order:
    dry run prints is the sha that `--publish` pushes.
 4. **Gate.** The candidate must fast-forward the public main by exactly one
    commit that changes the tree, and that tree must be the trunk tree minus
-   the omit list. Then the command writes the reports you read before a
+   the omit list and the change notes. Then the command writes the reports you read before a
    public release, under `<work>/reports/` and never in the repository:
    `world_audit.txt` (private tokens, seat names, addresses that are not
    placeholders, task cites, dates and the owner's voice, counted per class

@@ -1,0 +1,1 @@
+| `SubagentStop` (`*`) | `helm chat delegation-stop --hook-json` (timeout 2) | tombstones that exact full-session/`agent_id` independently of claim-lock contention; the next claim-locked read rejects and prunes it, so teardown never races another agent's producer |

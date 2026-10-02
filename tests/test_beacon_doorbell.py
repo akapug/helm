@@ -487,9 +487,10 @@ class RingIsNotDeliveryTest(DoorbellBase):
 
 class BackstopTest(DoorbellBase):
     """Rows a ring announced and the seat has not read ring again once every
-    HELM_BEACON_BACKSTOP_S (720 s), with no new row, so a ring that lands
-    mid-turn and is dropped is not the last one. The minute step puts pass k
-    at t0 + 60*(k-1): pass 13 is the backstop's first pass."""
+    HELM_BEACON_BACKSTOP_S (720 s), with no new row, while one of them was
+    only counted, never a ring's lead (task/4019: a row a ring showed whole
+    never leads again). The minute step puts pass k at t0 + 60*(k-1): pass 13
+    is the backstop's first pass."""
     STEP = 60.0
 
     def owed_rows(self):
@@ -502,7 +503,10 @@ class BackstopTest(DoorbellBase):
         lines, seen = self.follow(passes=23, step=self.STEP, clock=True)
         self.assertEqual(len(lines), 2, lines)
         self.assertEqual(seen[12], 2, "the pass at the backstop rang")
-        self.assertIn("] bob: @gemini owed 2 (+2 waiting — ", lines[1])
+        # the catch-up ring showed `owed 2`; the backstop leads with the
+        # newest row it only counted
+        self.assertIn("] bob: @gemini owed 2 (+2 waiting — ", lines[0])
+        self.assertIn("] bob: @gemini owed 1 (+2 waiting — ", lines[1])
         self.assertIn("doorbell: 3 unread = 3 addressed", lines[1])
         self.assertIn("0 new since the last ring", lines[1])
 
@@ -531,15 +535,17 @@ class BackstopTest(DoorbellBase):
                                   clock=True)
         self.assertEqual(len(lines), 2, lines)
         self.assertEqual(seen[12], 2)
-        self.assertIn("] bob: @gemini owed 2 (+1 waiting — ", lines[1])
+        self.assertIn("] bob: @gemini owed 1 (+1 waiting — ", lines[1])
         self.assertIn("doorbell: 2 unread", lines[1])
 
     def test_the_backstop_waits_for_the_hourly_cap(self):
         """A backstop ring counts against the cap like any broadcast ring:
-        with a cap of 1, the debounce ring at t0+120 holds it until t0+3720."""
+        with a cap of 1, the debounce ring at t0+120 holds it until t0+3720.
+        Two rows, so the backstop has a row the debounce ring only counted."""
         def script(n, _now):
             if n == 1:
                 chat.post("@gemini after arming", who="bob")
+                chat.post("@gemini and one more", who="bob")
         with mock.patch.dict(os.environ, {"HELM_BEACON_RINGS_PER_H": "1"}):
             lines, seen = self.follow(passes=66, step=self.STEP,
                                       script=script, clock=True)

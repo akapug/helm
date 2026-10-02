@@ -1004,7 +1004,9 @@ class WeakRungDoesNotWearAStrongFamilysNameTest(unittest.TestCase):
         # CONTROL: the pro route still resolves to the pro family, so the
         # split moved the flash route and did not break the family it left.
         pro = [r for r in seat.proxy_routes(self.PRO_FAMILY)]
-        self.assertEqual(len(pro), 1, pro)
+        # the direct key and the Go subscription, both on the pro model
+        self.assertEqual(sorted(r["provider"] for r in pro),
+                         ["deepseek-direct", "opencode-go"], pro)
         for route in pro:
             self.assertEqual(seat.proxy_route_family(route),
                              (self.PRO_FAMILY, None))

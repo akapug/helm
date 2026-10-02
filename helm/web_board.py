@@ -120,8 +120,10 @@ QUIET_S = 30 * 86400
 _WORKTREE = re.compile(r"^worktree:([^:]+):(.+)$")
 
 # THE FLAG FIELDS THE PAGE READS: the chip's hover and the flag card's rows.
+# `declared_pending` is an owner declaration the watchdog has not folded yet
+# (task/4027), drawn beside the reading and never as its colour.
 _FLAG_KEYS = ("colour", "cause", "axis", "provenance", "money_provenance",
-              "expires_at", "credits")
+              "expires_at", "credits", "declared_pending")
 
 _SECTIONS = (("lights", "helm projects state"), ("flags", "helm burn"),
              ("tasks", "helm task list"), ("seats", "helm chat seats"),
@@ -335,16 +337,20 @@ def _trunk_join(projects):
 
 
 def _flags_section():
-    """The burn flags, through `/api/flags`'s own cached read."""
+    """The burn flags, through `/api/flags`'s own cached read. The owner's
+    declarations the watchdog has not folded yet ride the section either way
+    (`declared_pending`, task/4027): with no fresh snapshot there is no
+    family to carry them, and they are still saved."""
     try:
         got = get_flags()
     except Exception as exc:                # noqa: BLE001 — named, never zero
         return _section("helm burn", None, None, families={}, overall=None,
                         unavailable="the burn-flag read raised (%s)"
                         % type(exc).__name__)
+    pending = got.get("declared_pending") or {}
     if not got.get("measured"):
         return _section("helm burn", None, got.get("bound_s"), families={},
-                        overall=None,
+                        overall=None, declared_pending=pending,
                         unavailable=got.get("why") or "no fresh burn-flag "
                         "snapshot")
     fams = {fam: dict({k: fl.get(k) for k in _FLAG_KEYS},
@@ -352,7 +358,8 @@ def _flags_section():
             for fam, fl in (got.get("families") or {}).items()
             if isinstance(fl, dict)}
     return _section("helm burn", got.get("measured_at"), got.get("bound_s"),
-                    families=fams, overall=got.get("overall"))
+                    families=fams, overall=got.get("overall"),
+                    declared_pending=pending)
 
 
 def _family_bills(family):
@@ -386,54 +393,21 @@ def _teams_join():
         {key: {"team": rec} for key, rec in model["projects"].items()}
 
 
-def _closings():
-    """(closed_at, born_closed, accept): an `accept` for `tasks.snapshot` that
-    watches every event go by, and the two things it learns — when each row
-    last CLOSED, and which rows were born closed. A row filed already closed
-    is a record of history (a tombstone), not work, so it is neither opened
-    nor closed in any week."""
-    closed_at, born = {}, set()
-
-    def accept(row, prior):
-        rid = str(row.get("id"))
-        status = row.get("status")
-        if prior is None and status == "closed":
-            born.add(rid)
-        if status == "closed" and (prior or {}).get("status") != "closed":
-            closed_at[rid] = row.get("last_updated") or row.get("ts")
-        elif status != "closed":
-            closed_at.pop(rid, None)
-        return True
-    return closed_at, born, accept
-
-
 def _tasks_join(keys):
     """(section, {project: {open, in_progress, p0, p1, top}}, {project:
-    {opened7, closed7}}) from ONE read of the task ledger. `p0` and `p1`
-    count the open rows at each rank, for the project's line (task/3445). The week's flow is counted
-    off the ledger's events, so a row closed and then commented on is dated
-    by its close, not by the comment."""
-    from . import tasks
+    the one reader's health line}) from the task ledger. `p0` and `p1` count
+    the open rows at each rank, for the project's line (task/3445); the open
+    rows are read here. The week's flow and today's counts are
+    `taskhomes.health`'s answer — the ONE reader `helm task health` renders
+    from — so the board and the command line cannot disagree about one
+    project (task/3745). The key None is the homeless rows: it rides the
+    headline, not a project row."""
+    from . import tasks, taskhomes
     read_at = time.time()
-    closed_at, born, accept = _closings()
-    rows, unavailable = tasks.snapshot(accept=accept)
+    rows, unavailable = tasks.snapshot()
     if unavailable:
         return _section("helm task list", None, SECTION_LIMIT_S,
                         unavailable=str(unavailable)), {}, {}
-    cut = read_at - WEEK_S
-    flow = {}
-    for rid, row in rows.items():
-        if rid in born:
-            continue
-        key = tasks.project_of_row(row)
-        if key is None or (keys is not None and key not in keys):
-            continue
-        rec = flow.setdefault(key, {"opened7": 0, "closed7": 0})
-        ts = row.get("ts")
-        rec["opened7"] += isinstance(ts, (int, float)) and ts >= cut
-        at = closed_at.get(rid)
-        rec["closed7"] += row.get("status") == "closed" \
-            and isinstance(at, (int, float)) and at >= cut
     live = [r for r in rows.values() if r.get("status") in tasks.OPEN_STATUSES]
     out, unscoped, unplaced = {}, 0, 0
     for row in tasks.board_order(live):
@@ -457,9 +431,21 @@ def _tasks_join(keys):
                 "title": str(row.get("title") or ""),
                 "priority": prio if prio in tasks.PRIORITIES else None,
                 "status": str(row.get("status") or "")})
+    # THE ONE READER'S LINES, for every project the board renders and the
+    # homeless rows: a registered project with no rows gets the one reader's
+    # zero line, and an unregistered name with an open row gets its own.
+    report, _err = taskhomes.health()
+    lines = {}
+    if report is not None:
+        known = set(keys) if keys is not None else set()
+        shown = taskhomes.every_project(report, known)
+        lines = dict(zip(shown, taskhomes.select(report, shown)))
+    # The homeless line (the key None) is not a project's: it rides the
+    # headline, where the board's other no-project counts already do.
     return _section("helm task list", read_at, SECTION_LIMIT_S,
                     unscoped=unscoped,
-                    unplaced=unplaced if keys is not None else None), out, flow
+                    homeless=lines.pop(None, None),
+                    unplaced=unplaced if keys is not None else None), out, lines
 
 
 def _burn_family(row):
@@ -491,7 +477,7 @@ def _claims_landed(projects, key, lanes, gate=None, memo=None):
     """({lane: {state, proof, tip}}, {lane: dirty}, {lane: gate}) for one
     project's claimed
     lanes — IS THE WORK UNDER EACH LEASE ALREADY ON THE TRUNK, and for the
-    lanes whose work is, IS THEIR ROOM DIRTY. A land releases no lease, so a
+    lanes whose work is, IS THEIR ROOM DIRTY. A hand land releases no lease (auto-land releases the lanes it lands, unless the room is occupied), so a
     lane stays claimed after it lands, and a claim read alone draws a landed
     lane as BUILDING — work in flight that is already in history.
 
@@ -1553,8 +1539,8 @@ def _board_marks():
 def _board_build():
     """Every join, each section stamped with its own read (`_board_legs`)."""
     projects, flags, got, absent = _board_legs()
-    tasks_sec, by_tasks, flow = got.get("tasks") or (absent.get("tasks"),
-                                                     {}, {})
+    tasks_sec, by_tasks, health_lines = got.get("tasks") or (absent.get("tasks"),
+                                                             {}, {})
     gate_sec, by_gate = got.get("gate") or (absent.get("gate"), {})
     # ONE ANCESTRY CACHE FOR THIS BUILD: each leased lane is asked once
     # whether the running gate's head carries it (`_claims_landed`)
@@ -1575,23 +1561,26 @@ def _board_build():
         joins.setdefault(key, {}).update(rec)
     for key, rec in by_lands.items():
         joins.setdefault(key, {}).update(rec)
+    # THE HEALTH LINE RIDES EVERY RENDERED ROW (task/3745): the one reader's
+    # line for a registered project, a zero line when it has no rows, and a
+    # line of its own for an unregistered name the ledger names. It rides the
+    # tasks read, not the trunk — a project with no checkout still has a week,
+    # so it is added before the defaulting below, not off the trunk loop.
+    for key, line in (health_lines if _read(tasks_sec) else {}).items():
+        joins.setdefault(key, {})["health"] = line
     if _read(seats_sec):
         # A READABLE ROSTER ANSWERS FOR EVERY PROJECT ON THE BOARD: one with
         # open work and nobody seated says so in two empty lists.
         for rec in joins.values():
             rec.setdefault("seats", [])
             rec.setdefault("families", [])
-    # THE LAST LAND RIDES EVERY RENDERED ROW, added after the defaulting
-    # above so a project joined by nothing else does not grow empty seat
-    # lists it was never read for.
+    # THE LAST LAND RIDES EVERY ROW WITH A CHECKOUT. The About tab's progress
+    # keeps only the commits noun (`lands7`); its week figure is the row's
+    # health line's `net_7d`, one number per noun, read off `health`.
     for key, rec in by_trunk.items():
         rec = dict(rec)
         lands7 = rec.pop("lands7")
-        week = flow.get(key) or {}
-        joins.setdefault(key, {}).update(rec, progress={
-            "lands7": lands7,
-            "opened7": week.get("opened7", 0) if _read(tasks_sec) else None,
-            "closed7": week.get("closed7", 0) if _read(tasks_sec) else None})
+        joins.setdefault(key, {}).update(rec, progress={"lands7": lands7})
     # THE GATE RIDES EVERY ROW WITH A CHECKOUT, an empty list when no gate
     # runs there: the gate window was read, and it said so
     for key, cards in by_gate.items():

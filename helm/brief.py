@@ -22,6 +22,8 @@ Sections (headline-first; an empty section is omitted entirely):
                     (no cache -> "quota: run `helm creds`", never a probe)
   WAITING ON YOU  — estate-health gates and distinct fleet-filed owner asks,
                     including the board-recorded age of each ask
+The OFFICE WEATHER line (task/3902) heads it all: the settled sunny, cloudy
+or stormy line the weather pass last recorded, read from its state file.
 
 THE MORNING REPORT (`--report`, task/3537) is the part of the owner's report
 that was written by hand: one plain line per LAND, its words from trunk's
@@ -31,6 +33,12 @@ tree; every open owner ask, none folded; and a CHECKLIST it verifies, which
 prints a MISSING line for every LAND n..m no line carries, for trunk that no
 LAND number records, and for an open ask the report does not name.
 `--check FILE` holds a report written by hand to the same checklist.
+ORDER lines (task/3821) name a story whose lead has no lane while a later
+sub-task went first, and owner-asked P0/P1 work with no lane for over 2h,
+and each seat that owes seen-working checks on landed tasks
+(helm/observed.py): "ORDER @seat owes N seen-working checks: <ids>". The
+owing seat itself hears the same line through its stop whisper
+(observed.stop_candidate), once per owed set.
 """
 import glob
 import json
@@ -537,6 +545,20 @@ def _chat_durability():
     return []
 
 
+def _weather():
+    """THE OFFICE WEATHER heads the brief (task/3902): the floor's settled
+    word and its line, every change of it, though the owner's phone hears
+    only a storm and its all-clear. Read from the weather
+    pass's own state file, the one small read this section allows: the brief
+    never measures the floor itself."""
+    from . import officeweather
+    try:
+        return officeweather.surface()
+    except Exception as exc:                 # noqa: BLE001 — said, not lost
+        return {"word": None, "shown": "office weather: UNKNOWN (%s)"
+                % officeweather._why(exc)}
+
+
 # --------------------------------------------------------------- compose/render
 
 def compose(hours=12.0, repo=None):
@@ -555,7 +577,8 @@ def compose(hours=12.0, repo=None):
             "seats": _seats(),
             "owner_asks": asks,
             "owner_asks_unavailable": asks_err,
-            "waiting": _waiting()}
+            "waiting": _waiting(),
+            "weather": _weather()}
 
 
 def _ago(iso):
@@ -586,6 +609,9 @@ def render(b):
     """Tight, headline-first text (~40 lines max): every section headed and
     skippable, empty sections omitted, a no-data estate says so in one line."""
     lines = ["helm brief — %s (last %gh)" % (b["generated_at"], b["hours"])]
+    if b.get("weather"):
+        lines.append(b["weather"]["shown"])
+    top = len(lines)
     s = b["sessions"]
     if s["total"]:
         lines += ["", "SINCE YOU LEFT — %d session%s, %d project%s" % (
@@ -737,7 +763,7 @@ def render(b):
                     more, "s"[:more != 1]))
     if not (s["total"] or segs or live_inject or rq_active or estate or asks
             or asks_err or bl["total"]):
-        lines.insert(1, "quiet — nothing new in the window.")
+        lines.insert(top, "quiet — nothing new in the window.")
     return "\n".join(lines)
 
 
@@ -1013,9 +1039,120 @@ def _runs(numbers):
     return [tuple(r) for r in runs]
 
 
+#: How long an owner-asked P0/P1 task may have no lane before the ORDER line
+#: names it.
+ORDER_UNROUTED_S = 2 * 3600
+
+
+def _check_lines(rows):
+    """One ORDER line per seat that owes seen-working checks on landed
+    tasks among `rows` (helm/observed.py), in seat order; [] when none
+    are owed."""
+    from . import observed
+    return ["ORDER @%s %s" % (seat, observed.line(len(ids), ids))
+            for seat, ids in sorted(observed.owed(rows).items())]
+
+
+def _went(tid, because, verb=""):
+    """How one skip reads on an ORDER line: its reason quoted, or that it
+    went ahead without one, or that nothing was recorded."""
+    from . import tasks
+    head = "%s %s" % (tid, verb) if verb else tid
+    if because == tasks.NO_REASON:
+        return "%s without a reason" % head
+    if because:
+        return '%s%s "%s"' % (head, ":" if verb else "", because)
+    return "%s (no reason recorded)" % head
+
+
+def _order_lines(repo, now):
+    """The owner's ORDER lines (task/3821): the biggest lever first, as a
+    fact he can check. [] when nothing is inverted or unrouted.
+
+    One line per open story whose lead (the first open sub-task in the
+    story's order, `tasks.story_order`) has no lane while a later sub-task
+    has one, with the reason that later task went first when one was
+    recorded (`--because`, on its lane or its chain's first row). One line
+    for owner-asked P0/P1 tasks filed over ORDER_UNROUTED_S ago with no
+    lane, naming each task that went ahead of one of them and its reason.
+    Each list names its first `tasks.LEVER_NAMED` and counts the rest. A lane is a lane record in `repo` or an open dispatch chain for
+    the task or a task below it (`taskkey.live_tasks`), or that task being
+    `in_progress` (`helm task claim`). Rows are those of
+    `repo`'s project when it derives to one. A read that fails is one ORDER
+    UNKNOWN line, never silence."""
+    from . import dispatches, taskkey, tasks
+    from .inject._ledger import project_for_cwd
+    from .work import _lanes
+    root = _lanes.find_root(repo) or repo
+    known, why = tasks.snapshot()
+    why = why and "the task ledger could not be read (%s)" % why
+    current, live, levers = {}, frozenset(), {}
+    if not why:
+        current, why = dispatches.snapshot()
+        why = why and "the dispatch ledger could not be read (%s)" % why
+    if not why:
+        live, why = taskkey.live_tasks(root, current=current)
+    if not why:
+        levers, why = taskkey.lever_records(root)
+    if why:
+        return ["ORDER UNKNOWN: %s" % why]
+    went = {rec["task"]: rec["because"] for rec in levers.values()}
+    over = {rec["task"]: set(rec["skipped"]) for rec in levers.values()}
+    for row in current.values():
+        if row.get("task") and row.get("lever_because"):
+            went.setdefault(row["task"], row["lever_because"])
+            over.setdefault(row["task"], set(row.get("lever_skipped") or ()))
+    facts = tasks.story_facts(known)
+
+    def lane(tid):
+        return any(r.get("id") in live or r.get("status") == "in_progress"
+                   for r in [known.get(tid) or {}]
+                   + list((facts.get(tid) or {}).get("below", ())))
+
+    try:
+        project = project_for_cwd(root)
+    except Exception:                         # noqa: BLE001 — scope unknown
+        project = None
+    rows = tasks.board_order(
+        r for r in known.values() if isinstance(r, dict)
+        and r.get("status") in tasks.OPEN_STATUSES
+        and (project is None or tasks.project_of_row(r) == project))
+    kids = {}
+    for r in rows:
+        kids.setdefault(r.get("continues"), []).append(r)
+    lines = []
+    for story in rows:
+        order = tasks.story_order(story, kids.get(story.get("id"), ()))
+        ahead = [r["id"] for r in order[1:] if lane(r["id"])]
+        if not ahead or lane(order[0]["id"]):
+            continue
+        lead = order[0]
+        filed = tasks.filed_epoch(lead)
+        lines.append("ORDER %s (%s): lead %s has no lane, filed %s · %s" % (
+            _clip(story.get("title") or "", 48), story["id"], lead["id"],
+            _age_s(int(now - filed)) if filed else "at an unknown time",
+            tasks.named(_went(t, went.get(t), "went first") for t in ahead)))
+    waiting = [r for r in rows if tasks.origin_of(r) == "owner"
+               and r.get("priority") in tasks.LEVER_RANKS
+               and (tasks.filed_epoch(r) or now) <= now - ORDER_UNROUTED_S
+               and not lane(r["id"])]
+    if waiting:
+        ids = {r["id"] for r in waiting}
+        ahead = sorted((t for t in went if went[t] and over.get(t, ()) & ids),
+                       key=lambda t: tasks.sort_key({"id": t}))
+        lines.append("ORDER owner-asked with no lane for over %dh: %s%s" % (
+            ORDER_UNROUTED_S // 3600, tasks.named(
+                "%s (%s, filed %s)" % (r["id"], r["priority"], _age_s(
+                    int(now - tasks.filed_epoch(r)))) for r in waiting),
+            " · went ahead: " + tasks.named(_went(t, went[t])
+                                            for t in ahead) if ahead else ""))
+    return lines + _check_lines(rows)
+
+
 def morning_report(hours=12.0, repo=None, first=None):
     """(text, rc): the morning report and its checklist; rc is 1 when any
-    checklist line is MISSING or UNKNOWN, else 0."""
+    checklist line is MISSING or UNKNOWN, else 0. The ORDER lines
+    (`_order_lines`) sit between LANDED and WAITING ON YOU."""
     now = time.time()
     repo = repo or os.getcwd()
     got = _report_lands(repo, now - hours * 3600, first)
@@ -1038,6 +1175,8 @@ def morning_report(hours=12.0, repo=None, first=None):
         lines.append("  none in the last %gh%s" % (
             hours, "; the last recorded is LAND %d" % got["last"]
             if got["last"] is not None else ""))
+    order = _order_lines(repo, now)
+    lines += [""] + order if order else []
     lines += ["", "WAITING ON YOU — %s" % (
         "UNKNOWN: " + str(asks_err) if asks_err else
         "%d open owner ask%s" % (len(asks), "s"[:len(asks) != 1]))]

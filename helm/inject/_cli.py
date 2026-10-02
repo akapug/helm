@@ -6,6 +6,7 @@ through the package namespace (_inject.X) — the test contract monkeypatches
 them on helm.inject.
 """
 import json
+import os
 import sys
 
 from .. import inject as _inject
@@ -135,15 +136,41 @@ def cmd_inject(args):
                 _ledger_append(timed_out_row(text, project, session, cwd, hook))
             except Exception:
                 pass
+        nag = _pending_nag(session)
+        if nag:
+            print(nag)
         return 0
     moments.disarm_deadline()
     if "--json" in args:
         print(json.dumps(sections, ensure_ascii=False))
         return 0
-    out = _inject.render(sections)
+    out = "\n".join(x for x in (_pending_nag(session),
+                                _inject.render(sections)) if x)
     if out:
         print(out)
     return 0
+
+
+NAG_HEAD = "helm: the handoff check before your last compaction said:"
+
+
+def _pending_nag(session):
+    """THE NAG'S BACKSTOP (task/4070). The PreCompact handoff nag no longer
+    prints at PreCompact (Claude Code feeds that stdout to the summarizer):
+    it waits in the session's nag file for the SessionStart(compact) hook.
+    A seat whose settings predate that hook never runs it, so the nag would
+    wait forever; this, the already-installed per-turn hook, hands a fresh
+    pending nag to the seat on its next prompt instead. take_nag reads and
+    removes the file, so the nag arrives once, from whichever reader comes
+    first. Only the hook path carries a session; fail open."""
+    if not session:
+        return ""
+    try:
+        from .. import workingset
+        return workingset.nag_text(workingset.take_nag(str(session)),
+                                   head=NAG_HEAD)
+    except Exception:                          # noqa: BLE001 — fail open
+        return ""
 
 
 def _moment_report(args):
@@ -157,7 +184,15 @@ def _moment_report(args):
         except (IndexError, ValueError):
             print("helm inject: --days needs a number", file=sys.stderr)
             return 2
-    rep = moments.report(days=days)
+    # WHAT EACH DOOR WOULD SAY TODAY (task/1135): the act routes' bound
+    # rules, off a fresh read of this checkout's project store. A store that
+    # cannot be read leaves the column UNKNOWN; the verdicts stand.
+    try:
+        from .. import doors
+        bound = doors.bound_lookup(project_for_cwd(os.getcwd()))
+    except Exception:                          # noqa: BLE001 — fail open
+        bound = None
+    rep = moments.report(days=days, bound=bound)
     if "--json" in args:
         print(json.dumps(rep, ensure_ascii=False, indent=1, default=str))
     else:

@@ -181,7 +181,7 @@ class DeafSeatRearmNudgeTest(tb.Base):
             json.dump(r, f)
 
     def pass_(self, agent=True, covered=False, fresh=True, owed=None,
-              obligation=False, expired_ago=None, **row):
+              obligation=False, expired_ago=None, once_ended_ago=None, **row):
         """One census, attend and escalate. `agent` plants a pane that
         DECLARES alpha; `covered` plants a live waiter for it. `owed` puts
         one addressed row in alpha's room, read WHOLE (default: owed unless
@@ -208,6 +208,16 @@ class DeafSeatRearmNudgeTest(tb.Base):
                 json.dump({"seat": "alpha", "pid": 4242,
                            "session": tb.SID_A, "starttime": 100,
                            "armed": time.time() - expired_ago,
+                           "home": os.environ["HELM_HOME"]}, f)
+        if once_ended_ago is not None:
+            # the row a one-shot beacon leaves when it rang and exited
+            os.makedirs(beacons.registry_dir(), exist_ok=True)
+            now = time.time()
+            with open(beacons._entry_path("alpha", 4343), "w") as f:
+                json.dump({"seat": "alpha", "pid": 4343,
+                           "session": tb.SID_A, "starttime": 100,
+                           "armed": now - once_ended_ago - 40,
+                           "ended": now - once_ended_ago, "ended_how": "once",
                            "home": os.environ["HELM_HOME"]}, f)
         ev = {"oldest": None, "scanned": ("helm",), "seen": (),
               "bounded": {}, "estate": ("complete", "")}
@@ -361,6 +371,23 @@ class DeafSeatRearmNudgeTest(tb.Base):
 
     def test_CONTROL_past_the_grace_the_same_seat_is_nudged(self):
         rep, out = self.pass_(expired_ago=1800 + 3600)
+        self.assertEqual([beacons.DEAF], [r["verdict"] for r in rep["seats"]])
+        self.assertEqual(1, len(self.spawned), out)
+
+    def test_a_seat_between_a_one_shot_ring_and_its_rearm_is_not_typed_into(self):  # noqa: VACUOUS_ASSERTION — the verdict WAKING is the positive observable; test_CONTROL_a_one_shot_seat_that_never_rearms_is_nudged types into the same seat past the grace
+        """task/4019: a one-shot beacon exits after its ring, and the seat
+        re-arms in the turn that ring started. RED before the cure: the
+        census read that gap DEAF and the re-arm leg typed a resume turn into
+        a pane that was already awake and owed the row it was woken for."""
+        rep, out = self.pass_(once_ended_ago=30)
+        self.assertEqual([beacons.WAKING], [r["verdict"] for r in rep["seats"]],
+                         rep["seats"][0]["why"])
+        self.assertEqual([], self.spawned)
+        self.assertIsNone(out.get("rearmed"))
+        self.assertFalse(self.att()["alarm"])
+
+    def test_CONTROL_a_one_shot_seat_that_never_rearms_is_nudged(self):
+        rep, out = self.pass_(once_ended_ago=beacons.REARM_GRACE_S + 60)
         self.assertEqual([beacons.DEAF], [r["verdict"] for r in rep["seats"]])
         self.assertEqual(1, len(self.spawned), out)
 

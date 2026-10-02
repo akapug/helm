@@ -74,18 +74,20 @@ USAGE = ('usage: helm review done <row-id-prefix> clean|concur|fix "<evidence>" 
          "[--patch-tip SHA] [--no-patch-because R] [--worse-than-main PATH] "
          "[--imperfect] [--finding-count N] [--prior-relation "
          "new|uncured|regression-of-cure] [--diff-handoff ROOM/MSGID] "
+         "[--finding TEXT]... [--finding-carried task/N]... [--note TEXT]... "
          "[--tip SHA]")
 #: The flags `done` takes, each mapped to whether it may repeat.
 VALUED = {"--patch-tip": False, "--no-patch-because": False,
           "--diff-handoff": False, "--worse-than-main": True,
           "--finding-count": False, "--prior-relation": False,
+          "--finding": True, "--finding-carried": True, "--note": True,
           "--tip": False}
 BARE = ("--imperfect",)
 #: What a clean read cannot carry: it records a hold, which names no cure, no
 #: exit answer and no findings. `--tip` is the one flag every outcome takes.
 NOT_CLEAN = ("--patch-tip", "--no-patch-because", "--diff-handoff",
              "--worse-than-main", "--imperfect", "--finding-count",
-             "--prior-relation")
+             "--prior-relation", "--finding", "--finding-carried", "--note")
 #: A row id prefix shorter than this names too many rows to be worth a lookup.
 MIN_PREFIX = 4
 #: The shortest `--tip` accepted, git's own default abbreviation.
@@ -165,7 +167,9 @@ _TEXTS = {"evidence": ("<evidence>", "VERDICT_EVIDENCE_BUDGET",
           "clean": ("<evidence>", "HOLD_REASON_CAP", None),
           "reason": ("<reason>", "HOLD_REASON_CAP", None),
           "cure": ("<REASON>", "NO_PATCH_REASON_CAP", None),
-          "design": ("<FINDING>", "DESIGN_FINDING_CAP", None)}
+          "design": ("<FINDING>", "DESIGN_FINDING_CAP", None),
+          "finding": ("<FINDING>", "FINDING_TEXT_CAP", None),
+          "note": (NOTE_PLACEHOLDER, "FINDING_TEXT_CAP", None)}
 
 
 def _q(text):
@@ -444,24 +448,32 @@ def with_corrected(fn, args):
     path, and the door would otherwise record it as one. So is a send brief
     that carries one inside it (task/3382 F6)."""
     verb = args[0] if args else None
-    if verb not in CORRECTED_VERBS:
-        return fn(args)
-    why = unfilled_refusal(args[1:]) \
-        or (brief_refusal(args[1:]) if verb == "send" else None)
-    if why:
-        print("helm dispatch %s: %s" % (verb, why), file=sys.stderr)
-        rc = 2
-    else:
-        before = _ledger_size() if verb == "send" else None
-        rc = fn(args)
-        if not rc or (verb == "send" and _ledger_size() != before):
-            return rc
-    line, note = _corrected(args) or (None, None)
-    if line:
-        for text in (note or "").splitlines():
-            print("  " + text, file=sys.stderr)
-        print(CORRECTED + line, file=sys.stderr)
-    return rc
+    if verb == "send":
+        # A previous call can have read stdin; only THIS door may supply it.
+        global _stdin_brief
+        _stdin_brief = None
+    try:
+        if verb not in CORRECTED_VERBS:
+            return fn(args)
+        why = unfilled_refusal(args[1:]) \
+            or (brief_refusal(args[1:]) if verb == "send" else None)
+        if why:
+            print("helm dispatch %s: %s" % (verb, why), file=sys.stderr)
+            rc = 2
+        else:
+            before = _ledger_size() if verb == "send" else None
+            rc = fn(args)
+            if not rc or (verb == "send" and _ledger_size() != before):
+                return rc
+        line, note = _corrected(args) or (None, None)
+        if line:
+            for text in (note or "").splitlines():
+                print("  " + text, file=sys.stderr)
+            print(CORRECTED + line, file=sys.stderr)
+        return rc
+    finally:
+        if verb == "send":
+            _stdin_brief = None
 
 
 def corrected(args):
@@ -547,8 +559,9 @@ def _text(kind, text):
 
 
 #: Flags that belong to `send`, which seats mixing the two verbs typed into a
-#: verdict: dropped from the corrected verdict WITH their value.
-_FOREIGN_VALUED = ("--ref", "--kind", "--note", "--supersedes", "--repo",
+#: verdict: dropped from the corrected verdict WITH their value. `--note` is
+#: the verdict's own now (an observation on the task, task/3742), and kept.
+_FOREIGN_VALUED = ("--ref", "--kind", "--supersedes", "--repo",
                    "--deadline", "--key", "--lane", "--reason", "--to")
 
 
@@ -610,7 +623,7 @@ def _diff_handoff_words(values, polarity, row=None):
     if not refs:
         return []
     ref = refs[0] if len(refs) == 1 else DIFF_HANDOFF_PLACEHOLDER
-    if not dispatches._DIFF_HANDOFF_REF.fullmatch(str(ref)):
+    if not dispatches._diff_handoff_ref(ref):
         ref = DIFF_HANDOFF_PLACEHOLDER
     elif row and row.get("tip"):
         current, unavailable = dispatches.snapshot()
@@ -640,8 +653,14 @@ def _observations(values, owed):
     relation the seat gave beside one is two answers, and both become
     placeholders. A count or relation the door refuses by its shape is its
     placeholder, and a counted relation with no count owes one, because the
-    door refuses a relation that describes nothing counted (task/3403)."""
-    count = _given(values, "--finding-count", COUNT_PLACEHOLDER)
+    door refuses a relation that describes nothing counted (task/3403).
+    A read that NAMES its findings (`--finding`, `--finding-carried`) has
+    counted them: the door derives the count, so the line carries none."""
+    named = any(values.get(flag) for flag in (
+        dispatches.review_findings.FINDING_FLAG,
+        dispatches.review_findings.CARRIED_FLAG))
+    count = None if named else _given(values, "--finding-count",
+                                      COUNT_PLACEHOLDER)
     relation = _given(values, "--prior-relation", RELATION_PLACEHOLDER)
     unknown = _unknown(count)
     if count and not unknown \
@@ -652,10 +671,10 @@ def _observations(values, owed):
         relation = RELATION_PLACEHOLDER
     if unknown and relation and not _unknown(relation):
         count, relation = COUNT_PLACEHOLDER, RELATION_PLACEHOLDER
-    if relation and not count and not _unknown(relation):
+    if relation and not count and not _unknown(relation) and not named:
         count = COUNT_PLACEHOLDER
     if owed:
-        count = count or COUNT_PLACEHOLDER
+        count = count or (None if named else COUNT_PLACEHOLDER)
         relation = relation or (dispatches.UNKNOWN_OBSERVATION if unknown
                                 else RELATION_PLACEHOLDER)
     out = []
@@ -765,12 +784,25 @@ def verdict_line(rest):
     polarity = polarity[2:] if polarity else None
     basis = _one(values, sorted(dispatches.BASIS_FLAGS)) or BASIS_PLACEHOLDER
     advisory = any(flag in values for flag, _hole in _RUN_FLAGS)
+    # WORK NAMED ON A READ THAT HANDS NOTHING BACK REOPENS ITS DIRECTION
+    # (task/3742): only a FIX files a --finding, so the line keeps the work
+    # and leaves the direction to the seat rather than dropping the work.
+    rf = dispatches.review_findings
+    if not advisory and polarity not in (None, "fix") \
+            and any(values.get(f) for f in (rf.FINDING_FLAG, rf.CARRIED_FLAG)):
+        polarity = None
     if advisory and polarity == "approve":
         # A MODEL RUN NEVER APPROVES (`_on_behalf_shape`), so the direction
         # is the refused choice and the seat's to make again (task/3403).
         polarity = None
-    if polarity == "approve" \
-            and not dispatches._GATE_TOKEN_RE.search(evidence or ""):
+    hold = polarity == "approve" \
+        and not dispatches._GATE_TOKEN_RE.search(evidence or "")
+    # THE WORK AND NOTES A LINE CANNOT CARRY are kept above it (task/3742):
+    # a model run's read files nothing, and a hold takes no note.
+    kept = _kept_work(values, row, current, rid, tip, basis, evidence,
+                      advisory, hold)
+    note = "\n".join(n for n in [note] + kept if n) or None
+    if hold:
         # THE DOOR'S OWN REPAIR: a clean source read holds, and the approve
         # binds the token the integrator's land gate mints.
         return "helm dispatch hold %s --source-clean %s -- %s" % (
@@ -790,6 +822,39 @@ def verdict_line(rest):
     parts += [] if reopened else _exit_and_cure(row, values, polarity)
     parts += _riders(values, polarity, advisory, row)
     return " ".join(parts + ["--", _text("evidence", evidence)]), note
+
+
+def _kept_work(values, row, current, rid, tip, basis, evidence, advisory,
+               hold):
+    """The lines that keep what a review named when its corrected line
+    cannot (task/3742): a model run's read files no finding and no note, so
+    its findings ride a FIX line of the seat's own, notes included; and a
+    hold takes no note, so each note is a comment on the chain's task."""
+    rf = dispatches.review_findings
+    work = any(values.get(flag) for flag in (rf.FINDING_FLAG,
+                                             rf.CARRIED_FLAG))
+    notes = values.get(rf.NOTE_FLAG) or ()
+    if not (advisory or hold) or not (work or notes):
+        return []
+    if work and advisory:
+        parts = ["helm dispatch verdict", _q(rid), tip, "--fix", _q(basis)]
+        parts += _observations(values, True)
+        parts += _exit_and_cure(row, values, "fix")
+        parts += _riders(values, "fix", False, row)
+        return ["a model run's read files no finding; the work it named "
+                "rides a FIX of your own: " + " ".join(
+                    parts + ["--", _text("evidence", evidence)])]
+    try:
+        from . import tasks
+        task = rf.chain_task(row, current, tasks.snapshot()[0] or {})[0]
+    except Exception:                  # noqa: BLE001 — a hint never breaks a refusal
+        task = None
+    what = "a model run's read" if advisory else "a hold"
+    if not task:
+        return ["%s takes no note and this chain names no task; keep it by "
+                "hand: %s" % (what, _text("note", n)) for n in notes]
+    return ["%s takes no note; it is a comment on the task: helm task "
+            "comment %s %s" % (what, task, _text("note", n)) for n in notes]
 
 
 #: The direction placeholders a reopened read carries: pasted back unfilled,
@@ -830,6 +895,18 @@ def _riders(values, polarity, advisory, row=None):
     if polarity in (None, "fix"):
         for finding in values.get("--design-finding") or ():
             out += ["--design-finding", _text("design", finding)]
+    # A REVIEW'S WORK AND OBSERVATIONS (task/3742) ride a seat's own verdict,
+    # the work only a FIX: a line that dropped them would record the verdict
+    # and lose the findings it named.
+    rf = dispatches.review_findings
+    if not advisory and polarity in (None, "fix"):
+        for finding in values.get(rf.FINDING_FLAG) or ():
+            out += [rf.FINDING_FLAG, _text("finding", finding)]
+        for tid in values.get(rf.CARRIED_FLAG) or ():
+            out += [rf.CARRIED_FLAG, _q(tid)]
+    if not advisory:
+        for note in values.get(rf.NOTE_FLAG) or ():
+            out += [rf.NOTE_FLAG, _text("note", note)]
     if not advisory:
         return out + _diff_handoff_words(values, polarity, row)
     model, run, author = (_run_word(values, flag, hole)
@@ -902,6 +979,10 @@ def hold_line(rest):
         stop = _not_open(row)
         if stop:
             return stop
+        if clean is not None and not open_holder:
+            other = _cannot_hold(current, row, clean, words[1:])
+            if other:
+                return other
         rid, note = row["id"], None
     parts = ["helm dispatch hold", _q(rid)]
     if open_holder:
@@ -915,6 +996,71 @@ def hold_line(rest):
     parts += [dispatches._MELD_FLAG, _q(meld)] if meld else []
     return " ".join(parts + ["--", _text("reason", _free_text(words[1:]))]), \
         note
+
+
+def _cannot_hold(current, row, clean, text):
+    """(line, note) when this seat's own source-clean hold of `row` can
+    never record, else None.
+
+    THE HOLD DOOR TAKES A SOURCE-CLEAN HOLD FROM THE ROW'S RECIPIENT, OR
+    from its sender or custodian holding on a fresh-context read it recorded
+    on the row at exactly that tip (task/3658); and a recipient that wrote a
+    round of the lane holds only on such a read too (task/3483). Any other
+    hold is refused whatever the seat types, so a corrected hold line can
+    never record (task/4026: it repeated the refused command). The real path
+    for the sender and for the authoring recipient is that read: a
+    fresh-context run reads the tip, and its CONCUR, recorded on the row,
+    records the hold too. The line is that verdict, with the run, its model
+    and the basis left for the seat; the note says whose hold it otherwise
+    is. A seat on neither end of the row is sent to its own rows. An
+    unreadable identity, tip or authorship answers None: the door's own
+    refusal says why, and the hold line stands."""
+    seat, err = dispatches._acting_author("hold this row")
+    if err or not seat:
+        return None
+    recipient = row.get("recipient") or "?"
+    mine = _matches(seat, row.get("recipient"))
+    if not mine and not any(_matches(seat, party) for party in (
+            row.get("sender"), dispatches.custodian_of(row))):
+        return "helm dispatch list --mine --open", (
+            "only this row's recipient @%s can hold dispatch %s "
+            "--source-clean; you neither received nor sent it"
+            % (recipient, row["id"][:12]))
+    typed = str(clean or "").strip()
+    held = None if not typed or placeholder(typed) else dispatches._resolve_tip(
+        row.get("repo_root"), typed, infer_sha_branch=False)[0]
+    if not held:
+        return None
+    if mine:
+        from . import landreq           # deferred: it imports dispatches
+        try:
+            why = landreq.source_clean_author_error(
+                row, seat, current, tip=held,
+                doors=dispatches.held_tip_doors(row, held, current))
+        except Exception:              # noqa: BLE001 — a hint never breaks a refusal
+            return None
+        if getattr(why, "kind", None) != landreq.SourceCleanRefusal.LANE_AUTHOR:
+            return None
+        note = ("you wrote a round of lane %s, so your clean read of dispatch "
+                "%s is not an independent one: a seat that wrote none of the "
+                "lane reads it and holds it, or a fresh-context run reads the "
+                "tip and you record its read here — its CONCUR records the "
+                "hold too" % (row.get("lane") or "?", row["id"][:12]))
+    elif dispatches.holds_on_its_fresh_read(row, seat, held):
+        return None
+    else:
+        note = ("only this row's recipient @%s holds dispatch %s "
+                "--source-clean on its own read; as its sender you hold it "
+                "on a fresh-context run's read of the tip: spawn one, then "
+                "record its read here — its CONCUR records the hold too"
+                % (recipient, row["id"][:12]))
+    tip, tip_note = _typed_tip(row, clean)
+    line = " ".join(["helm dispatch verdict", _q(row["id"]), tip, "--concur",
+                     _q(BASIS_PLACEHOLDER), "--reviewer-model",
+                     _q(MODEL_PLACEHOLDER), "--reviewer-run",
+                     _q(RUN_PLACEHOLDER), "--",
+                     _text("evidence", _free_text(text))])
+    return line, "\n".join(n for n in (tip_note, note) if n)
 
 
 def _send_parts(rest):
@@ -994,7 +1140,11 @@ def send_line(rest):
     seat's own, or `<--new-work|--supersedes ROW>` — never a row it did not
     name, which is offered on the line above (task/3382 F5, F8). None when
     the send's row already exists."""
+    global _stdin_brief
     recipient, lane, brief, values, flags = _send_words(rest)
+    piped = _stdin_brief
+    _stdin_brief = None
+    stdined = piped is not None
     seat, _err = dispatches._acting_author()
     typed = recipient
     new_work, supersedes = "--new-work" in flags, values.get("--supersedes")
@@ -1042,10 +1192,24 @@ def send_line(rest):
     parts = ["helm dispatch send", _q(recipient or "<recipient>"),
              _q(_shaped(lane, "LANE_CAP") or "<lane>"),
              _q(brief if carried else "<brief>")]
+    notes = []
+    if stdined:
+        # NO WORD OF THE BRIEF IS IN ARGV: it came on stdin, so the corrected
+        # line leaves it for the caller to re-pipe — no argv `<brief>` to loop
+        # on — and names the file's path so a paste with the file works.
+        parts[3] = STDIN_BRIEF_PLACEHOLDER
+        notes.append(STDIN_BRIEF_NOTE)
     parts += ["--ref", _q(tip if tip and _sha_prefix(ref)
                           else _shaped(ref, "REF_CAP") or "<TIP>"),
               "--kind", _q(kind or "<build|review>")]
-    notes = []
+    # A CONTINUATION STARTS NO NEW CHAIN: `--task` and `--whole/--part`
+    # name the task a NEW chain records, and a `--supersedes` row keeps its
+    # chain's, so the measured loop is a corrected line that carried them
+    # back — pasting it was refused again. The drop is scoped here, to the
+    # three arms that emit `--supersedes`; a `--new-work` line keeps its own
+    # flags byte-for-byte, and so does a cross-repo hand-back, which the
+    # line sends as `--new-work`: a new chain records its own task.
+    continuation = bool(supersedes) and not new_work and not cross_repo
     if cross_repo and row is not None:
         parts.append("--new-work")
         notes.append(
@@ -1071,15 +1235,30 @@ def send_line(rest):
             notes.append(_answers(row, lane or row.get("lane"),
                                   "" if recipient
                                   else _counterpart(seat, row)))
+        if new_work and supersedes and (values.get("--task") or {
+                "--whole", "--part"} & set(flags)):
+            # BOTH ARMS, AND A NEW CHAIN'S FLAGS: the line keeps them for a
+            # --new-work fill, and says what a --supersedes fill drops, or
+            # that paste is refused at the task door again.
+            notes.append(BOTH_ARMS_NOTE)
     for flag in _SEND_CARRIED:
+        # --task names a new chain's task: on a continuation the line never
+        # carries it, or the paste is refused at the task door again.
+        if flag == "--task" and continuation:
+            continue
         if values.get(flag):
             check, hole = _SEND_SHAPES.get(flag, (None, None))
             parts += [flag, _q(hole if check and check(values[flag])
                                else values[flag])]
-    parts += _owed(brief if carried else None, lane, values,
+    parts += _owed(piped if stdined else (brief if carried else None), lane, values,
                    dispatches.clean_kind(kind)[0],
                    None if cross_repo else supersedes, seat, recipient)
-    parts += ["--force"] if "--force" in flags else []
+    # --whole/--part are read only among the trailing options, as --force is;
+    # a continuation carries --force only -- --whole/--part name a chain's
+    # first row, and carrying them would refuse the paste again.
+    trailing = ("--force",) if continuation else ("--whole", "--part",
+                                                 "--force")
+    parts += [f for f in trailing if f in flags]
     if brief is not None and brief.startswith("--"):
         # NO ARGUMENT CAN CARRY IT: the door reads a word that starts `--`
         # as an option, so the brief is the seat's to retype.
@@ -1090,10 +1269,24 @@ def send_line(rest):
     return (" ".join(parts), "\n".join(notes)) if notes else " ".join(parts)
 
 
-#: The send flags a corrected line carries as the seat typed them.
+#: STDIN_BRIEF_PLACEHOLDER: when the brief came on STDIN (argv carries none),
+#: the corrected send line leaves the brief for the caller to re-pipe — the
+#: argv with no brief word plus this appended, pasting it with the file
+#: re-pipes it.
+STDIN_BRIEF_PLACEHOLDER = "< <brief-file>"
+#: BOTH_ARMS_NOTE: printed above a send line that named both work arms and
+#: also --task, --whole or --part, which only a --new-work fill keeps.
+BOTH_ARMS_NOTE = "a --supersedes continuation takes no --task, --whole or " \
+    "--part: fill the arm with --supersedes ROW and drop them, or with " \
+    "--new-work and keep them"
+#: The stdin brief belongs to one send only; the renderer consumes it once.
+_stdin_brief = None
+#: STDIN_BRIEF_NOTE: printed above a send line whose brief came on stdin.
+STDIN_BRIEF_NOTE = "your brief came on stdin: type the rest above and append " \
+    "the file's path where the brief was"
 _SEND_CARRIED = ("--note", "--deadline", "--repo", "--key", "--posture-na",
                  "--read-only-because", "--async-because", "--disputes",
-                 "--meld")
+                 "--meld", "--task")
 #: THE SEND VALUES ITS DOOR REFUSES BY SHAPE ALONE (task/3403): each flag's
 #: check, the door's own, and the placeholder a refused value becomes.
 _SEND_SHAPES = {
@@ -1276,6 +1469,9 @@ class _Read:
         if outcome != "clean":
             # THE SEAT'S OWN COUNTS, and a FIX owes them (task/3382 F10).
             parts += _observations(self.opts, outcome == "fix")
+            for flag in ("--finding", "--finding-carried", "--note"):
+                for value in self.opts.get(flag) or ():
+                    parts += [flag, _q(value)]
         if outcome == "fix":
             parts += _exit_and_cure(self.row or {}, self.opts, "fix")
             parts += _diff_handoff_words(self.opts, "fix", self.row)
@@ -1351,6 +1547,9 @@ def _door_argv(read, reviewed):
         relation = relation or dispatches.UNKNOWN_OBSERVATION
     argv += ["--finding-count", count] if count else []
     argv += ["--prior-relation", relation] if relation else []
+    for flag in ("--finding", "--finding-carried", "--note"):
+        for value in opts.get(flag) or ():
+            argv += [flag, value]
     for path in opts.get("--worse-than-main") or ():
         argv += ["--worse-than-main", path]
     argv += ["--imperfect"] if "--imperfect" in opts else []

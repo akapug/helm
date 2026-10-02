@@ -55,6 +55,12 @@ receipts in the same task snapshot that changes owner.
 session stays in the store and is dropped on the wire. Every earlier release
 stays in the event history.
 
+A HOLDER'S HAND-OFF (`handoff`, task/2309) is also recorded in ``takeover``:
+{kind: "holder-handoff", from, to, by, session, pid, ppid, owner_was,
+status_was, note, ts, resolved}, with the session dropped on the wire the same
+way. A seat reassign writes ``takeover`` too, so the key holds the LAST custody
+capability; every earlier one stays in the event history.
+
 TOMBSTONES ARE FIRST-CLASS. 55% of the fleet's citation load points at items
 that were CLOSED before the migration. A tombstone carries the id, the title
 and `status: closed` and nothing else — it exists so that a seat reading a
@@ -62,6 +68,8 @@ week-old row gets a sentence instead of a dangling pointer. It is never work,
 never assigned, and never shown in the open list.
 """
 import calendar
+import collections
+import heapq
 import json
 import math
 import os
@@ -69,8 +77,9 @@ import re
 import shlex
 import sys
 import time
+import unicodedata
 
-from . import eventledger, freetext, home, refstore
+from . import eventledger, freetext, home, refstore, taskverify
 # THE DUPLICATE INDEX IS IMPORTED, NEVER RE-SPELLED. The tokenizer and the
 # overlap threshold this module's add door refuses on are the STORE's — one
 # similarity rule for the repo — so retuning it there moves this door too.
@@ -545,6 +554,8 @@ _SLUG_ID = re.compile(r"^\s*task[/-](?!\d+\s*$)([a-z0-9][a-z0-9-]{1,63})\s*$",
 # turn every issue reference into a task citation, so cited_in requires the
 # explicit task/ or task- form and leaves the ambiguous case alone.
 _CITED = re.compile(r"\btask[/-](\d{1,6})\b", re.IGNORECASE)
+# A dispatch row id, the shape `found_in` and `found_chain` record.
+_FOUND_ID = re.compile(r"[0-9a-f]{8,64}\Z")
 
 
 def ledger_path(name="tasks.jsonl"):
@@ -645,6 +656,76 @@ def resolve_scope(explicit, door):
                                home.registry_path(),
                                ", ".join(known) or "(none)"))
     return name, "flag", None
+
+
+OWN_PROJECT = "helm"
+"""The project helm's own loops file a row under when nothing else names one
+(task/3745): a mirrored scratchpad item no registered checkout claims, or a
+recovery row for an injection helm stranded, is helm's to triage. The
+upstream watch declares the same project (`upstream_watch.PROJECT`)."""
+
+NO_PROJECT_WORDS = ("none", "null", "unscoped")
+"""Spellings of "no project" a filer might hand the flag. Each is refused as
+a way out of naming one, even before the registry is asked."""
+
+
+def homeless_refusal(door, typed=None, flag=True):
+    """The ONE sentence a filing door prints for a row with no project.
+
+    EVERY ROW LIVES IN EXACTLY ONE PROJECT (task/3745): a row with none is
+    listed by no project's default `helm task list`, so no project's lead
+    sees it. The sentence names both ways in: the cwd (the lens `list`
+    scopes with) and the flag, with the names the flag takes. `typed` is a
+    no-project spelling the filer handed the flag, refused by name. A door
+    with no --project flag passes `flag=False` and names the cwd alone."""
+    known, kerr = registered_projects()
+    names = ", ".join(known) if known else "none is registered here"
+    try:
+        here = os.getcwd()
+    except OSError:
+        here = "a directory that no longer exists"
+    if typed is not None:
+        lead = ("%s %s is not a way out — a task must name its project"
+                % (PROJECT_FLAG, typed))
+    elif known is None:
+        # AN UNREADABLE REGISTRY IS NOT AN EMPTY ONE. The cwd lens fails
+        # open to "no project", so this is where the difference is said:
+        # the fix is the registry, not the cwd.
+        lead = ("a task must name its project, and none could be found: "
+                "the project registry (%s) is UNREADABLE (%s), so the cwd "
+                "(%s) cannot be matched to a project. Repair the registry "
+                "first" % (home.registry_path(), kerr, here))
+        names = "unknown until the registry is readable"
+    else:
+        lead = ("a task must name its project, and this one has none: the "
+                "cwd (%s) is inside no registered project%s"
+                % (here, " and %s was not given" % PROJECT_FLAG
+                   if flag else ""))
+    way = (", or pass %s NAME (registered: %s)" % (PROJECT_FLAG, names)
+           if flag else " (registered: %s)" % names)
+    return ("%s: %s. Nothing was filed. File it from inside a project's "
+            "checkout (the cwd decides, the way `helm task list` scopes)%s."
+            % (door, lead, way))
+
+
+def require_project(explicit, door):
+    """(project, decided_by, refusal) — THE ONE CHECK a filing door makes.
+
+    Every door that files a new row asks it (`helm task add`, `helm goal
+    add`): a no-project spelling handed to the flag is refused by name
+    before the registry is asked, so a project somebody registers as `none`
+    cannot become the way out; a bad flag value is resolve_scope's own
+    refusal; and a row the cwd gives no project and no flag names is
+    refused with the sentence that names both ways in."""
+    if explicit is not None and \
+            str(explicit).strip().casefold() in NO_PROJECT_WORDS:
+        return None, None, homeless_refusal(door, typed=explicit)
+    project, decided_by, err = resolve_scope(explicit, door)
+    if err:
+        return None, None, "%s Nothing was filed." % err
+    if not project:
+        return None, None, homeless_refusal(door)
+    return project, decided_by, None
 
 
 def scope_line(door, project, decided_by, tail=""):
@@ -763,7 +844,8 @@ def project_flag_not_applicable(door, rest):
           "FLEET-WIDE id, so it needs no scope: any row resolves from any "
           "directory. %s scopes `add`, `list` and `triage`, the verbs where "
           "cwd would otherwise decide. (Moving a filed row between projects "
-          "is not this door either.)" % (door, PROJECT_FLAG, PROJECT_FLAG),
+          "is `helm task rehome --plan FILE`.)" % (door, PROJECT_FLAG,
+                                                  PROJECT_FLAG),
           file=sys.stderr)
     return 2
 
@@ -777,7 +859,9 @@ def project_of_row(row):
     `project:<cwd-slug>` ref is deliberately NOT read here: that value is a
     cwd-slug, a DIFFERENT NAMESPACE than registry project names, and treating
     one as the other quietly builds the second identity mechanism. The bridge,
-    if ever wanted, is design work, not a read-time coercion.)"""
+    if ever wanted, is design work, not a read-time coercion.) A home is
+    given by a WITNESSED WRITE instead: `helm task rehome` appends an update
+    that names who homed the row and what it was before (task/3745)."""
     value = str(row.get("project") or "").strip()
     return value or None
 
@@ -918,6 +1002,17 @@ def rank_actor_error(actor):
             % type(actor).__name__)
 
 
+def _system_ranker(actor):
+    """`actor` when it is helm's own `actors.SystemRankCapability`, else
+    None (a seat's admission, or nothing, which rank_actor_error judges).
+    An unimportable `actors` is None here, and rank_actor_error refuses."""
+    try:
+        from . import actors as _actors
+    except Exception:                   # noqa: BLE001 — judged as no seam
+        return None
+    return actor if isinstance(actor, _actors.SystemRankCapability) else None
+
+
 def normalize_id(token):
     """Every spelling of one id -> the canonical `task/<n>`, or None.
 
@@ -1028,7 +1123,15 @@ def _typed_field_error(name, value):
 
     `type(...) is not str` rather than isinstance, matching this file's bool
     discipline: a str subclass carrying its own __eq__ is not a ledger id.
+
+    `order` is the one list-valued key: a list of id strings, or absent.
     """
+    if name in _ID_LIST_KEYS:
+        if value is None or (type(value) in (list, tuple)
+                             and all(type(v) is str for v in value)):
+            return None
+        return ("%s must be a list of task ids or omitted, got %s"
+                % (name, type(value).__name__))
     if value is None or type(value) is str:
         return None
     return ("%s must be a string or omitted, got %s — a non-string either "
@@ -1091,6 +1194,22 @@ def _story_chain(known, start):
             return path, cur, None, None
         cur = nxt
     return path, None, None, None
+
+
+def _closed_parent_error(existing, continues, status):
+    """Why a row of `status` may NOT continue `continues` in the ledger
+    snapshot `existing`, or None: an open row under a parent that is not
+    open would be open work under a closed parent (task/3742). A closed
+    row may: a tombstone records history."""
+    if not continues or status == "closed":
+        return None
+    parent_status = (existing.get(continues) or {}).get("status")
+    if parent_status in OPEN_STATUSES:
+        return None
+    return ("%s is %s, so an open row continuing it would be open work under "
+            "a closed parent; reopen it (`helm task update %s --status open`) "
+            "if its work goes on, or file this row on its own"
+            % (continues, parent_status or "of no status", continues))
 
 
 def _story_error(known, tid, parent):
@@ -1164,6 +1283,68 @@ def _story_root(known, tid):
     return root or str(tid)
 
 
+def story_facts(known):
+    """{id: facts} — THE STORY ROLL-UP over one fold of the ledger (task/3742).
+
+    A row that continues another is its sub-task; the row at the head of the
+    chain is the story. Every surface that says "3 of 5 done", lists a row's
+    children or counts open stories reads THIS, so the answer is computed once
+    per read and from the one walk, never re-derived per surface.
+
+    facts, per string id the fold holds:
+      parent       the id `continues` records (a string), or None. Recorded,
+                   not resolved: a parent the ledger does not hold still shows.
+      story_root   `_story_root`'s answer — the head of the chain, or the row
+                   itself when its chain is a ring or its own parent dangles.
+      broken       None, or {"kind": "ring" | "dangling", "at": id} — the
+                   walk's third answer, kept so no reader mistakes a broken
+                   chain for a rooted one.
+      below        every row under this one, at any depth, in any status and
+                   any project. Done = closed.
+
+    A BROKEN CHAIN RENDERS FLAT. A row whose chain rings counts under nobody,
+    so a ring costs its members their story and never their visibility. A
+    chain that dangles is rooted at its last readable row, which is exactly
+    where `_story_order` puts it. The fold is ledger-wide on purpose: a story
+    spans projects, and ids are fleet-wide."""
+    facts, below = {}, {}
+    for tid, row in known.items():
+        if type(tid) is not str or not isinstance(row, dict):
+            continue
+        path, root, ring_at, dangling_at = _story_chain(known, tid)
+        parent = row.get("continues")
+        facts[tid] = {
+            "parent": parent if type(parent) is str and parent else None,
+            "story_root": root or tid,
+            "broken": ({"kind": "ring", "at": ring_at} if ring_at else
+                       {"kind": "dangling", "at": dangling_at}
+                       if dangling_at else None)}
+        if ring_at is None:
+            for up in path[1:]:
+                below.setdefault(up, []).append(row)
+    for tid, f in facts.items():
+        f["below"] = below.get(tid, [])
+    return facts
+
+
+def _below(facts, tid):
+    """Every row under `tid` in `facts`; () for an id the fold does not hold."""
+    return ((facts.get(tid) or {}).get("below") or ()) \
+        if type(tid) is str else ()
+
+
+def story_count(facts, tid):
+    """(done, total) over every row below `tid`; (0, 0) for a row with none."""
+    under = _below(facts, tid)
+    return sum(1 for r in under if r.get("status") == "closed"), len(under)
+
+
+def story_children(facts, tid):
+    """The rows directly below `tid`, board order."""
+    return board_order([r for r in _below(facts, tid)
+                        if r.get("continues") == tid])
+
+
 def _reported_session():
     """The session id THIS PROCESS DECLARES, or None when it declares none.
 
@@ -1207,7 +1388,8 @@ def _reported_session():
 
 def _row(tid, title, status, owner, note, refs, source, origin, closed_reason,
          project=None, posture_na=None, continues=None, priority=None,
-         reported_session=None, goal=None, tax=None, tax_cost=None):
+         reported_session=None, goal=None, tax=None, tax_cost=None,
+         found_in=None, found_chain=None, order=None):
     now = time.time()
     # STORAGE DERIVES FROM THE SCHEMA like the doors do: present and explicit
     # from birth for every STORY_FIELDS key (`continues` None = a story of
@@ -1216,7 +1398,8 @@ def _row(tid, title, status, owner, note, refs, source, origin, closed_reason,
     # schema key cannot be stored by a hand-list this literal forgot. The []
     # lookup is the same drift alarm as add()'s: a key added to STORY_FIELDS
     # without threading through this signature raises KeyError here, loudly.
-    _story = {"continues": continues, "priority": priority}
+    _story = {"continues": continues, "priority": priority,
+              "order": list(order) if order else None}
     row = {
         "id": tid,
         "ts": now,
@@ -1231,9 +1414,9 @@ def _row(tid, title, status, owner, note, refs, source, origin, closed_reason,
         "origin": origin or None,
         "closed_reason": closed_reason or None,
         # WHOSE PROJECT'S WORK THIS IS (task/974). Stamped at filing time from
-        # the filer's derived or declared project; None = UNSCOPED, forever —
-        # update() does not list it in `allowed`, so no later edit can
-        # retro-scope history (deliberate: migration is design work).
+        # the filer's derived or declared project; None = UNSCOPED. Only a
+        # witnessed act changes it later: update() with an admitted
+        # home_actor, which records homed_by/homed_at/homed_from (task/3745).
         "project": project or None,
         # THE SESSION THIS ROW'S FILER CLAIMED, AS SOMETHING THAT SURVIVES A
         # RENAME (task/1898). A CLAIM, NOT AN ATTRIBUTION — it is read from
@@ -1282,6 +1465,13 @@ def _row(tid, title, status, owner, note, refs, source, origin, closed_reason,
     # THE FRICTION TAX, only when present too (see TAX_FIELDS): an untaxed
     # row keeps the shape every older reader already reads.
     for key, value in (("tax", tax), ("tax_cost", tax_cost)):
+        if value is not None:
+            row[key] = value
+    # A FILED FINDING NAMES WHERE IT WAS FOUND (helm/review_findings.py):
+    # the dispatch row whose verdict filed it and that row's chain, which is
+    # what its closers read. Only when present, and never editable: update()
+    # does not list them, since where a finding was found is history.
+    for key, value in (("found_in", found_in), ("found_chain", found_chain)):
         if value is not None:
             row[key] = value
     return row
@@ -1383,7 +1573,9 @@ def _goal_guard(prev, fields, row, goal_door):
 def add(title, owner, note=None, refs=None, source=None, tid=None,
         status="open", origin=None, closed_reason=None, path=None,
         project=None, posture_na=None, continues=None, priority=None,
-        force_new=False, goal=None, goal_door=None, tax=None, tax_cost=None):
+        force_new=False, goal=None, goal_door=None, tax=None, tax_cost=None,
+        story_homes=None, found_in=None, found_chain=None,
+        order=None):
     """File one task -> (row, error). Exactly one of the pair is None.
 
     `owner` is REQUIRED for live work and refused when blank: a backlog nobody
@@ -1398,6 +1590,17 @@ def add(title, owner, note=None, refs=None, source=None, tid=None,
     the work's project — deriving from cwd HERE would stamp the sweep-runner's
     project onto every foreign row it carries. Absent stays absent (UNSCOPED),
     the same law origin follows one field up.
+
+    `story_homes`, when it is a list, is filled with `story_home_candidates`
+    for an open row filed with no parent, read from the same snapshot the
+    duplicate check reads, so naming them costs no second ledger read.
+
+    Every door that files through
+    here names a project (task/3745): `helm task add` and `helm goal add`
+    refuse without one, `helm todos promote` takes the cwd's and refuses
+    without one, and the harness mirror and the resume-turn recovery fall
+    back to OWN_PROJECT. A caller that still passes none files a homeless
+    row, which `helm doctor` counts and `helm task rehome` gives a home.
     """
     # A NON-STRING TITLE REFUSES, IT DOES NOT RAISE. `(title or "").strip()`
     # was the first statement in this function, so an int, a list or a dict —
@@ -1437,7 +1640,8 @@ def add(title, owner, note=None, refs=None, source=None, tid=None,
     # rationale: hand-registered doors do not converge. The [] lookup is the
     # drift alarm: a key added to STORY_FIELDS without threading through this
     # signature raises KeyError HERE, at the door, not silently skips.
-    _story_args = {"continues": continues, "priority": priority}
+    _story_args = {"continues": continues, "priority": priority,
+                   "order": order}
     for _name in STORY_KEYS:
         _bad = _typed_field_error(_name, _story_args[_name])
         if _bad:
@@ -1451,6 +1655,13 @@ def add(title, owner, note=None, refs=None, source=None, tid=None,
     _bad = _tax_error(_taxes) or _tax_pair_error(_taxes)
     if _bad:
         return None, _bad
+    # WHERE A FILED FINDING WAS FOUND: a dispatch row id and its chain's,
+    # both or neither, so no closer reads half a record.
+    _found = {"found_in": found_in, "found_chain": found_chain}
+    if any(v is not None for v in _found.values()) and not all(
+            type(v) is str and _FOUND_ID.fullmatch(v) for v in _found.values()):
+        return None, ("found_in and found_chain name a dispatch row and its "
+                      "chain (hex ids), both or neither")
     # UNOWNED IS NOT UNACCOUNTABLE, AND THE DIFFERENCE IS THE WHOLE BACKLOG.
     #
     # The mandate this ledger was built under said a row "must name an OWNER
@@ -1532,11 +1743,24 @@ def add(title, owner, note=None, refs=None, source=None, tid=None,
         #
         # A TOMBSTONE IS EXEMPT because it records history rather than work,
         # the same exception the owner rule and the posture guard both make.
+        # ONE FINDING IS ONE ROW (task/3742): a finding is keyed by the review
+        # row it was found in and its words, so a second filer of the same
+        # one (a racing retry of one verdict) is answered the row already
+        # filed, decided on the read this append would extend.
+        if found_in is not None:
+            filed = next((r for r in existing.values() if isinstance(r, dict)
+                          and r.get("found_in") == found_in
+                          and r.get("title") == title), None)
+            if filed is not None:
+                return filed, None
         if status != "closed":
             verdict, near = duplicate_verdict(title, existing, project=project)
             refusal = duplicate_refusal(verdict, near)
             if refusal and not force_new:
                 return None, refusal
+            if isinstance(story_homes, list) and continues is None:
+                story_homes.extend(story_home_candidates(title, existing,
+                                                         project))
         if tid is None:
             new_id = "task/%d" % _next_number(existing)
         else:
@@ -1552,6 +1776,19 @@ def add(title, owner, note=None, refs=None, source=None, tid=None,
         # while `existing` is in hand: a declaration that cannot be verified is the
         # dangling pointer this field exists to replace.
         story_err = _story_error(existing, new_id, continues)
+        if story_err:
+            return None, "%s %s" % (new_id, story_err)
+        # NO OPEN ROW IS BORN UNDER A CLOSED PARENT (task/3742). A close
+        # refuses over open sub-tasks, so a birth there makes the same orphan
+        # from the other side; checked on the read this append extends, so a
+        # parent closed a moment ago is seen. A tombstone records history.
+        parent_err = _closed_parent_error(existing, continues, status)
+        if parent_err:
+            return None, parent_err
+        # A NEW ROW HAS NO SUB-TASKS YET, so any order it is born with names
+        # rows outside its story and is refused by the same check update()
+        # runs.
+        order, story_err = _order_error(existing, new_id, order)
         if story_err:
             return None, "%s %s" % (new_id, story_err)
         # A ROW CAN BE BORN A REASONLESS TOMBSTONE, AND UPDATE() REFUSES THE
@@ -1575,7 +1812,7 @@ def add(title, owner, note=None, refs=None, source=None, tid=None,
                           "drop whether it happens at birth or later")
         row = _row(new_id, title, status, owner, note, refs, source, origin,
                    closed_reason, project=project, posture_na=posture_na,
-                   continues=continues, priority=priority,
+                   continues=continues, priority=priority, order=order,
                    # EVERY ROW RECORDS THE SESSION ITS FILER REPORTED,
                    # DELEGATED ROWS INCLUDED, and the stamp is UNCONDITIONAL
                    # because it authorizes nothing. IT IS A CLAIM AND NOT AN
@@ -1602,7 +1839,8 @@ def add(title, owner, note=None, refs=None, source=None, tid=None,
                    # recovers work through the evidence-bound takeover
                    # contract until identity ACQUISITION is bound (task/1918).
                    reported_session=_reported_session(), goal=goal,
-                   tax=tax, tax_cost=tax_cost)
+                   tax=tax, tax_cost=tax_cost, found_in=found_in,
+                   found_chain=found_chain)
         row, err = _commit(p, row)
         if err:
             return None, err
@@ -1654,7 +1892,7 @@ def _door_ask(door):
 
 def update(token, path=None, force=False, takeover_auth=None,
            rank_rule=None, rank_actor=None, expect=None, goal_door=None,
-           **fields):
+           open_children=None, home_actor=None, home_force=False, **fields):
     """Append a new full snapshot with `fields` applied -> (row, error).
 
     Event-sourced: the previous row is never rewritten, so a correction stays
@@ -1672,7 +1910,12 @@ def update(token, path=None, force=False, takeover_auth=None,
     is an ``actors.AdmittedActor`` and it is REQUIRED whenever this call would
     change ``priority``: the row's ``source`` records who FILED the work and
     must not be relabelled as who RANKED it, so a rank with no admitted actor
-    is refused rather than attributed to the filer. ``rank_rule`` is a
+    is refused rather than attributed to the filer. The one actor that is not
+    a seat is helm's own ``actors.SystemRankCapability`` (task/3899): it may
+    only raise a row its subsystem filed from P1 to P0, its ``refusal``
+    judges that against the row under the lock, ``ranked_by`` records
+    ``system:<subsystem>``, and the raise keeps ``last_updated``, because it
+    is not a seat working the row. ``rank_rule`` is a
     ``RankRule`` whose ``decide`` runs against the row THIS CALL holds the lock
     on; it yields the third answer ``(SKIPPED, reason)`` when the rule declines,
     and it may not be combined with any other field.
@@ -1684,6 +1927,17 @@ def update(token, path=None, force=False, takeover_auth=None,
 
     ``goal_door`` is the ``goals.GoalDoor`` a `helm goal` verb holds. A goal
     row's `goal` record, its close and its reopen need one; see _goal_guard.
+
+    ``open_children`` is the story rule for a close; see ``close``.
+
+    A PROJECT CHANGE IS AN ACT WITH AN ACTOR TOO (task/3745). ``project`` is
+    writable so a homeless row can get its home, and ``home_actor`` (an
+    admitted actor, the rank rule's type) is required whenever this call
+    changes it: the row records ``homed_by``, ``homed_at`` and
+    ``homed_from``. A project is never cleared, and a row that already has
+    one moves only with ``home_force``. A change of project alone is not
+    work on the row, so it keeps ``last_updated`` the way a custody move
+    does, and the staleness readers see no motion.
     """
     tid = normalize_id(token)
     if not tid:
@@ -1691,6 +1945,9 @@ def update(token, path=None, force=False, takeover_auth=None,
     expect_err = _expect_error(expect)
     if expect_err:
         return None, expect_err
+    if open_children not in (None,) + OPEN_CHILDREN_RULES:
+        return None, ("open_children must be None or one of %s, got %r"
+                      % ("|".join(OPEN_CHILDREN_RULES), open_children))
     if rank_rule is not None:
         if not isinstance(rank_rule, RankRule):
             return None, ("rank_rule must be a tasks.RankRule — the rule is "
@@ -1709,16 +1966,29 @@ def update(token, path=None, force=False, takeover_auth=None,
     # picture changes. Same for rank: priority that cannot be revised is a
     # guess frozen at the moment of least information.
     #
-    # `project` stays absent from this tuple for the opposite and still-valid
-    # reason documented at _row: retro-scoping history is migration work.
+    # `project` IS MUTABLE ONLY AS A WITNESSED ACT: an admitted actor homes
+    # the row and the row says who, when and from where (task/3745). The
+    # event the row was filed with still records the scope it had then.
+    # `landed` and `observed` are the seen-working check's record
+    # (helm/observed.py): the land that owes it and who owns it, then what
+    # was seen working and who recorded it.
     allowed = ("title", "status", "owner", "note", "refs", "source",
-               "origin", "closed_reason", "standdown", "goal") + STORY_KEYS \
-        + TAX_KEYS
+               "origin", "closed_reason", "standdown", "goal",
+               "project", "landed", "observed") + STORY_KEYS + TAX_KEYS
     unknown = [k for k in fields if k not in allowed]
     if unknown:
         return None, "unknown field(s): %s" % ", ".join(sorted(unknown))
     if "status" in fields and fields["status"] not in STATUSES:
         return None, "unknown status %r" % fields["status"]
+    # A HOME IS A NAME, NEVER A CLEAR. None, "" and whitespace would each
+    # write the homeless state this field is being written to end.
+    if "project" in fields:
+        if not isinstance(fields["project"], str) \
+                or not fields["project"].strip():
+            return None, ("a project cannot be cleared or blanked — a row "
+                          "with no project is listed by no project's task "
+                          "list; write a registered project name")
+        fields = dict(fields, project=fields["project"].strip())
     # THE FRICTION TAX, same check as add(); None here is a deliberate clear.
     _bad = _tax_error(fields)
     if _bad:
@@ -1818,6 +2088,24 @@ def update(token, path=None, force=False, takeover_auth=None,
             story_err = _story_error(existing, tid, fields["continues"])
             if story_err:
                 return None, "%s %s" % (tid, story_err)
+        # THE STORY'S ORDER is checked against the rows this append lands on:
+        # every id must continue this row (`_order_error`).
+        if "order" in fields:
+            order, story_err = _order_error(existing, tid, fields["order"])
+            if story_err:
+                return None, "%s %s" % (tid, story_err)
+            fields = dict(fields, order=order)
+        # NO OPEN ROW IS MOVED UNDER A CLOSED PARENT (task/3862), add()'s own
+        # question asked of a re-parent: the orphan a close refuses to make.
+        # Asked only when `continues` changes, so a row an owner's
+        # --open-children-stay left open keeps every other update.
+        if "continues" in fields \
+                and fields["continues"] != prev.get("continues"):
+            parent_err = _closed_parent_error(
+                existing, fields["continues"],
+                fields.get("status", prev.get("status")))
+            if parent_err:
+                return None, parent_err
         # THE RULE DECIDES HERE, AGAINST THE ROW THE LOCK PROTECTS. Every
         # fact it reads — the current rank, the current status, the current
         # project, the current origin — is the state this append will land
@@ -1828,9 +2116,38 @@ def update(token, path=None, force=False, takeover_auth=None,
             if decline:
                 return SKIPPED, decline
             fields = {"priority": want}
+        # A HOME IS DECIDED AGAINST THE ROW UNDER THE LOCK: a row somebody
+        # homed a moment ago is "already homed", never overwritten.
+        was_home = project_of_row(prev)
+        homing = "project" in fields and fields["project"] != was_home
+        if homing:
+            actor_err = rank_actor_error(home_actor)
+            if actor_err:
+                return None, (
+                    "homing %s needs an ADMITTED ACTOR (%s) — a project "
+                    "change is an act, and the row records who made it as "
+                    "homed_by. Resolve one with helm.actors.resolve_actor()"
+                    % (tid, actor_err))
+            if was_home and not home_force:
+                return None, (
+                    "%s already has project '%s' — moving it to '%s' needs "
+                    "home_force (a rehome plan row with \"force\": true "
+                    "and \"from\": \"%s\")"
+                    % (tid, was_home, fields["project"], was_home))
         ranking = ("priority" in fields
                    and fields["priority"] != prev.get("priority"))
-        if ranking:
+        # A SYSTEM RANK IS JUDGED HERE, AGAINST THE ROW UNDER THE LOCK
+        # (task/3899): helm's own capability ranks only a row its subsystem
+        # filed, only P1 to P0, only the priority, and never through a rule.
+        system = _system_ranker(rank_actor) if ranking else None
+        if system is not None:
+            sys_err = ("a rank rule decides for a seat, never for %s"
+                       % system.ranker if rank_rule is not None
+                       else system.refusal(prev, fields))
+            if sys_err:
+                return None, "ranking %s as %s is refused: %s" % (
+                    tid, system.ranker, sys_err)
+        elif ranking:
             actor_err = rank_actor_error(rank_actor)
             if actor_err:
                 return None, (
@@ -1870,6 +2187,17 @@ def update(token, path=None, force=False, takeover_auth=None,
         if closing and not (row.get("closed_reason") or "").strip():
             return None, ("closing needs a reason — use `close`, or pass "
                           "closed_reason; a silent close is a drop")
+        # A PARENT CLOSES OVER OPEN SUB-TASKS ONLY BY SAYING SO (task/3742),
+        # decided HERE against the fold this append lands on, so a sub-task
+        # filed a moment before cannot slip under a close judged without it.
+        if closing and open_children is not None:
+            left = [r for r in story_facts(existing).get(tid, {})
+                    .get("below", ()) if r.get("status") in OPEN_STATUSES]
+            if left and open_children == OPEN_CHILDREN_REFUSE:
+                return None, _open_children_refusal(tid, left)
+            if left:
+                row["open_children_at_close"] = [
+                    r.get("id") for r in board_order(left)]
         # A GOAL CLOSES ON ITS APPROVED CRITERIA, NEVER ON A LAND. Here, after
         # the transition is known and before the resurrection rule, because
         # the one legal reopen in the ledger is a goal the owner disputed.
@@ -2006,16 +2334,33 @@ def update(token, path=None, force=False, takeover_auth=None,
                 # than on the refusal. See `_door_ask` — on an UNKNOWN
                 # door that reason is frequently the only actionable
                 # text the whole sentence carries.
+                # SPLIT BY WHO PERFORMS THE ASK (task/2026's two remainders,
+                # live since the hand-off door made `mine` reachable): a door
+                # the holder opens is RUN, not requested, so it never sits
+                # under "say it on the row".
+                self_asks = [_door_ask(d) for d in facts
+                             if d.holder_may_open and d.reachable is not False]
                 asks = [_door_ask(d) for d in facts
-                        if d.reachable is not False]
+                        if not d.holder_may_open and d.reachable is not False]
                 if mine:
                     # A HOLDER-OPENABLE DOOR EXISTS, so the refusal must not
                     # say none does. It still refuses — this branch is the
                     # incumbent guard, not an authorization — but it names
-                    # the door instead of denying it.
-                    clause = ("%d of them IS yours to open: %s"
-                              % (len(mine), "; and ".join(d.text
-                                                          for d in mine)))
+                    # the door instead of denying it. The verb's number is
+                    # derived like the count beside it.
+                    clause = ("%d of them %s yours to open: %s"
+                              % (len(mine), "IS" if len(mine) == 1 else "ARE",
+                                 "; and ".join(d.text for d in mine)))
+                    # AND THE REST KEEP THEIR MECHANICS. Naming the holder's
+                    # door dropped how every other door opens (an omission a
+                    # review recorded on task/2026, deferred until this case
+                    # existed).
+                    if how:
+                        rest_n = len(facts) - len(mine)
+                        clause += ("; the other%s %s %s by somebody else"
+                                   % ("" if rest_n == 1 else "s",
+                                      "is" if rest_n == 1 else "are",
+                                      " or ".join(how)))
                 elif how:
                     clause = ("NONE of them is yours to open: each is %s by "
                               "somebody else, never offered by the holder"
@@ -2028,7 +2373,12 @@ def update(token, path=None, force=False, takeover_auth=None,
                 # for this seat" is about this incumbent's environment and is
                 # false the moment another seat reads the same row. Collapsing
                 # them tells a reader the wrong one is fixable.
-                if asks:
+                if self_asks:
+                    advice = "As %s, %s." % (incumbent, ", or ".join(self_asks))
+                    if asks:
+                        advice += (" To have somebody else move it, say it on "
+                                   "the row — %s." % ", or ".join(asks))
+                elif asks:
                     advice = "So say it on the row — %s." % ", or ".join(asks)
                 elif not facts:
                     advice = ("So say it on the row: there is no capability "
@@ -2096,20 +2446,39 @@ def update(token, path=None, force=False, takeover_auth=None,
         _custody_only = (takeover_auth is not None
                          and set(fields) <= {"owner"}
                          and prev.get("last_updated") is not None)
+        # A HOME IS NOT WORK ON THE ROW EITHER, for the same reason: homing
+        # a backlog of old rows at once would read to stalebot and the
+        # freshness contract as every one of them moving today.
+        _home_only = (homing and set(fields) == {"project"}
+                      and prev.get("last_updated") is not None)
+        # NOR IS A SYSTEM RANK: helm raising its own row is not a seat
+        # working it, and the staleness readers must not see it move.
+        _system_only = (system is not None
+                        and prev.get("last_updated") is not None)
         if _custody_only:
             row["last_updated"] = prev.get("last_updated")
             row["custody_updated"] = time.time()
+        elif _home_only or _system_only:
+            row["last_updated"] = prev.get("last_updated")
         else:
             row["last_updated"] = time.time()
+        if homing:
+            row["homed_by"] = home_actor.canonical_name
+            row["homed_at"] = time.time()
+            row["homed_from"] = was_home
         # WHO RANKED IT, BY WHICH ACT, AND FROM WHAT. The rank field recorded
         # a history of VALUES and could not answer a single question about
         # AGENCY: a sweep's derived P2 and an operator's deliberate P2 landed
         # as the same event. `source` stays the filer's, untouched, on this
         # row and on every historical one.
         if ranking:
-            row["ranked_by"] = rank_actor.canonical_name
-            row["ranked_at"] = row["last_updated"]
-            row["rank_action"] = "rule" if rank_rule is not None else "manual"
+            row["ranked_by"] = (system.ranker if system is not None
+                                else rank_actor.canonical_name)
+            row["ranked_at"] = (time.time() if _system_only
+                                else row["last_updated"])
+            row["rank_action"] = ("system" if system is not None else
+                                  "rule" if rank_rule is not None else
+                                  "manual")
             row["ranked_from"] = prev.get("priority") or None
         if row.get("status") == "in_progress" and not (row.get("owner") or ""):
             return None, ("%s would be in_progress with no owner seat — name "
@@ -2136,12 +2505,41 @@ def _moved(tid):
             "judge it again from a fresh read" % tid)
 
 
-def close(token, reason, path=None, expect=None):
+# The story rule a close can ask for (task/3742), and the phrase its refusal
+# carries so the CLI can add its own remedy (`_cli_error`).
+OPEN_CHILDREN_REFUSE = "refuse"
+OPEN_CHILDREN_STAY = "stay"
+OPEN_CHILDREN_RULES = (OPEN_CHILDREN_REFUSE, OPEN_CHILDREN_STAY)
+OPEN_CHILDREN_FLAG = "--open-children-stay"
+_OPEN_CHILDREN_REFUSED = "would leave them under a closed parent"
+
+
+def _open_children_refusal(tid, left):
+    return ("%s has %s: %s. Closing it %s, so nothing was closed"
+            % (tid, _plural(len(left), "open sub-task", "open sub-tasks"),
+               "; ".join("%s (%s) %s" % (r.get("id"), r.get("status"),
+                                         (r.get("title") or "")[:60])
+                         for r in board_order(left)),
+               _OPEN_CHILDREN_REFUSED))
+
+
+def close(token, reason, path=None, expect=None, open_children=None):
+    """Close one row with its reason -> (row, error).
+
+    OPEN SUB-TASKS (task/3742). A parent may close over open sub-tasks only
+    by saying so, as a GitHub issue may. `open_children` picks the rule, and
+    only a door that asks gets one:
+      None                  no story rule — the land sweep, the mirror and
+                            every other library closer keep what they had;
+      OPEN_CHILDREN_REFUSE  refuse while any row below is open, naming them;
+      OPEN_CHILDREN_STAY    close, and record the open ids on the row as
+                            `open_children_at_close`.
+    The rule is decided under the writer's lock (see update)."""
     reason = (reason or "").strip()
     if not reason:
         return None, "closing a task needs a reason — a silent close is a drop"
     return update(token, path=path, expect=expect, status="closed",
-                  closed_reason=reason)
+                  closed_reason=reason, open_children=open_children)
 
 
 # The longest release note, in characters (see release()).
@@ -2298,6 +2696,120 @@ def release(token, releaser, note=None, path=None):
         if err:
             return None, err
     return row, None
+
+
+def handoff(token, actor, to, note=None, path=None):
+    """The HOLDER gives its own row to a known seat -> (row, error), or
+    (SKIPPED, reason) when the named seat already holds it.
+
+    THE GAP (task/2309, story task/1915). The incumbent guard in `update`
+    refuses every owner change that carries no capability, and before this
+    the two it admitted were both acts ON the holder: BUILD continuation is
+    TAKEN from a wedged incumbent and a seat reassign is FORCED onto a dead
+    one. So a live holder that agreed the work belonged elsewhere could not
+    say so: `update --owner` by the holder and `claim` by the recipient were
+    refused exactly as a seizure is. Measured five times, including a
+    retiring seat whose 18 rows only an operator's `--force` could move.
+
+    NOT A SECOND GUARD. This mints `takeover.HolderHandoffAuthorization` and
+    goes through `update`, so the incumbent guard stays the one door every
+    owner change passes and a seizure refuses there as before. The mint is
+    where the holder rule lives: an ADMITTED actor (`actors.resolve_actor`,
+    task/1918's act-door rule, which admits a declared name only when
+    `seats_roster.seat_for_session` resolves the presented session to the
+    same seat) that `held_by` names as the holder, on a row that is not
+    closed. `to` resolves through `seat_reassign.resolve_target`, the one
+    door that decides whether a name can receive work.
+
+    NEVER KEYED ON A SESSION A ROW RECORDS. `reported_session` and the
+    release event's `session` are public or near-public values, and the
+    three killed reclaim designs at the incumbent guard were keyed on
+    exactly such a value. The holder test reads the actor's canonical name
+    against the row's owner, and nothing else.
+
+    WHAT THIS DOES NOT CLOSE, stated rather than solved: identity here is a
+    COST barrier, not a proof (every seat runs as one user), so a process
+    that presents the holder's declared name AND the session the roster
+    binds to it is admitted as the holder. That was already true of the
+    two-step path this door replaces, `release` then `claim --owner SEAT`,
+    whose release leg admits a declared name with no session at all and
+    whose claim leg resolves nobody. This door is the stronger of the two.
+
+    THE EVENT: the snapshot carries `takeover: {kind: "holder-handoff",
+    from, to, by, session, pid, ppid, owner_was, status_was, note, ts,
+    resolved}`, where `session` is the session the roster resolved to `by`
+    (kept in the store, dropped on every wire by `public_row`, as the
+    release event's is), `owner_was` keeps the holder's exact spelling, and
+    `resolved` says how `to` resolved. The row's event history keeps every
+    earlier hand-off, so who held it and who gave it away stays readable
+    (task/305).
+
+    AN OWNER MOVE ONLY. The status stays what it was, and like every custody
+    move it keeps `last_updated` and stamps `custody_updated`.
+    """
+    actor_err = rank_actor_error(actor)
+    if actor_err:
+        return None, ("a hand-off needs the holder as an ADMITTED actor (%s) "
+                      "— resolve one with helm.actors.resolve_actor()"
+                      % actor_err)
+    me = actor.canonical_name
+    # THE SESSION THE ROSTER RESOLVES TO THE ACTOR, read here and not taken
+    # from the caller, so the record says which session the roster bound and
+    # a library caller holding an actor from another process state is
+    # refused rather than recorded under this one's session.
+    from . import seat_reassign, seats_roster
+    session = home.session_id()
+    bound = seats_roster.seat_for_session(session) if session else None
+    if not bound or str(bound).casefold() != me.casefold():
+        return None, ("refusing to hand off as %r: the roster does not "
+                      "resolve this process's session to that seat (%s), so "
+                      "the acting identity is unresolved. Nothing was written"
+                      % (me, "no session was presented" if not session
+                         else "it resolves to %r" % (bound,)))
+    tid = normalize_id(token)
+    if not tid:
+        return None, "unparseable task id %r" % (token,)
+    note = str(note or "").strip() or None
+    p = path or ledger_path()
+    # STRICT, BECAUSE THIS CALLER DECIDES. The row read here is the one the
+    # proof is minted over; `update` re-reads it under the ledger lock and
+    # refuses when it moved in between (the proof's compare-and-swap).
+    existing, unavailable = snapshot(p, strict=True)
+    if unavailable:
+        return None, "task ledger unreadable (%s)" % unavailable
+    prev = existing.get(tid)
+    if not prev:
+        return None, "%s does not exist" % tid
+    from . import takeover
+    # THE ROW IS JUDGED BEFORE THE SEAT: a non-holder, a closed row and an
+    # unowned row each get their own answer, never "unknown seat" for a
+    # hand-off that could not happen.
+    why = takeover.holder_handoff_refusal(tid, prev, actor)
+    if why:
+        return None, why
+    target, how = seat_reassign.resolve_target(to)
+    if not target:
+        return None, "%s — nothing was handed off" % how
+    holder = owner_of(prev)
+    if target.casefold() == holder.casefold():
+        return SKIPPED, ("%s is already held by %s — there is nothing to hand "
+                         "off, so nothing was written" % (tid, holder))
+    if note and len(note) > RELEASE_NOTE_MAX:
+        return None, ("the hand-off note is %d characters and may be at most "
+                      "%d: it stays on the row until the next custody move. "
+                      "Nothing was handed off and nothing was cut; put the "
+                      "rest in `helm task comment %s <text>`"
+                      % (len(note), RELEASE_NOTE_MAX, tid))
+    record = {"kind": "holder-handoff", "from": holder, "to": target,
+              "by": me, "session": session, "pid": os.getpid(),
+              "ppid": os.getppid(), "owner_was": prev.get("owner"),
+              "status_was": prev.get("status"), "note": note,
+              "ts": time.time(), "resolved": how}
+    auth, mint_err = takeover.mint_holder_handoff(tid, prev, actor, target,
+                                                  record)
+    if mint_err:
+        return None, mint_err
+    return update(tid, path=p, takeover_auth=auth, owner=target)
 
 
 def release_stale(token, reason, expect, path=None):
@@ -3020,6 +3532,81 @@ def comment(token, text, by=None, path=None, expect=None):
     return row, None
 
 
+def verify(token, verdict, trunk, evidence, by=None, link=None, path=None):
+    """Stamp one verdict on a task row -> (row, error).
+
+    THE READER IS NAMED, AND NAMED AGAINST THE TRUNK THEY READ. `trunk` is the
+    sha the caller actually read (a full 40-hex sha or a 7+-hex prefix); it is
+    resolved in the row's PROJECT repo via `git rev-parse --verify <sha>^{commit}`
+    and stored as that FULL sha, so a later reader can re-check `git log` against
+    the exact commit, never a raw input or `origin/main` guessed at write time.
+    `verify` is the verdict twin of `comment`: it reads the row through the
+    same strict ledger lock, resolves its project via `project_of_row`, stamps
+    through `taskverify.stamp` (refusing a verdict outside `VERDICTS` and any
+    empty or multi-line `evidence`), and rewrites via the same `_commit` door
+    `comment` uses. `by` is validated with `_comment_author` the way `comment`
+    takes its author — a seat name or the owner's door, never a caller-stated
+    owner name — so the recorded `verified_by` is an identity a reader can
+    stand behind.
+
+    The read row is returned on error (so a caller can see the state it read
+    and retry), and only the stamped row on success."""
+    tid = normalize_id(token)
+    if not tid:
+        return None, "unparseable task id %r" % (token,)
+    p = path or ledger_path()
+    with eventledger.locked(p) as held:
+        if not held:
+            return None, "task ledger is not writable"
+        # STRICT, BECAUSE THIS CALLER DECIDES (the same split `latest_checked`
+        # keeps: a tolerant PROJECTION read vs a DECISION read). A malformed
+        # row skipped here would be a verdict written without reading the row it
+        # annotates — the same poison as `comment` guards against.
+        existing, unavailable = eventledger.latest_checked(p, strict=True)
+        if unavailable:
+            return None, "task ledger unreadable (%s)" % unavailable
+        prev = existing.get(tid)
+        if not prev:
+            return None, "%s does not exist" % tid
+        # RESOLVE THE TRUNK IN THE TASK'S PROJECT REPO BEFORE ANYTHING IS
+        # WRITTEN. A row with no registered project repo cannot be verified
+        # against a trunk: refuse and name what is missing rather than stamp a
+        # verdict with a trunk nobody can re-check.
+        repo_path, why = taskverify.project_repo_path(project_of_row(prev))
+        if repo_path is None:
+            return None, "cannot verify %s: %s" % (tid, why)
+        # THE READ ROW, TAKEN UNCHANGED: on any refusal the caller gets back the
+        # exact snapshot it read (so a retry starts from truth), and on success
+        # it is stamped in place and committed.
+        row = dict(prev)
+        # THE AUTHOR, THE SAME DOOR AS `comment`: a caller-stated author is
+        # validated against the seat roster (a hostiled name is a wrong stamp,
+        # and the owner's name is never written in an agent's voice) — the one
+        # place this module may refuse BEFORE touching the row.
+        by_name, door, author_err = _comment_author(by)
+        if author_err:
+            return row, author_err
+        # THE VERDICT IS NAMED AGAINST THE TRUNK THE READER ACTUALLY READ.
+        # Resolve in the row's project repo (refusing an unresolvable one
+        # before a single byte is written), then stamp once with the
+        # canonical author.
+        try:
+            full_trunk = taskverify.resolve_trunk(repo_path, trunk)
+        except taskverify.REFUSE as exc:
+            return row, str(exc)
+        try:
+            taskverify.stamp(row, verdict, full_trunk, evidence, by_name,
+                             link=link)
+        except taskverify.REFUSE as exc:
+            return row, str(exc)
+        row["last_updated"] = time.time()
+        row, err = _commit(p, row)
+        if err:
+            return row, err
+        _touch_goal_projection(p, existing, row)
+    return row, None
+
+
 def offer_rows(path=None, seat=None, claimed=(), live=None):
     """The idle-seat work-offer producer -> [(id8, line, claim_cmd, mine, kind,
     raw), ...] in seats._offer_rows' tuple shape.
@@ -3062,6 +3649,11 @@ def offer_rows(path=None, seat=None, claimed=(), live=None):
     resources, and `live` is the live-seat set. All three are passed IN rather
     than imported, so this module never reaches into seats and cannot create
     the cycle that the offer rung's own consumers already have to route around.
+
+    THE ORDER IS THE BOARD'S (task/3821): rank, a fast tax cut, then age
+    (`board_order`); a story row is offered as its lead sub-task
+    (`_stories_as_leads`), and the head yields to a story lead it skips
+    (`_lead_first`), so an idle seat is offered the biggest lever first.
     """
     me = str(seat or "")
     held = set(claimed or ())
@@ -3078,7 +3670,9 @@ def offer_rows(path=None, seat=None, claimed=(), live=None):
     me_key = me.casefold()
     live_keys = None if live is None else {str(s).casefold() for s in live}
     out = []
-    for row in open_rows(path):
+    population = open_rows(path)
+    known = {r.get("id"): r for r in population}
+    for row in board_order(population):
         tid = str(row.get("id", ""))
         short = tid.split("/", 1)[-1]
         # THE RESOURCE NAMESPACE IS OURS, NOT dispatch's. The rung skips a row
@@ -3098,6 +3692,13 @@ def offer_rows(path=None, seat=None, claimed=(), live=None):
         # ignore, because a pause that lives in a note is not a fact any guard
         # can consult. It is one now.
         if standdown_blocks_offer(row):
+            continue
+        # A LANDED TASK OWING ITS SEEN-WORKING CHECK IS NOT WORK (task/4202).
+        # Its whole land already ran; offering it as stranded or unowned work
+        # steers idle seats, and its own builder as an auto-claim, to rebuild
+        # what landed. Its check owner hears it through the seen-working stop
+        # rung instead. Read inline because the observed module imports this one.
+        if isinstance(row.get("landed"), dict) and not row.get("observed"):
             continue
         # `owner_of`, because a row holding the display word is NOT held by a
         # seat called "UNOWNED". Read raw, `others` goes True, no live seat
@@ -3121,10 +3722,72 @@ def offer_rows(path=None, seat=None, claimed=(), live=None):
         # seat could argue fit — so they stay offers and never auto-claims.
         out.append((short, line, "helm task claim " + short,
                     bool(owner) and owner_key == me_key, "task", row))
+    return _lead_first(_stories_as_leads(out, known), known)
+
+
+def _stories_as_leads(offers, known):
+    """`offers` with each story row replaced by its lead sub-task.
+
+    A row with open sub-tasks is not itself the work; they are. So it is
+    offered as the first of them in the story's order (`story_order`, down
+    to a row with no open sub-task) that is offered too, at the story's
+    place, and that sub-task is not offered a second time. A story none of
+    whose sub-tasks is offered is left out: they are all in someone's
+    hands. `known` is the open rows the offers came from."""
+    kids, at = {}, {o[5].get("id"): o for o in offers}
+    for r in known.values():
+        kids.setdefault(r.get("continues"), []).append(r)
+
+    def lead(tid, seen):
+        if tid in seen:
+            return None
+        if not kids.get(tid):
+            return tid if tid in at else None
+        seen.add(tid)
+        for kid in story_order(known.get(tid), kids[tid]):
+            got = lead(kid.get("id"), seen)
+            if got:
+                return got
+        return None
+
+    out, placed = [], set()
+    for offer in offers:
+        tid = lead(offer[5].get("id"), set())
+        if tid and tid not in placed:
+            placed.add(tid)
+            out.append(at[tid])
     return out
 
 
-def public_row(row):
+def _lead_first(offers, known):
+    """`offers` with the head replaced by the first task it skips that is
+    offered too (`leverage_inversion`): the story's lead before a later
+    sub-task. `known` is the open rows the offers came from. Only the
+    offered rows count as free; every other row is in someone's hands, so it
+    is treated as having a lane."""
+    if not offers:
+        return offers
+    at = {o[5].get("id"): i for i, o in enumerate(offers)}
+    lever = leverage_inversion(offers[0][5].get("id"), known=known,
+                               live=set(known) - set(at))
+    for sid in lever_skipped(lever):
+        if sid in at:
+            i = at[sid]
+            return [offers[i]] + offers[:i] + offers[i + 1:]
+    return offers
+
+
+def offer_order(first, second):
+    """Two offer lists, each already in its producer's order, merged in
+    board order (`board_key` of each offer's row): a ranked task goes ahead
+    of an unranked row, and rows of one rank go oldest first. A dispatch row
+    has no rank, so it sorts by age among the unranked rows."""
+    def key(offer):
+        return board_key(offer[5] if isinstance(offer[5], dict) else {})
+    return list(heapq.merge(sorted(first, key=key), second, key=key))
+
+
+def public_row(row, facts=None):
     """THE serialization shape — ONE owner, because routing N readers through
     origin_of by hand is what produced four rounds of the same defect.
 
@@ -3142,7 +3805,21 @@ def public_row(row):
     everything READS through.
 
     The raw value rides along as `origin_recorded` when it differs, so an
-    audit reader loses nothing and no consumer can mistake it for the field."""
+    audit reader loses nothing and no consumer can mistake it for the field.
+
+    THE STORY KEYS (task/3742) ride along when the caller passes `facts`, the
+    `story_facts` fold of the same read the row came from. They are derived
+    from the whole ledger, which one row cannot carry, and every door that
+    holds the fold (`task show --json`, `task list --json`) passes it, so the
+    six keys are on every row those doors print:
+      parent        the id `continues` records, or null
+      story_root    the head of its story; the row itself for a story of one
+                    and for a broken chain
+      story_broken  null, or {"kind": "ring" | "dangling", "at": id}
+      children      [{id, status, title}] directly below it, board order
+      done, total   closed rows and all rows below it, at every depth
+    A row closed with open sub-tasks carries `open_children_at_close`, the ids
+    that were open, as a stored field."""
     out = dict(row)
     raw = out.get("origin")
     out["origin"] = origin_of(row)
@@ -3184,9 +3861,12 @@ def public_row(row):
     # releasing process declared so a forged release can be traced; the store
     # keeps it and the wire drops it, for the reason above. A copy, never an
     # edit: `out` shares the nested dict with the caller's row.
-    rel = out.get("released")
-    if isinstance(rel, dict) and "session" in rel:
-        out["released"] = {k: v for k, v in rel.items() if k != "session"}
+    # A HAND-OFF records the session the roster resolved to its giver in the
+    # custody record (`takeover`), for the same reason and with the same rule.
+    for key in ("released", "takeover"):
+        rec = out.get(key)
+        if isinstance(rec, dict) and "session" in rec:
+            out[key] = {k: v for k, v in rec.items() if k != "session"}
     # PAYBACK DAYS, DERIVED BY THE ONE READER and published only when both
     # halves are set, so a JSON reader never re-derives cost / tax on its own.
     _payback = tax_of(row)[2]
@@ -3203,11 +3883,29 @@ def public_row(row):
             isinstance(c, dict) and c.get("text_digest") is not None
             for c in row.get("comments") or ()):
         out["comments"] = comments_of(row)
+    if facts is not None:
+        out.update(_story_wire(facts, row))
     return out
 
 
-def as_json(row):
-    return json.dumps(public_row(row), sort_keys=True)
+def _story_wire(facts, row):
+    """The six story keys for one row (see public_row)."""
+    tid = row.get("id")
+    got = facts.get(tid) if type(tid) is str else None
+    parent = row.get("continues")
+    done, total = story_count(facts, tid)
+    return {"parent": got["parent"] if got else
+            (parent if type(parent) is str and parent else None),
+            "story_root": got["story_root"] if got else tid,
+            "story_broken": got["broken"] if got else None,
+            "children": [{"id": c.get("id"), "status": c.get("status"),
+                          "title": c.get("title")}
+                         for c in story_children(facts, tid)],
+            "done": done, "total": total}
+
+
+def as_json(row, facts=None):
+    return json.dumps(public_row(row, facts), sort_keys=True)
 
 
 def _coerce_continues(raw):
@@ -3238,10 +3936,63 @@ def _coerce_priority(raw):
     return ((raw or "").strip().upper() or None), None
 
 
+def _coerce_order(raw):
+    """(ids_or_None, error) from `--order 3746,3745,3742`. EMPTY CLEARS the
+    order. Every token must be a task id, or nothing is stored; whether each
+    one is a sub-task of the row is checked at the API door (`_order_error`),
+    which both CLI doors reach."""
+    raw = (raw or "").strip()
+    if not raw:
+        return None, None
+    ids = []
+    for token in re.split(r"[,\s]+", raw):
+        tid = normalize_id(token) if token else None
+        if token and not tid:
+            return None, ("%r is not a task id — refusing rather than storing "
+                          "part of the order" % token)
+        if tid:
+            ids.append(tid)
+    return ids, None
+
+
+def _order_error(known, tid, order):
+    """(order, why) — story `tid`'s `order` checked against the ledger.
+
+    THE STORY'S SEQUENCE (task/3821): which of its sub-tasks goes first, as a
+    list of ids. Each id must be a sub-task of `tid` (a row that continues
+    it), once: an order over rows outside the story ranks nothing, and a
+    reader could not tell it from one that does. Sub-tasks it leaves out come
+    after the listed ones in board order (`story_order`). An empty list
+    clears the order."""
+    if order is None:
+        return None, None
+    ids = []
+    for token in order:
+        sid = normalize_id(token)
+        if not sid:
+            return None, "%r in the order is not a task id" % (token,)
+        if sid in ids:
+            return None, "the order names %s twice" % sid
+        row = known.get(sid)
+        if not isinstance(row, dict):
+            return None, ("the order names %s, which is not in the ledger"
+                          % sid)
+        if row.get("continues") != tid:
+            return None, ("the order names %s, which is not a sub-task of %s "
+                          "— an order ranks the story's own sub-tasks; "
+                          "`helm task update %s --continues %s` makes it one"
+                          % (sid, tid, sid, tid))
+        ids.append(sid)
+    return ids or None, None
+
+
 STORY_FIELDS = (
     ("--continues", "continues", _coerce_continues),
     ("--priority", "priority", _coerce_priority),
+    ("--order", "order", _coerce_order),
 )
+# THE LIST-VALUED STORY KEYS: the type check reads a list of ids, not a str.
+_ID_LIST_KEYS = ("order",)
 STORY_FLAGS = tuple(flag for flag, _key, _coerce in STORY_FIELDS)
 STORY_KEYS = tuple(key for _flag, key, _coerce in STORY_FIELDS)
 
@@ -3434,6 +4185,8 @@ USAGE = (
     "       helm task claim <id> [--owner SEAT]\n"
     "       helm task release <id> [--note TEXT]   (the holder hands "
     "its row back: OPEN, UNOWNED; the note is at most 2000 characters)\n"
+    "       helm task handoff <id> --to SEAT [--note TEXT]   (the holder "
+    "gives its row to a seat on the roster; status kept)\n"
     "       helm task takeover <id> --from-lane L --transfer-id ID "
     "[--superseding]\n"
     "       helm task update <id> [--title T] [--note N] [--owner S] "
@@ -3443,14 +4196,26 @@ USAGE = (
     + "   (empty value promotes a row out / unranks it / clears a tax)\n"
     "       helm task triage [--apply] [--limit N] [--project NAME]"
     "   (rank the UNRANKED open rows)\n"
-    "       helm task close <id> <reason...>\n"
-    "       helm task close-candidates [--json]   (rows a train landed "
-    "whole; the stale sweep links them)\n"
-    "       helm task confirm-close <id>   (the owner's one word: close a "
-    "candidate with its land)\n"
+    "       helm task close <id> [--open-children-stay] <reason...>   "
+    "(a row with open sub-tasks closes only with the flag)\n"
+    "       helm task close-candidates [--json]   (rows a land named, "
+    "from the land itself: a train's merge or the land step)\n"
+    "       helm task confirm-close <id> [--open-children-stay]   (the "
+    "owner's one word: close a candidate with its land; a row with open "
+    "sub-tasks closes only with the flag)\n"
     "       helm task comment <id> <text...>\n"
+    "       helm task verify <id> <verdict> --trunk <sha> --evidence "
+    "<one line> [--link <ref>]   (stamp a verdict; trunk resolves in the "
+    "row's project repo)\n"
+    "       helm task observed <id> --evidence <what was seen working, "
+    "where>   (close a landed task: done is live and seen working)\n"
     "       helm task standdown <id> <reason...> [--lift TEXT] [--until 4h|2d|YYYY-MM-DD]\n"
     "       helm task standdown <id> --clear\n"
+    "       helm task rehome --plan FILE [--apply]   (give homeless rows "
+    "their project; a dry run unless --apply)\n"
+    "       helm task health [--project NAME | --all-projects] [--json]   "
+    "(one line per project: open stories and rows, opened and closed "
+    "today, 7-day net)\n"
     "\n"
     "The FLEET TASK LEDGER — shared work items every seat can resolve. Ids keep\n"
     "the number they were born with, so a week-old chat row citing '#263' still\n"
@@ -3460,10 +4225,18 @@ USAGE = (
     "cwd otherwise — THE FLAG WINS, so a task about helm files to helm from\n"
     "any checkout (task/2446) — and each says which scope it used and how it\n"
     "decided. An unregistered name is refused, naming the registry.\n"
+    "A TASK MUST NAME ITS PROJECT: `add` refuses a row the cwd gives no\n"
+    "project and no --project names, and `--project none` is refused too.\n"
+    "`rehome --plan FILE` gives older homeless rows a project from a JSON\n"
+    "plan ({task id: project}, or nesting.json's `homes` + `home_notes`):\n"
+    "one line per row, unknown projects and closed or missing rows refused\n"
+    "by name; --apply writes one update per row, homed_by the caller, and a\n"
+    "row that already has a project moves only when its plan row says\n"
+    "\"force\": true and names \"from\", the project it was read in.\n"
     "`update`/`close`/`show` take a FLEET-WIDE id and read no scope at all.\n"
     "\n"
     "`list` shows THIS project's rows (cwd-derived, the store's own lens) and\n"
-    "DISCLOSES what it withholds — unscoped legacy + other projects' counts —\n"
+    "DISCLOSES what it withholds — homeless rows + other projects' counts —\n"
     "in one line; --all-projects renders every row, labeled. Ids stay\n"
     "fleet-wide: `show`/`resolve` answer across every scope.\n"
     "\n"
@@ -3480,6 +4253,17 @@ USAGE = (
     "days are cost / tax. A cut that pays back within 2 days goes ahead of\n"
     "the other rows of its rank in `list` and `triage`; `list --by-tax`\n"
     "ranks the taxed rows, highest tax first.\n"
+    "\n"
+    "STORIES: a row that `--continues` another is its sub-task, and the row at\n"
+    "the head of the chain is the story; a row with no parent is a story of\n"
+    "one. `show` lists a row's sub-tasks, then \"N of M done\" over every row\n"
+    "below it, and a sub-task names its parent and its story root. `list`\n"
+    "counts open stories next to open rows, a parent line shows \"[N of M\n"
+    "done]\", and an open sub-task of a closed parent lists under a\n"
+    "\"(closed) task/N title\" line. `close` refuses a row with open\n"
+    "sub-tasks, naming them, unless --open-children-stay is given; the close\n"
+    "records the ids it left open. `--json` carries parent, story_root,\n"
+    "story_broken, children, done and total on every row.\n"
     "\n"
     "A value that starts with a dash needs the `=` spelling: `--note=-5` and\n"
     "`--note=--force` are taken literally, while `--note -5` is refused as a\n"
@@ -3644,6 +4428,11 @@ def _cli_error(err):
         return err + " (`helm task add ... --ref <id>`)"
     if "tax_cost is set with no tax" in err:
         return err + " (`--tax N`, or `--tax-cost=` to clear the cost)"
+    if _OPEN_CHILDREN_REFUSED in err:
+        return err + (". Close or move them first, or give %s before the "
+                      "reason and let the reason say why they stay open "
+                      "(`helm task close <id> %s <reason...>`)"
+                      % (OPEN_CHILDREN_FLAG, OPEN_CHILDREN_FLAG))
     return err
 
 
@@ -3878,6 +4667,199 @@ def board_order(rows_):
     """
     return sorted(rows_.values() if hasattr(rows_, "values") else rows_,
                   key=board_key)
+
+
+def story_order(parent, children):
+    """`children` of story row `parent` in the story's order -> list.
+
+    The story's `order` ids come first, as listed; the children it leaves out
+    follow in board order (rank, a fast tax cut, then age). An id in the order
+    that is no longer among `children` is passed over, since a re-parented
+    row leaves its old story."""
+    kids = list(children)
+    by_id = {r.get("id"): r for r in kids}
+    order = (parent or {}).get("order")
+    listed = [by_id[i] for i in dict.fromkeys(
+        i for i in (order if isinstance(order, (list, tuple)) else ())
+        if type(i) is str) if i in by_id]
+    head = {r.get("id") for r in listed}
+    return listed + board_order(r for r in kids if r.get("id") not in head)
+
+
+# ---------------------------------------------------------------------------
+# the leverage guard — the biggest lever first, at the moment work is chosen
+# ---------------------------------------------------------------------------
+
+# task/3821: the highest-priority, biggest-impact work goes first, the way a
+# person who manages their time well works. A rule that lives only in prose
+# does not fire when work is chosen, so a small item can start while the
+# biggest levers have no lane. `leverage_inversion` is the check; the doors
+# that choose work call it: `helm work claim --task`, a chain's first
+# `dispatch send`, and the idle-seat offer.
+LEVER_MARK = "LEVER INVERSION"
+LEVER_UNKNOWN_MARK = "LEVER CHECK UNKNOWN"
+LEVER_FLAG = "--because"
+LEVER_BECAUSE_CAP = 300
+LEVER_RANKS = ("P0", "P1")
+#: How many ids a leverage line names before it counts the rest: five on
+#: the owner's ORDER lines and in a task comment. The steer a door prints
+#: names one.
+LEVER_NAMED = 5
+#: How many ranks an owner-asked lever must sit above a pick to be named.
+LEVER_STEP = 2
+#: What a skip records when no reason was given: the check steers and never
+#: refuses, so the choice is still written down where a reason would go.
+NO_REASON = "went ahead without a reason"
+
+Lever = collections.namedtuple("Lever", "task skipped unknown")
+Lever.__doc__ = """One answer of the leverage check.
+
+task     the chosen task id
+skipped  ((id, kind, what), ...) in the order to take them: kind "story"
+         names the parent the two share, kind "owner" names the skipped
+         row's rank
+unknown  why the check could not run, else None"""
+
+
+def leverage_inversion(tid, known=None, live=None, repo=None, current=None):
+    """Lever(task, skipped, unknown): the open tasks with more leverage than
+    `tid` that nobody is on.
+
+    A task S is skipped when it is open, has no live lane, and either
+      (a) SAME STORY: S has `tid`'s parent and comes first in the story's
+          order (`story_order`), and either the parent's explicit `order`
+          puts S first, or, where no order decides the two, S OUTRANKS
+          `tid` (`_outranks`: a higher priority, or a fast tax cut at the
+          same priority). Age alone never speaks: an older sibling of the
+          same rank is not a bigger lever, only an earlier one, or
+      (b) OWNER-ASKED: S is owner-asked, P0 or P1, in `tid`'s project, and
+          ranked CLEARLY higher than the best rank on `tid`'s own chain,
+          LEVER_STEP ranks or more (a sub-task works for its story, the way
+          `_story_order` ranks a story by its best member): a P2 or P3 pick
+          under an owner-asked P0. A line said on nearly every pick is a line
+          nobody reads, so a closer rank, an UNRANKED pick (nobody has judged
+          it, which is not judged low) and a row with no project to compare
+          say nothing.
+    The skipped tasks come back best rank first; within a rank the story's
+    own order, then the owner-asked rows in board order (a fast tax cut,
+    then the oldest). The first is the lever a steer names.
+    A live lane is a lane record (`helm work claim --task`) or an open
+    dispatch chain whose first row records the task, and a task that is
+    `in_progress` (what `helm task claim` writes) has someone on it too; a
+    lane on any task below S counts as S's, since a story is worked through
+    its sub-tasks.
+
+    DEPENDENCY-AWARE: a task on `tid`'s own chain is never skipped. One that
+    continues `tid` (at any depth) builds on it, so `tid` going first is the
+    right order; one that `tid` continues is the story `tid` is part of.
+
+    `known` is a ledger snapshot and `live` the set of task ids with a live
+    lane; each is read when not given (`live` from `repo`'s lane records and
+    the dispatch ledger, `taskkey.live_tasks`, which reads `current` when
+    given). A read that fails answers `unknown` with the reason and skips
+    nothing: the caller says so and the work goes ahead."""
+    tid = normalize_id(tid) or tid
+    if known is None:
+        known, bad = snapshot(strict=True)
+        if bad:
+            return Lever(tid, (), "the task ledger could not be read (%s)"
+                         % bad)
+    row = known.get(tid)
+    if not isinstance(row, dict) or row.get("status") not in OPEN_STATUSES:
+        return Lever(tid, (), None)
+    if live is None:
+        from . import taskkey
+        live, why = taskkey.live_tasks(repo, current=current)
+        if why:
+            return Lever(tid, (), why)
+    live = set(live)
+    facts = story_facts(known)
+    chain = _story_chain(known, tid)[0]
+    own = set(chain) | {r.get("id") for r in _below(facts, tid)}
+    mine = min(_rank(known[a]) for a in chain if isinstance(known.get(a),
+                                                            dict))
+
+    def free(r):
+        return r.get("status") == "open" and r.get("id") not in own \
+            and not any(k.get("id") in live or k.get("status") == "in_progress"
+                        for k in [r] + list(_below(facts, r.get("id"))))
+
+    out = []
+    parent = (facts.get(tid) or {}).get("parent")
+    if isinstance(known.get(parent), dict):
+        kids = story_order(known[parent], (
+            r for r in _below(facts, parent) if r.get("continues") == parent
+            and r.get("status") in OPEN_STATUSES))
+        ids = [r.get("id") for r in kids]
+        ahead = kids[:ids.index(tid)] if tid in ids else ()
+        order = known[parent].get("order")
+        listed = {i for i in (order if isinstance(order, (list, tuple))
+                              else ()) if type(i) is str}
+        out += [(r["id"], "story", parent) for r in ahead if free(r)
+                and (r["id"] in listed or _outranks(r, row))]
+    project = project_of_row(row)
+    if project:
+        named = {sid for sid, _kind, _what in out}
+        out += [(r["id"], "owner", r["priority"]) for r in board_order(
+            r for r in known.values() if isinstance(r, dict)
+            and r.get("id") not in named and origin_of(r) == "owner"
+            and r.get("priority") in LEVER_RANKS
+            and project_of_row(r) == project and mine < len(PRIORITIES)
+            and _rank(r) <= mine - LEVER_STEP and free(r))]
+    out.sort(key=lambda e: _rank(known[e[0]]))
+    return Lever(tid, tuple(out), None)
+
+
+def _outranks(a, b):
+    """True when row `a` ranks strictly above row `b` on the board's judged
+    parts: its priority, then a fast tax cut (`tax_key`). The board's last
+    part, age, is left out: an older row is not a judged-bigger one."""
+    return (_rank(a),) + tax_key(a) < (_rank(b),) + tax_key(b)
+
+
+def named(ids, cap=LEVER_NAMED):
+    """The first `cap` of `ids`, joined, then "+N more" for the rest."""
+    ids = list(ids)
+    more = len(ids) - cap
+    return ", ".join(ids[:cap]) + (" +%d more" % more if more > 0 else "")
+
+
+def lever_line(lever):
+    """The one line a door prints for `lever`, or None when it has nothing
+    to say. It STEERS: it names ONE lever, the first skipped (the
+    best-ranked, oldest), and says the work goes ahead and what is
+    recorded."""
+    if lever.unknown:
+        return ("%s: %s — the check did not run, so this goes ahead"
+                % (LEVER_UNKNOWN_MARK, lever.unknown))
+    if not lever.skipped:
+        return None
+    sid, kind, what = lever.skipped[0]
+    return ('%s: %s goes ahead of %s (%s %s, no lane). Take it first if you '
+            'can; this goes ahead, recorded as "%s" (next time, say why with '
+            '%s "<one line>").' % (LEVER_MARK, lever.task, sid,
+                          "story" if kind == "story" else "owner-asked", what,
+                          NO_REASON, LEVER_FLAG))
+
+
+def lever_because_error(because, flag=LEVER_FLAG):
+    """Why `because` cannot be recorded as the reason `flag` gives, or
+    None. `--start-anyway` (FINISH FIRST) is held to the same one line."""
+    text = str(because or "").strip()
+    if not text:
+        return "%s wants a one-line reason" % flag
+    if any(unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp")
+           for c in text):
+        return "%s is one line: no newline or control character" % flag
+    if len(text) > LEVER_BECAUSE_CAP:
+        return ("%s is %d characters, over the %d a one-line reason may be"
+                % (flag, len(text), LEVER_BECAUSE_CAP))
+    return None
+
+
+def lever_skipped(lever):
+    """The skipped ids of `lever`, in order."""
+    return [sid for sid, _kind, _what in lever.skipped]
 
 
 def row_ages(row, now=None):
@@ -4130,6 +5112,80 @@ def duplicate_verdict(title, rows, project=None):
     return "distinct", near
 
 
+STORY_HOME_SHOW = 3
+"""How many story homes `helm task add` names for a row filed with no
+parent."""
+
+
+def story_home_candidates(title, rows, project, limit=STORY_HOME_SHOW):
+    """[(home row, shared rare words)] — where a new row may belong.
+
+    A NEW ROW WITH NO PARENT MAY STILL BELONG TO A STORY (task/3745). This
+    names up to `limit` open stories in `project` whose rows share a RARE
+    word with `title`, the words `title_tokens` gives the duplicate check. A
+    word is rare when at most max(2, 2% of the project's open rows) of them
+    carry it, so words every row carries in this project never match. A
+    matching child names its story root only when that root is open and in
+    this project; a row that continues nothing is a home only when another
+    row continues it, including a closed child and a child filed in another
+    project. A standalone task is not a story,
+    and a root in another project is not named and is not replaced by the
+    child. A row scores the sum of 1/count over its shared rare words, so
+    rarer words weigh more, and ties keep board order. It only NAMES:
+    nothing is refused, and the row's parent is the filer's to set."""
+    want = title_tokens(title)
+    if not want:
+        return []
+    pool = [r for r in (rows.values() if hasattr(rows, "values") else rows)
+            if isinstance(r, dict) and r.get("status") in OPEN_STATUSES
+            and project_of_row(r) == project]
+    shared = [(r, title_tokens(r.get("title")) & want) for r in pool]
+    count = {}
+    for _r, words in shared:
+        for w in words:
+            count[w] = count.get(w, 0) + 1
+    cap = max(2, len(pool) // 50)
+    # A STORY IS A ROW SOMETHING CONTINUES. The pointer is read off every
+    # row, so a closed child and a child in another project still mark the
+    # root. The home offered is an open root in this project: a parent in
+    # another project is not named and the child is not offered in its
+    # place (task/3994).
+    continued = set()
+    for other in (rows.values() if hasattr(rows, "values") else rows):
+        if not isinstance(other, dict):
+            continue
+        parent = other.get("continues")
+        if type(parent) is str and parent:
+            continued.add(parent)
+    best = {}
+    for r, words in shared:
+        rare = sorted(w for w in words if count[w] <= cap)
+        if not rare or type(r.get("id")) is not str:
+            continue
+        score = sum(1.0 / count[w] for w in rare)
+        root_id = _story_root(rows, r["id"])
+        if root_id != r["id"]:
+            root = rows.get(root_id) if hasattr(rows, "get") else None
+            if not (isinstance(root, dict) and type(root.get("id")) is str
+                    and root.get("status") in OPEN_STATUSES
+                    and project_of_row(root) == project):
+                continue
+            home = root
+        elif r["id"] not in continued:
+            continue
+        else:
+            home = r
+        got = best.get(home.get("id"))
+        if got is None:
+            best[home.get("id")] = [score, home, set(rare)]
+        else:
+            got[0] = max(got[0], score)
+            got[2].update(rare)
+    ranked = sorted(best.values(),
+                    key=lambda g: (-g[0],) + tuple(board_key(g[1])))
+    return [(home, sorted(words)) for _s, home, words in ranked[:limit]]
+
+
 def _dup_listing(near):
     """The closest rows as lines — id, owner and score, strongest first."""
     return "".join(
@@ -4259,7 +5315,7 @@ def _story_order(rows_):
     return out
 
 
-def _fmt(row, indent="", project_col=False):
+def _fmt(row, indent="", project_col=False, story=(0, 0)):
     st = row.get("status") or "?"
     mark = {"open": " ", "in_progress": ">", "closed": "x"}.get(st, "?")
     # A STAND-DOWN EARNS THE GLYPH COLUMN because that column answers "what
@@ -4305,9 +5361,119 @@ def _fmt(row, indent="", project_col=False):
     if isinstance(row.get("goal"), dict):
         from . import goals
         badge = goals.badge(row) + " "
+    # A PARENT SAYS HOW FAR ITS STORY HAS GOT (task/3742), ahead of the title
+    # so a long title cannot cut it off. `story` is (done, total) over every
+    # row below this one; a row with nothing below prints no badge.
+    if story[1]:
+        badge += "[%d of %d done] " % story
     return "%s%s%s %-2s %-12s %-11s %-16s %s%s%s" % (
         indent, mark, origin, rank, row.get("id"), st, owner[:16], proj,
         badge, (row.get("title") or "")[:96])
+
+
+def _story_view(rows_, known, facts):
+    """(order, stories, closed) for the listing's story view (task/3742).
+
+    `order` is `_story_order` over the shown rows plus one stand-in for each
+    CLOSED parent of a shown row. `closed` holds the stand-ins' identities;
+    the listing prints each as a "(closed) task/N title" line, not as a row.
+
+    AN OPEN CHILD OF A CLOSED PARENT IS NEVER PROMOTED SILENTLY. Scope is the
+    shown set, so a child whose parent is not listed renders at the top level
+    (`_story_order`); for a parent that is filtered out that is scope, but for
+    a parent that CLOSED it would read as a story of its own. The stand-in
+    keeps the child under its story. A chain that rings gets none: a broken
+    chain renders flat.
+
+    `stories` counts the open stories: each top-level group with an open row
+    in it is one, so a lone row is a story of one, a parent with its children
+    is one, and the open children of one closed parent are one. A group with
+    no open row (a closed story `--all` shows) is not an open story."""
+    shown = {r.get("id") for r in rows_ if type(r.get("id")) is str}
+    stand = {}
+    for r in rows_:
+        pid, rid = r.get("continues"), r.get("id")
+        up = known.get(pid) if type(pid) is str else None
+        f = (facts.get(rid) if type(rid) is str else None) or {}
+        if (r.get("status") in OPEN_STATUSES and pid not in shown
+                and isinstance(up, dict) and up.get("status") == "closed"
+                and (f.get("broken") or {}).get("kind") != "ring"):
+            # RANKLESS, so a closed row cannot lift its story's place.
+            stand.setdefault(pid, dict(up, priority=None))
+    order = _story_order(list(rows_) + list(stand.values()))
+    closed = {id(r) for r in stand.values()}
+    stories, live = 0, False
+    for row, indent in order + [(None, "")]:
+        if not indent:
+            stories += live
+            live = False
+        if row is not None and id(row) not in closed \
+                and row.get("status") in OPEN_STATUSES:
+            live = True
+    return order, stories, closed
+
+
+def open_story_count(rows_, known, facts):
+    """How many open stories the shown rows `rows_` hold, counted the way
+    `list`'s header counts them (task/3742): the one count, so a project's
+    health line and its listing cannot disagree."""
+    return _story_view(rows_, known, facts)[1]
+
+
+def _dim(text):
+    """`text` dimmed on a terminal that allows colour, plain otherwise."""
+    try:
+        tty = sys.stdout.isatty()
+    except (AttributeError, ValueError):
+        tty = False
+    return ("\033[2m%s\033[0m" % text
+            if tty and not os.environ.get("NO_COLOR") else text)
+
+
+def _plural(n, one, many):
+    return "%d %s" % (n, one if n == 1 else many)
+
+
+def _story_line(label, row):
+    return "    %-14s %-12s %-11s %s" % (label, row.get("id"),
+                                         row.get("status") or "?",
+                                         (row.get("title") or "")[:96])
+
+
+def _story_lines(row, known, facts):
+    """`show`'s story block (task/3742): where the row sits in its story, then
+    its children and "N of M done" over every row below it.
+
+    A child names its parent and its story root. A parent lists its direct
+    children (id, status, title) and then counts the whole story below it,
+    every depth, done = closed. A broken chain says what broke and that the
+    row is shown as its own story."""
+    tid = row.get("id")
+    got = facts.get(tid) if type(tid) is str else None
+    if not got:
+        return []
+    out = []
+    parent = got["parent"]
+    if parent:
+        up = known.get(parent)
+        out.append(_story_line("parent", up) if isinstance(up, dict) else
+                   "    %-14s %-12s NOT IN THE LEDGER" % ("parent", parent))
+    if got["story_root"] != tid:
+        out.append(_story_line("story root", known[got["story_root"]]))
+    broken = got["broken"]
+    if broken:
+        out.append("    %-14s %s at %s — %s" % (
+            "story", "RING" if broken["kind"] == "ring" else "DANGLES",
+            broken["at"],
+            "the chain above never reaches a root, so this row is shown as "
+            "its own story" if broken["kind"] == "ring" else
+            "the chain above names a row the ledger does not hold, so the "
+            "story is rooted at %s" % got["story_root"]))
+    out.extend(_story_line("child", c) for c in story_children(facts, tid))
+    done, total = story_count(facts, tid)
+    if total:
+        out.append("    %-14s %d of %d done" % ("sub-tasks", done, total))
+    return out
 
 
 def _free_text(verb, words, what):
@@ -4336,9 +5502,172 @@ def _free_text(verb, words, what):
     return freetext.tail("helm task", verb, words, what)
 
 
+REHOME_USAGE = "usage: helm task rehome --plan FILE [--apply]"
+
+
+def _cmd_rehome(rest):
+    """`helm task rehome --plan FILE [--apply]` (task/3745): give homeless
+    rows their project from a plan file. A dry run unless --apply; the plan
+    shapes and the verdicts are helm/taskhomes.py's."""
+    from . import taskhomes
+    door = "helm task rehome"
+    adj_err = option_adjacency_error(rest, ("--plan",), door)
+    if adj_err:
+        print("%s\n%s" % (adj_err, REHOME_USAGE), file=sys.stderr)
+        return 2
+    plan_path = _take(rest, "--plan")
+    apply = "--apply" in rest
+    while "--apply" in rest:
+        rest.remove("--apply")
+    if rest:
+        print("%s: unknown argument%s %s — nothing was read or written.\n%s"
+              % (door, "" if len(rest) == 1 else "s", " ".join(rest),
+                 REHOME_USAGE), file=sys.stderr)
+        return 2
+    if not plan_path:
+        print("%s: --plan FILE is required — a JSON plan of {task id: "
+              "project}, or nesting.json's shape. Nothing was read or "
+              "written.\n%s" % (door, REHOME_USAGE), file=sys.stderr)
+        return 2
+    # THE ACTOR IS RESOLVED FIRST, so an apply nobody can be named for
+    # writes nothing and prints no plan it could not carry out.
+    actor = None
+    if apply:
+        actor, aerr = _admit("rehome task rows")
+        if aerr:
+            print("%s --apply: %s — nothing was written." % (door, aerr),
+                  file=sys.stderr)
+            return 2
+    plan, perr = taskhomes.read_plan(plan_path)
+    if perr:
+        print("%s: %s — nothing was written." % (door, perr), file=sys.stderr)
+        return 2
+    known, kerr = registered_projects()
+    if known is None:
+        print("%s: the project registry (%s) is UNREADABLE (%s), so no plan "
+              "project can be checked — nothing was written."
+              % (door, home.registry_path(), kerr), file=sys.stderr)
+        return 2
+    snap, unavailable = snapshot(strict=True)
+    if unavailable:
+        print("%s: the task ledger is UNREADABLE (%s) — nothing was written."
+              % (door, unavailable), file=sys.stderr)
+        return 2
+    judged = taskhomes.judge(plan, snap, known)
+    print(taskhomes.header(plan_path, plan))
+    for j in judged:
+        print(taskhomes.line(j))
+    if not apply:
+        n = taskhomes.counts(judged)
+        print("%s: DRY RUN — %d row(s) would be homed, %d already homed, %d "
+              "refused. Nothing was written; re-run with --apply to write "
+              "them." % (door, n.get("home", 0), n.get("already", 0),
+                         n.get("refused", 0)))
+        return 1 if n.get("refused") else 0
+    taskhomes.apply(judged, actor)
+    for j in judged:
+        if j.get("outcome") in ("skipped", "failed"):
+            print("  %-11s NOT WRITTEN (%s): %s"
+                  % (j["id"], j["outcome"], j["why"]))
+    n = taskhomes.counts(judged)
+    print("%s: homed %d row(s), one event each, homed_by %s; %d already "
+          "homed, %d refused, %d not written."
+          % (door, n.get("homed", 0), actor.canonical_name,
+             n.get("already", 0), n.get("refused", 0),
+             n.get("skipped", 0) + n.get("failed", 0)))
+    return 1 if (n.get("refused") or n.get("skipped") or n.get("failed")) \
+        else 0
+
+
+HEALTH_USAGE = ("usage: helm task health [--project NAME | --all-projects] "
+                "[--json]")
+
+
+def _cmd_health(rest):
+    """`helm task health [--project NAME | --all-projects] [--json]`
+    (task/3745): one line per project — open stories, open rows, opened
+    today, closed today, 7-day net. Scoped the way `list` is: the flag, else
+    the cwd's project, else every project."""
+    from . import taskhomes
+    door = "helm task health"
+    adj_err = option_adjacency_error(rest, (PROJECT_FLAG,), "helm task")
+    if adj_err:
+        print(adj_err, file=sys.stderr)
+        return 2
+    all_projects = "--all-projects" in rest
+    as_js = "--json" in rest
+    for flag in ("--all-projects", "--json"):
+        while flag in rest:
+            rest.remove(flag)
+    project_opt, flag_err = take_project_flag(rest, "helm task")
+    if flag_err:
+        print("%s Nothing was read." % flag_err, file=sys.stderr)
+        return 2
+    if rest:
+        print("%s: unknown argument%s %s — nothing was read.\n%s"
+              % (door, "" if len(rest) == 1 else "s", " ".join(rest),
+                 HEALTH_USAGE), file=sys.stderr)
+        return 2
+    scope, decided_by, scope_err = resolve_scope(project_opt, door)
+    if scope_err:
+        print("%s Nothing was read." % scope_err, file=sys.stderr)
+        return 2
+    if all_projects and decided_by == "flag":
+        print("%s: %s %s and --all-projects name two different scopes and "
+              "cannot be combined — pass %s %s for that project's line, or "
+              "--all-projects for every project's."
+              % (door, PROJECT_FLAG, scope, PROJECT_FLAG, scope),
+              file=sys.stderr)
+        return 2
+    report, err = taskhomes.health()
+    if err:
+        print("%s: %s — the health of every project is UNKNOWN, not zero."
+              % (door, err), file=sys.stderr)
+        return 1
+    if scope and not all_projects:
+        print(scope_line("helm task", scope, decided_by,
+                         "; --all-projects for every project"),
+              file=sys.stderr)
+        names = [scope]
+    else:
+        known, kerr = registered_projects()
+        if known is None:
+            print("%s: the project registry is UNREADABLE (%s), so only the "
+                  "projects the rows name are shown." % (door, kerr),
+                  file=sys.stderr)
+        names = taskhomes.every_project(report, known or [])
+    lines = taskhomes.select(report, names)
+    if as_js:
+        print(json.dumps({"today_since": report["today_since"],
+                          "week_since": report["week_since"],
+                          "tz": report["tz"], "projects": lines}))
+        return 0
+    print(taskhomes.health_header(report))
+    for line in lines:
+        print(taskhomes.health_line(line))
+    return 0
+
+
+def _priority_door(row):
+    """THE PRIORITY DOOR (task/1135 C, task/3821's first chokepoint). A rank
+    set on an OWNER-ASKED row prints the friction-tax rule, how many times
+    the owner has asked for it, the row's tax and payback, and the payback
+    question, then the verb proceeds exactly as before: the owner ruled that
+    the act prints its rule and is never refused. The
+    measured miss: `task add --owner-asked --priority P1` typed by habit while
+    the rule sat in the store. Fail-open: a ledger that cannot be read
+    prints nothing here and changes nothing."""
+    try:
+        from . import doors
+        for line in doors.priority_note(row):
+            print("  " + line)
+    except Exception:                          # noqa: BLE001 — fail open
+        pass
+
+
 def cmd_task(args):
     """task add|list|triage|show|resolve|claim|release|takeover|close|
-    close-candidates|confirm-close|comment."""
+    close-candidates|confirm-close|comment|verify|observed|rehome|health."""
     from . import seats
 
     args = list(args or [])
@@ -4391,16 +5720,27 @@ def cmd_task(args):
         # A MACHINE READER STILL GETS THE WHOLE REPORT. A structured answer and
         # a truthful exit code are not in tension: --json prints `rep`, which
         # carries `dedup_unreadable`, and exits 1 beside it.
-        refused = rep.get("dedup_unreadable")
+        dedup_refused = rep.get("dedup_unreadable")
+        registry_refused = rep.get("registry_unreadable")
+        # rc IS DECIDED BEFORE THE RENDERER, for both refusals. --json
+        # over a malformed registry exits 1 beside the empty import, because
+        # rc 0 there would read as "nothing to do" (task/3994, the same cut
+        # as the dedup refusal).
         if "--json" in rest:
             print(json.dumps(rep, indent=1, ensure_ascii=False))
-            return 1 if refused else 0
-        if refused:
+            return 1 if dedup_refused or registry_refused else 0
+        if dedup_refused:
             print("helm task mirror: REFUSED — the dedup source could not be "
                   "read (%s), so every already-imported row would look NEW "
                   "and this sweep would duplicate all of them. Nothing was "
                   "imported. Repair the task ledger, then re-run."
-                  % refused, file=sys.stderr)
+                  % dedup_refused, file=sys.stderr)
+            return 1
+        if registry_refused:
+            print("helm task mirror: REFUSED — the project registry is "
+                  "malformed (%s), so every row would be filed under helm, "
+                  "a home the broken file never named. Nothing was imported."
+                  % registry_refused, file=sys.stderr)
             return 1
         head = "imported" if apply else "would import"
         print("helm task mirror: %s %d row(s) from %d session(s) in %d "
@@ -4418,6 +5758,14 @@ def cmd_task(args):
                 byproj[key] = byproj.get(key, 0) + 1
             print("  projects: " + ", ".join(
                 "%s %d" % kv for kv in sorted(byproj.items())))
+            # THE HOME EACH ROW IS FILED UNDER (task/3745): the registered
+            # project its session's cwd resolves to, else helm's own.
+            byhome = {}
+            for it in rep["imported"]:
+                byhome[it.get("home")] = byhome.get(it.get("home"), 0) + 1
+            print("  homes: " + ", ".join(
+                "%s %d" % (k or "none", v) for k, v in
+                sorted(byhome.items(), key=lambda kv: str(kv[0]))))
         if rep["already"]:
             print("  %d already mirrored — the dedup key is in each row's refs,"
                   " so re-running is safe" % rep["already"])
@@ -4506,7 +5854,6 @@ def cmd_task(args):
             if _cerr:
                 print("helm task: %s %s" % (_flag, _cerr), file=sys.stderr)
                 return 2
-        continues, priority = story["continues"], story["priority"]
         # THE FRICTION TAX, from its own table the same way: raw for the
         # valueless guard below, coerced for the write.
         raw_tax, taxes = {}, {}
@@ -4784,25 +6131,25 @@ def cmd_task(args):
         # cwd→project derivation the store scopes with, one lens for one
         # question. Said out loud the way the store says
         # it, so a surprising scope is visible at filing time and not a fact
-        # discovered later in a listing. No project (unregistered cwd) files
-        # UNSCOPED and stays silent, the store's exact global-only contract.
+        # discovered later in a listing.
         # THE FLAG WINS OVER cwd, THROUGH THE ONE RESOLVER (task/2446).
         # Measured: this door read cwd and nothing else, so
         # a task filed ABOUT HELM from another project's checkout went to its
         # scope and the making team's `helm task list` never showed it. A
         # team USING helm must never need to stand in helm's own checkout to
         # report something about helm.
-        project, decided_by, scope_err = resolve_scope(
+        # AND A ROW WITH NO PROJECT IS REFUSED (task/3745). An unscoped row
+        # is listed by no project's default `list`, so no lead ever burns it
+        # down. `require_project` is the one check every filing door makes.
+        project, decided_by, scope_err = require_project(
             project_opt, "helm task add")
         if scope_err:
-            print("%s Nothing was filed." % scope_err, file=sys.stderr)
+            print(scope_err, file=sys.stderr)
             return 2
-        if project:
-            # WHICH SCOPE, AND HOW IT WAS DECIDED, on one line. The flag and
-            # the cwd readings are not interchangeable facts: an operator who
-            # cannot tell them apart cannot tell an override from a lucky cwd.
-            print(scope_line("helm task", project, decided_by),
-                  file=sys.stderr)
+        # WHICH SCOPE, AND HOW IT WAS DECIDED, on one line. The flag and the
+        # cwd readings are not interchangeable facts: an operator who cannot
+        # tell them apart cannot tell an override from a lucky cwd.
+        print(scope_line("helm task", project, decided_by), file=sys.stderr)
         # THE ASK REFLEX IS `add()`'S, NOT THIS DOOR'S (task/2622, owner: "how
         # do we prevent me continually asking for things that have been placed
         # on the list and ignored"). The first cut resolved the title HERE,
@@ -4819,12 +6166,13 @@ def cmd_task(args):
             print("helm task add: --force-new — the near-duplicate refusal is "
                   "BYPASSED for this row; nothing was resolved against the "
                   "backlog.", file=sys.stderr)
+        homes = []
         row, err = add(title, owner, note=note, refs=refs,
                        tid=tid, source=filer,
                        origin="owner" if owner_asked else "agent",
                        project=project, posture_na=posture_na,
-                       continues=continues, priority=priority,
-                       force_new=force_new, **taxes)
+                       force_new=force_new, story_homes=homes, **story,
+                       **taxes)
         if err:
             # a posture refusal is printed whole — its three questions ARE
             # the message — where every other refusal takes the one-line form
@@ -4834,6 +6182,17 @@ def cmd_task(args):
         print("helm task: filed %s — %s" % (row["id"], row["title"]))
         if tax_line(row):
             print("  " + tax_line(row))
+        # WHERE IT MAY BELONG, ONE LINE, NEVER A REFUSAL (task/3745): the
+        # open stories in this project that share a rare title word with
+        # the new row, so a sub-task is not filed as a story of its own.
+        if homes:
+            print("  story home? %s — open stories sharing rare title words; "
+                  "`helm task update %s --continues <id>` makes this row a "
+                  "sub-task of one" % (", ".join(
+                      "%s (%s)" % (h.get("id"), ", ".join(words))
+                      for h, words in homes), row["id"]))
+        if owner_asked and row.get("priority"):
+            _priority_door(row)
         # THE DOOR SAYS WHAT IT FILED, AND UNRANKED IS A STATE IT NAMES.
         # The field has existed since the free-text census and nothing has
         # ever said a word about it at creation, which is how 403 of this
@@ -5098,6 +6457,12 @@ def cmd_task(args):
             print("    %-12s %s" % (rid, err))
         return 0 if not failed else 1
 
+    if verb == "rehome":
+        return _cmd_rehome(rest)
+
+    if verb == "health":
+        return _cmd_health(rest)
+
     if verb == "list":
         # SAME SCAN, SAME REASON (task/2446 r2): this leg takes the scope
         # BEFORE `--owner`, so `--owner --project fixproj seat-a` handed
@@ -5304,10 +6669,23 @@ def cmd_task(args):
             rows_ = [r for r in pool if project_of_row(r) == scope]
             unscoped = sum(1 for r in pool if project_of_row(r) is None)
             foreign = len(pool) - len(rows_) - unscoped
+            # A HOMELESS ROW IS NAMED AS ONE (task/3745): it lives in no
+            # project, so this scoped list is not where it will be burned
+            # down, and the verb that gives it a home is named with it —
+            # for the OPEN ones only, since rehome refuses a closed row.
             if unscoped or foreign:
-                disclosure = ("%d unscoped legacy row(s), %d row(s) from "
-                              "other projects — --all-projects shows them"
-                              % (unscoped, foreign))
+                if not want_all:
+                    remedy = " (`helm task rehome` gives them one)"
+                else:
+                    live = sum(1 for r in pool if project_of_row(r) is None
+                               and r.get("status") in OPEN_STATUSES)
+                    remedy = (", %d of them open (`helm task rehome` gives "
+                              "those one)" % live if live else
+                              ", none of them open (a closed row is not "
+                              "rehomed)")
+                disclosure = ("%d homeless row(s) with no project%s, %d "
+                              "row(s) from other projects — --all-projects "
+                              "shows them" % (unscoped, remedy, foreign))
         # RANKED BY THE FRICTION TAX, and what it leaves out is SAID: the
         # untaxed rows are counted, never silently dropped.
         untaxed_line = None
@@ -5318,11 +6696,15 @@ def cmd_task(args):
                                 "— set one with `helm task update <id> --tax "
                                 "N --tax-cost N`"
                                 % (untaxed, "" if want_all else "open "))
+        # THE STORY FOLD IS LEDGER-WIDE, from the same snapshot: a parent's
+        # "N of M done" counts the closed rows the open listing never shows.
+        facts = story_facts(snap)
         if as_js:
             # THROUGH THE ONE OWNER. This path built its own json.dumps and so
             # emitted raw rows while `show` next door was correct — the exact
             # divergence a single serialization door removes.
-            print(json.dumps([public_row(r) for r in rows_], sort_keys=True))
+            print(json.dumps([public_row(r, facts) for r in rows_],
+                             sort_keys=True))
             if disclosure:
                 # stderr, because stdout is a parseable JSON array by
                 # contract and the disclosure must survive without breaking it
@@ -5349,11 +6731,27 @@ def cmd_task(args):
             # and ranked work sorts above unranked — the two fields exist so
             # a reader can see the SHAPE of the backlog rather than its
             # filing sequence.
-            for r, indent in _story_order(rows_):
+            order, stories, closed = _story_view(rows_, snap, facts)
+            # THE HEADER COUNTS STORIES NEXT TO ROWS (task/3742): a backlog of
+            # sub-tasks read as a row count overstates the work outstanding.
+            print("%s, %s" % (
+                _plural(stories, "open story", "open stories"),
+                _plural(sum(1 for r in rows_
+                            if r.get("status") in OPEN_STATUSES),
+                        "open row", "open rows")))
+            for r, indent in order:
+                story = story_count(facts, r.get("id"))
+                if id(r) in closed:
+                    print(_dim("%s(closed) %s  %s%s" % (
+                        indent, r.get("id"),
+                        "[%d of %d done] " % story if story[1] else "",
+                        (r.get("title") or "")[:96])))
+                    continue
                 # labeled per row only in the cross-project view — a scoped
                 # listing is one project by construction and says so in its
                 # header
-                print(_fmt(r, indent=indent, project_col=all_projects))
+                print(_fmt(r, indent=indent, project_col=all_projects,
+                           story=story))
         if untaxed_line:
             print("\n" + untaxed_line)
         if disclosure:
@@ -5394,14 +6792,32 @@ def cmd_task(args):
                   "citation (#263) or the full form (task/263)" % token,
                   file=sys.stderr)
             return 2
-        row = get(tid)
+        # ONE READ FOR THE ROW AND ITS STORY: the children and the count come
+        # from the same fold the row does, so they cannot disagree with it.
+        known = rows()
+        row = known.get(tid)
         if not row:
             print("helm task: %s does not exist" % tid, file=sys.stderr)
             return 1
+        facts = story_facts(known)
         if as_js:
-            print(as_json(row))
+            print(as_json(row, facts))
             return 0
         print(_fmt(row))
+        # THE VERDICT STAMP, ONE LINE, NEWEST LAST. It sits right after the
+        # row's own line — the fact a reader wants most before trusting a row:
+        # the verdict, the seat who measured it, when, against which trunk
+        # (the FULL sha the reader re-checks `git log` against), and the
+        # evidence. No stamp -> no line, like note/source.
+        verified_line = taskverify.show_line(row)
+        if verified_line:
+            print("    " + verified_line)
+        # THE SEEN-WORKING CHECK (helm/observed.py): who owes it, or what
+        # was seen working and who recorded it.
+        from . import observed as _observed
+        seen_line = _observed.show_line(row)
+        if seen_line:
+            print("    " + seen_line)
         # `project` prints with the provenance fields: a cross-scope reader —
         # the one `show` exists for, since ids are fleet-wide — needs to see
         # WHOSE row answered. Absent = UNSCOPED = no line, like note/source.
@@ -5409,6 +6825,13 @@ def cmd_task(args):
                       "posture_na"):
             if row.get(field):
                 print("    %-14s %s" % (field, row[field]))
+        for line in _story_lines(row, known, facts):
+            print(line)
+        if row.get("open_children_at_close"):
+            print("    %-14s %s — sub-tasks that were open when this row "
+                  "closed (%s)" % ("left open",
+                                   " ".join(row["open_children_at_close"]),
+                                   OPEN_CHILDREN_FLAG))
         if tax_line(row):
             print("    " + tax_line(row))
         # ORIGIN THROUGH THE NORMALIZER, WITH THE RECORD BESIDE IT.
@@ -5462,6 +6885,20 @@ def cmd_task(args):
                 proof.get("incumbent") or "?", proof.get("successor") or "?",
                 proof.get("source_lane") or "?",
                 proof.get("successor_lane") or "?"))
+        elif isinstance(proof, dict) \
+                and proof.get("kind") == "holder-handoff":
+            # THE LAST GIFT, SAID LIKE THE LAST RELEASE: who gave it to
+            # whom, when, from what status, and why. Earlier ones stay in
+            # the ledger's event history.
+            when = proof.get("ts")
+            print("    %-14s by %s%s: %s -> %s (was %s)%s" % (
+                "handed off", proof.get("by") or "?",
+                time.strftime(" %Y-%m-%dT%H:%M:%SZ", time.gmtime(when))
+                if isinstance(when, (int, float)) and not
+                isinstance(when, bool) else "",
+                proof.get("from") or "?", proof.get("to") or "?",
+                proof.get("status_was") or "?",
+                ": %s" % proof["note"] if proof.get("note") else ""))
         # THE LAST RELEASE, SAID WITH ITS REASON. The ledger keeps every
         # release event; the row carries the latest, which is the one a
         # reader deciding whether to claim it wants.
@@ -5608,18 +7045,31 @@ def cmd_task(args):
             for c in cands:
                 # NO LAND CLOSES A ROW (task/3643): every candidate waits
                 # for its owner's re-read of the whole ask and confirm-close
-                state = ("HELD: " + "; ".join(c["blockers"]) if c["blockers"]
+                state = ("LANDED: " + c["check"] if c.get("check")
+                         else "HELD: " + "; ".join(c["blockers"])
+                         if c["blockers"]
                          else "%s, %s: waits for confirm-close" % (
                              c.get("state") or "landed", c["needs_confirm"])
                          if c.get("needs_confirm")
                          else "%s: waits for its owner's confirm-close"
                          % (c.get("state") or "landed"))
-                print("%-10s @%-14s landed %s by %s — %s — %s" % (
+                # ITS LAND AND WHOLE OR PART (task/3746): the LAND number,
+                # and whether the lane said it carried the whole ask
+                kind = {True: "whole", False: "part: asked whether the "
+                        "whole ask is done"}.get(c.get("whole"),
+                                                 "whole or part unrecorded")
+                print("%-10s @%-14s landed %s by %s (%s%s) — %s — %s" % (
                     c["id"], c["owner"] or UNOWNED_DISPLAY, c["sha"],
-                    c["train"], (c["title"] or "")[:60], state))
+                    c["train"] or c.get("land") or "a hand land",
+                    "%s, " % c["land"] if c.get("land") else "", kind,
+                    (c["title"] or "")[:60], state))
             print("helm task close-candidates: %d candidate(s); confirm one "
                   "with `helm task confirm-close <id>`" % len(cands))
             return 0
+        # THE STORY FLAG, as `helm task close` takes it (task/3746): a row
+        # with open sub-tasks closes only when they are said to stay.
+        stay = OPEN_CHILDREN_FLAG in rest
+        rest = [a for a in rest if a != OPEN_CHILDREN_FLAG]
         if len(rest) != 1 or rest[0].startswith("-"):
             print("helm task confirm-close: takes exactly one task id — "
                   "nothing was closed", file=sys.stderr)
@@ -5630,29 +7080,61 @@ def cmd_task(args):
             print("helm task confirm-close: %s — nothing was closed"
                   % ident_err, file=sys.stderr)
             return 2
-        row, err = taskhygiene.confirm_close(rest[0], me)
+        row, err = taskhygiene.confirm_close(
+            rest[0], me, plan_lands=True, open_children=(
+                OPEN_CHILDREN_STAY if stay else OPEN_CHILDREN_REFUSE))
         if row is SKIPPED or err:
-            print("helm task confirm-close: REFUSED — %s" % _cli_error(err),
+            said = err + (". Close or move them first, or confirm with "
+                          "`helm task confirm-close %s %s`"
+                          % (rest[0], OPEN_CHILDREN_FLAG)) \
+                if err and _OPEN_CHILDREN_REFUSED in err else _cli_error(err)
+            print("helm task confirm-close: REFUSED — %s" % said,
                   file=sys.stderr)
             return 2
         print("helm task: %s closed — %s" % (row["id"], row["closed_reason"]))
+        left = row.get("open_children_at_close") or ()
+        if left:
+            print("helm task: %s under %s (%s): %s"
+                  % (_plural(len(left), "open sub-task stays open",
+                             "open sub-tasks stay open"),
+                     row["id"], OPEN_CHILDREN_FLAG, ", ".join(left)))
         return 0
 
     if verb == "close":
         rc = project_flag_not_applicable("helm task close", rest)
         if rc is not None:
             return rc
+        # THE STORY FLAG IS TAKEN FROM THE LEADING OPTION POSITIONS ONLY —
+        # before the id or between the id and the reason — the same scope
+        # the free-text door polices, so a reason that mentions the flag in
+        # its prose is never read as the flag.
+        stay = False
+        while rest and rest[0] == OPEN_CHILDREN_FLAG:
+            rest.pop(0)
+            stay = True
+        while len(rest) > 1 and rest[1] == OPEN_CHILDREN_FLAG:
+            rest.pop(1)
+            stay = True
         if len(rest) < 2:
             print("helm task: close needs an id and a reason", file=sys.stderr)
             return 2
         reason, rc = _free_text("close", rest[1:], "a close reason")
         if rc is not None:
             return rc
-        row, err = close(rest[0], reason or "")
+        row, err = close(rest[0], reason or "", open_children=(
+            OPEN_CHILDREN_STAY if stay else OPEN_CHILDREN_REFUSE))
         if err:
             print("helm task: %s" % _cli_error(err), file=sys.stderr)
             return 2
         print("helm task: %s closed — %s" % (row["id"], row["closed_reason"]))
+        left = row.get("open_children_at_close") or ()
+        if left:
+            print("helm task: %s under %s (%s): %s — `helm task list` shows "
+                  "%s under \"(closed) %s\""
+                  % (_plural(len(left), "open sub-task stays open",
+                             "open sub-tasks stay open"),
+                     row["id"], OPEN_CHILDREN_FLAG, ", ".join(left),
+                     "it" if len(left) == 1 else "them", row["id"]))
         return 0
 
     if verb == "release":
@@ -5704,6 +7186,59 @@ def cmd_task(args):
         print("helm task: %s released by %s — OPEN and UNOWNED, back in the "
               "claimable pool (was %s)"
               % (row["id"], me, row["released"]["status_was"]))
+        return 0
+
+    if verb == "handoff":
+        # THE HOLDER'S GIFT TO A NAMED SEAT (task/2309). One id, one --to,
+        # at most one --note, and every other token REFUSES: a custody write
+        # must never succeed under a flag the caller believed had steered it.
+        rc = project_flag_not_applicable("helm task handoff", rest)
+        if rc is not None:
+            return rc
+        if not rest or rest[0].startswith("-"):
+            print("helm task handoff: needs a task id — nothing was handed "
+                  "off.\n%s" % USAGE, file=sys.stderr)
+            return 2
+        token = rest.pop(0)
+        typed = {f: [t for t in rest if t == f or t.startswith(f + "=")]
+                 for f in ("--to", "--note")}
+        to = _take(rest, "--to")
+        note = _take(rest, "--note")
+        if to is None or (typed["--note"] and note is None):
+            print("helm task handoff: --to SEAT is required and --note "
+                  "needs a value — nothing was handed off. A value that "
+                  "starts with a dash is written --note=VALUE.",
+                  file=sys.stderr)
+            return 2
+        extra = typed["--to"][1:] + typed["--note"][1:] + rest
+        if extra:
+            print("helm task handoff: takes one id, one --to and at most one "
+                  "--note (got %s) — nothing was handed off. Quote a note of "
+                  "several words; hand off one row per call."
+                  % " ".join(repr(t) for t in extra), file=sys.stderr)
+            return 2
+        # task/1918's ACT DOOR, NOT THE --mine DOOR: a gift to a named seat
+        # admits a declared name only when the roster resolves this
+        # process's session to the same seat.
+        actor, ident_err = _admit("hand off %s" % token)
+        if not actor:
+            print("helm task handoff: %s" % ident_err, file=sys.stderr)
+            print("helm task handoff: NOTHING WAS HANDED OFF — only the "
+                  "holder may give a row away, so an identity the roster "
+                  "does not resolve cannot.", file=sys.stderr)
+            return 2
+        row, err = handoff(token, actor, to, note=note)
+        if row is SKIPPED:
+            print("helm task handoff: NOTHING HANDED OFF — %s" % err,
+                  file=sys.stderr)
+            return 1
+        if err:
+            print("helm task handoff: REFUSED — %s" % _cli_error(err),
+                  file=sys.stderr)
+            return 2
+        gift = row["takeover"]
+        print("helm task: %s handed off by %s to %s (status %s kept)"
+              % (row["id"], gift["by"], gift["to"], row.get("status")))
         return 0
 
     if verb == "update":
@@ -5815,6 +7350,8 @@ def cmd_task(args):
                  " (ranked by %s)" % rank_actor.canonical_name))
         if any(key in fields for key in TAX_KEYS):
             print("  " + (tax_line(row) or "friction tax: cleared"))
+        if fields.get("priority") and row.get("origin") == "owner":
+            _priority_door(row)
         return 0
 
     if verb == "comment":
@@ -5833,6 +7370,118 @@ def cmd_task(args):
             print("helm task: %s" % _cli_error(err), file=sys.stderr)
             return 2
         print("helm task: noted on %s" % row["id"])
+        return 0
+
+    if verb == "verify":
+        # THE VERDICT VERB: `verify <id> <verdict> --trunk <sha> --evidence
+        # <one line> [--link <ref>]`. A verdict is a claim about a row, so a
+        # typo must refuse BEFORE a stamp is written — a verdict carries no
+        # free-text tail, and everything not consumed here is a mistake. The
+        # trunk is REQUIRED: it names the trunk the reader READ, and `verify`
+        # resolves it in the row's project repo, so the row stores the FULL sha,
+        # never a raw prefix or an origin/main guessed at write time.
+        if len(rest) < 3:
+            print("helm task: verify needs an id, a verdict and --trunk",
+                  file=sys.stderr)
+            return 2
+        token = rest.pop(0)
+        verdict = rest[0] if rest else ""
+        if not verdict or verdict.startswith("-"):
+            print("helm task: verify needs a verdict (one of %s) after the id"
+                  % " | ".join(taskverify.VERDICTS), file=sys.stderr)
+            return 2
+        rest.pop(0)
+        # WHAT THE OPERATOR ACTUALLY TYPED, snapshotted BEFORE ANY CONSUMPTION
+        # (the same shape `add` uses for its valueless guard): `_take` deletes
+        # a trailing valueless flag while returning None, so a bare `--link`
+        # vanishes without trace and the verb would stamp link=None. The
+        # snapshot is the only thing that remembers the flag was typed.
+        typed = set(rest)
+        trunk = _take(rest, "--trunk")
+        evidence = _take(rest, "--evidence")
+        link = _take(rest, "--link")
+        # A VALUED FLAG THAT PRODUCED NOTHING IS A TYPO, NOT A DEFAULT. `add`
+        # names exactly this door with a valueless list; a verdict verb has no
+        # title to hide behind, so its flags live in the option run and the
+        # same guard applies to --trunk, --evidence and --link — refusing BEFORE
+        # a stamp rather than silently filing link=None.
+        valueless = [f for f, v in (("--trunk", trunk),
+                                    ("--evidence", evidence),
+                                    ("--link", link))
+                     if f in typed and v is None]
+        if valueless:
+            print("helm task: verify %s needs a value that is not another flag "
+                  "— nothing was stamped. If the value really starts with a "
+                  "dash, write it as %s=VALUE."
+                  % (", ".join(valueless), valueless[0]),
+                  file=sys.stderr)
+            return 2
+        if not trunk:
+            print("helm task: verify --trunk is REQUIRED (a full sha or a 7+ "
+                  "hex prefix) — the trunk you read. Nothing was stamped.",
+                  file=sys.stderr)
+            return 2
+        if not evidence:
+            print("helm task: verify --evidence is REQUIRED (one line) — what "
+                  "you checked. Nothing was stamped.", file=sys.stderr)
+            return 2
+        if verdict not in taskverify.VERDICTS:
+            print("helm task: verdict must be one of %s (got %r)" %
+                  (" | ".join(taskverify.VERDICTS), verdict),
+                  file=sys.stderr)
+            return 2
+        # CONSUME THE FLAGS THIS VERB READS BY MEMBERSHIP: anything left that
+        # is flag-shaped is an unrecognized option; anything else is a stray
+        # word. A verdict has no free-text tail, so both refuse before a stamp.
+        leftover = rest
+        if leftover:
+            print("helm task verify: unknown token%s %s — accepts <id> "
+                  "<verdict> --trunk <sha> --evidence <one line> "
+                  "[--link <ref>] (got %s)" %
+                  ("s" if len(leftover) > 1 else "",
+                   " ".join(leftover),
+                   " ".join(repr(t) for t in leftover)),
+                  file=sys.stderr)
+            return 2
+        row, err = verify(token, verdict, trunk, evidence, by=seats.own_name(),
+                          link=link)
+        if err:
+            print("helm task: %s" % _cli_error(err), file=sys.stderr)
+            return 2
+        print("helm task: %s stamped %s" % (row["id"], verdict))
+        return 0
+
+    if verb == "observed":
+        # THE LAST STEP OF A LAND (helm/observed.py): a whole land leaves its
+        # task open, owing a seen-working check; this records what was seen
+        # working, and where, and closes it. The evidence is required and
+        # the record names the seat that wrote it.
+        from . import dispatches as _d, observed as _observed
+        rc = project_flag_not_applicable("helm task observed", rest)
+        if rc is not None:
+            return rc
+        evidence = _take(rest, "--evidence")
+        if not (evidence or "").strip():
+            print("helm task observed: --evidence \"%s\" is required — "
+                  "nothing was closed" % _observed.EVIDENCE_HINT,
+                  file=sys.stderr)
+            return 2
+        if len(rest) != 1 or rest[0].startswith("-"):
+            print("helm task observed: takes exactly one task id (got %s) — "
+                  "nothing was closed" % (" ".join(repr(t) for t in rest)
+                                          or "none"), file=sys.stderr)
+            return 2
+        me, ident_err = _d.acting_author("record a seen-working check")
+        if not me:
+            print("helm task observed: %s — nothing was closed" % ident_err,
+                  file=sys.stderr)
+            return 2
+        row, err = _observed.observe(rest[0], evidence, me)
+        if err:
+            print("helm task observed: REFUSED — %s" % _cli_error(err),
+                  file=sys.stderr)
+            return 2
+        print("helm task: %s closed — %s" % (row["id"], row["closed_reason"]))
         return 0
 
     if verb == "standdown":

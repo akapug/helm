@@ -2067,8 +2067,7 @@ class SessionCooldownTest(InjectBase):
         suppressed while STILL charging its bytes against the tail called
         those nudges over-budget on the very turns gather was sending them.
         Half-modelling a suppression is its own kind of lie."""
-        os.environ["HELM_CHAT_NAME"] = "codex"
-        self.addCleanup(os.environ.pop, "HELM_CHAT_NAME", None)
+        os.environ["HELM_CHAT_NAME"] = "codex"   # InjectBase.tearDown restores it
         # A budget where the arithmetic is exact rather than assumed: the base
         # line renders to 195B, the two nudges are 84B and 127B. At 250B the
         # base fits and crowds BOTH nudges out; with the base suppressed the

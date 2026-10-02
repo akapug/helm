@@ -34,12 +34,13 @@ import json
 import os
 import time
 
-from . import (chat, home, pk, projscope, seat_rest, seats_advice,
-               seats_stop_budget, stopfacts, vcs)
+from . import (chat, home, needs_act, pk, projscope, seat_rest,
+               seats_advice, seats_stop_budget, stopfacts, vcs)
 from .seats_common import STATUS_BYTES, _clip, _scrub
-from .seats_identity import _delivery_pause, identity_disagreement
-from .seats_delegation import (_claim_evidence_warning, _lane_stem,
-                               _lease_worktree)
+from .seats_identity import (_delivery_pause, identity_disagreement,
+                             seat_names, seat_scope)
+from .seats_delegation import _claim_evidence_warning, _lease_worktree
+from .seats_gate_exemption import _lane_stem
 from .seats_cursor import _write_stop_latch
 from .seats_roomscan import _ESTATE_FAILED
 from .seats_stop_signals import (_beacon_block, _off, _pair_turn_gate,
@@ -332,6 +333,24 @@ def _unread_rooms_warn(coverage, seat):
             % (_scrub(str(seat)), "; ".join(parts)))
 
 
+def _act_rows(rows, seat):
+    """(rows that need an ACT from `seat`, how many were dropped as FYI).
+
+    task/4019 slice A cure 1a: 50 of 235 integrator wakes in one measured
+    night were stop-guard blocks on rows that needed no
+    act from it. A row needs_act calls FYI (an all-keep stale-bot sweep, a
+    row addressed to other seats) never blocks a stop; it is NOT
+    consumed — its cursor does not move, so the next tool boundary, the
+    beacon's hold and `helm chat read` still deliver it. Unclassifiable is
+    ACT, so a misread row errs toward blocking. HELM_STOP_GUARD_NOACT=0 turns
+    the filter off."""
+    if not rows or _off("STOP_GUARD_NOACT"):
+        return rows, 0
+    names = seat_names(seat, seat_scope(seat))
+    act = [(r, m) for r, m in rows if needs_act.needs_act(m, names)]
+    return act, len(rows) - len(act)
+
+
 def _stop_guard(session=None, room="main", seat=None, stop_active=False,
                 transcript=None, cwd=None, budget=None, detail=False):
     """-> (blocks, warns) for one Stop event. Posture resolved once (seat via
@@ -381,8 +400,9 @@ def _stop_guard(session=None, room="main", seat=None, stop_active=False,
           HELM_STOP_GUARD_SPIRAL=0 disables.
       (b3p) BLOCK — a PAIR-MELD TURN (_pair_turn_gate): a round of a task's
           pair meld whose floor is this seat's (the peer yielded, joined, or
-          closed). Its chunks carry no @mention, so the inbox rung cannot see
-          it. Latched per set of owed turns; HELM_STOP_GUARD_PAIR=0 disables.
+          closed). The inbox rung sees its row only until it is delivered;
+          this sees the turn until it is taken. Latched per set of owed
+          turns; HELM_STOP_GUARD_PAIR=0 disables.
       (b4) BLOCK — an UNTESTED COMPOSITION (_seam_gate): the worktree this seat
           stands in (plus any lane rooms it leases) and another LIVE worktree
           of the same repo under a DIFFERENT holder have both authored the same
@@ -518,6 +538,7 @@ def _stop_guard(session=None, room="main", seat=None, stop_active=False,
         unread = _unread_rooms_warn(seen, seat)
         if unread:
             surfaced.append(unread)
+        waiting = _act_rows(waiting, seat)[0]
         if waiting:
             surfaced.append(
                 "[helm stop-guard] %d row(s) arrived DURING this turn and are "
@@ -552,6 +573,13 @@ def _stop_guard(session=None, room="main", seat=None, stop_active=False,
         pending = _pending_all(
             room, seat, session, scan_lane="stop",
             coverage=seen)  # EVERY room's inbox gates
+        pending, fyi = _act_rows(pending, seat)
+        if fyi:
+            warns.append(
+                "[helm stop-guard] %d row(s) pending that need no ACT from "
+                "seat '%s' (addressed to other seats, an all-keep stale-bot "
+                "sweep, a recovery notice) — not blocking; they deliver at the next "
+                "tool boundary or a `helm chat read`" % (fyi, _scrub(str(seat))))
         unread = _unread_rooms_warn(seen, seat)
         if unread:
             warns.append(unread)

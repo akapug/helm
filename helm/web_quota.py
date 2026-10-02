@@ -26,7 +26,7 @@ import traceback
 # import order and neither imports the facade or this module, so there is no
 # cycle; the fanout still rebinds every name here to the facade's object, so a
 # test that patches `web._provider` still reaches this module.
-from .web_cache import _cached, _provider, _qlock, _qstate
+from .web_cache import _cached, _drop, _provider, _qlock, _qstate
 from .web_common import _q1, _transcripts
 
 _web =sys.modules.get(__package__ + ".web")
@@ -592,9 +592,20 @@ def get_flags():
     through the same 120-second single-flight cache the other quota readers
     use. A stale or absent snapshot comes back as `measured: false` rather
     than as an old colour, because a colour nobody refreshed is the one thing
-    this tab must not render as current."""
+    this tab must not render as current.
+
+    THE OWNER'S DECLARATIONS ARE READ ON EVERY CALL, OUTSIDE THE CACHE
+    (task/4027). The watchdog folds a declaration only at its next pass, up
+    to 15 minutes after he saved it, so a sheet that showed the snapshot
+    alone read NOT MEASURED after his refresh, and he read that as "it did
+    not save". `declared_pending` carries each live declaration the snapshot
+    has not folded (`burnflags.pending_declarations`), on the body and on
+    that family's flag. It is PENDING, never measured: no colour changes
+    here. The declarations file is read for every writer, the sheet and
+    `helm burn declare` alike."""
+    from . import burnflags
+
     def build():
-        from . import burnflags
         snap, age = burnflags.cached_snapshot()
         if not snap:
             return {"measured": False, "bound_s": burnflags.max_age_s(),
@@ -609,7 +620,14 @@ def get_flags():
                 "families": snap.get("families") or {},
                 "overall": snap.get("overall"),
                 "line": burnflags.line(snap)}
-    return _cached("flags", 120, build)
+    got = _cached("flags", 120, build)
+    pending = burnflags.pending_declarations(
+        burnflags.read_declarations(), got.get("families"),
+        got.get("measured_at"))
+    fams = {f: dict(fl, declared_pending=pending[f])
+            if f in pending and isinstance(fl, dict) else fl
+            for f, fl in (got.get("families") or {}).items()}
+    return dict(got, families=fams, declared_pending=pending)
 
 
 
@@ -669,10 +687,15 @@ def _api_burn_declare(payload):
     ok, err = bf.declare(family, colour, at, why=reason)
     if not ok:
         return {"error": err, "code": "failed"}, 500
+    # THE SHEET READS THE BOARD, whose flags leg keeps its reading for a
+    # cache window. Drop it, so the owner's next read shows the declaration
+    # as pending (`get_flags`), never the reading from before it (task/4027).
+    _drop("board:flags")
     return {"ok": True, "family": family, "colour": colour, "until": at,
-            "note": "Declared. It takes effect at the next watchdog pass "
-                    "(every 15 minutes) and shows as DECLARED by the owner, "
-                    "never as measured."}, 200
+            "note": "Declared. The sheet shows it now as DECLARED by the "
+                    "owner and pending, never as measured. The watchdog "
+                    "folds it into the colour at its next pass (every 15 "
+                    "minutes)."}, 200
 
 
 

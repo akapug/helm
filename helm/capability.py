@@ -152,8 +152,10 @@ CAPABILITIES = (
     },
     {
         "id": "recall",
-        "verb": "cv recall (helm recall)",
-        "tool": "mcp__cv__recall",
+        "verb": "cv search / cv pack (the recall skill)",
+        # cv 0.11 named its MCP tools after its commands and dropped `recall`;
+        # a host still on cv 0.10 has only the old name.
+        "tool": "mcp__cv__search (cv 0.11+; mcp__cv__recall on cv 0.10)",
         "what": "cold semantic search over past agent sessions — 'have we "
                 "solved this before / where's the prior art'",
         "wired_via": "clustervision (cv) MCP + the recall skill",

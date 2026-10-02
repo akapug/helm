@@ -82,12 +82,19 @@ SCHEMA_UNSAFE_TOOLS = ("Artifact",)
 # stalls the seat exactly as ExitPlanMode's prompt did. Artifact was already
 # denied where a validator rejects its schema (SCHEMA_UNSAFE_TOOLS); here it
 # leaves for the context it costs, whatever the family's validator says.
+#
+# THE ARTIFACT TRIO IS NAMED ONCE, because the leads take it too (task/4056,
+# the owner: "I already said yes to turning off the artifact tool"): an artifact belongs to whichever baseload account published it and
+# those accounts rotate, so every report goes as a local file. A lead's lean
+# profile (lead_lean_settings_doc) denies exactly this tuple, through the same
+# recorded deny the seat seeder writes.
+ARTIFACT_TOOLS = ("Artifact", "ArtifactComments", "ArtifactData")
 LOCAL_UNUSED_TOOLS = ("DesignSync", "ScheduleWakeup", "CronCreate",
                       "CronDelete", "CronList", "EnterWorktree", "ExitWorktree",
                       "ReportFindings", "NotebookEdit", "ListMcpResourcesTool",
                       "ReadMcpResourceTool", "ReadMcpResourceDirTool",
-                      "ExitPlanMode", "Artifact", "ArtifactComments",
-                      "ArtifactData", "PushNotification", "AskUserQuestion")
+                      "ExitPlanMode") + ARTIFACT_TOOLS + (
+                      "PushNotification", "AskUserQuestion")
 
 # A TOOL A FAMILY'S ROUTE CANNOT SERVE IS DENIED (task/3242). Claude Code's
 # WebSearch does not search by itself: it sends the upstream a request that
@@ -163,6 +170,82 @@ PROFILES = {
     "lite": {"denied_tools": LITE_UNUSED_TOOLS, "mcp_floor": True,
              "pin_window": True, "exclude_rules": True},
 }
+
+# THE LEAD-LEAN SWITCHES (task/4056). A Claude lead re-sends a large fixed
+# floor on every request, and part of it is servers and listings a lead never
+# calls. These are the same switches the lite profile uses, but keyed on the
+# ROLE rather than the family, because lite is a family property
+# (`"profile": "lite"` on a FAMILIES entry) and lead is a role carried in the
+# seat's spawn register. A lead keeps everything it actually uses: the lite
+# MCP floor is NOT here (leads call cv and the Docs tools), and neither is the
+# lite deny of the delegation and agent-listing tools. The Artifact trio IS
+# denied, on the owner's ruling (LEAD_DENIED_TOOLS, below ARTIFACT_TOOLS).
+# Every switch is ADDITIVE on a home: it fills a key the home does not hold
+# and never replaces a value the owner set
+# (seat_launch_assets._apply_lead_lean).
+def lead_denied_mcp_servers():
+    """The MCP servers a LEAD's lean profile denies, READ FROM THIS HOST.
+
+    THE SOURCE NAMES NO PRIVATE PROJECT. The servers a lead never calls are
+    the operator's own, and a public-bound file must not carry their names, so
+    the list is a local-names key (`lead-denied-mcp-servers`) like every other
+    host-local name helm depends on. Unset, the profile denies nothing beyond
+    what it already does: a fresh clone configures no private name, and the
+    lean profile still takes the Artifact denies, the skill-listing budget and
+    the plugin switch, which are not names."""
+    from . import localnames
+    return localnames.words("lead-denied-mcp-servers")
+
+#: The skill-listing budget a lead is given: a fraction of the window, small
+#: because a lead's skill list is a fixed cost it re-sends on every request
+#: and it is not what a lead spends its context on.
+LEAD_SKILL_LISTING_BUDGET = 0.0025
+
+#: The plugin switched off for a lead. `plugin-dev` instruments plugin
+#: authoring, which a lead is not doing. THE KEY IS THE INSTALLED ID, NOT THE
+#: BARE NAME: an entry in `enabledPlugins` is `<id>@<marketplace>`, and the
+#: bare name matches nothing (read off the host's installed_plugins.json).
+LEAD_DISABLED_PLUGIN_ID = "plugin-dev@claude-plugins-official"
+
+#: The tools a LEAD loses outright, on the owner's ruling (stated at
+#: ARTIFACT_TOOLS): the whole Artifact trio, not Artifact alone, since the
+#: two deferred siblings exist only to serve a published page. Denying them
+#: also takes Artifact's schema out of every request: 14.1k tokens measured
+#: alone in `claude -p`, about 10.5k by a lead's own floor census.
+LEAD_DENIED_TOOLS = ARTIFACT_TOOLS
+
+#: The settings keys the lead-lean profile writes, and the values it writes
+#: them, as (key, value) pairs. ONE table so the seeder and the doctor read
+#: the same shape, and a key added here reaches both.
+def lead_lean_settings_doc():
+    """The COMPLETE settings document a lead's sessions carry, as one dict.
+
+    ONE source for every delivery path, so they cannot drift into different
+    profiles: the native-home pass (homes.py "lead lean", which reaches the
+    leads the fleet actually runs, on the default home and credhomes), the
+    seat settings.json seeder for a seat helm spawned as a lead, and the
+    native launch's `--settings` layer for such a seat."""
+    doc = dict(lead_lean_settings())
+    doc["permissions"] = {"deny": list(LEAD_DENIED_TOOLS)}
+    return doc
+
+
+def lead_lean_settings():
+    """((key, value), ...) the settings a LEAD's settings.json carries for
+    the lean profile, in the order they are written. Empty for a worker: the
+    caller decides the role, this says what the role means."""
+    out = []
+    servers = lead_denied_mcp_servers()
+    if servers:
+        # THE OBJECT SHAPE, NEVER BARE STRINGS: measured on the installed
+        # binary, a string entry is refused ("expected object, received
+        # string") and leaves the whole file schema-invalid.
+        out.append(("deniedMcpServers",
+                    [{"serverName": name} for name in servers]))
+    out.append(("skillListingBudgetFraction", LEAD_SKILL_LISTING_BUDGET))
+    out.append(("enabledPlugins", {LEAD_DISABLED_PLUGIN_ID: False}))
+    return tuple(out)
+
 
 # A LOCAL SEAT CANNOT PUSH OR WRITE TO GITHUB. An apprentice seat followed a
 # pull-request habit and pushed a branch to the PUBLIC remote, which exposed
@@ -369,9 +452,9 @@ def denied_tools(family):
 def context_lean(family):
     """Does the catalog save context for a seat of `family`? True for a
     family that is denied tools for the context their schemas cost
-    (`context_denied_tools`, LOCAL_UNUSED_TOOLS: the local families), so a
-    surface with a shorter form gives it to exactly those seats
-    (helm.chatshort, the short `helm chat read`)."""
+    (`context_denied_tools`: LOCAL_UNUSED_TOOLS on the local families and on
+    cursor), so a surface with a shorter form gives it to exactly those
+    seats (helm.chatshort, the short `helm chat read`)."""
     return bool((FAMILIES.get(family) or {}).get("context_denied_tools"))
 
 
@@ -1225,6 +1308,25 @@ OAUTH_ALIAS_CHANNELS = ("vertex", "aistudio", "antigravity", "claude", "codex",
 ANTIGRAVITY_GEMINI_GROUP = "antigravity-gemini"
 ANTIGRAVITY_CLAUDE_GPT_GROUP = "antigravity-claude-gpt"
 
+#: THE FAMILIES THAT ARE NO REVIEW BENCH (task/3855). A family entry's
+#: `bench_role` names why its seats never take a review row: role ->
+#: (the store premise that says so, the reason in one clause). The one
+#: writer every `dispatch send` and `dispatch add` reaches refuses a review
+#: row to such a seat (`dispatches._bench_role_refusal`). MEASURED
+#: (task/3855): a door read booked to opus46 sat on its quota wall for 55
+#: minutes while the premise that forbade it was only words.
+BENCH_ROLES = {
+    "proof-of-life": (
+        "opus46-is-a-proof-of-life-seat-not-bench-capacity",
+        "its credit is small and exists to prove the seat works, so a "
+        "review booked there strands on its quota wall mid-read"),
+    "council-only": (
+        "weak-models-review-only-in-councils-openrouter-is-the-cheap-sota-"
+        "xfam-fallback",
+        "it reads only inside a council beside other models, never as a "
+        "review row of its own"),
+}
+
 CODEX_HOMES = os.path.join(os.path.expanduser("~"), ".codex-homes")
 # The hermes CLI's OAuth artifact — the mint SOURCE for hermes-keyed families
 # (ds4pro). Read-only, never modified; tests point this at a fixture.
@@ -1306,6 +1408,15 @@ DEEPSEEK_BILLING_WINDOW = {
     "guard_lead_s": 300, "guard_lag_s": 300, "clock_max_skew_s": 30,
     "offpeak_dates": (), "peak_dates": (),
     "source": "DeepSeek API pricing page, peak/off-peak table"}
+
+#: The header OpenCode Go refuses a request without (HTTP 400
+#: MissingSessionID). It must be the same for every turn of one conversation
+#: and different for another, so no static value serves: a pool row naming it
+#: as `session_header` makes the generator write `session-header` into that
+#: provider block, and the proxy fork (CLIProxyAPI lane/opencode-go-session-3824)
+#: sets it on every request from Claude Code's session id, joined with the
+#: subagent id, as `ses_` plus 26 base32 characters of a digest.
+GO_SESSION_HEADER = "x-opencode-session"
 
 
 FAMILIES = {
@@ -1951,7 +2062,7 @@ FAMILIES = {
     # is the fallback for the same reason or-code is over there: an established
     # shop rather than a preview-only label, and still a CODE model. Its window
     # is smaller than this family's, so `model_context` keys it; without that
-    # a degraded seat would be launched claiming 512000 and wedge at 256000.
+    # a degraded seat would be launched claiming 463616 and wedge at 256000.
     "dots3": {"port": 8316, "model": "dots3", "mode": "proxy-key",
               "base_url": "https://openrouter.ai/api/v1",
               "key_env": "OPENROUTER_API_KEY", "provider": "openrouter",
@@ -1961,7 +2072,13 @@ FAMILIES = {
               # reports for this id (no auth required, re-read at the mint),
               # and its sole endpoint (AtlasCloud) reports the same — the same
               # evidence grade kimi's and the openrouter family's pins carry.
-              "max_context": 512000,
+              # The probe below stays that number. max_context 463616 =
+              # 512000 - 32000 - LOCAL_COMPACTION_MARGIN: input and output
+              # share the slot, so the taught window leaves the output cap
+              # and the compaction floor free in it (task/3196). Teaching
+              # the probe itself filled the slot and left the compaction
+              # call no room.
+              "max_context": 463616,
               "probed_context_length": 512000,
               # THE DEGRADED LAUNCH GETS THE FALLBACK MODEL'S WINDOW, not this
               # family's: cohere/north-mini-code:free reports 256000.
@@ -2113,13 +2230,14 @@ FAMILIES = {
              # bounds the cost.
              "fresh_session_floor": 100000,
              "probe_models": ("kimi-k3",)},
-    # This family = DeepSeek v4 Pro on the owner's DeepSeek DIRECT API key, and on
-    # nothing else. ONE TOKEN SOURCE PER SEAT (owner ruling): the flat OpenCode
-    # Go subscription is the ds4flash family's route, so a cooldown on one
-    # source can never move this seat's traffic onto the other, and every
-    # token this seat spends is billed to the one account it names.
+    # This family = DeepSeek v4 Pro, on the owner's DeepSeek DIRECT API key by
+    # default or on the OpenCode Go subscription when minted with `--provider
+    # opencode-go`. ONE TOKEN SOURCE PER SEAT (owner ruling): a seat's config
+    # carries the ONE row it was minted with, so a cooldown on one source can
+    # never move this seat's traffic onto the other, and every token this seat
+    # spends is billed to the one account it names.
     #
-    # OFF-PEAK-ONLY. The row carries DEEPSEEK_BILLING_WINDOW: the key is spent
+    # OFF-PEAK-ONLY on the direct key. That row carries DEEPSEEK_BILLING_WINDOW: the key is spent
     # only at the vendor's half price. `proxy_config_plan` closes the block
     # while the peak is on (the */3 `seat doctor --ensure` reconciler and
     # `helm offpeak --apply` both run it), delivery to the seat is held with
@@ -2151,13 +2269,28 @@ FAMILIES = {
                        "rung": "paid",
                        "authstore": "deepseek",
                        "billing_window": DEEPSEEK_BILLING_WINDOW},
-                   # THE FLASH ROUTE AND THE FLAT SUBSCRIPTION ARE NOT IN THIS
-                   # POOL, and their absence is the cure rather than an
-                   # omission. A pool row serving this family's alias on a
-                   # weaker model resolved a proof to family `ds4pro` and
-                   # carried this family's approval identity; a second token
-                   # source let a cooldown on one silently spend the other.
-                   # Both are the `ds4flash` family below.
+                   # THE OPENCODE GO SUBSCRIPTION, ON THE SAME MODEL, at the
+                   # owner's word that this family runs through the Go account
+                   # as well as the direct key. Go's own /models lists
+                   # `deepseek-v4-pro`, the id the direct key serves, so the
+                   # pool stays one model across two vendors and a proof on
+                   # either row is this family's by the model that answered.
+                   # ONE TOKEN SOURCE PER SEAT STILL HOLDS: the mint writes the
+                   # ONE row it is given (`helm seat add ds4pro --provider
+                   # opencode-go`), never both, so a cooldown on one source
+                   # cannot move traffic onto the other. The flash model stays
+                   # the `ds4flash` family below; a weaker model in this pool
+                   # would carry this family's approval identity.
+                   "opencode-go": {
+                       "base_url": "https://opencode.ai/zen/go/v1",
+                       "upstream_model": "deepseek-v4-pro",
+                       # a turn on the flat subscription costs nothing further
+                       "rung": "free",
+                       "authstore": "opencode-go",
+                       "vendor": "opencode",
+                       # Go refuses a request without it (HTTP 400
+                       # MissingSessionID); see GO_SESSION_HEADER
+                       "session_header": GO_SESSION_HEADER},
                },
                # 1000000 — PROBE-BACKED, and the omission it replaces was a
                # borrowed argument rather than this family's own.
@@ -2249,31 +2382,28 @@ FAMILIES = {
     "ds4flash": {"port": 8330, "model": "deepseek-v4-flash",
                  "mode": "proxy-key",
                  "key_env": "DS4FLASH_API_KEY",
-                 "activation_refusal":
-                     "ds4flash is not yet activatable: OpenCode Go requires a "
-                     "stable per-conversation x-opencode-session header, and "
-                     "Helm does not yet inject that session-bound header",
                  "pool_default": "opencode-go",
-                 # NO WINDOW, DELIBERATELY, and the only family left without
-                 # one. The OpenCode Go route publishes no context window for
-                 # deepseek-v4.1-flash, and the model's window on another
-                 # vendor is not this route's: the opus46 and gptoss routes
-                 # both cap their models below the raw number. With the
-                 # family not activatable (above), no seat is taught anything,
-                 # so nothing relies on a window yet. Pin one from the route's
-                 # own published number before the activation refusal is
-                 # lifted.
+                 # THE ROUTE'S WINDOW, PUBLISHED. Go's /models lists ids only,
+                 # so the number is the one OpenCode publishes for its own Go
+                 # provider on models.dev (opencode-go deepseek-v4.1-flash:
+                 # context 1000000, output 384000; the record, with the day it
+                 # was read, is PUBLISHED_ROUTE_WINDOWS). Recorded as
+                 # probed_context_length, the grade opus46 and gptoss carry,
+                 # so `_unbacked_window_reason` bounds the pin by it. THE PIN
+                 # IS THE INPUT CEILING by the codex law: 1000000 total -
+                 # 32000 output (Claude Code's request; no cap declared here)
+                 # - 20000 CC reserve = 948000.
+                 "probed_context_length": 1000000,
+                 "max_context": 948000,
                  "pool_providers": {
                      # THE OPENCODE GO TOKEN SOURCE, and the only one: the
                      # owner's flat subscription, which now carries a standing
                      # DeepSeek v4.1 Flash allowance. `deepseek-v4.1-flash` is
                      # the id Go's own /models lists for that model. Go refuses
                      # a request without an `x-opencode-session` header (HTTP
-                     # 400 MissingSessionID). A static family-wide value would
-                     # collapse conversation identity, while the generator has
-                     # no session-bound injection seam yet; activation is
-                     # therefore refused above rather than minting a broken or
-                     # cross-conversation route.
+                     # 400 MissingSessionID), so the block names the header and
+                     # the proxy stamps a per-conversation value on every
+                     # request (GO_SESSION_HEADER).
                      "opencode-go": {
                          "base_url": "https://opencode.ai/zen/go/v1",
                          "upstream_model": "deepseek-v4.1-flash",
@@ -2284,7 +2414,8 @@ FAMILIES = {
                          # subscription and its route, and OpenCode is the
                          # vendor whose accounts carry it (`billing_accounts`,
                          # task/3461)
-                         "vendor": "opencode"},
+                         "vendor": "opencode",
+                         "session_header": GO_SESSION_HEADER},
                  },
                  "probe_models": ("deepseek-v4-flash",)},
     # qwen27 = Qwen3.8-27B-UD-Q4_K_XL (dense 27B, unsloth), served by
@@ -2955,6 +3086,9 @@ FAMILIES = {
     # on top of it. So a surface may render the group's remaining percent, and
     # must never read a member's reachability off it.
     "opus46": {"port": 8346, "model": "claude-opus-4-6-thinking",
+               # NO REVIEW ROWS (BENCH_ROLES). The owner (task/3855): "that
+               # opus 46 seed is just a toy for council experimentation".
+               "bench_role": "proof-of-life",
                "mode": "proxy-oauth", "auth_type": "antigravity",
                "login_flag": "-antigravity-login",
                "auth_glob": "antigravity-*.json",
@@ -2987,11 +3121,20 @@ FAMILIES = {
                # the pin by it. Unpinned, a seat is taught Claude Code's 200k
                # default, which is the route's WHOLE window with no room for
                # the output it shares.
-               # THE PIN IS THE INPUT CEILING, by the codex law (the codex
-               # entry's max_context): 200000 total − 32000 output (the cap
-               # above) − 20000 CC reserve = 148000.
+               # THE PIN COUNTS CLAUDE CODE'S RESERVE ONCE (task/3826), as
+               # cursor's does (task/3616). The codex law's 148000 (200000 −
+               # 32000 output − 20000 reserve) took the reserve twice:
+               # Claude Code takes min(output, 20000) again from the window
+               # it is taught, so 148000 compacts at 102,400 over a
+               # measured fresh boot of 55,037. 173000 is the largest
+               # thousand whose worst requests all stay 10,000 under 200000
+               # (effective 153,000, compaction at 122,400): 154,400 under
+               # compaction; 181,999 at the block (effective − 3000) with
+               # the 32000 output; 189,248 for a compaction after the
+               # fleet's largest measured one-request growth (46,848) with
+               # its 20000 summary, the case that binds; 168,904 for pi.
                "probed_context_length": 200000,
-               "max_context": 148000,
+               "max_context": 173000,
                "probe_models": ("claude-opus-4-6-thinking",)},
     # gptoss = gpt-oss-120b-medium, the OpenAI open-weights model on the same
     # Antigravity allotment. A NEW FAMILY KEY, and the reason to spend one is
@@ -3022,15 +3165,24 @@ FAMILIES = {
                # same guard as opus46 above. Unpinned, a seat is taught Claude
                # Code's 200k default, 86k past the route's whole window: a seat
                # that grows past 114k hits the 400 compaction cannot escape.
-               # THE PIN IS THE INPUT CEILING, by the codex law: 114000 total
-               # − 32000 output (the cap above) − 20000 CC reserve = 62000.
-               # A NARROW WINDOW, SAID PLAINLY: a helm seat's preamble alone
-               # measures 37,257 to 40,199 tokens (the qwen27 entry), so this
-               # seat compacts after roughly 10k-20k of work. The lever that
-               # buys room is the output cap, whose floor the reasoning trap
-               # above sets; that is a separate decision, not taken here.
+               # THE PIN COUNTS CLAUDE CODE'S RESERVE ONCE (task/3826), as
+               # opus46 and grok do. The codex law's 62000 (114000 total −
+               # 32000 output − 20000 reserve) took the reserve twice:
+               # Claude Code takes min(output, 20000) again from the window
+               # it is taught, so 62000 blocked requests at 39,000, under
+               # a measured full-tool boot of 54-59k (gemini 54,435, opus46
+               # 55,037, grok 59,249). 66000 is the largest thousand whose
+               # 80% compaction point (36,800) after the fleet's largest
+               # measured growth (46,848) stays 10,000 under 114000 (worst
+               # request 103,648; 99,848 with Claude Code's native 13,000 gap).
+               # That still sits under a full-tool boot, so gptoss denies
+               # the tools it never calls (LOCAL_UNUSED_TOOLS + Workflow +
+               # ListAgents, the cursor set, task/3803). Cursor's measured
+               # lean boot (13.7-20.8k) clears the 33,000 compaction point.
                "probed_context_length": 114000,
-               "max_context": 62000,
+               "max_context": 66000,
+               "context_denied_tools": LOCAL_UNUSED_TOOLS + (WORKFLOW_TOOL,
+                                                             "ListAgents"),
                "probe_models": ("gpt-oss-120b-medium",)},
     # grok rides the native xAI OIDC device-code flow against
     # auth.x.ai/.well-known/openid-configuration, which routes to
@@ -3068,10 +3220,21 @@ FAMILIES = {
              # Recorded as probed_context_length, the grade the DeepSeek V4
              # Pro pin carries, so `_unbacked_window_reason` bounds the pin by
              # it.
-             # THE PIN IS THE INPUT CEILING, by the codex law: 256000 total −
-             # 32000 output (the max_tokens a seat requests; this family
-             # declares no cap of its own, as codex does not) − 20000 CC
-             # reserve = 204000.
+             # THE PIN COUNTS CLAUDE CODE'S RESERVE ONCE (task/3826), as
+             # cursor's does (task/3616). The codex law's 204000 (256000 −
+             # 32000 output, the max_tokens a seat requests since this family
+             # declares no cap of its own − 20000 reserve) took the reserve
+             # twice, so it compacts at 147,200. MEASURED on this seat at
+             # the 200k it ran before the pin (compaction at 144,000): 8
+             # compactions at 144-148k, 17-55 minutes apart, the first
+             # request after each at 51-69k, so about 80k of work per
+             # cycle, which 204000 barely moved. 237000 is the largest thousand
+             # whose worst requests all stay 10,000 under 256000 (effective
+             # 217,000, compaction at 173,600): 205,600 under compaction;
+             # 245,999 at the block (effective − 3000) with the 32000 output,
+             # the case that binds; 240,448 for a compaction after the
+             # fleet's largest measured one-request growth (46,848) with its
+             # 20000 summary; 232,904 for pi.
              #
              # THE UNPINNED CONTROL MOVED, as the note that stood here asked:
              # grok was the family every window test that needs an unpinned
@@ -3079,7 +3242,7 @@ FAMILIES = {
              # left unpinned (its route publishes no window), so a `_window()`
              # that answered one number for everybody is still detectable.
              "probed_context_length": 256000,
-             "max_context": 204000,
+             "max_context": 237000,
              "probe_models": ("grok-build-0.1",)},
     # cursor = the owner's Cursor Pro subscription, served by grok-4.7-high
     # through a LOCAL BRIDGE (egoist/cursor-openai-api, vendored in the seat
@@ -3199,6 +3362,29 @@ FAMILIES = {
                # in its tool list and it arms `helm chat wait` itself.
                # WebSearch fails on this route (task/3242, measured)
                "unserved_tools": UNSERVED_WEB_SEARCH,
+               # THE TOOLS IT NEVER CALLS LEAVE, FOR ITS WINDOW (task/3803).
+               # Claude Code turns tool search off on a base URL that is not
+               # Anthropic's, so every tool schema rides every request.
+               # MEASURED with `claude -p /context` on a hook-free copy of
+               # the seat's config and its own env: 48.6k at boot of the 110k
+               # budget it was taught then (task/3652, gone since task/3816),
+               # 41.1k of it tool schemas, 28.4k (26%) free. With
+               # these denied: 20.8k at boot, 13.3k of tools, 56.2k (51%)
+               # free; Workflow alone was 11.2k. Its transcripts hold 3,638
+               # tool calls (Bash 2505, Read 826, Edit 165, Monitor 94, Write
+               # 36, SendMessage 5, TaskStop 2, Agent 2, WebFetch 1) and none
+               # to Workflow, ListAgents or a LOCAL_UNUSED_TOOLS name.
+               # ExitPlanMode leaves with them, as on the local seats: only
+               # the owner's hand puts a pane in plan mode, and the same hand
+               # takes it out. SendMessage and WebFetch stay: it calls them,
+               # and its system_line maps Cursor's Fetch to WebFetch. Workflow
+               # goes by the reconciliation written at LITE_UNUSED_TOOLS: the
+               # family declares no `subagent_tiers` and serves one model, so
+               # it has no same-family model to delegate to, and a denied
+               # Workflow carries no cap (workflow_cap_env). It also reads
+               # `helm chat read` short (context_lean).
+               "context_denied_tools": LOCAL_UNUSED_TOOLS + (WORKFLOW_TOOL,
+                                                             "ListAgents"),
                "provider": "cursor-bridge",
                # BILLED BY CURSOR: the provider above is the local bridge this
                # seat reaches Cursor through, and no account is billed as it
@@ -3234,16 +3420,21 @@ FAMILIES = {
                # Claude Code's own margin counted once, 10,000 kept for
                # estimate error (THE PIN, above)
                "max_context": 225000,
-               # CURSOR-BUDGET (task/3652): this narrows what the seat is taught
-               # on its launch line; the 256k probe and 225k max_context stay —
-               # they are the evidence for the model, not the seat's allowance.
-               # Cursor counts the Claude Code history the seat's own tool calls
-               # push 3-6x the bridge's estimate, so every run at/under 91k
-               # estimated still made tool calls and the first tool-silence
-               # failure was at 98.9k. The watchdog's 80% of 110000 is 88k;
-               # Claude Code first reserves 20k for output, so its own 80%
-               # compaction threshold is near 72k, below that watchdog bound.
-               "context_budget": 110000,
+               # NO CONTEXT BUDGET: THE SEAT IS TAUGHT THIS 225000 (task/3816).
+               # task/3652 narrowed it to 110000 on the premise that Cursor
+               # counts the Claude Code history 3-6x the bridge's estimate and
+               # goes tool-silent past its 256k. That count was a run-start
+               # artifact: the bridge replayed the whole history into a new
+               # Cursor conversation on every run (task/3817). MEASURED with
+               # the task/3817 probe on the bridge that keeps Cursor's
+               # conversation: replaying, 8 of 16 run starts counted 2.0-4.6x
+               # the estimate (269,723 at 66,562); continuing, Cursor counted
+               # 1.06x at est 66k, 157,163 at this window's compaction point
+               # (est 164,873) and 173,587 at est 186,237, with a tool call on
+               # every one of 25 turns. The budget made Claude Code compact
+               # near 73k by the estimate, every 10-16 minutes, and it never
+               # guarded the replay that remains (after a compaction, /clear
+               # or unclean run end): that one inflates past 256k at 66k too.
                "probe_models": ("cursor",),
                # THE ROUTE TO ITS TOOLS, ON EVERY TURN. Cursor offers the
                # model its own tools first (Shell, Read, Grep, ...), and the
@@ -3296,8 +3487,18 @@ FAMILIES = {
                    # it until this table is re-vetted. Each file names the
                    # fail-open behaviours its patches close, so a reader knows
                    # what a drift risks. The pin is the bridge repository's
-                   # commit a34a5ad34790c19646edd246c2d44dcb7efb637f, helm's
-                   # own (a native read brings at most 400 lines and 24,000
+                   # commit 726050f3185c0f40c042087dc21f7473bd7094c9, helm's
+                   # own (Cursor keeps its own conversation between the
+                   # client's turns: a run that closed cleanly leaves Cursor's
+                   # checkpoint (one it sent during that run) and blobs, and
+                   # a request that extends it by
+                   # the reply and new user text sends Cursor only that text
+                   # under the same conversation id, where a compaction,
+                   # /clear, edit or unclean run end replays the history and
+                   # the bridge log says why; every run names the caller's
+                   # tools, Monitor included, in Cursor's MCP instructions,
+                   # task/3817; below it, a native read brings at most 400
+                   # lines and 24,000
                    # bytes of a file into the client's context, measured on
                    # the file before the client reads it, and names the route
                    # to the rest; a read it cannot measure, or from the end,
@@ -3315,11 +3516,11 @@ FAMILIES = {
                    # before that timeout); upstream does not carry it
                    # (docref_guard SKIP says why).
                    "origin": "https://github.com/egoist/cursor-openai-api",
-                   "pin": "a34a5ad34790c19646edd246c2d44dcb7efb637f",
+                   "pin": "726050f3185c0f40c042087dc21f7473bd7094c9",
                    "required_patches": {
                        "src/proxy.ts": {
                            "sha256":
-                           "f4bc0b29ec16e36bbc5fa49c1822669dec18d80e160e3b90e5e8979bb2527647",
+                           "c84bd8341a1ddaa013e87580c55aa3935bbcfe56b0798d03967ce178ff42ca5a",
                            # a 0.0.0.0 bind offered an unauthenticated Cursor
                            # gateway to the network; a quota refusal on the
                            # first frame was a 200 text answer; the
@@ -3383,7 +3584,21 @@ FAMILIES = {
                            # measure (a relative path, a file not on its disk,
                            # a window past its scan bound) still went out for
                            # 400 lines, where now it fails closed with that
-                           # error and no client call.
+                           # error and no client call; every run replayed the
+                           # whole history into a new Cursor conversation and
+                           # threw Cursor's checkpoint away, so Cursor counted
+                           # each run start 2-5x the history (8 of 16 turns of
+                           # one probe session, 269,723 against its 256,000
+                           # window at a 66,562 estimate), where now a turn
+                           # that extends a kept conversation carries only its
+                           # new text and Cursor counts about 1.06-1.2x
+                           # (task/3817), where a continued run is kept only on
+                           # a checkpoint Cursor sent during it, never the one
+                           # it continued from; and the caller's tools reached
+                           # the model only through GetDynamicTools, so after a
+                           # compaction the seat decided Monitor was
+                           # unavailable, where now every run names them in
+                           # Cursor's MCP instructions.
                            "patches": ("loopback-bind", "refusal-is-429",
                                        "nonstream-tools", "tool-results-kept",
                                        "mcp-state-answered",
@@ -3399,7 +3614,10 @@ FAMILIES = {
                                        "first-frame-budget",
                                        "native-runs-as-caller-tool",
                                        "native-read-bounded",
-                                       "native-read-byte-bounded")},
+                                       "native-read-byte-bounded",
+                                       "conversation-kept",
+                                       "kept-checkpoint-is-the-runs-own",
+                                       "tools-in-mcp-instructions")},
                        "src/models.ts": {
                            "sha256":
                            "e6e140a50eea5509a95f14a2c6671274bbf6b077a00417832658ece2ffab8ce1",
@@ -3427,7 +3645,7 @@ FAMILIES = {
                    # not hashed. seat_sidecar `runtime_digest` defines it and
                    # computes it for a re-vet.
                    "runtime_sha256":
-                   "534854ab038a35b1db1bc6972dda13d785e17c8049d5b3fc6090c19ecc6869fd",
+                   "e455a9039d3dcd71ac71669285e94a4c9c250ba9d9caf7f38aafa398966510ea",
                    "runtime_exclude": ("test/", "README.md", "LICENSE"),
                    # the variables the bridge reads beyond PORT (its trace
                    # switch; its stall window, which it holds below the
@@ -3686,6 +3904,23 @@ def provider_rung(family, provider, table=None):
             continue
         rung = row.get("rung")
         return rung if rung in PROVIDER_RUNGS else None
+    return None
+
+
+def provider_session_header(family, provider, table=None):
+    """The per-conversation header one provider block must carry, or None.
+
+    A fact about the BLOCK, asked for separately for the reason
+    `provider_rung` gives: a route dict is matched by exact equality against
+    a proof's route, so a field added there would stop every proof matching.
+    """
+    table = FAMILIES if table is None else table
+    fam = table.get(family) if isinstance(table, dict) else None
+    rows = (fam or {}).get("pool_providers")
+    for name, row in (rows.items() if isinstance(rows, dict) and provider
+                      else ()):
+        if isinstance(row, dict) and (row.get("proxy_provider") or name) == provider:
+            return row.get("session_header") or None
     return None
 
 
@@ -4271,8 +4506,11 @@ def _owner_statement_reason(name, win, owner, fam=None):
 # MEASURED on all three local families across a day of compactions, so CC's
 # gauge reads the proxy's usage; the watchdog reading the transcript is the
 # second enforcer. Kept aligned, not dropped, so the launch line still declares
-# one coherent 80. Honored only for non-`claude-` model names — exactly the proxy
-# seats. Both env knobs verified in CC 2.1.216 (undocumented — re-verify on CC
+# one coherent 80. Honored on every proxied seat, a `claude-` model name
+# included: MEASURED on opus46 (claude-opus-4-6-thinking), which compacted at
+# preTokens 144,945 on a 200k window, 80% of (200,000 − 20,000) = 144,000,
+# where Claude Code's own default would have waited to 167,000 (task/3826).
+# Both env knobs verified in CC 2.1.216 (undocumented — re-verify on CC
 # upgrades: `strings` the binary for the names).
 AUTOCOMPACT_PCT_OVERRIDE = "80"
 
@@ -4296,26 +4534,63 @@ AUTOCOMPACT_PCT_OVERRIDE = "80"
 # autocompact watchdog's gauge. If they disagreed, CC would be told one window
 # and the watchdog would compact against another.
 
-def taught_window(fam, window):
+#: THE WORKING WINDOW A LEAD IS TAUGHT (task/4049), wherever it launches from.
+#: Per-request cost scales with the context re-sent; a lead runs the hottest
+#: loop in the fleet and re-sends the most, so its window is narrowed at
+#: launch and the gauge reads the same number. It lives here, beside
+#: `context_budget`, because it is the same kind of number — a POLICY ceiling
+#: over a model's capacity, never a measurement of it — and it is read by
+#: `taught_window`, so the launch line and the watchdog cannot drift.
+#: It rides the LEAD POSTURE the spawn register already records
+#: (seat_role.HELM_SEAT_ROLE), never a seat name: helm has no roster of which
+#: seats are leads, and a hardcoded list would be wrong the day a seat moved.
+#: 400,000: the measured best (task/4049's priced sweep and the loop editor
+#: built from it): 370-420k gives the fewest compactions per token re-sent.
+#: Below it a lead thrashes, measured: 240k compacted 24 times a day and lost
+#: its working thread; 160k re-compacted every 10-15 calls. Above it a lead
+#: re-sends more per request for little fewer compactions. It NARROWS only, on
+#: the budget's own rule: a family already taught less keeps its smaller
+#: window.
+LEAD_CONTEXT_WINDOW = 400000
+
+def taught_window(fam, window, role=None):
     """The window a seat of this family is TAUGHT, given its model's `window`.
 
     `window` is the model's own (a `model_context` entry or `max_context`).
     The family's `context_budget` narrows it when declared below it, and never
     widens it. A falsy `window` passes through unchanged: an unpinned family is
-    already taught CC's 200k default, and a budget has no window to narrow."""
+    already taught CC's 200k default, and a budget has no window to narrow.
+
+    A LEAD IS TAUGHT `LEAD_CONTEXT_WINDOW` (task/4049), on the same
+    may-only-narrow rule and for the same reason the budget uses it: the
+    owner's cost model is that per-request cost scales with the context
+    re-sent, and a lead runs the hottest loop in the fleet. `role` is the
+    posture the spawn register already carries (seat_role.HELM_SEAT_ROLE), so
+    a worker of the very same family is untouched. For a family that pins NO
+    window (the native claude seat, which has no catalog entry at all) a lead
+    is still taught the number: the alternative there is CC's 200k default,
+    which is a number nobody chose."""
     budget = fam.get("context_budget")
+    if role == "lead":
+        lead = LEAD_CONTEXT_WINDOW
+        if window and lead >= window:
+            return window
+        if budget and budget < lead:
+            return budget
+        return lead
     if window and budget and budget < window:
         return budget
     return window
 
 
-def launch_window(fam, model=None):
+def launch_window(fam, model=None, role=None):
     """The window a pane of this family launched on `model` is taught: the
     model's `model_context` entry, else `max_context`, narrowed by
-    taught_window. The ONE reading launch_line stamps and the lite profile
-    pins, so the two surfaces cannot disagree."""
+    taught_window (and by the lead posture, task/4049). The ONE reading
+    launch_line stamps and the lite profile pins, so the two surfaces cannot
+    disagree."""
     return taught_window(fam, (fam.get("model_context") or {}).get(model)
-                         or fam.get("max_context"))
+                         or fam.get("max_context"), role=role)
 
 
 #: The window knobs and the output knob the launch line stamps, spelled once
@@ -4325,17 +4600,19 @@ WINDOW_VARS = ("CLAUDE_CODE_MAX_CONTEXT_TOKENS", "CLAUDE_CODE_AUTO_COMPACT_WINDO
 OUTPUT_VAR = "CLAUDE_CODE_MAX_OUTPUT_TOKENS"
 
 
-def profile_env(family, model=None):
+def profile_env(family, model=None, window=None):
     """((name, value), ...) a seat's settings.json `env` carries for its
     launch profile, in order: the window the launch line stamps for `model`
     (both knobs), the output cap it stamps, then the family's `lite_env`.
     Values are strings, as the settings `env` map holds them. Empty for a
-    family whose profile pins nothing. `model` defaults to the family's."""
+    family whose profile pins nothing. `model` defaults to the family's.
+    `window` is the one an exact resume stamps (the recipe's, task/3695):
+    the pin outranks the stamp, so it must name the same number."""
     fam = FAMILIES.get(family) or {}
     if not launch_profile(family).get("pin_window"):
         return ()
     out = []
-    window = launch_window(fam, model or fam.get("model"))
+    window = window or launch_window(fam, model or fam.get("model"))
     if window:
         out += [(name, str(window)) for name in WINDOW_VARS]
     if fam.get("max_output_tokens"):
@@ -4694,10 +4971,9 @@ CODEX_MODEL_RULING = {
 # which `_unbacked_window_reason` bounds the pin by. Arms pin both readings to
 # these records.
 #
-# NOT RECORDED: ds4flash, whose OpenCode Go route publishes no window (the
-# family is not activatable, so nothing is taught one), and gpt-5.3-codex-spark,
-# which the codex route listing no longer carries (its 76000 is kept for
-# reading only, beside the other retired codex ids).
+# NOT RECORDED: gpt-5.3-codex-spark, which the codex route listing no longer
+# carries (its 76000 is kept for reading only, beside the other retired codex
+# ids).
 PUBLISHED_ROUTE_WINDOWS = {
     ("codex", "gpt-6.1-sol"): {
         "context_length": 272000,
@@ -4744,6 +5020,13 @@ PUBLISHED_ROUTE_WINDOWS = {
                   "(the raw model is 131072 on OpenRouter; this route caps "
                   "it lower)",
         "read": "2026-09-28"},
+    ("ds4flash", "deepseek-v4.1-flash"): {
+        "context_length": 1000000,
+        "route": "opencode-go",
+        "source": "models.dev api.json, OpenCode's own opencode-go provider: "
+                  "deepseek-v4.1-flash limit context 1000000, output 384000 "
+                  "(Go's /models lists ids only)",
+        "read": "2026-09-30"},
     ("cursor", "grok-4.7-high"): {
         "context_length": 256000,
         "route": "Cursor agent API (not an OpenRouter route)",

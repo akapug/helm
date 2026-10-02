@@ -61,11 +61,21 @@ class _ActPane(object):
                 if self.on_send is not None:
                     self.on_send(self, text, enter)
                 self.sent.append((text, enter))
+                if text == harness.END_OF_LINE and not enter:
+                    return
+                if text == "\x15" and not enter:
+                    # Ctrl+U: a TUI empties the line, unless it ingests no keys
+                    if not self.swallow_clear:
+                        self.composer = ""
+                    return
                 if not (enter and self.swallow_enter):
                     self.composer = "" if enter else self.composer + text
         pane = Pane()
         # An Enter the TUI never ingests: the composer keeps Helm's text.
         pane.swallow_enter = False
+        # A Ctrl+U it never ingests: Helm cannot take its line back out, so
+        # the line stays STRANDED for the census and `composers --submit`.
+        pane.swallow_clear = False
         return pane
 
 
@@ -96,6 +106,17 @@ class TheFinalCaptureIsTheLastWordTest(SeatsBase):
         seats.join(session=self.SID, seat=self.SEAT, cwd="/tmp/p")
         # The family has been healthy for a minute, as a watcher records it.
         self.health("HEALTHY", since=proxywatch._iso(time.time() - 60))
+
+    def test_cursor_move_does_not_change_the_line_before_clear(self):
+        from helm import harness
+        pane = _ActPane()
+        pane.composer = "GO"
+        pane.swallow_clear = True
+        state, detail = pane.clear_placed("h1", "GO", reads=1, interval=0)
+        self.assertEqual(pane.sent, [(harness.END_OF_LINE, False),
+                                     (harness.CLEAR_LINE, False)])
+        self.assertEqual(pane.composer, "GO")
+        self.assertEqual(state, harness.UNKNOWN, detail)
 
     def health(self, state, family="codex", since=None):
         """A watcher pass, COMPOSED by the watcher's own
@@ -491,17 +512,17 @@ class TheFinalCaptureIsTheLastWordTest(SeatsBase):
             self.SEAT, self.SID, room="main", door="recovery", attempt=fresh,
             key=self.key()).ok)
 
-    def test_submit_refuses_the_stranded_text_of_an_obsolete_act(self):  # noqa: VACUOUS_ASSERTION — the Enter count is asserted equal to the one the child pressed, the routed note to name the refusal, and submit to answer UNKNOWN obsolete
+    def test_submit_refuses_the_stranded_text_of_an_obsolete_act(self):  # noqa: VACUOUS_ASSERTION — the Enter count is asserted equal to the one the child pressed, the stranded composer and the empty row ledger, and submit to answer UNKNOWN obsolete
         """THE DOOR A REFUSAL POINTS AT REFUSES TOO. A child's Enter is
-        accounted obsolete and the TUI never ingests it, so Helm's text stays
-        in the composer; the recovery is refused and routed; and `helm seat
-        composers --submit` on that pane refuses the repeat."""
+        accounted obsolete and the TUI never ingests it, nor the Ctrl+U that
+        would take it back, so Helm's text stays in the composer; the recovery
+        is refused; and `helm seat composers --submit` on that pane refuses
+        the repeat."""
         from helm import composers, harness, resumeturn, tasks
         chat.post("@codex-41 an owed row", who="daria")
         _att, attempt = self.mint()
         pane = _ActPane()
-        pane.swallow_enter = True
-        notes = []
+        pane.swallow_enter = pane.swallow_clear = True
 
         def wall_and_back(p, text, enter):
             if enter and not [s for s in p.sent if s[1]]:
@@ -511,10 +532,6 @@ class TheFinalCaptureIsTheLastWordTest(SeatsBase):
 
         def reproved(_row, _adapter, action, **_kw):
             return action(pane, "h1", "re-proved h1"), None
-
-        def add(title, owner, **kw):
-            notes.append(kw.get("note"))
-            return {"id": kw.get("tid"), "title": title}, None
         with mock.patch.dict(os.environ, {
                 "HELM_RESUME_TURN_RECOVERY_PERSIST_S": "0",
                 "HELM_RESUME_TURN_RECOVERY_BACKOFF_S": "0",
@@ -524,8 +541,7 @@ class TheFinalCaptureIsTheLastWordTest(SeatsBase):
                            side_effect=reproved), \
                 mock.patch.object(resumeturn, "_await_or_withdraw",
                                   return_value=(False, "")), \
-                mock.patch.object(resumeturn, "_alert"), \
-                mock.patch.object(tasks, "add", side_effect=add):
+                mock.patch.object(resumeturn, "_alert"):
             mode, detail = resumeturn.child(
                 self.SEAT, self.SID, "GO", 0, adapter=pane,
                 record_key=self.key(), attempt=attempt, owed_room="main")
@@ -536,10 +552,9 @@ class TheFinalCaptureIsTheLastWordTest(SeatsBase):
             self.assertEqual(pane.composer, "GO",
                              "fixture: the text was not stranded")
             self.assertIn("OBSOLETE-AUTHORIZATION", detail)
-            self.assertEqual(len(notes), 1, "fixture: nothing was routed")
-            self.assertIn("will refuse it", notes[0],
-                          "the routed note still points the owner at "
-                          "--submit: %s" % notes[0])
+            self.assertEqual(
+                [r for r in tasks.rows() if r.startswith("task/resume-turn-")],
+                [], "the child filed a recovery row: %s" % detail)
             state, why = composers.submit("h1", adapter=pane)
         self.assertEqual([s for s in pane.sent if s[1]], enters,
                          "composers --submit pressed Enter for an obsolete "
@@ -988,19 +1003,17 @@ class TheFinalCaptureIsTheLastWordTest(SeatsBase):
     def _submit_after_the_child(self, attempt, move):
         """THE PRODUCER OF EVERY INJECTION A REPAIR TYPES, driven whole.
         `resumeturn.child` places "GO" for `attempt` into a pane whose TUI
-        ingests no Enter, fails its own recovery through its act door the
-        same way, and routes the held text. The TUI then ingests Enters again,
-        `move()` changes the world, and the owner runs `helm seat composers
-        --submit h1`. -> (state, detail, the Enters the submit pressed)."""
+        ingests no Enter and no Ctrl+U, fails its own recovery through its act
+        door the same way, and cannot take the line back out, so it stays
+        stranded. The TUI then ingests Enters again, `move()` changes the
+        world, and the owner runs `helm seat composers --submit h1`.
+        -> (state, detail, the Enters the submit pressed)."""
         from helm import composers, harness, resumeturn, tasks
         pane = _ActPane()
-        pane.swallow_enter = True
+        pane.swallow_enter = pane.swallow_clear = True
 
         def reproved(_row, _adapter, action, **_kw):
             return action(pane, "h1", "re-proved h1"), None
-
-        def add(title, owner, **kw):
-            return {"id": kw.get("tid"), "title": title}, None
         with mock.patch.dict(os.environ, {
                 "HELM_RESUME_TURN_RECOVERY_PERSIST_S": "0",
                 "HELM_RESUME_TURN_RECOVERY_BACKOFF_S": "0",
@@ -1011,14 +1024,16 @@ class TheFinalCaptureIsTheLastWordTest(SeatsBase):
                            side_effect=reproved), \
                 mock.patch.object(resumeturn, "_await_or_withdraw",
                                   return_value=(False, "")), \
-                mock.patch.object(resumeturn, "_alert"), \
-                mock.patch.object(tasks, "add", side_effect=add):
+                mock.patch.object(resumeturn, "_alert"):
             _mode, detail = resumeturn.child(
                 self.SEAT, self.SID, "GO", 0, adapter=pane,
                 record_key=self.key(), attempt=attempt, owed_room="main")
             self.assertEqual(pane.composer, "GO",
                              "fixture: the child did not strand its text: %s"
                              % detail)
+            self.assertEqual(
+                [r for r in tasks.rows() if r.startswith("task/resume-turn-")],
+                [], "the child filed a recovery row: %s" % detail)
             spent = len([s for s in pane.sent if s[1]])
             self.assertGreaterEqual(spent, 1, "fixture: the child pressed no "
                                               "Enter: %s" % detail)
@@ -1150,25 +1165,27 @@ class TheFinalCaptureIsTheLastWordTest(SeatsBase):
         self.assertEqual(state, harness.UNKNOWN, why)
         self.assertIn("resolve the held text by hand", why)
 
-    def _routed_then_asked(self, attempt, move=lambda: None, persist="0",
-                           in_recovery=None, repair=True):
-        """THE CHILD STRANDS AND ROUTES, THEN THE CENSUS AND THE SUBMIT ANSWER
-        FOR THE SAME PANE. `resumeturn.child` places "GO" into a pane whose
-        TUI ingests no Enter -- for `attempt` under this seat's repair key,
-        or, without `repair`, as the compaction leg under no authorization --
-        and routes the held text to a recovery task. `in_recovery()` runs as
-        the child enters its own recovery. The TUI then ingests Enters again,
-        `move()` changes the world, `helm seat composers` reads the pane, and
-        the owner runs `helm seat composers --submit h1`.
-        -> (the routed note, the census row for h1, the submit's state and
+    def _stranded_then_asked(self, attempt, move=lambda: None, persist="0",
+                             in_recovery=None, repair=True, keep=True):
+        """THE CHILD STRANDS, THEN THE CENSUS AND THE SUBMIT ANSWER FOR THE
+        SAME PANE. `resumeturn.child` places "GO" into a pane whose TUI
+        ingests no Enter -- for `attempt` under this seat's repair key, or,
+        without `repair`, as the compaction leg under no authorization. With
+        `keep` the TUI ingests no Ctrl+U either, so the child cannot take the
+        line back out and it stays stranded; without it the child takes it
+        back. `in_recovery()` runs as the child enters its own recovery. The
+        TUI then ingests Enters again, `move()` changes the world, `helm seat
+        composers` reads the pane, and the owner runs `helm seat composers
+        --submit h1`. No recovery row is ever filed (task/1818).
+        -> (the child's detail, the census row for h1, the submit's state and
         detail, the Enters the submit pressed)."""
         from helm import composers, harness, resumeturn, tasks
         pane = _ActPane()
-        pane.swallow_enter = True
+        pane.swallow_enter, pane.swallow_clear = True, keep
         pane.list = lambda: [{"handle": "h1", "title": self.SEAT,
                               "worktree": "/tmp/p",
                               "last_output_at": time.time()}]
-        notes, entered = [], []
+        entered = []
         real_recover = resumeturn.recover_injection
 
         def recover(*args, **kwargs):
@@ -1180,9 +1197,6 @@ class TheFinalCaptureIsTheLastWordTest(SeatsBase):
         def reproved(_row, _adapter, action, **_kw):
             return action(pane, "h1", "re-proved h1"), None
 
-        def add(title, owner, **kw):
-            notes.append(kw.get("note"))
-            return {"id": kw.get("tid"), "title": title}, None
         authority = ({"record_key": self.key(), "attempt": attempt,
                       "owed_room": "main"} if repair else {})
         with mock.patch.dict(os.environ, {
@@ -1195,23 +1209,23 @@ class TheFinalCaptureIsTheLastWordTest(SeatsBase):
                            side_effect=reproved), \
                 mock.patch.object(resumeturn, "_await_or_withdraw",
                                   return_value=(False, "")), \
-                mock.patch.object(resumeturn, "_alert"), \
-                mock.patch.object(tasks, "add", side_effect=add):
+                mock.patch.object(resumeturn, "_alert"):
             with mock.patch.object(resumeturn, "recover_injection",
                                    side_effect=recover):
                 _mode, detail = resumeturn.child(
                     self.SEAT, self.SID, "GO", 0, adapter=pane, **authority)
-            self.assertEqual(pane.composer, "GO",
-                             "fixture: the child did not strand its text: %s"
-                             % detail)
-            self.assertEqual(len(notes), 1,
-                             "fixture: the child routed %d recovery tasks: %s"
-                             % (len(notes), detail))
+            self.assertEqual(pane.composer, "GO" if keep else "",
+                             "fixture: the child %s its text: %s"
+                             % ("did not strand" if keep else "left", detail))
+            self.assertEqual(
+                [r for r in tasks.rows() if r.startswith("task/resume-turn-")],
+                [], "the child filed a recovery row: %s" % detail)
             injection = resumeturn.recorded_injections(
                 include_expired=True).get("h1") or {}
-            self.assertEqual(bool(injection.get("account_key")), repair,
-                             "fixture: the record's authority is not the "
-                             "leg's: %r" % (injection,))
+            if keep:
+                self.assertEqual(bool(injection.get("account_key")), repair,
+                                 "fixture: the record's authority is not "
+                                 "the leg's: %r" % (injection,))
             pane.swallow_enter = False
             move()
             rows, err = composers.scan(adapter=pane)
@@ -1221,69 +1235,61 @@ class TheFinalCaptureIsTheLastWordTest(SeatsBase):
                              "fixture: the census did not read h1: %r" % rows)
             spent = len([s for s in pane.sent if s[1]])
             state, why = composers.submit("h1", adapter=pane)
-        return (notes[0], census[0], state, why,
+        return (detail, census[0], state, why,
                 [s for s in pane.sent if s[1]][spent:])
 
-    def test_a_strand_past_its_horizon_is_not_routed_to_a_submit_that_refuses(self):  # noqa: VACUOUS_ASSERTION — the note is asserted to name the horizon refusal and to say --submit will refuse, and the Enter list is paired with the submit's kind asserted EQUAL to stale
+    def test_a_strand_past_its_horizon_is_taken_back_not_routed(self):  # noqa: VACUOUS_ASSERTION — the child's detail is asserted to name the horizon refusal and the cleared line, and the census row is asserted EQUAL to clear
         """A HORIZON THAT PASSES WHILE THE CHILD WAITS OUT PERSISTENCE ENDS
         THAT ATTEMPT FOR GOOD. The child types inside the horizon, the horizon
         passes during its persistence wait, and its own recovery is refused as
-        stale. The recovery task it writes must not send the owner to `helm
-        seat composers --submit`, which refuses the same attempt and always
-        will; it says so and sends the owner to the pane.
+        stale. That line can never be submitted, so the child takes it back
+        out of the composer; nothing is left for the owner to find, and no
+        row sends him to a --submit that refuses.
 
         The horizon falls 0.4s after the mint and the persistence wait is
         0.5s, the 4:5 the arm always had: the child types inside the horizon
         and the horizon passes before its wait ends."""
-        from helm import resumeturn
+        from helm import composers, harness, resumeturn
         chat.post("@codex-41 an owed row", who="daria")
         born = time.time() - resumeturn._debounce_s() + 0.4
         _att, attempt = self.mint(since=born - 1, born=born)
-        note, _row, _state, why, enters = self._routed_then_asked(
-            attempt, persist="0.5")
-        self.assertIn("launch horizon", note,
+        detail, row, state, why, enters = self._stranded_then_asked(
+            attempt, persist="0.5", keep=False)
+        self.assertIn("launch horizon", detail,
                       "fixture: the child's own recovery was not refused past "
-                      "the horizon: %s" % note)
-        self.assertNotIn("Only if that later reading reports helm-stranded",
-                         note,
-                         "the recovery task sends the owner to a --submit that "
-                         "refuses an attempt past its horizon: %s" % note)
-        self.assertIn("will refuse it", note, note)
-        self.assertIn("resolve the held text by hand", note, note)
+                      "the horizon: %s" % detail)
+        self.assertIn("Helm's own line cleared", detail, detail)
+        self.assertEqual(row["state"], composers.CLEAR, row)
         self.assertEqual(enters, [], why)
-        self.assertEqual(getattr(why, "kind", None), "stale", why)
+        self.assertEqual(state, harness.UNKNOWN, why)
 
-    def test_a_strand_whose_attempt_retired_in_the_childs_recovery_is_not_routed_to_submit(self):  # noqa: VACUOUS_ASSERTION — the note is asserted to name the retirement and to say --submit will refuse, and the Enter list is paired with the submit's kind asserted EQUAL to stale
-        """THE SAME NOTE WHEN THE ACT DOOR OF THE CHILD'S OWN RECOVERY REFUSES.
+    def test_a_strand_whose_attempt_retired_in_the_childs_recovery_is_taken_back(self):  # noqa: VACUOUS_ASSERTION — the child's detail is asserted to name the retirement and the cleared line, and the census row is asserted EQUAL to clear
+        """THE SAME WHEN THE ACT DOOR OF THE CHILD'S OWN RECOVERY REFUSES.
         The attempt is current when the child enters its recovery and retired
-        by the time the recovery's door re-reads it; the task that recovery
-        routes must not point at a --submit that refuses it too."""
-        from helm import beacons
+        by the time the recovery's door re-reads it; the child takes its line
+        back out."""
+        from helm import beacons, composers, harness
         chat.post("@codex-41 an owed row", who="daria")
         att, attempt = self.mint()
         minted = []
 
         def retire():
             minted.append(beacons.install_repair(self.SEAT, att, time.time()))
-        note, _row, _state, why, enters = self._routed_then_asked(
-            attempt, in_recovery=retire)
+        detail, row, state, why, enters = self._stranded_then_asked(
+            attempt, in_recovery=retire, keep=False)
         self.assertEqual(len(minted), 1,
                          "fixture: the child never entered its own recovery")
         self.assertNotIn(minted[0], (None, attempt),
                          "fixture: no newer attempt was minted")
-        self.assertIn("retired", note,
+        self.assertIn("retired", detail,
                       "fixture: the child's own recovery was not refused for "
-                      "the retired attempt: %s" % note)
-        self.assertNotIn("Only if that later reading reports helm-stranded",
-                         note,
-                         "the recovery task sends the owner to a --submit that "
-                         "refuses a retired attempt: %s" % note)
-        self.assertIn("will refuse it", note, note)
-        self.assertIn("resolve the held text by hand", note, note)
+                      "the retired attempt: %s" % detail)
+        self.assertIn("Helm's own line cleared", detail, detail)
+        self.assertEqual(row["state"], composers.CLEAR, row)
         self.assertEqual(enters, [], why)
-        self.assertEqual(getattr(why, "kind", None), "stale", why)
+        self.assertEqual(state, harness.UNKNOWN, why)
 
-    def test_the_census_does_not_call_a_retired_attempts_strand_eligible(self):  # noqa: VACUOUS_ASSERTION — the same census row's why is asserted to carry the retirement and the will-refuse sentence, and test_a_current_attempts_strand_is_routed_to_submit_and_called_eligible reads that row as eligible
+    def test_the_census_does_not_call_a_retired_attempts_strand_eligible(self):  # noqa: VACUOUS_ASSERTION — the same census row's why is asserted to carry the retirement and the will-refuse sentence, and test_a_current_attempts_strand_is_called_eligible_and_submitted reads that row as eligible
         """THE CENSUS SAYS WHAT THE DOOR WILL SAY. A newer attempt retires the
         one that typed the held text; `helm seat composers` must not call that
         strand eligible for a --submit that refuses it, and it names why and
@@ -1295,7 +1301,7 @@ class TheFinalCaptureIsTheLastWordTest(SeatsBase):
 
         def retire():
             minted.append(beacons.install_repair(self.SEAT, att, time.time()))
-        _note, row, _state, why, enters = self._routed_then_asked(
+        _detail, row, _state, why, enters = self._stranded_then_asked(
             attempt, move=retire)
         self.assertNotIn(minted[0], (None, attempt),
                          "fixture: no newer attempt was minted")
@@ -1336,7 +1342,7 @@ class TheFinalCaptureIsTheLastWordTest(SeatsBase):
 
         def run():
             try:
-                box["value"] = self._routed_then_asked(attempt, move=fifo_roster)
+                box["value"] = self._stranded_then_asked(attempt, move=fifo_roster)
             except BaseException as e:      # noqa: BLE001 — re-raised below
                 box["error"] = e
         t = threading.Thread(target=run, daemon=True)
@@ -1355,37 +1361,33 @@ class TheFinalCaptureIsTheLastWordTest(SeatsBase):
                       "at %s" % path)
         if "error" in box:
             raise box["error"]
-        _note, row, _state, why, enters = box["value"]
+        _detail, row, _state, why, enters = box["value"]
         self.assertEqual(row["state"], composers.HELM_STRANDED, row)
         self.assertNotIn("eligible", row["why"], row["why"])
         self.assertIn("could not be re-read", row["why"], row["why"])
         self.assertEqual(enters, [], why)
         self.assertEqual(getattr(why, "kind", None), "unknown", why)
 
-    def test_a_current_attempts_strand_is_routed_to_submit_and_called_eligible(self):
-        """THE CONTROL for the three above, on the same producer: the attempt
-        is still current, so the task sends the owner to --submit, the census
-        calls the strand eligible, and --submit recovers it with one Enter."""
+    def test_a_current_attempts_strand_is_called_eligible_and_submitted(self):
+        """THE CONTROL for the arms above, on the same producer: the attempt
+        is still current, so the census calls the strand eligible, and
+        --submit recovers it with one Enter."""
         from helm import composers, harness
         chat.post("@codex-41 an owed row", who="daria")
         _att, attempt = self.mint()
-        note, row, state, why, enters = self._routed_then_asked(attempt)
-        self.assertIn("Only if that later reading reports helm-stranded run "
-                      "`helm seat composers --submit h1`", note, note)
+        _detail, row, state, why, enters = self._stranded_then_asked(attempt)
         self.assertEqual(row["state"], composers.HELM_STRANDED, row)
         self.assertIn("eligible for guarded bare-Enter recovery", row["why"])
         self.assertEqual(enters, [("", True)], why)
         self.assertEqual(state, harness.DELIVERED, why)
 
-    def test_a_compaction_strand_keeps_its_submit_note_and_eligible_wording(self):
+    def test_a_compaction_strand_keeps_its_eligible_wording(self):
         """THE CONTROL for a record typed under no authorization: the
-        compaction leg's strand keeps the payload-only wording in the task and
-        the census, and --submit recovers it with one Enter."""
+        compaction leg's strand keeps the payload-only wording in the census,
+        and --submit recovers it with one Enter."""
         from helm import composers, harness
-        note, row, state, why, enters = self._routed_then_asked(
+        _detail, row, state, why, enters = self._stranded_then_asked(
             None, repair=False)
-        self.assertIn("Only if that later reading reports helm-stranded run "
-                      "`helm seat composers --submit h1`", note, note)
         self.assertEqual(row["state"], composers.HELM_STRANDED, row)
         self.assertEqual(row["why"], "composer exactly matches a persistent "
                          "Helm injection and is eligible for guarded "

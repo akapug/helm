@@ -228,19 +228,33 @@ class StopGuardDelegationTest(SeatsBase):
             pass
 
     def test_interval_sampling_allows_subagent_between_tool_calls(self):
+        # THE CHILD LEAVES WHEN THE TEST SAYS SO, NOT AFTER 0.5 s. The arm is
+        # about the guard SAMPLING a child that is still in the room, and a
+        # fixed sleep made that a race: on a loaded host the guard ran after
+        # the child had already chdir'd away, found no evidence, and refused
+        # (measured: rc 2 with 'no evidence', while the same arm passes alone).
+        # A gate file removes the race without weakening what is asserted --
+        # the guard still has to find a LIVE child in self.wt to pass.
         seats.claim(self.res, "alice", ttl=120, session=self.sid)
+        gate = os.path.join(self.tmp, "leave")
         sub = self.spawn(self.root, mark=self.sid, argv=(
             "python3", "-c",
-            "import os, time; os.chdir('%s'); open('%s/ready', 'w').close(); time.sleep(0.5); os.chdir('%s'); time.sleep(300)"
-            % (self.wt, self.tmp, self.tmp)))
+            "import os, time; os.chdir('%s'); open('%s/ready', 'w').close();"
+            "\nwhile not os.path.exists('%s'): time.sleep(0.01)"
+            "\nos.chdir('%s'); time.sleep(300)"
+            % (self.wt, self.tmp, gate, self.tmp)))
         self.settle(sub.pid, self.wt, mark=self.sid)
         # First stop-guard call records process activity in self.wt
         rc, _o, err = self.guard({"session_id": self.sid})
         self.assertEqual(rc, 0, err)
         self.assertIn("live delegated build", err)
 
-        # Wait for sub's cwd to move away from self.wt (simulating between-tool-calls state)
-        for _ in range(100):
+        # RELEASE THE CHILD, then wait for its cwd to move away (simulating
+        # the between-tool-calls state). The wait below is the assertion's
+        # own; the point is that the guard above ran while the child was
+        # provably still in the room.
+        open(gate, "w").close()
+        for _ in range(400):
             try:
                 if os.path.realpath("/proc/%d/cwd" % sub.pid) != os.path.realpath(self.wt):
                     break
@@ -979,15 +993,21 @@ class StopGuardDelegationTest(SeatsBase):
 
     def test_interval_sampling_refuses_recycled_or_expired_pid(self):
         seats.claim(self.res, "alice", ttl=120, session=self.sid)
+        # THE CHILD HOLDS THE ROOM UNTIL THE FIRST GUARD HAS RUN (see the
+        # sibling arm): a fixed 0.5 s made the first assertion a race on a
+        # loaded host, where the child exited before the guard sampled it.
+        gate = os.path.join(self.tmp, "leave")
         sub = self.spawn(self.root, mark=self.sid, argv=(
             "python3", "-c",
-            "import os, time; os.chdir('%s'); open('%s/ready', 'w').close(); time.sleep(0.5)"
-            % (self.wt, self.tmp)))
+            "import os, time; os.chdir('%s'); open('%s/ready', 'w').close();"
+            "\nwhile not os.path.exists('%s'): time.sleep(0.01)"
+            % (self.wt, self.tmp, gate)))
         self.settle(sub.pid, self.wt, mark=self.sid)
         rc, _o, err = self.guard({"session_id": self.sid})
         self.assertEqual(rc, 0, err)
 
-        # Wait for sub process to exit completely
+        # Let it exit completely; the SECOND guard must now refuse.
+        open(gate, "w").close()
         sub.wait()
         for _ in range(50):
             if not seats._is_pid_alive(sub.pid):

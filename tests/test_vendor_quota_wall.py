@@ -39,7 +39,9 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from helm import burnflags as bf  # noqa: E402
+from helm import poolwall  # noqa: E402
 from helm import proxywatch  # noqa: E402
+from helm import seat  # noqa: E402,F401 — the facade first (seat_compat)
 
 KIMI_MESSAGE = "You've reached your weekly (7-day) usage limit"
 KIMI_403 = json.dumps({"type": "error", "error": {
@@ -385,6 +387,28 @@ class VendorQuotaWallTest(unittest.TestCase):
         self.assertEqual(proxywatch._upstream_state(
             429, KIMI_MESSAGE, origin="local"), "PROXY-COOLDOWN")
 
+    def test_the_wall_names_its_repair_by_the_refusals_kind(self):  # noqa: VACUOUS_ASSERTION — each record's own repair sentence is positively asserted before the other kind's sentence is asserted absent from it
+        """A spent WINDOW lifts at the vendor's reset; an empty BALANCE has
+        no reset and lifts only on a top-up. The kind is the one poolwall
+        already reads off the vendor's words (a signature with no timed
+        reset, or the balance words)."""
+        deepseek = json.dumps({"error": {"message": "Insufficient Balance",
+                                         "type": "unknown_error"}})
+        balance = self._record(*_canary(402, deepseek)[:2])
+        self.assertEqual(balance["quota_wall"], "QUOTA-WALL")
+        self.assertEqual(proxywatch.quota_wall_kind(balance), "balance")
+        text = bf.derive_quota_wall("kimi", balance)["cause"]
+        self.assertIn("top-up", text)
+        self.assertIn("no reset to wait for", text)
+        self.assertNotIn("a wait for its reset", text)
+        self.assertEqual(bf.derive_quota_wall("kimi", balance)["cause_id"],
+                         "money:vendor-quota-wall")
+        window = self._record(*_canary(403, KIMI_403)[:2])
+        self.assertEqual(proxywatch.quota_wall_kind(window), "window")
+        text = bf.derive_quota_wall("kimi", window)["cause"]
+        self.assertIn("a wait for its reset", text)
+        self.assertNotIn("top-up", text)
+
     # ------------------------------------------------------------ arm 2
 
     def test_a_genuine_401_invalid_or_expired_stays_auth_on_reach(self):
@@ -636,6 +660,218 @@ class VendorQuotaWallTest(unittest.TestCase):
         self.assertEqual(detail, "HTTP 403 — %s" % near)
         self.assertEqual(self._record(state, detail)["resets_at_ms"],
                          int(proxywatch._parse_timestamp(at) * 1000))
+
+
+# ------------------------------------------------------------ arm 10
+#: The measured gemini seat: Google's own 429 through the
+#: antigravity provider, then the proxy cooling the credential and renewing
+#: the cooldown on every retry. Copied from the seat's proxy.log.
+GOOGLE_EXHAUSTED = "Resource has been exhausted (e.g. check quota)."
+GEMINI_POOL = ("no available credential for gemini-3.8-flash-high via "
+               "provider antigravity: 1 cooling down (reset in %s)")
+
+
+def _log_row(at, code, message=None, origin="local"):
+    """One proxy.log request row in the fork's shape (tests/test_poolwall)."""
+    head = ('[%s] [abcdef12] [warn ] [gin_logger.go:159] %d |            2ms '
+            '|       127.0.0.1 | POST    "/v1/messages?beta=true"' % (
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(at)), code))
+    if message is None:
+        return head
+    body = json.dumps({"type": "error", "error": {
+        "type": "rate_limit_error", "message": message}},
+        separators=(",", ":")).replace('"', '\\"')
+    return '%s | refusal_origin_v1=%s | response_body="%s"' % (
+        head, origin, body)
+
+
+class VendorCausedCooldownTest(unittest.TestCase):
+    """A PROXY-COOLDOWN THE VENDOR CAUSED IS THE VENDOR'S WALL.
+
+    MEASURED: the gemini flag read "the family is dark in
+    a cooldown WE imposed (PROXY-COOLDOWN); the repair is a restart and then
+    a probe, not a wait". The proxy cooled its credential because Google
+    refused it on quota (HTTP 429 "Resource has been exhausted"), and the
+    canary only ever met the proxy's own 429, so no QUOTA-WALL was measured
+    and none was held. The cause was in the seat's proxy.log, where poolwall
+    already reads it. A restart re-asks the same spent window.
+
+    These arms drive the real log reader, the real pass composition, the real
+    durable record and the real burn fold."""
+
+    SEAT = FAMILY = "gemini"
+
+    def setUp(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        env = mock.patch.dict(os.environ, {
+            "HELM_HOME": os.path.join(td.name, "helm-home"),
+            "HELM_CHAT_DIR": os.path.join(td.name, "chat")})
+        env.start()
+        self.addCleanup(env.stop)
+        resets = mock.patch.object(
+            proxywatch, "_vendor_resets_path",
+            return_value=os.path.join(td.name, "vendor-resets.json"))
+        resets.start()
+        self.addCleanup(resets.stop)
+        self.now = time.time()
+        self.assertIn(self.FAMILY, bf.families())
+
+    def _log(self, *rows):
+        path = poolwall.log_path(self.FAMILY, self.SEAT)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("\n".join(rows) + "\n")
+
+    def _pass(self, held=None):
+        """One proxywatch pass over the live-shaped prior record (dark in
+        PROXY-COOLDOWN past its falsification bar, no quota_wall unless
+        ``held`` plants one on the seat, a verified proxy identity) ->
+        (seat record, durable family record, flag)."""
+        since = proxywatch._iso(self.now - 1000)
+        birth = "proc:185084605"
+        seat_before = {"state": "PROXY-COOLDOWN", "dark": True,
+                       "since": since, "falsification_observed_at": since,
+                       "falsification_proxy_identity": birth,
+                       "falsification_identity_state": "VERIFIED"}
+        seat_before.update(held or {})
+        prior = {"upstream": {self.FAMILY: {
+            "state": "PROXY-COOLDOWN", "dark": True, "since": since,
+            "seats": {self.SEAT: seat_before}}}}
+        body = json.dumps({"type": "error", "error": {
+            "type": "rate_limit_error",
+            "message": GEMINI_POOL % "4m2s"}})
+        reading = (("PROXY-COOLDOWN", "HTTP 429 — " + body, 12), birth,
+                   "VERIFIED")
+        with mock.patch.object(proxywatch, "_seat_canary_observation",
+                               return_value=reading):
+            current = proxywatch.upstream_health(
+                [{"seat": self.SEAT, "family": self.FAMILY,
+                  "probe": "healthy"}], now=self.now, prior=prior)
+        upstream, err = proxywatch._compose_upstream_records(
+            {"ts": self.now, "upstream": current}, prior["upstream"])
+        self.assertIsNone(err, err)
+        record = upstream[self.FAMILY]
+        flag = bf.fold({"upstream": {self.FAMILY: record}},
+                       now=self.now)["families"][self.FAMILY]
+        return record["seats"][self.SEAT], record, flag, upstream
+
+    def _cooling(self, start):
+        """The proxy's renewals after ``start``: its own 429, minute by
+        minute, the last one ahead of the clock."""
+        return [_log_row(self.now - 60 * k, 429, GEMINI_POOL % "4m2s")
+                for k in range(start, -1, -1)]
+
+    def test_the_vendor_caused_cooldown_reads_as_the_vendors_wall(self):  # noqa: VACUOUS_ASSERTION — the held wall, its provenance and the vendor-quota-wall flag are positively asserted first; the absent OURS wording is the contract, and the control arm asserts that same wording present
+        self._log(_log_row(self.now - 2000, 200),
+                  _log_row(self.now - 1990, 429, GOOGLE_EXHAUSTED,
+                           origin="unknown"),
+                  *self._cooling(30))
+        seat, record, flag, upstream = self._pass()
+        self.assertEqual((seat["state"], seat["dark"]),
+                         ("PROXY-COOLDOWN", True))
+        self.assertEqual(seat["quota_wall"], "QUOTA-WALL")
+        self.assertEqual(seat["refusal_provenance"],
+                         "proxy-log:antigravity:window")
+        self.assertEqual(record["quota_wall"], "QUOTA-WALL")
+        self.assertEqual(proxywatch.quota_wall(record), "QUOTA-WALL")
+        self.assertTrue(flag["cause_id"].endswith(":vendor-quota-wall"),
+                        flag)
+        self.assertEqual(flag["colour"], bf.RED)
+        self.assertIn("the vendor refused on its usage quota", flag["cause"])
+        self.assertIn("mirrors it", flag["cause"])
+        self.assertIn("a wait for its reset", flag["cause"])
+        self.assertNotIn("top-up", flag["cause"])
+        reach = bf.derive_reach(self.FAMILY, record, now=self.now)
+        for text in (flag["cause"], (reach or {}).get("cause") or ""):
+            self.assertNotIn("WE imposed", text)
+            self.assertNotIn("a restart", text)
+        # the restart verdict asks the same question and gets the same answer
+        from helm import seat_lifecycle
+        rem = seat_lifecycle.upstream_remediation(
+            {"upstream": upstream}, self.FAMILY, self.SEAT)
+        self.assertNotEqual(rem["restart"], seat_lifecycle.RESTART_HELPFUL)
+        self.assertIn("vendor", rem["evidence"])
+
+    def test_a_held_wall_whose_reset_has_passed_mirrors_nothing(self):  # noqa: VACUOUS_ASSERTION — the future-reset control positively asserts the family wall, the vendor flag and NOT_HELPFUL on the same observables first
+        # A canary-measured wall held by the cooldown, its recorded vendor
+        # reset now past: the vendor may answer again, so the cooldown is
+        # ours again and a restart is worth asking about, as on main.
+        def held(reset_ms):
+            return {"quota_wall": "QUOTA-WALL", "refusal_class": "money",
+                    "refusal_provenance": "body-signature:quota",
+                    "refusal_kind": "window", "resets_at_ms": reset_ms,
+                    "reset_kind": "vendor", "reset_source": "canary",
+                    "wall_observed_at": proxywatch._iso(self.now - 7200)}
+        from helm import seat_lifecycle
+        # CONTROL: a future reset still mirrors the vendor's wall
+        _seat, record, flag, upstream = self._pass(
+            held(int((self.now + 3600) * 1000)))
+        self.assertEqual(record["quota_wall"], "QUOTA-WALL")
+        self.assertTrue(flag["cause_id"].endswith(":vendor-quota-wall"),
+                        flag)
+        self.assertEqual(seat_lifecycle.upstream_remediation(
+            {"upstream": upstream}, self.FAMILY, self.SEAT)["restart"],
+            seat_lifecycle.RESTART_NOT_HELPFUL)
+        past = int((self.now - 60) * 1000)
+        seat, record, flag, upstream = self._pass(held(past))
+        self.assertEqual(seat["resets_at_ms"], past)
+        self.assertNotIn("quota_wall", record)
+        self.assertFalse(flag["cause_id"].endswith(":vendor-quota-wall"),
+                         flag)
+        self.assertNotEqual(seat_lifecycle.upstream_remediation(
+            {"upstream": upstream}, self.FAMILY, self.SEAT)["restart"],
+            seat_lifecycle.RESTART_NOT_HELPFUL)
+        self.assertIsNone(proxywatch.live_quota_wall(seat, self.now * 1000))
+
+    def test_an_empty_balance_behind_the_cooldown_names_a_top_up(self):  # noqa: VACUOUS_ASSERTION — the held wall, its balance provenance and the top-up sentence are positively asserted first; the absent reset wording is the contract
+        # MEASURED on ds4pro: the upstream answered 402 Insufficient Balance
+        # and the pool cooled its credential behind it
+        self._log(_log_row(self.now - 2000, 200),
+                  _log_row(self.now - 1990, 402,
+                           "Insufficient Balance (request_id: 33b86a8b)",
+                           origin="unknown"),
+                  *self._cooling(30))
+        seat, record, flag, upstream = self._pass()
+        self.assertEqual(seat["quota_wall"], "QUOTA-WALL")
+        self.assertEqual(seat["refusal_provenance"],
+                         "proxy-log:deepseek:balance")
+        self.assertEqual(proxywatch.quota_wall_kind(record), "balance")
+        self.assertTrue(flag["cause_id"].endswith(":vendor-quota-wall"),
+                        flag)
+        self.assertIn("top-up", flag["cause"])
+        self.assertNotIn("a wait for its reset", flag["cause"])
+        self.assertNotIn("WE imposed", flag["cause"])
+        from helm import seat_lifecycle
+        rem = seat_lifecycle.upstream_remediation(
+            {"upstream": upstream}, self.FAMILY, self.SEAT)
+        self.assertEqual(rem["restart"], seat_lifecycle.RESTART_NOT_HELPFUL)
+        self.assertIn("top-up", rem["action"])
+
+    def test_a_cooldown_with_no_vendor_cause_stays_ours(self):
+        # CONTROL: the same renewals after a completed request, with no
+        # vendor refusal between them, are the proxy's own cooldown
+        self._log(_log_row(self.now - 2000, 200), *self._cooling(30))
+        seat, record, flag, upstream = self._pass()
+        self.assertEqual(seat["state"], "PROXY-COOLDOWN")
+        self.assertNotIn("quota_wall", seat)
+        self.assertNotIn("quota_wall", record)
+        self.assertEqual((flag["cause_id"], flag["colour"]),
+                         ("reach:our-cooldown", bf.ORANGE))
+        self.assertIn("WE imposed", flag["cause"])
+        from helm import seat_lifecycle
+        self.assertEqual(seat_lifecycle.upstream_remediation(
+            {"upstream": upstream}, self.FAMILY, self.SEAT)["restart"],
+            seat_lifecycle.RESTART_HELPFUL)
+
+    def test_an_unreadable_log_keeps_the_cooldown_ours(self):  # noqa: VACUOUS_ASSERTION — the dark PROXY-COOLDOWN seat and the reach:our-cooldown flag are positively asserted on the same pass; the absent wall is the fail-toward-loud contract
+        # FAIL TOWARD LOUD: no log, no vendor cause, the current reading
+        self.assertFalse(os.path.exists(
+            poolwall.log_path(self.FAMILY, self.SEAT)))
+        seat, record, flag, _upstream = self._pass()
+        self.assertEqual(seat["state"], "PROXY-COOLDOWN")
+        self.assertNotIn("quota_wall", record)
+        self.assertEqual(flag["cause_id"], "reach:our-cooldown")
 
 
 if __name__ == "__main__":

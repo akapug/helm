@@ -145,8 +145,8 @@ TOP_SEATS_S = 3 * 3600
 TOP_SEATS = 3
 TOP_SEAT_MIN_SHARE = 0.05
 WALL_KEEP_S = 86400
-ROOM = "helm"
-WHO = "proxywatch"
+#: The seatevents component a codex wall and its reset belong to.
+COMPONENT = "credentials"
 
 
 def _state_dir():
@@ -959,7 +959,8 @@ def wall_events(rows, reading, requests, now):
                    still_open, len(rows),
                    (" " + runway[:1].upper() + runway[1:] + ".")
                    if runway else ""))
-        events.append({"member": key, "reset_at": reset, "body": body})
+        events.append({"member": key, "reset_at": reset, "body": body,
+                       "label": label, "window": w.get("label") or "longest"})
     return events
 
 
@@ -971,11 +972,34 @@ def _same_wall(rec, event):
 
 
 def _post(body, post):
+    """The room leg: #seats, @mentioning the credentials steward
+    (seatevents, task/3876). It was #helm, addressed to nobody."""
     if post is None:
-        from . import chat
-        chat.post(body, who=WHO, room=ROOM)
+        from . import seatevents
+        seatevents.post(COMPONENT, body)
     else:
         post(body)
+
+
+def _resets(ledger, now):
+    """Queue one RESET line for each announced wall whose reset instant has
+    passed: the wall's episode closes, and the steward hears the account is
+    open again. Its own record, so a new wall on the same account cannot
+    replace it before it is delivered. It rides no phone push: none existed
+    for a reset."""
+    for member in [m for m in ledger if "|" not in m]:
+        rec = ledger[member]
+        reset = _num(rec.get("reset_at"))
+        if not rec.get("chat") or rec.get("reset") or reset is None \
+                or reset > now:
+            continue
+        rec["reset"] = True
+        ledger[member + "|reset"] = {
+            "reset_at": reset, "claimed_at": now, "chat": False, "push": True,
+            "body": "codex RESET: %s's %s window reset at %s; its wall is "
+                    "over and its seats can take work again."
+                    % (rec.get("label") or "an account",
+                       rec.get("window") or "longest", _local(reset))}
 
 
 def _push(body, push, member):
@@ -1008,15 +1032,19 @@ def announce(events, now=None, post=None, push=None, path=None):
                 if not isinstance(rec, dict) or \
                         (_num(rec.get("reset_at")) or 0) < now - WALL_KEEP_S:
                     ledger.pop(member)
+            _resets(ledger, now)
             for event in events or ():
                 rec = ledger.get(event["member"])
                 if rec and _same_wall(rec, event):
                     continue
                 ledger[event["member"]] = {
                     "reset_at": event["reset_at"], "claimed_at": now,
-                    "body": event["body"], "chat": False, "push": False}
+                    "body": event["body"], "label": event.get("label"),
+                    "window": event.get("window"), "chat": False,
+                    "push": False}
             pk.write_json(target, ledger)
-            for member in sorted(ledger):
+            for member in sorted(ledger, key=lambda m: (
+                    _num(ledger[m].get("reset_at")) or 0, m)):
                 rec = ledger[member]
                 if not rec.get("chat"):
                     try:

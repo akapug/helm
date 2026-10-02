@@ -612,9 +612,8 @@ class SeatTest(unittest.TestCase):
         proxy 8315, the bridge on 18315, grok-4.7-high behind the alias the
         owner named (`cursor`), and the keyless placeholder as the one key.
         launch.sh points claude at 8315 with the same alias, and teaches the
-        110000 context_budget narrowed from the 225000 max_context
-        (task/3652), which itself is derived from Cursor's 256000 probe
-        (task/3616)."""
+        225000 max_context derived from Cursor's 256000 probe (task/3616),
+        no longer narrowed by a context_budget (task/3816)."""
         from helm import seat_catalog
         live = self._CURSOR_LIVE
         rc, out, err = self._add(("add", "cursor"))  # noqa: SEAT_NAME — the catalog FAMILY key the mint verb takes
@@ -635,7 +634,7 @@ class SeatTest(unittest.TestCase):
         for word in ("ANTHROPIC_BASE_URL=http://127.0.0.1:%d" % live["port"],
                      "CLAUDE_CODE_SUBAGENT_MODEL=cursor",
                      "HELM_MODEL_FAMILY=cursor",
-                     "CLAUDE_CODE_MAX_CONTEXT_TOKENS=110000",
+                     "CLAUDE_CODE_MAX_CONTEXT_TOKENS=225000",
                      "--model cursor"):
             self.assertIn(word, launch)
         # NO TRAFFIC SWITCH ON ANY SEAT: either one takes Monitor out of the
@@ -1399,6 +1398,91 @@ class SeatTest(unittest.TestCase):
         self.assertEqual(again["env"]["CLAUDE_CODE_MAX_OUTPUT_TOKENS"], cap)
         self.assertNotIn("CLAUDE_CODE_MAX_OUTPUT_TOKENS",
                          again["helm"]["seeded_env"])
+
+    def _reminted_lite(self, recipe=None):
+        """A minted lite family's launch assets written again, as an exact
+        resume writes them when `recipe` carries the window it ran with;
+        -> (settings env, launch.sh text)."""
+        lite, canon = self._mint_lite()
+        family = lite[0]
+        d = seat.seat_dir(family)
+        with mock.patch.dict(os.environ, {"HELM_MCPS_CANONICAL": canon}):
+            self.assertIsNot(seat._write_launch_assets(
+                family, d, None, family, recipe=recipe),
+                seat._SEAT_SURFACE_REFUSED)
+        with open(os.path.join(d, "claude", "settings.json")) as f:
+            env = json.load(f)["env"]
+        with open(os.path.join(d, "launch.sh")) as f:
+            return family, env, f.read()
+
+    def test_an_exact_resume_pins_the_window_it_ran_with(self):
+        """A lite seat's settings.json `env` pin OUTRANKS the launch stamp
+        (envtidy.seat_stamp), so an exact resume that stamps the window the
+        seat ran with must pin that window too, or the process runs on the
+        catalog's. MUTATION: seed the pin from the catalog on an exact
+        resume — launch.sh says one window and the seat runs another."""
+        family = self._lite_families()[0]
+        fam = seat.FAMILIES[family]
+        ran = seat_catalog.launch_window(fam, fam["model"]) - 8192
+        _family, env, text = self._reminted_lite({"window": ran})
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=%d" % ran, text)
+        for name in seat_catalog.WINDOW_VARS:
+            self.assertEqual(env[name], str(ran), name)
+
+    def test_every_lite_family_pins_a_recipe_window_below_its_catalogs(self):
+        """codex's input on qwen27: a recipe window half the catalog's
+        (81920 against 163840), on every lite family. MUTATION: seed the
+        pin from the catalog — each family runs twice the window it ran."""
+        lite, canon = self._mint_lite()
+        for family in lite:
+            with self.subTest(family=family):
+                fam = seat.FAMILIES[family]
+                ran = seat_catalog.launch_window(fam, fam["model"]) // 2
+                d = seat.seat_dir(family)
+                with mock.patch.dict(os.environ,
+                                     {"HELM_MCPS_CANONICAL": canon}):
+                    self.assertIsNot(seat._write_launch_assets(
+                        family, d, None, family, recipe={"window": ran}),
+                        seat._SEAT_SURFACE_REFUSED)
+                with open(os.path.join(d, "claude", "settings.json")) as f:
+                    env = json.load(f)["env"]
+                for name in seat_catalog.WINDOW_VARS:
+                    self.assertEqual(env[name], str(ran), name)
+
+    def test_a_fresh_mint_pins_the_catalogs_window(self):
+        """The control: with no recipe the pin is the catalog's, as ever."""
+        family = self._lite_families()[0]
+        fam = seat.FAMILIES[family]
+        _family, env, _text = self._reminted_lite()
+        for name in seat_catalog.WINDOW_VARS:
+            self.assertEqual(env[name], str(seat_catalog.launch_window(
+                fam, fam["model"])), name)
+
+    def test_an_operators_lower_pin_refuses_the_exact_window(self):
+        """An operator's pin below the window the seat ran with is one the
+        re-seed KEEPS (pin_action), and it outranks the launch stamp, so the
+        exact resume cannot bring that window back: it refuses naming the
+        knob, never a number. The control on the same number: helm's own pin
+        is re-seeded to the recipe's window, so nothing conflicts."""
+        from helm import seat_recipe
+        family = self._lite_families()[0]
+        fam = seat.FAMILIES[family]
+        ran = seat_catalog.launch_window(fam, fam["model"])
+        low = str(ran - 16384)
+        for record, conflicts in (({}, True),
+                                  ({"CLAUDE_CODE_MAX_CONTEXT_TOKENS": low},
+                                   False)):
+            with self.subTest(helms=bool(record)):
+                cdir = tempfile.mkdtemp(dir=self.tmp)
+                with open(os.path.join(cdir, "settings.json"), "w") as f:
+                    json.dump({"env": {"CLAUDE_CODE_MAX_CONTEXT_TOKENS": low},
+                               "helm": {"seeded_env": record}}, f)
+                why = seat_recipe.window_pin_conflict(cdir, family, ran)
+                if conflicts:
+                    self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS", why)
+                    self.assertNotIn(low, why)
+                else:
+                    self.assertIsNone(why)
 
     def test_helms_own_pin_follows_the_catalog_both_ways(self):  # noqa: VACUOUS_ASSERTION — both arms assert the pin's value by equality (raised vs kept) before the record membership equality, and the arm tuple is a literal of two
         """A pin helm's record names AT ITS CURRENT VALUE is helm's own: it
@@ -2511,16 +2595,17 @@ class SeatTest(unittest.TestCase):
         self.assertNotIn("owner_stated_window", fam)
         self.assertIn("owner_stated_window", seat.FAMILIES["gemini"])
         # ONE TOKEN SOURCE PER SEAT: the DeepSeek direct key is this
-        # family's only route, carries the REAL model id the vendor's own
+        # family's DEFAULT route, carries the REAL model id the vendor's own
         # /models advertises plus the cost RUNG, and is OFF-PEAK-ONLY through
-        # the declared billing window. The flat OpenCode Go subscription and
-        # the flash model are the ds4flash family, asserted below.
+        # the declared billing window. The OpenCode Go row serves the same
+        # model and is chosen at the mint (`--provider opencode-go`), never
+        # beside the direct key; the flash model is the ds4flash family.
         #
         # native DeepSeek: the owner-facing selector stays `deepseek`, while the
         # proxy's loaded provider identity is `deepseek-direct`; /v1 is part of
         # the exact endpoint tuple proved at runtime.
         self.assertEqual(fam["pool_default"], "deepseek")
-        self.assertEqual(set(fam["pool_providers"]), {"deepseek"})
+        self.assertEqual(set(fam["pool_providers"]), {"deepseek", "opencode-go"})
         self.assertEqual(fam["pool_providers"]["deepseek"],
                          {"proxy_provider": "deepseek-direct",
                           "base_url": "https://api.deepseek.com/v1",
@@ -2547,7 +2632,9 @@ class SeatTest(unittest.TestCase):
                              "rung": "free",
                              "authstore": "opencode-go",
                              # OpenCode bills the Go subscription (task/3461)
-                             "vendor": "opencode"}})
+                             "vendor": "opencode",
+                             # Go's per-conversation header (task/3824)
+                             "session_header": "x-opencode-session"}})
         self.assertNotIn("money_reader", flash)
         flash_route = {"alias": "deepseek-v4-flash", "provider": "opencode-go",
                        "upstream_model": "deepseek-v4.1-flash",
@@ -2764,28 +2851,121 @@ class SeatTest(unittest.TestCase):
         self.assertIn("port: 8360", cfg)
         self.assertNotIn("auth-dir", cfg)     # no OAuth dir for proxy-key
 
-    def test_flash_stays_unmintable_until_its_session_header_is_supported(self):
-        """OpenCode Go rejects a request without x-opencode-session, and Helm
-        cannot yet give each conversation a stable distinct value. A staged
-        family must refuse before writing a runnable credential-bearing config.
-        """
-        self._plant_pool()
-        rc, out, err = self._add(("add", "ds4flash", "--provider",  # noqa: SEAT_NAME — the staged family whose activation door is under test
+    def test_add_ds4flash_mints_with_a_per_conversation_session_header(self):
+        """OpenCode Go refuses a request without x-opencode-session, so the
+        flash family's block asks the proxy for a per-conversation value
+        (`session-header`) instead of carrying one static value that would
+        make every conversation one (task/3824)."""
+        self._plant_authstore()
+        rc, out, err = self._add(("add", "ds4flash"))  # noqa: SEAT_NAME — the family whose mint is under test
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn(self._AS_OC, out + err)   # secret: never printed
+        self.assertIn("provider opencode-go", out)
+        with open(os.path.join(seat.seat_dir("ds4flash"), "config.yaml")) as f:  # noqa: SEAT_NAME — the minted family's own config
+            cfg = f.read()
+        self.assertIn('name: "opencode-go"', cfg)
+        self.assertIn('base-url: "https://opencode.ai/zen/go/v1"\n'
+                      '    session-header: "x-opencode-session"\n', cfg)
+        self.assertIn('- name: "deepseek-v4.1-flash"', cfg)
+        self.assertIn('alias: "deepseek-v4-flash"', cfg)
+        self.assertIn("port: 8330", cfg)
+        self.assertNotIn("headers:", cfg)       # no static family-wide value
+        self.assertNotIn("deepseek-direct", cfg)  # one token source
+        self.assertTrue(os.path.exists(os.path.join(
+            seat.seat_dir("ds4flash"), "launch.sh")))  # noqa: SEAT_NAME — the minted family's own launch script
+
+    def test_ds4pro_repoints_at_go_with_one_mint_and_one_source(self):  # noqa: VACUOUS_ASSERTION — the Go block and the key are asserted present on the same config
+        """The owner: "ds4pro works through the account". The
+        re-point is ONE mint naming the Go row; the config then carries Go
+        alone (the same deepseek-v4-pro), with the session header, and the
+        default mint is still the direct key alone."""
+        self._plant_authstore()
+        rc, out, err = self._add(("add", "ds4pro", "--provider",  # noqa: SEAT_NAME — the family whose re-point is under test
                                   "opencode-go"))
-        self.assertEqual(rc, 1)
-        self.assertEqual(out, "")
-        self.assertIn("x-opencode-session", err)
-        self.assertIn("not yet activatable", err)
-        self.assertFalse(os.path.exists(os.path.join(
-            seat.seat_dir("ds4flash"), "config.yaml")))  # noqa: SEAT_NAME — the staged family's config must not exist
-        self.assertNotIn(self._LIVE, out + err)
-        # CONTROL: staging the flash family never makes its subscription
-        # selectable under the direct-key pro family.
-        rc, _out, err = self._add(("add", "ds4pro", "--provider",  # noqa: SEAT_NAME — the two catalog names whose SEPARATION is the property under test
-                                   "opencode-go"))
-        self.assertEqual(rc, 2)
-        self.assertIn("no provider 'opencode-go'", err)
-        self.assertIn("deepseek", err)
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn(self._AS_OC, out + err)
+        with open(os.path.join(seat.seat_dir("ds4pro"), "config.yaml")) as f:  # noqa: SEAT_NAME — the minted family's own config
+            cfg = f.read()
+        self.assertIn('api-key: "%s"' % self._AS_OC, cfg)
+        self.assertIn('base-url: "https://opencode.ai/zen/go/v1"\n'
+                      '    session-header: "x-opencode-session"\n', cfg)
+        self.assertIn('- name: "deepseek-v4-pro"', cfg)
+        self.assertIn('alias: "ds4-pro"', cfg)
+        self.assertNotIn("deepseek-direct", cfg)
+        self.assertNotIn(self._AS_DS, cfg)
+        # CONTROL: the default mint is the direct key, with no session header
+        rc, out, err = self._add(("add", "ds4pro"))  # noqa: SEAT_NAME — the family whose default mint is the control
+        self.assertEqual(rc, 0, err)
+        with open(os.path.join(seat.seat_dir("ds4pro"), "config.yaml")) as f:  # noqa: SEAT_NAME — the minted family's own config
+            cfg = f.read()
+        self.assertIn('name: "deepseek-direct"', cfg)
+        self.assertNotIn("opencode", cfg)
+        self.assertNotIn("session-header", cfg)
+
+    def test_the_go_row_never_takes_the_familys_direct_key_env(self):
+        """The family's key_env (DS4PRO_API_KEY) is the DeepSeek direct key:
+        it belongs to the default row. A seat minted on the Go row reads the
+        Go credential, never that variable, or it would send the direct key
+        to OpenCode."""
+        self._plant_authstore()
+        direct = "sk-env-direct-key-must-not-reach-go-3f9c2a1e6b7d80"
+        os.environ["DS4PRO_API_KEY"] = direct
+        rc, out, err = self._add(("add", "ds4pro", "--provider",  # noqa: SEAT_NAME — the family whose Go mint is under test
+                                  "opencode-go"))
+        self.assertEqual(rc, 0, err)
+        cfg_path = os.path.join(seat.seat_dir("ds4pro"), "config.yaml")  # noqa: SEAT_NAME — the minted family's own config
+        with open(cfg_path) as f:
+            cfg = f.read()
+        self.assertIn('api-key: "%s"' % self._AS_OC, cfg)
+        self.assertNotIn(direct, cfg + out + err)
+        self.assertNotIn("DS4PRO_API_KEY", out)
+        # CONTROL: the default row still takes the family's own variable
+        rc, out, err = self._add(("add", "ds4pro"))  # noqa: SEAT_NAME — the family whose default mint is the control
+        self.assertEqual(rc, 0, err)
+        with open(cfg_path) as f:
+            self.assertIn('api-key: "%s"' % direct, f.read())
+        self.assertIn("DS4PRO_API_KEY", out)
+
+    def test_up_refuses_an_old_binary_when_the_plan_adds_the_session_header(self):
+        """The start preflight must judge the config the proxy will LOAD. A
+        seat config without session-header is given it by the plan, so an old
+        binary would start on a config it cannot serve (every Go request 400
+        MissingSessionID); the refusal leaves the bytes and starts nothing."""
+        self._plant_authstore()
+        rc, _out, err = self._add(("add", "ds4flash"))  # noqa: SEAT_NAME — the family whose proxy start is under test
+        self.assertEqual(rc, 0, err)
+        path = os.path.join(seat.seat_dir("ds4flash"), "config.yaml")  # noqa: SEAT_NAME — the minted family's own config
+        with open(path) as f:
+            minted = f.read()
+        line = '    session-header: "x-opencode-session"\n'
+        self.assertIn(line, minted)
+        stale = minted.replace(line, "")
+        with open(path, "w") as f:
+            f.write(stale)
+        old = os.path.join(self.tmp, "old-cli-proxy-api")
+        with open(old, "w") as f:
+            f.write("#!/bin/sh\necho 'Usage of cli-proxy-api'\n"
+                    "echo '  -config string'\n")
+        os.chmod(old, 0o755)
+        os.environ["HELM_PROXY_BIN"] = old
+        booby = seat.subprocess.Popen
+
+        def refuse(argv, *a, **k):
+            if argv and argv[0] == old and "-config" in argv:
+                self.fail("the old binary was started on the Go config")
+            return booby(argv, *a, **k)
+        seat.subprocess.Popen = refuse
+        try:
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                rc = seat.cmd_seat(["up", "ds4flash"])  # noqa: SEAT_NAME — the family whose proxy start is under test
+        finally:
+            seat.subprocess.Popen = booby
+        self.assertEqual(rc, 1, err.getvalue())
+        self.assertIn("session-header", err.getvalue())
+        self.assertIn("MissingSessionID", err.getvalue())
+        with open(path) as f:
+            self.assertEqual(f.read(), stale)
 
     def test_add_ds4pro_unknown_provider_refused(self):
         self._plant_pool()
@@ -2852,15 +3032,20 @@ class SeatTest(unittest.TestCase):
         # told CC nothing for this family and CC used its hardcoded 200k.
         self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=%d"
                       % seat.FAMILIES["ds4pro"]["max_context"], line)
-        # DS4FLASH IS THE ONLY UNPINNED FAMILY LEFT, and it is what keeps
-        # this from proving merely that the emitter always mints. The control
-        # read grok until grok pinned the 256000 its xai route publishes; its
-        # OpenCode Go route publishes no window, so ds4flash stays unpinned.
-        # POSITIVE CONTROL ON ds4flash's OWN LINE, unconditional and sharing
+        # EVERY LIVE FAMILY PINS NOW (ds4flash took its Go route's published
+        # window, task/3824), so the unpinned control is ds4flash's own entry
+        # with its window keys removed, and it is what keeps this from proving
+        # merely that the emitter always mints.
+        # POSITIVE CONTROL ON THAT OWN LINE, unconditional and sharing
         # the root object of the absence below: a sibling family's
         # launch_line is a DIFFERENT observable and could not tell an empty
         # line from a windowless one. This membership proves the line is real.
-        unpinned_line = seat.launch_line("ds4flash")
+        unpinned = {k: v for k, v in seat.FAMILIES["ds4flash"].items()
+                    if k not in ("max_context", "probed_context_length")}
+        with mock.patch.dict(seat.FAMILIES, {"ds4flash": unpinned}):
+            unpinned_line = seat.launch_line("ds4flash")
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=948000",
+                      seat.launch_line("ds4flash"))
         self.assertIn("HELM_CHAT_NAME=ds4flash", unpinned_line)
         self.assertNotIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS", unpinned_line)
         # The window knob is gated on the same max_context, so it stays away
@@ -2874,7 +3059,7 @@ class SeatTest(unittest.TestCase):
                       seat.launch_line("kimi"))
         self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS",
                       seat.launch_line("gemini"))
-        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=204000",
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=237000",
                       seat.launch_line("grok"))
         # WebSearch: its route cannot serve the tool (task/3242, measured)
         self.assertTrue(line.endswith(
@@ -3186,26 +3371,25 @@ class SeatTest(unittest.TestCase):
         self.assertEqual(autocompact._window("kimi"),
                          (380000, "FAMILIES.context_budget"))
 
-    def test_cursor_launch_assets_teach_the_budget_the_watchdog_reads(self):  # noqa: VACUOUS_ASSERTION — positive launch.sh model and two knob matches, plus live watchdog window
-        """task/3652: cursor stops making any tool call the moment Cursor's own
-        (3-6x the bridge's) token count of the Claude Code history crosses
-        Cursor's 256k window — every run at/under 91k estimated still made tool
-        calls, the first failure was at 98.9k — and Claude Code compacted
-        near 164k with the old 225k setting, so the seat went silent first.
-        The GENERATED launch.sh now teaches the cursor family's 110000
-        context_budget on BOTH CC knobs. The watchdog's 80% threshold is 88k;
-        Claude Code's native threshold is near 72k after its 20k output
-        reserve. The watchdog reads the SAME taught window, so the two readers
-        of one window cannot drift. The measured
-        256k probe and 225k max_context stay in the catalog: the budget narrows
-        what the seat is taught, and does not rewrite the evidence for the
-        model's capacity."""
+    def test_cursor_launch_assets_teach_the_window_the_watchdog_reads(self):  # noqa: VACUOUS_ASSERTION — positive launch.sh model and two knob matches, plus live watchdog window
+        """task/3816: the cursor seat is taught its 225000 max_context on BOTH
+        Claude Code knobs, and the watchdog reads the SAME taught window, so
+        the two readers of one window cannot drift. task/3652 had narrowed it
+        to a 110000 context_budget on the premise that Cursor counts the
+        Claude Code history 3-6x the bridge's estimate and goes tool-silent
+        past 256k. MEASURED (task/3817's probe): that count is a run-start
+        artifact of replaying the whole history into a new Cursor
+        conversation (2.0-4.6x on 8 of 16 run starts, 269,723 at an estimate
+        of 66,562); in a conversation the bridge keeps, Cursor counted 1.06x
+        at est 66k and 157,163 at the 225000 window's compaction point (est
+        164,873), with a tool call on every one of 25 turns. The budget made
+        the seat compact near 73k by the estimate, every 10-16 minutes."""
         from helm import autocompact
         self._plant("home-a")
         self.assertEqual(self._add()[0], 0)
         fam = seat.FAMILIES["cursor"]
         self.assertEqual(fam["max_context"], 225000)
-        self.assertEqual(fam["context_budget"], 110000)
+        self.assertIsNone(fam.get("context_budget"))
         inst = seat._instance_dir("cursor", "cursor")
         os.makedirs(inst, exist_ok=True)
         seat._write_launch_assets("cursor", inst, seat="cursor")
@@ -3214,13 +3398,13 @@ class SeatTest(unittest.TestCase):
         self.assertIn("--model cursor", text)
         self.assertEqual(
             re.findall(r"CLAUDE_CODE_MAX_CONTEXT_TOKENS=(\d+)", text),
-            ["110000"])
+            ["225000"])
         self.assertEqual(
             re.findall(r"CLAUDE_CODE_AUTO_COMPACT_WINDOW=(\d+)", text),
-            ["110000"])
+            ["225000"])
         self.assertIn("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=80", text)
         self.assertEqual(autocompact._window("cursor"),
-                         (110000, "FAMILIES.context_budget"))
+                         (225000, "FAMILIES.max_context"))
 
     def test_a_minted_seat_carries_no_ai_attribution_before_its_first_session(self):
         """task/3591: the seat path writes the estate defaults at mint
@@ -3374,15 +3558,57 @@ class SeatTest(unittest.TestCase):
         p = os.path.join(d, "launch.sh")
         with open(p) as f:
             sh = f.read()
-        lines = [ln for ln in sh.splitlines()
-                 if "HELM_CHAT_ROOM=" not in ln
-                 and "HELM_CHAT_ROOM_SOURCE=" not in ln]
+        # the room WORDS go, never the line that carries them: the exec line
+        # holds the seat's whole launch recipe, which the resume restores
+        # and refuses to guess (task/3695). A value is a whole shell word:
+        # bare characters, a quoted run, or the '"'"' spelling of a quote
+        # inside the single-quoted argument the launch owner passes on.
+        word = r"""(?:'"'"'[^']*'"'"'|'[^']*'|"[^"]*"|[^\s'"])*"""
+        lines = [re.sub(r" HELM_CHAT_ROOM(?:_SOURCE)?=" + word, "", ln)
+                 for ln in sh.splitlines()]
         inject = ['export HELM_CHAT_ROOM=%s' % room] if room else []
         if source:
             inject.append('export HELM_CHAT_ROOM_SOURCE=%s' % source)
         lines[1:1] = inject
         with open(p, "w") as f:
             f.write("\n".join(lines) + "\n")
+
+    def _minted_with_room(self, room):
+        """A seat whose launch.sh the real minter wrote carrying `room`,
+        spelled the way the launch line quotes it inside the one argument
+        the launch owner hands its supervisor."""
+        self._plant("home-a")
+        self.assertEqual(self._add()[0], 0)
+        d = seat.seat_dir("codex")
+        self.assertIsNot(seat._write_launch_assets(
+            "codex", d, room, room_source="explicit"),
+            seat._SEAT_SURFACE_REFUSED)
+        p = os.path.join(d, "launch.sh")
+        with open(p) as f:
+            self.assertIn("HELM_CHAT_ROOM=", f.read())
+        return d, p
+
+    def test_planting_a_room_strips_a_quoted_room_whole(self):
+        """A room the shell must quote is spelled as a quoted word nested in
+        the supervisor's quoted argument. MUTATION: stop the strip at the
+        first quote — the quoted value is left on the exec line, glued to
+        the word before it, where it rewrites that word's value."""
+        d, p = self._minted_with_room("#ops x")
+        self._plant_launch_room(d, "main", "explicit")
+        with open(p) as f:
+            planted = f.read()
+        self.assertNotIn("#ops", planted)
+        self.assertIn("export HELM_CHAT_ROOM=main", planted)
+
+    def test_planting_a_room_strips_an_unquoted_room(self):
+        """The control: a room the shell takes bare is stripped whole on
+        the same line."""
+        d, p = self._minted_with_room("ops-room")
+        self._plant_launch_room(d, "main", "explicit")
+        with open(p) as f:
+            planted = f.read()
+        self.assertNotIn("ops-room", planted)
+        self.assertIn("export HELM_CHAT_ROOM=main", planted)
 
     # -- the seam these arms assert on -------------------------------------
     #
@@ -8241,14 +8467,16 @@ class AProxySeatAdmitsACappedWorkflowOnItsOwnTier(unittest.TestCase):
     def denies_workflow(family):
         """The task/3253 reconciliation, spelled from the DECLARATIONS rather
         than read back through denied_tools: a lite family with no
-        same-family delegate tier denies Workflow; every other family keeps
-        the capped tool this class pins."""
-        return bool(family) and seat_catalog.lite(family) \
-            and not seat.FAMILIES[family].get("subagent_tiers")
+        same-family delegate tier denies Workflow, and so does a family whose
+        own `context_denied_tools` names it (task/3803); every other family
+        keeps the capped tool this class pins."""
+        fam = seat.FAMILIES.get(family) or {}
+        return (seat_catalog.lite(family) and not fam.get("subagent_tiers")) \
+            or "Workflow" in fam.get("context_denied_tools", ())
 
     #: the proxy families the arms below measure: every one task/2559 still
-    #: admits Workflow on (the lite families that deny it are the lite
-    #: profile's arms, which pin the inverse)
+    #: admits Workflow on (the families that deny it are pinned by the lite
+    #: profile's arms and the context-deny arm, which pin the inverse)
     ADMITS = tuple(filter(lambda f, denies=denies_workflow.__func__: not denies(f),
                           PROXY))
     VAR = "CLAUDE_CODE_WORKFLOW_MAX_CONCURRENT_AGENTS"
@@ -10827,3 +11055,219 @@ class PoolListingNamesWhatItOmits(unittest.TestCase):
         # than pass for the wrong reason.
         self.assertIn("red", t)
         self.assertNotIn("\x1b", t)
+
+
+class LeadLeanProfileTest(unittest.TestCase):
+    """task/4056 part 3: a LEAD's settings.json is lean.
+
+    A Claude lead re-sends a fixed ~83k tokens on every request (the floor
+    census under the token-mechanics review). Part of that floor is MCP
+    servers and listings a lead never calls, so a lead's home takes a lean
+    profile. The switches are the LITE profile's own (seat_catalog
+    PROFILES), extended rather than duplicated — but the KEY is different on
+    purpose: lite is a FAMILY property, and lead is a ROLE, so this one is
+    read from the seat's spawn register and applied on top of whatever family
+    profile the seat already has.
+
+    WHAT IS DELIBERATELY NOT HERE, because a lead uses them: the lite MCP
+    floor (leads call cv and the Docs tools), and the lite deny of the
+    delegation and agent-listing tools (leads use both).
+
+    ARTIFACT IS DENIED, on the owner's ruling: an artifact belongs to
+    whichever baseload account published it and those accounts rotate, so a
+    lead's reports go as local HTML files instead. Denying the tool is also
+    what removes its schema from the request."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-lean-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def _mint(self, role):
+        cdir = os.path.join(self.tmp, "cfg-" + str(role))
+        os.makedirs(cdir)
+        seat._seed_seat_settings(cdir, "kimi", role=role)
+        with open(os.path.join(cdir, "settings.json")) as f:
+            return json.load(f)
+
+    def test_the_deny_list_is_the_object_shape_CC_actually_accepts(self):
+        """MEASURED against the installed binary (2.1.287, `claude doctor`
+        reading a settings file): a plain string is REFUSED with
+        "deniedMcpServers[0]: Invalid entry was ignored: Invalid input:
+        expected object, received string", and `{"serverName": ...}` is
+        accepted. A string list would make the whole file schema-invalid, and
+        CC may then skip it entirely, taking the bypass flag, the deny list
+        and the hook wiring down with it."""
+        # the servers are a host-local name, so the arm SETS one: without
+        # this the shape is only exercised on a host that has configured it,
+        # and the assertion would pass vacuously wherever it is not.
+        from helm import localnames
+        with mock.patch.object(localnames, "words",
+                               return_value=("alpha", "beta")):
+            got = self._mint("lead")
+        servers = got.get("deniedMcpServers") or []
+        self.assertTrue(servers, servers)
+        for entry in servers:
+            self.assertIsInstance(entry, dict, entry)
+            self.assertEqual(sorted(entry), ["serverName"], entry)
+            self.assertIsInstance(entry["serverName"], str)
+
+    def test_the_plugin_key_is_the_installed_id_not_the_bare_name(self):
+        """An installed plugin's key is `<id>@<marketplace>`; the bare name
+        matches nothing."""
+        got = self._mint("lead")
+        plugins = got.get("enabledPlugins") or {}
+        self.assertEqual(list(plugins),
+                         [seat_catalog.LEAD_DISABLED_PLUGIN_ID])
+        self.assertIn("@", seat_catalog.LEAD_DISABLED_PLUGIN_ID)
+        self.assertIs(plugins[seat_catalog.LEAD_DISABLED_PLUGIN_ID], False)
+
+    def test_a_lead_home_denies_the_servers_and_listings_it_never_uses(self):
+        """The SERVERS are host-local: the source names no private project,
+        so they come from a local-names key and a fresh clone denies none.
+        The other three switches are not names, so they always apply."""
+        from helm import localnames
+        got = self._mint("lead")
+        self.assertEqual(got["enabledPlugins"],
+                         {seat_catalog.LEAD_DISABLED_PLUGIN_ID: False})
+        self.assertEqual(got["skillListingBudgetFraction"],
+                         seat_catalog.LEAD_SKILL_LISTING_BUDGET)
+        self.assertEqual(sorted(got.get("deniedMcpServers") or []),
+                         sorted(seat_catalog.lead_denied_mcp_servers()))
+        # the positive control on the same call: the key is really read from
+        # localnames rather than restated in this file.
+        self.assertIn("lead-denied-mcp-servers", localnames.KEYS)
+
+    def test_a_worker_home_is_untouched(self):
+        # THE POSITIVE CONTROL on the same call: a lead really is changed, so
+        # the worker's equality with the plain file below is the role branch
+        # and not a seeder that wrote nothing at all.
+        lead = self._mint("lead")
+        # the control names a switch that is NOT host-local, so it holds on a
+        # machine whose local-names file is absent (as this one is).
+        self.assertEqual(lead["enabledPlugins"],
+                         {seat_catalog.LEAD_DISABLED_PLUGIN_ID: False})
+        base = os.path.join(self.tmp, "cfg-plain")
+        os.makedirs(base)
+        seat._seed_seat_settings(base, "kimi")
+        with open(os.path.join(base, "settings.json")) as f:
+            plain = json.load(f)
+        self.assertEqual(self._mint("worker"), plain)
+        self.assertNotIn("skillListingBudgetFraction", plain)
+        self.assertNotIn("enabledPlugins", plain)
+
+    def test_the_profile_is_read_from_the_seat_register_not_the_name(self):
+        """A lead is whoever the SPAWN recorded as one. A name that looks like
+        a lead is an ordinary worker, because the reader is the spawn record,
+        not the name."""
+        from helm.seat_role import recorded_role
+        self.assertEqual(recorded_role("nothing-registered-here"), "worker")
+        # the positive control on the same reader: a seat the register knows
+        # is answered from the register, so a reader that always said
+        # "worker" would be caught here rather than passing by accident.
+        self.assertIn(recorded_role("nothing-registered-here"),
+                      ("lead", "worker"))
+
+    def test_a_lead_denies_Artifact_on_the_owners_ruling(self):
+        """An artifact belongs to whichever baseload account published it and
+        those accounts rotate, so a lead's reports go as local files; denying
+        the tool also takes its schema out of every request."""
+        deny = (self._mint("lead").get("permissions") or {}).get("deny") or []
+        self.assertIn("Artifact", deny)
+        # the positive control on the same observable: the deny list is real
+        # and carries the other helm-wide entries, so an empty list (which
+        # would also contain no Artifact) cannot pass this arm.
+        self.assertTrue(deny, deny)
+
+    def test_a_registered_lead_record_gives_lead_and_a_broken_one_gives_worker(self):
+        """The role comes from the spawn register, so the READER must be
+        pinned: a mutant that always returned "worker" would pass every arm
+        that only asserts on role=None."""
+        from helm import seat as seat_mod
+        from helm.seat_role import recorded_role
+        d = os.path.join(self.tmp, "reglead")
+        os.makedirs(d)
+        with mock.patch.object(seat_mod, "_instance_dir", return_value=d), \
+                mock.patch.object(seat_mod, "_seat_family",
+                                  return_value=("claude", None)):
+            with open(os.path.join(d, "spawn.json"), "w") as f:
+                json.dump({"seat": "reglead", "role": "lead"}, f)
+            self.assertEqual(recorded_role("reglead"), "lead")
+            # a record whose seat does not MATCH is somebody else's row
+            with open(os.path.join(d, "spawn.json"), "w") as f:
+                json.dump({"seat": "other", "role": "lead"}, f)
+            self.assertEqual(recorded_role("reglead"), "worker")
+            # a record with no role, and a corrupt one, are workers
+            with open(os.path.join(d, "spawn.json"), "w") as f:
+                json.dump({"seat": "reglead"}, f)
+            self.assertEqual(recorded_role("reglead"), "worker")
+            with open(os.path.join(d, "spawn.json"), "w") as f:
+                f.write("{not json")
+            self.assertEqual(recorded_role("reglead"), "worker")
+            # and a role that is not a seat role is a worker, never a typo
+            # that reaches the profile
+            with open(os.path.join(d, "spawn.json"), "w") as f:
+                json.dump({"seat": "reglead", "role": "leader"}, f)
+            self.assertEqual(recorded_role("reglead"), "worker")
+
+    def test_the_launch_threads_the_recorded_role_into_the_seeder(self):
+        """The other half of the same mutant: reading a role nobody consumes
+        changes nothing, so the launch path must really pass it through."""
+        # patch the DEFINING module, not the facade: `seat._seed_seat_settings`
+        # is a re-export, and the implementation calls its own module global.
+        from helm import seat_launch_assets, seat_role
+        seen = {}
+        real = seat_launch_assets._seed_seat_settings
+
+        def spy(cdir, family=None, workdir=None, model=None, window=None,
+                role=None):
+            seen["role"] = role
+            return real(cdir, family, workdir=workdir, model=model,
+                        window=window, role=role)
+
+        # THE TARGET MUST BE THE SEAT'S OWN INSTANCE DIR, or the surface
+        # ownership gate refuses before the seeder is ever reached (and an arm
+        # that never reached it would read as "role not threaded").
+        d = seat._instance_dir("kimi", "leanlead")
+        os.makedirs(d)
+        with mock.patch.object(seat_launch_assets, "_seed_seat_settings",
+                               side_effect=spy), \
+                mock.patch.object(seat_role, "recorded_role",
+                                  return_value="lead"):
+            seat._write_launch_assets("kimi", d, seat="leanlead")
+        self.assertEqual(seen.get("role"), "lead")
+
+    def test_a_lead_denies_the_whole_artifact_trio_through_the_recorded_deny(self):
+        """The owner's ruling turns the Artifact TOOLS off, not one of them,
+        and the deny goes through the one recorded-deny writer: on a seat
+        whose family denies none of the trio itself, all three are appended
+        AND named in helm.seeded_denies, so `helm seat retire-deny` can see
+        who wrote them. CONTROL on the same mint: a worker gets none."""
+        trio = ["Artifact", "ArtifactComments", "ArtifactData"]
+        cdir = os.path.join(self.tmp, "cfg-native-lead")
+        os.makedirs(cdir)
+        seat._seed_seat_settings(cdir, None, role="lead")
+        with open(os.path.join(cdir, "settings.json")) as f:
+            got = json.load(f)
+        deny = got["permissions"]["deny"]
+        self.assertEqual([t for t in deny if t in trio], trio)
+        self.assertEqual([t for t in got["helm"]["seeded_denies"] if t in trio],
+                         trio)
+        self.assertEqual(list(seat_catalog.LEAD_DENIED_TOOLS), trio)
+        wdir = os.path.join(self.tmp, "cfg-native-worker")
+        os.makedirs(wdir)
+        seat._seed_seat_settings(wdir, None, role="worker")
+        with open(os.path.join(wdir, "settings.json")) as f:
+            wdeny = json.load(f)["permissions"]["deny"]
+        self.assertFalse(set(trio) & set(wdeny), wdeny)
+
+    def test_the_local_seats_still_deny_the_same_trio(self):
+        """The trio is named once: the local seats' set carries it whole."""
+        self.assertEqual([t for t in seat_catalog.LOCAL_UNUSED_TOOLS
+                          if t.startswith("Artifact")],
+                         ["Artifact", "ArtifactComments", "ArtifactData"])
+
+    def test_a_lead_keeps_the_tools_it_actually_uses(self):
+        got = self._mint("lead")
+        deny = (got.get("permissions") or {}).get("deny") or []
+        for tool in ("Workflow", "SendMessage", "ListAgents", "WebFetch"):
+            self.assertNotIn(tool, deny)

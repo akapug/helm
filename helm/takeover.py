@@ -901,6 +901,149 @@ def _authorize_seat_reassign(auth, task_id, previous, fields):
     return dict(auth.record), None
 
 
+_HANDOFF_MINT = object()
+
+# A hand-off's evidence is the holder's admission and the row it read, so it
+# expires on the same clock as the other two custody proofs.
+HANDOFF_MAX_AGE_S = EVIDENCE_MAX_AGE_S
+
+
+class HolderHandoffAuthorization(object):
+    """Opaque authority for the HOLDER to give one exact row to one seat.
+
+    THE THIRD SIBLING, for the population the other two cannot reach
+    (task/2309). BUILD continuation is TAKEN by a successor from a wedged
+    incumbent; a seat reassign is FORCED onto a dead or renamed one. Both are
+    somebody else acting ON the holder, so a live holder who agrees the work
+    belongs elsewhere reached neither, and the incumbent guard refused it
+    exactly as it refuses a seizure. This one is OFFERED: it is minted only
+    for an ADMITTED actor (actors.resolve_actor, task/1918's act-door rule)
+    that `tasks.held_by` names as the row's holder, never from a seat string
+    or a session a row records.
+
+    LIKE A REASSIGN IT MOVES THE OWNER AND NOTHING ELSE. A gift says who
+    holds the row, never that the recipient has started it.
+    """
+    __slots__ = ("task_id", "before", "incumbent", "successor", "fields",
+                 "record", "minted_at", "scope")
+
+    def __init__(self, task_id=None, before=None, incumbent=None,
+                 successor=None, record=None, minted_at=None, *, mint=None):
+        if mint is not _HANDOFF_MINT:
+            raise TakeoverRefused(
+                "a hand-off authorization is minted only for the admitted "
+                "holder (takeover.mint_holder_handoff); direct construction "
+                "cannot move custody")
+        self.task_id = task_id
+        self.before = before
+        self.incumbent = incumbent
+        self.successor = successor
+        self.fields = {"owner": successor}
+        self.record = dict(record or {})
+        self.minted_at = minted_at
+        self.scope = "task-holder-handoff"
+
+
+def holder_handoff_refusal(task_id, previous, actor):
+    """Why `actor` may not give `previous` away, or None — THE HOLDER RULE.
+
+    Refuses a seat NAME instead of an admitted actor, a closed row, an
+    unowned row, and every actor `tasks.held_by` does not name as the
+    holder. The holder test is the one `list --mine` and `release` read, on
+    the admitted actor's canonical name, so no value a row publishes is
+    consulted. `tasks.handoff` asks it before resolving the seat, so a row
+    that cannot be handed off gets that answer first."""
+    actor_err = tasks.rank_actor_error(actor)
+    if actor_err:
+        return ("a hand-off needs an admitted actor (%s) — a seat name is not "
+                "evidence of who is giving the row" % actor_err)
+    tid = tasks.normalize_id(task_id)
+    if not tid or not isinstance(previous, dict) \
+            or tasks.normalize_id(previous.get("id")) != tid:
+        return ("a hand-off proof is minted over the row it moves; %r is not "
+                "that row" % (task_id,))
+    if previous.get("status") == "closed":
+        return ("%s is CLOSED (%s) — a closed row holds no live work, so "
+                "there is nothing to hand off"
+                % (tid, previous.get("closed_reason") or "no reason recorded"))
+    holder = tasks.owner_of(previous)
+    if not holder:
+        return ("%s is UNOWNED — nobody holds it, so there is nothing to hand "
+                "off; an unowned row goes to a seat with `helm task claim %s`"
+                % (tid, tid))
+    if not tasks.held_by(previous, actor.canonical_name):
+        return ("%s is held by %s, not by %s — only the HOLDER can hand a row "
+                "off, and a hand-off by anybody else is a seizure, which "
+                "stays refused. Nothing was written"
+                % (tid, holder, actor.canonical_name))
+    return None
+
+
+def mint_holder_handoff(task_id, previous, actor, successor, record):
+    """(auth, error) — the ONLY mint, and it applies the holder rule itself.
+
+    A capability whose safety property lives in one of its callers does not
+    have that property (the reassign lesson), so the mint runs
+    `holder_handoff_refusal` on its own and refuses a successor that is the
+    holder or blank.
+    """
+    why = holder_handoff_refusal(task_id, previous, actor)
+    if why:
+        return None, why
+    holder = tasks.owner_of(previous)
+    want = str(successor or "").strip()
+    if not want or want.casefold() == holder.casefold():
+        return None, ("a hand-off names a seat other than the holder %s "
+                      "(got %r)" % (holder, successor))
+    return HolderHandoffAuthorization(
+        task_id=tasks.normalize_id(task_id), before=_task_digest(previous),
+        incumbent=holder, successor=want, record=record,
+        minted_at=time.time(), mint=_HANDOFF_MINT), None
+
+
+def _authorize_holder_handoff(auth, task_id, previous, fields):
+    if not _stamp_fresh(getattr(auth, "minted_at", None), HANDOFF_MAX_AGE_S):
+        return None, "hand-off proof is stale or clock-invalid — hand off again"
+    expected = {"owner": auth.successor}
+    if auth.task_id != task_id or auth.before != _task_digest(previous) \
+            or auth.incumbent != tasks.owner_of(previous) \
+            or auth.fields != expected or fields != expected:
+        return None, ("hand-off proof does not match this exact task OWNER "
+                      "compare-and-swap; it cannot authorize another row, "
+                      "another seat, other fields, or a row that moved since "
+                      "it was minted")
+    return dict(auth.record), None
+
+
+def _holder_handoff_reach(incumbent):
+    """Can the holder's own door open for THIS incumbent? -> (bool|None, why).
+
+    Asked of the precondition the door itself has: the hand-off admits a
+    caller only when the roster resolves its session to the holder's name, so
+    an incumbent no roster row answers to can never be admitted as itself.
+    False on that measured absence, None on a roster nobody could read or a
+    name that cannot be compared, and True means only
+    NOT-SHUT-AT-THE-FIRST-GATE, the BUILD probe's asymmetry: the caller still
+    has to present the session the roster binds.
+
+    THE ROSTER IS ASKED THROUGH THE READER THAT ALREADY ANSWERS "does this
+    name have a roster row" in three states (`seat reassign`'s lease rung
+    reads it too), never through a second roster read of its own.
+    """
+    from . import seats_claims
+    listed = seats_claims.claim_holder_listedness({"holder": incumbent})
+    if listed == "listed":
+        return True, ""
+    if listed == "unlisted":
+        return False, ("no roster row answers to %r, so no process can be "
+                       "admitted as it at the hand-off door (`helm chat join` "
+                       "binds one)" % incumbent)
+    return None, ("whether %r has a roster row is %s here (the roster could "
+                  "not be read, or the name cannot be compared), so whether "
+                  "it can be admitted at the hand-off door is UNKNOWN"
+                  % (incumbent, listed))
+
+
 # THE REFUSAL IS BUILT FROM THIS DISPATCH, NOT MAINTAINED BESIDE IT.
 #
 # tasks.py refuses an incumbent-owner change and then has to tell the operator
@@ -925,10 +1068,9 @@ def _authorize_seat_reassign(auth, task_id, previous, fields):
 # row carries the fact and the sentence renders it.
 #
 # `opened_by` is the VERB IN THE PASSIVE, so several doors join into one
-# clause without grammar work. `holder_may_open` is False for every row today
-# and is not speculative: task/2026 is the open row for a holder-offerable
-# hand-off, and the day it lands its row sets this True and the refusal stops
-# saying NONE by itself.
+# clause without grammar work. `holder_may_open` is True on one row, the
+# holder's own hand-off (task/2309), and the refusal names it as the holder's
+# door by reading that flag rather than by a sentence of its own.
 def _build_contract_reach(incumbent):
     """Can the BUILD contract mint for THIS incumbent? -> (bool|None, why).
 
@@ -1020,6 +1162,12 @@ _TASK_OWNER_DOORS = (
           "FORCED", False,
           "ask an authorized operator to move it",
           _seat_reassign_reach, None, ""),
+    _Door(HolderHandoffAuthorization,
+          "`helm task handoff <id> --to <seat>`, run by %(incumbent)s itself "
+          "to give its own row to a seat on the roster",
+          "OFFERED", True,
+          "run `helm task handoff <id> --to <seat>` yourself",
+          _holder_handoff_reach, None, ""),
 )
 
 
@@ -1073,15 +1221,19 @@ def task_owner_door_facts(incumbent):
 def authorize_task_mutation(auth, task_id, previous, fields):
     """Validate one capability at tasks.py's owner boundary -> (record, error).
 
-    TWO CAPABILITIES, VALIDATED SEPARATELY AND NEVER INTERCHANGEABLY. The
+    THREE CAPABILITIES, VALIDATED SEPARATELY AND NEVER INTERCHANGEABLY. The
     BUILD-continuation branch keeps its own scope and compare-and-swap;
-    the reassign branch has its own rules because it answers a different
-    question about a different population. Dispatching on TYPE rather than on
-    a field means neither can be reached with the other's evidence.
+    the reassign and hand-off branches have their own rules because each
+    answers a different question about a different population (a dead seat;
+    the holder's own gift). Dispatching on TYPE rather than on a field means
+    none can be reached with another's evidence.
     """
     if type(auth) is SeatReassignAuthorization \
             and auth.scope == "task-seat-reassign":
         return _authorize_seat_reassign(auth, task_id, previous, fields)
+    if type(auth) is HolderHandoffAuthorization \
+            and auth.scope == "task-holder-handoff":
+        return _authorize_holder_handoff(auth, task_id, previous, fields)
     if type(auth) is not BuildContinuationAuthorization \
             or auth.scope != "task-build-continuation":
         return None, "owner reassignment needs a module-minted BUILD takeover proof"

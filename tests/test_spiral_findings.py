@@ -28,7 +28,7 @@ from unittest import mock
 import os as _os, sys as _sys  # noqa: E402
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
-from helm import dispatches as D, eventledger  # noqa: E402
+from helm import dispatches as D, eventledger, tasks  # noqa: E402
 from helm import seats_stop_signals as signals  # noqa: E402
 from helm import spiral_findings as SF  # noqa: E402
 
@@ -143,6 +143,11 @@ class SpiralKeyChainTest(unittest.TestCase):
         self.repo = os.path.join(self.tmp, "repo", ".git")
         self.chain = None
         self.rows = []
+        self.finding_by_path = {}
+        self.review_task, why = tasks.add(
+            "converge the fixture's review findings", SEAT, project="helm",
+            force_new=True)
+        self.assertIsNone(why, why)
 
     def tearDown(self):
         for k, v in self.prior.items():
@@ -169,7 +174,7 @@ class SpiralKeyChainTest(unittest.TestCase):
                                                + len(self.rows) * 60)),
                "sender": SEAT, "recipient": PEER, "lane": "one-lane",
                "deadline_s": 2700, "chain_root": self.chain,
-               "repo_id": self.repo}
+               "repo_id": self.repo, "task": self.review_task["id"]}
         if self.rows:
             row["supersedes"] = self.rows[-1]
         self.assertTrue(eventledger.append(D.ledger_path(), row))
@@ -184,8 +189,12 @@ class SpiralKeyChainTest(unittest.TestCase):
             argv = ["verdict", rid, tip, "--fix", "--measured",
                     "--finding-count", "1", "--prior-relation", "new",
                     "--worse-than-main", path,
-                    "--no-patch-because", "a design finding for a meld",
-                    "Reviewer observation naming %s." % path]
+                    "--no-patch-because", "a design finding for a meld"]
+            if path in self.finding_by_path:
+                argv += ["--finding-carried", self.finding_by_path[path]]
+            else:
+                argv += ["--finding", "Review defect in %s needs a cure" % path]
+            argv += ["Reviewer observation naming %s." % path]
             out, err = io.StringIO(), io.StringIO()
             with contextlib.redirect_stdout(out), \
                     contextlib.redirect_stderr(err):
@@ -196,6 +205,11 @@ class SpiralKeyChainTest(unittest.TestCase):
             folded, err = D.snapshot()
             self.assertIsNone(err)
             self.assertEqual(folded[rid]["status"], "verdict")
+            if path not in self.finding_by_path:
+                filed = [r for r in tasks.rows().values()
+                         if r.get("found_in") == rid]
+                self.assertEqual(len(filed), 1, "FIX must file its named finding")
+                self.finding_by_path[path] = filed[0]["id"]
         return rid
 
     def read(self, session):

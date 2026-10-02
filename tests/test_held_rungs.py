@@ -21,7 +21,7 @@ import io
 import unittest
 from unittest import mock
 
-from helm import dispatches, landreq
+from helm import dispatches, eventledger, landreq
 from tests import test_lr_close as _close
 
 
@@ -68,6 +68,7 @@ class HeldRungBase(_close.CloseBase):
         row, why = dispatches.add(
             "seat-a", lane, ref=ref, repo=self.repo, kind="review",
             notify=False, new_work=supersedes is None, supersedes=supersedes,
+            task=self.review_task["id"] if supersedes is None else None,
             force=True, _reason=True)
         self.assertIsNone(why, why)
         return row
@@ -103,8 +104,8 @@ class HeldRungBase(_close.CloseBase):
         """(held rung, approved successor): the rung is held with `hold`,
         and the successor's tip is merged, so the rung's tip is inside it."""
         held = self.rung(self.side)
-        self.hold(held["id"], hold.pop("reason", "awaiting the land gate"),
-                  **hold)
+        self.hold(held["id"], hold.pop(
+            "reason", "awaiting the land gate; fab Ran 5 tests OK"), **hold)
         succ, _tip = self.successor(held)
         self.git("merge", "--no-edit", "-q", "side")
         return held, succ
@@ -215,8 +216,26 @@ class AHoldThatNamesFindingsStaysTest(HeldRungBase):
             worse_than_main_paths=["g"])
         self.assertIsNone(err, err)
         self.assertEqual(read["status"], "open")
-        self.hold(held["id"], "awaiting the land gate",
-                  source_clean_tip=self.side)
+        # THE HOLD DOOR REFUSES IT NOW (task/4103): a read at the held tip
+        # found something, so a source-clean claim there is refused by that
+        # verdict's name, receipt or none.
+        reason = "awaiting the land gate; fab Ran 5 tests OK"
+        with mock.patch.object(dispatches, "_acting_author",
+                               return_value=("seat-a", None)):
+            out, why = dispatches.mark_hold(held["id"], reason,
+                                            source_clean_tip=self.side)
+        self.assertIsNone(out)
+        self.assertIn("carries a FIX verdict", str(why))
+        self.assertEqual(self.state(held["id"])["status"], "open")
+        # THE LAND STILL KEEPS SUCH A RUNG, for a hold the door wrote before
+        # it refused one: planted in the shape that door wrote.
+        state = self.state(held["id"])
+        self.assertTrue(eventledger.append(dispatches.ledger_path(), {
+            "v": 3, "event": "hold", "seq": int(state["seq"]) + 1,
+            "id": held["id"], "ts": dispatches.pk.now_ts(), "reason": reason,
+            "owner_gated": False, "source_clean_tip": self.side,
+            "hold_actor": "seat-a"}))
+        self.assertEqual(self.state(held["id"])["status"], "held")
         reads = self.state(held["id"])["advisory_reads"]
         self.assertEqual([r["polarity"] for r in reads], ["fix"])
         succ, _tip = self.successor(held)
@@ -264,7 +283,8 @@ class TheHeldListingReadsWhatIsOwedTest(HeldRungBase):
                 ("findings", {"reason": "Measured FIX delivered"}),
                 ("owner", {"reason": "awaiting the owner",
                            "owner_gated": True}),
-                ("clean", {"reason": "awaiting the land gate",
+                ("clean", {"reason": "awaiting the land gate; fab Ran 5 "
+                                     "tests OK",
                            "source_clean_tip": self.side})):
             lane = "lane/held-%s" % name
             held = self.rung(self.side, lane=lane)

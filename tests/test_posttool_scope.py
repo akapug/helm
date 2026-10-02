@@ -17,7 +17,8 @@ import unittest
 from unittest import mock
 
 from helm import (cli, hooks, record, hookrun, hookoutcome, posttoolrun,
-                  toolwhisper, seats, seats_cli, seats_rename, hooklatency)
+                  stop_early, toolwhisper, seats, seats_cli, seats_rename,
+                  hooklatency)
 from helm.inject import _ledger
 
 
@@ -219,6 +220,9 @@ class PosttoolScopeTest(unittest.TestCase):
                     (record, "_record", record_io),
                     (toolwhisper, "prepare_for_pair", prepare_io),
                     (toolwhisper, "commit_for_pair", commit_io),
+                    # The owed-row line's preparation (stop_early) reads the
+                    # stop facts; its real I/O is test_wake_slicec's.
+                    (stop_early, "prepare", lambda *a, **kw: None),
                     (seats, "resolve_homing", lambda *a, **kw: ("main", "operator")),
                     (seats, "_assert_own_seat", lambda *a, **kw: ("fixture-seat", None)),
                     (seats_cli.actors, "grant_on_behalf", lambda *a, **kw: (None, None)),

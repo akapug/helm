@@ -15,6 +15,7 @@ import contextlib
 import io
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -540,7 +541,7 @@ class WholeTranscriptReadTest(Isolated):
     def test_the_incident_command_hears_stream_it_per_line(self):
         rc, said, _err = self.hook("Bash", {"command": INCIDENT_READ})
         self.assertEqual(rc, 0)
-        for want in ("hundreds of MB", "for line in open(f)", "cv recall"):
+        for want in ("hundreds of MB", "for line in open(f)", "cv search or cv pack"):
             self.assertIn(want, said)
         self.assertEqual(self.ids(INCIDENT_READ), ["transcript-read"])
         # THE HOLE IT CLOSES: the plain rule reads the command with its quoted
@@ -601,7 +602,7 @@ class WholeTranscriptReadTest(Isolated):
         self.assertEqual(self.hook("Bash", {
             "command": "tail -3 ~/.codex/sessions/2026/09/x.jsonl"},
             session="latch-1")[1], "")
-        self.assertIn("cv recall", self.hook("Bash", {
+        self.assertIn("cv search or cv pack", self.hook("Bash", {
             "command": "tail -3 ~/.codex/sessions/2026/09/x.jsonl"},
             session="latch-2")[1], "control: the plain read speaks alone")
 
@@ -790,6 +791,75 @@ class WriteSteerTest(Isolated):
             os.killpg(proc.pid, signal.SIGKILL)
             proc.wait()
         self.assertEqual(held, [])
+
+    def _script(self, path, body):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            f.write("#!/bin/bash\n" + body)
+        os.chmod(path, 0o755)
+
+    def _asker(self):
+        """A shell line that prints `_runner_of($1)` from a python child."""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        code = ("import sys; sys.path.insert(0, %r); "
+                "from helm import actsteer; "
+                "print(actsteer._runner_of(sys.argv[1]))" % root)
+        return "%s -S -c %s \"$1\"\n" % (shlex.quote(sys.executable),
+                                          shlex.quote(code))
+
+    def test_the_hooks_own_shell_is_not_a_runner(self):  # noqa: VACUOUS_ASSERTION — the positive neighbours on the SAME reader are test_editing_a_script_a_shell_is_running_is_steered and test_a_script_above_the_hook_is_still_a_runner, where a bash that is not the hook is found
+        """The shell running bin/helm-hook (or bin/helm-hookres) is an
+        ancestor of the process asking: it runs the hook, not the script's
+        next line, so an edit of that script is not a live-script edit."""
+        hook = os.path.join(self.repo, "bin", "helm-hook")
+        self._script(hook, self._asker())
+        r = subprocess.run(["bash", hook, hook], capture_output=True,
+                           text=True, timeout=120, stdin=subprocess.DEVNULL)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "None")
+
+    def test_a_script_above_the_hook_is_still_a_runner(self):
+        """The hook's own chain ends at the outermost shell running a hook
+        script. A shell above it (a seat's own wrapper script that started
+        the harness and is still reading itself) is a real runner, and an
+        edit of its script is steered."""
+        hook = os.path.join(self.repo, "bin", "helm-hook")
+        self._script(hook, self._asker())
+        launch = os.path.join(self.repo, "launch.sh")
+        self._script(launch, "bash %s \"$0\"\n:\n" % shlex.quote(hook))
+        p = subprocess.Popen(["bash", launch], stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True,
+                             stdin=subprocess.DEVNULL)
+        out, err = p.communicate(timeout=120)
+        self.assertEqual(p.returncode, 0, err)
+        self.assertEqual(out.strip(), str(p.pid))
+
+    def test_a_served_hooks_caller_chain_is_not_a_runner(self):  # noqa: VACUOUS_ASSERTION — the CONTROL read on the same reader must EQUAL the shell's pid before the served read's None counts
+        """Served warm (helm/hookres.py), the hook's process is the
+        resident's forked child, and the shells running it (bin/helm-hookres,
+        bin/helm-hook) are the CALLER's chain, not its own: they are skipped
+        too. The same shell is a runner to anyone else."""
+        from helm import hookres
+        script = os.path.join(self.repo, "client.sh")
+        with open(script, "w") as f:
+            f.write("#!/bin/bash\nsleep 30\n")
+        os.chmod(script, 0o755)
+        proc = subprocess.Popen(["bash", script], start_new_session=True,
+                                stdin=subprocess.DEVNULL)
+        try:
+            deadline = time.monotonic() + 30
+            seen = actsteer._runner_of(script)
+            while seen is None and time.monotonic() < deadline:
+                time.sleep(0.02)
+                seen = actsteer._runner_of(script)
+            with mock.patch.object(hookres, "CALLER", proc.pid, create=True):
+                served = actsteer._runner_of(script)
+        finally:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait()
+        self.assertEqual(seen, str(proc.pid),
+                         "control: the shell is a runner to anyone else")
+        self.assertIsNone(served)
 
 
 # ---------------------------------------------------------------------------

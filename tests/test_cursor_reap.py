@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests._tmphome import home as _tmp_home                     # noqa: E402
 _tmp_home()
 from tests.test_seats import SeatsBase                           # noqa: E402
-from helm import chat, gc, pk, seats                             # noqa: E402
+from helm import chat, chatdebris, gc, pk, seats                 # noqa: E402
 from helm.seats_common import _seat_key, roster_path             # noqa: E402
 
 
@@ -486,6 +486,157 @@ class RoomlessDeliveryTest(SeatsBase):
             os.unlink(p)
         line = seats.deliver(session=self.SID, seat="alice", room=self.ROOM)
         self.assertNotIn("history", line or "")
+
+
+
+class RetiredRoomCursorTest(SeatsBase):
+    """task/3848: a cursor on a room `helm chat retire-rooms` took off the bus
+    goes, WHOEVER holds it -- a live session, a rostered seat.
+
+    `retire_room` removes a room's cursors under the room's locks, so one
+    found later was minted by a pass that listed the room before it left, or
+    left by a retirement that stopped between the log and its cursors. The
+    rules before this one keep it forever: a live session keeps its cursor
+    "room or no room", and a rostered seat's roomless cursor stays. Nothing
+    reads it again. The restore never brings a retired room back, and a room
+    REBORN under the name has a log again, which keeps every cursor on it.
+
+    THE DANGEROUS DIRECTIONS FIRST: a young cursor, a reborn room and an
+    index that cannot be read all keep, and a reborn room delivers its new
+    rows -- none dropped, none of the archived ones replayed."""
+
+    ROOM = "meld-1790000000-topic"
+    SID = "0fa7c4ed-9a5e-46a0-b2da-f862eb8afad6"
+    # read by name only when it exists, so on the tree before this rule
+    # every arm fails on what the reaper did, never on a missing constant
+    OLD = 2 * getattr(chat, "RETIRED_CURSOR_S", 3600)
+
+    def _retire(self):
+        os.makedirs(chat.journal_dir(), exist_ok=True)
+        chatdebris._record(self.ROOM, {
+            "through": "2026-09-01T00:00:00Z",
+            "retired_at": "2026-09-02T00:00:00Z",
+            "archive": "retired-rooms/" + self.ROOM, "bytes": 1})
+
+    def _cursor(self, seat, sid=None, age=0):
+        name = "%s.cursor.%s" % (pk.slug(self.ROOM), _seat_key(seat))
+        if sid:
+            name += "." + sid[:8]
+        path = os.path.join(chat.chat_dir(), name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write('{"dev": null, "ino": null, "off": 0, "rid": null}\n')
+        if age:
+            t = time.time() - age
+            os.utime(path, (t, t))
+        return path
+
+    def _pair(self, age):
+        """A live session's cursor and its rostered seat's seat-level one."""
+        seats.join(session=self.SID, cwd="/tmp/p", seat="alice")
+        return (self._cursor("alice", self.SID, age=age),
+                self._cursor("alice", age=age))
+
+    def _dead(self):
+        """A dead session's cursor on a room that is there: every rule
+        before this one reaps it, so each keep arm proves its scan ran."""
+        chat.post("present", who="bob", room="main")
+        path = os.path.join(chat.chat_dir(), "main.cursor.%s.dead0001"
+                            % _seat_key("alice"))
+        with open(path, "w", encoding="utf-8") as f:
+            f.write('{"off": 0}\n')
+        return path
+
+    def test_a_retired_rooms_cursors_go_whoever_holds_them(self):
+        self._retire()
+        session, seat = self._pair(self.OLD)
+        victims, _kept, err = chat.dead_cursors(live={self.SID})
+        self.assertIsNone(err)
+        self.assertIn(session, victims, "a live session's cursor on a "
+                      "retired room was kept")
+        self.assertIn(seat, victims, "a rostered seat's cursor on a retired "
+                      "room was kept")
+
+    def test_the_control_an_unretired_missing_room_keeps_both(self):
+        """The must-differ control: the same cursors on a missing room that
+        was never retired keep, by the rules before this one."""
+        session, seat = self._pair(self.OLD)
+        dead = self._dead()
+        victims, _kept, err = chat.dead_cursors(live={self.SID})
+        self.assertIsNone(err)
+        self.assertIn(dead, victims, "must-hit: the scan judged nothing")
+        self.assertNotIn(session, victims)
+        self.assertNotIn(seat, victims)
+
+    def test_a_young_cursor_on_a_retired_room_is_kept(self):
+        self._retire()
+        session, seat = self._pair(0)
+        dead = self._dead()
+        victims, _kept, err = chat.dead_cursors(live={self.SID})
+        self.assertIsNone(err)
+        self.assertIn(dead, victims, "must-hit: the scan judged nothing")
+        self.assertNotIn(session, victims)
+        self.assertNotIn(seat, victims)
+
+    def test_a_retired_room_reborn_keeps_every_cursor_on_it(self):
+        self._retire()
+        session, seat = self._pair(self.OLD)
+        chat.post("reborn", who="bob", room=self.ROOM)
+        dead = self._dead()
+        victims, _kept, err = chat.dead_cursors(live={self.SID})
+        self.assertIsNone(err)
+        self.assertIn(dead, victims, "must-hit: the scan judged nothing")
+        self.assertNotIn(session, victims)
+        self.assertNotIn(seat, victims)
+
+    def test_an_unreadable_retirement_index_retires_nothing(self):
+        self._retire()
+        with open(os.path.join(chat.journal_dir(), chatdebris.INDEX_NAME),
+                  "w", encoding="utf-8") as f:
+            f.write("{not json")
+        session, seat = self._pair(self.OLD)
+        dead = self._dead()
+        victims, _kept, err = chat.dead_cursors(live={self.SID})
+        self.assertIsNone(err)
+        self.assertIn(dead, victims, "must-hit: the scan judged nothing")
+        self.assertNotIn(session, victims)
+        self.assertNotIn(seat, victims)
+
+    def test_the_re_proof_reaps_it_and_refuses_once_the_room_is_reborn(self):
+        """gc re-proves every victim under the cursor lock. A room reborn
+        between the scan and the unlink keeps its cursor."""
+        self._retire()
+        session, _seat = self._pair(self.OLD)
+        self.assertTrue(chat.still_dead_cursor(live={self.SID})(session),
+                        "must-hit: the re-proof keeps a retired room's cursor")
+        chat.post("reborn", who="bob", room=self.ROOM)
+        self.assertFalse(chat.still_dead_cursor(live={self.SID})(session))
+
+    def test_a_reborn_room_delivers_its_new_rows_and_none_of_the_old(self):  # noqa: VACUOUS_ASSERTION — the one delivered line is asserted to carry the new row; the old row's absence from the same passes is the no-replay contract
+        """End to end: rows, a retirement, a cursor a stale pass minted, the
+        reap, then a post that brings the room back. The new row is
+        delivered (the reap dropped nothing) and the archived rows are not
+        (the reap replayed nothing)."""
+        chat.post("before the retirement @alice", who="bob", room=self.ROOM)
+        chat.post("the seat's primary room", who="bob", room="main")
+        seats.join(session=self.SID, cwd="/tmp/p", seat="alice")
+        out, why = chatdebris.retire_room(self.ROOM, idle_days=1,
+                                          now=time.time() + 3 * 86400)
+        self.assertIsNone(why)
+        self.assertFalse(os.path.exists(chat.room_path(self.ROOM)))
+        stale = self._cursor("alice", self.SID, age=self.OLD)
+        victims, _kept, err = chat._reap_for_test(live={self.SID})
+        self.assertIsNone(err)
+        self.assertIn(stale, victims)
+        self.assertFalse(os.path.exists(stale))
+        chat.post("@alice after the retirement", who="bob", room=self.ROOM)
+        got = [seats.deliver_any(session=self.SID, seat="alice")
+               for _ in range(3)]
+        lines = [g for g in got if g]
+        self.assertEqual(len(lines), 1, got)
+        self.assertIn("after the retirement", lines[0])
+        self.assertFalse(any("before the retirement" in (g or "")
+                             for g in got))
 
 
 if __name__ == "__main__":

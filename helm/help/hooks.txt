@@ -1,0 +1,1 @@
+hooks install [--dry]|status|latency [--json] [--since T] [--until T] [--hours H]|sync [--apply]|run <EVENT> [--tool NAME]|preflight --config-dir DIR|resident [--status] — self-wire the per-turn inject hook into every claude home; sync reconciles every home to the NAMED canonical hook set (dry-run default)

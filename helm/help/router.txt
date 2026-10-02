@@ -1,0 +1,1 @@
+router up|run|down|status|line|probes — the transparent multi-model router: claude-* forwarded VERBATIM to api.anthropic.com (the client's own OAuth, never an API key), non-claude models to their seat's CLIProxyAPI; line prints the claude-parent mixed-fleet launch line, probes mints the per-model example agents

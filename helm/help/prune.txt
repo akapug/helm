@@ -1,0 +1,1 @@
+prune <sid> [--preset lean|window20k] [--dry] — resume-optimized copy, original untouched

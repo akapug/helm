@@ -442,15 +442,40 @@ class InjectShadowTest(Base):
         m = classify.metrics(classify.INJECT_CONSUMER)["consumers"]
         self.assertEqual(m[classify.INJECT_CONSUMER]["answered"], 1)
 
-    def test_a_down_or_slow_backend_changes_no_byte_and_is_bounded(self):
+    def test_a_down_or_slow_backend_changes_no_byte_and_is_bounded(self):  # noqa: VACUOUS_ASSERTION — each arm pins the outcome to a non-empty literal through the loop's `want`, and `off` has an unconditional delivered-line control
+        """THE BOUND IS THE PRODUCT'S BUDGET, NOT THIS HOST'S SPEED.
+
+        Each turn's call must be handed `inject_ms()` twice: as the one
+        wall-clock limit `_within` waits, and as the transport's per-socket
+        timeout. Both are recorded at `_within`. The DOWN arm's question is
+        the outcome of a 503, not how fast a loaded host relays it: a
+        whole-suite gate once relayed an instant 503 past a 150 ms budget
+        and read `timeout`. So that arm waits on a finite, generous backstop
+        instead. The SLOW arm runs the real limits: its reply comes long
+        after the budget, so a load can only make it later, and `timeout`
+        (the 200 would read `ok`) proves the call stopped waiting."""
         off, _row = self.gather("s-off")
+        self.assertTrue(any("zebra-rule" in l for l in off["jit"]),
+                        "control: the turn delivers a line to compare")
         self.set(backend="openai-compatible", url=self.server(), inject_ms=150)
-        for status, delay, want in ((503, 0, "no-backend"),
-                                    (200, 1.0, "timeout")):
+        budget_s = classify.inject_ms() / 1000.0
+        real = classify._within
+        for status, delay, wide_s, want in ((503, 0, 60.0, "no-backend"),
+                                            (200, 1.0, None, "timeout")):
             with self.subTest(want=want):
+                limits = []
+
+                def within(limit_s, send, url, body, timeout_s, *rest):
+                    limits.append((limit_s, timeout_s))
+                    return real(wide_s or limit_s, send, url, body,
+                                wide_s or timeout_s, *rest)
+
                 Fake.script = [(status, contract(), delay)]
-                on, row = self.gather("s-" + want)
+                with mock.patch.object(classify, "_within", within):
+                    on, row = self.gather("s-" + want)
                 self.assertEqual(on["jit"], off["jit"])
+                self.assertEqual(limits, [(budget_s, budget_s)],
+                                 "the call ran under the shadow's own budget")
                 self.assertEqual(row["classify_shadow"]["outcome"], want)
 
     def test_a_dripping_backend_leaves_the_injection_whole(self):

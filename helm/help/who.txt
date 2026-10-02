@@ -1,0 +1,1 @@
+who [--json] — pid->cred attribution table: every live claude/codex process, its cred home, account, cwd, and session (shared sessions flagged)

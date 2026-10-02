@@ -19,8 +19,8 @@ import os
 
 from . import projscope, vcs
 from .seats_common import STATUS_BYTES, _clip, _scrub
-from .seats_delegation import (_lane_stem, _lease_worktree,
-                               lease_foreign_project)
+from .seats_delegation import _lease_worktree, lease_foreign_project
+from .seats_gate_exemption import _lane_stem
 
 _ROOM_READS = ("working tree", "landedness", "review", "gate")
 _ROOM_ROWS_SHOWN = 2
@@ -338,7 +338,7 @@ def _room_unfinished(resource, snap=None, ledger_note=None, cwd=None):
         # the only open review named `lane-u` sat in a DIFFERENT repo and
         # this read called it THIS room's unfinished work with unknowns=[].
         # The row already carries the writer's canonical `repo_id` (the
-        # scrubbed git-common-dir `_base` stamps), and `dispatches._repo_info`
+        # scrubbed git-common-dir `_base3` stamps), and `dispatches._repo_info`
         # is the one authority that derives it. Three arms, none collapsible:
         # a KNOWN same-repo row counts; a row POSITIVELY scoped to another
         # repo is not this room's work at all; a LEGACY row carrying no

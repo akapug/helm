@@ -847,9 +847,11 @@ class RecordedPlanBase(FocusBase):
 
     def _dispatch(self):
         os.makedirs(os.environ["HELM_HOME"], exist_ok=True)
+        from tests._tmphome import review_task
         d, err = dispatches.add("reviewer", "a-lane", self.head,
                                 kind="review", repo=self.repo, notify=False,
-                                _reason=True, new_work=True)
+                                _reason=True, new_work=True,
+                                task=review_task(self))
         self.assertIsNone(err, err)
         return d
 

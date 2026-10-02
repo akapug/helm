@@ -175,17 +175,37 @@ class TheLeadIsTheRowToActOnTest(_World):
         self.assertIn("1 from the owner", ring)
 
     def test_an_all_never_leads_while_an_addressed_row_is_unread(self):
-        """The first ring announced the ask; an @all lands and rings. RED
-        before the cure: the second ring led with the @all, because only the
-        rows new since the last ring could lead."""
-        chat.post("@gemini the ask", who="bob")
+        """The first ring announced the ask, and an @all lands and rings. An
+        @all never leads over an addressed row no ring has shown yet; this
+        ask was SHOWN whole by the first ring, so it does not lead again
+        (task/4019: one row is delivered once per seat). The second ring
+        leads with the @all, and its one pull still names the unread ask."""
+        ask = chat.post("@gemini the ask", who="bob")
 
         def script(n, _now):
             if n == 2:
                 chat.post("@all standup", who="carol")
         lines, _seen = self.follow(passes=40, script=script, clock=True)
         self.assertEqual(len(lines), 2, lines)
-        self.assertIn("] bob: @gemini the ask (+1 waiting — ", lines[1])
+        self.assertIn("] bob: @gemini the ask (+0 waiting — ", lines[0])
+        self.assertIn("] carol: @all standup (+1 waiting — helm chat read "
+                      "--id %s · " % ask["id"], lines[1])
+        self.assertIn("1 not addressed: read when idle", lines[1])
+
+    def test_an_all_never_leads_while_an_unshown_addressed_row_is_unread(self):
+        """The first ring led with the newer ask and only counted the older
+        one; an @all lands and rings. The older ask was never shown, so it
+        leads over the @all."""
+        chat.post("@gemini the older ask", who="bob")
+        chat.post("@gemini the newer ask", who="bob")
+
+        def script(n, _now):
+            if n == 2:
+                chat.post("@all standup", who="carol")
+        lines, _seen = self.follow(passes=40, script=script, clock=True)
+        self.assertEqual(len(lines), 2, lines)
+        self.assertIn("] bob: @gemini the newer ask (+1 waiting — ", lines[0])
+        self.assertIn("] bob: @gemini the older ask (+2 waiting — ", lines[1])
         self.assertIn("1 not addressed: read when idle", lines[1])
 
     def test_the_newest_addressed_row_leads(self):

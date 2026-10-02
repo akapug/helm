@@ -792,7 +792,7 @@ class SecondFreeLaneTest(unittest.TestCase):
         """The fallback model's window is smaller than this family's, so the
         degraded seat must be launched claiming the smaller one. Read off the
         SHIPPED launch line, both models through the same call, because the
-        failure is silent: a seat launched claiming 512000 against a 256000
+        failure is silent: a seat launched claiming the family window against a 256000
         model wedges with no in-band exit."""
         fam = seat.FAMILIES[SECOND_FREE_LANE]
         fallback = fam["model_fallback"]

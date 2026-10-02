@@ -1297,6 +1297,15 @@ def _api_ready():
         gauge = _cached("ready", max(_READY_TTL_S, 2 * _READY_FILL_S), build)
     except Exception as e:
         gauge = {"unavailable": "%s: %s" % (e.__class__.__name__, e)}
+    # THE OFFICE WEATHER heads every view (task/3902), so it rides the one
+    # heartbeat every view shares, outside the cache like the build below:
+    # one small read of the line the weather pass last settled, never a probe.
+    try:
+        from . import officeweather
+        gauge = dict(gauge, weather=officeweather.surface())
+    except Exception as e:                 # noqa: BLE001 — the gauge still renders
+        gauge = dict(gauge, weather={"unavailable": "%s: %s" % (
+            e.__class__.__name__, e)})
     # THE BUILD THE SERVER WOULD SERVE NOW, riding the one poll every view
     # already makes. The owner's tab ran a page for hours that a newer build had
     # replaced, and reported what the old one showed — nothing on the console
@@ -1358,19 +1367,28 @@ def _parse_qs_int(qs, key, default, lo, hi):
 
 def _qs_set(qs, key, valid=None, default=""):
     """A comma list from qs['key'] -> a set, or None when nothing is asked
-    (no filter). `all` anywhere means no filter; a value outside `valid`
-    selects nothing rather than being ignored, so a typo reads as zero rows
-    instead of as the whole backlog."""
+    (no filter). `all` anywhere means no filter. One member outside `valid`
+    selects nothing: the other members do not survive it, so a typo reads as
+    zero rows instead of as the rows those members named."""
     raw = str((qs.get(key) or [default])[0] or "").strip()
     got = {t.strip() for t in raw.split(",") if t.strip()}
     if not got or "all" in got:
         return None
-    return got & valid if valid is not None else got
+    if valid is not None and not got <= valid:
+        return set()
+    return got
 
 
 def _qs_flag(qs, key):
-    return str((qs.get(key) or [""])[0]).strip().lower() in ("1", "true",
-                                                              "yes", "on")
+    """True when `key` names an on-token, None when it is absent, False when
+    a value is present and is not on.
+
+    On is `1`, `true`, `yes` or `on`. Absence is no filter. Any other present
+    value selects nothing, so a typo cannot read as every row."""
+    raw = str((qs.get(key) or [""])[0]).strip().lower()
+    if not raw:
+        return None
+    return raw in ("1", "true", "yes", "on")
 
 
 def _backlog_facts(tasks, row, ages, of_row, owner_of):
@@ -1400,8 +1418,10 @@ def _api_backlog(qs):
       priority  comma list of P0, P1, P2, P3, unranked, all
       project   comma list of project keys; `none` is the rows with none
       owner     comma list of seats (case-insensitive, exact); `unowned`
-      asked     1 = only the rows the owner asked for (origin owner)
-      stale     1 = only the rows nobody has written on in seven days
+      asked     1, true, yes or on = only the rows the owner asked for
+                (origin owner). Any other present value selects nothing.
+      stale     1, true, yes or on = only the rows nobody has written on
+                in seven days. Any other present value selects nothing.
       q         words that must all appear in the id, title or note
       sort      priority (the board order `helm task list` prints), created
                 (newest first, GitHub's order), oldest, updated (latest
@@ -1441,8 +1461,8 @@ def _api_backlog(qs):
             "project": _qs_set(qs, "project"),
             "owner": {o.casefold() for o in _qs_set(qs, "owner") or ()}
             or None,
-            "asked": _qs_flag(qs, "asked") or None,
-            "stale": _qs_flag(qs, "stale") or None}
+            "asked": _qs_flag(qs, "asked"),
+            "stale": _qs_flag(qs, "stale")}
     terms = str((qs.get("q") or [""])[0]).lower().split()
     sort = str((qs.get("sort") or ["priority"])[0])
     sort = sort if sort in _VALID_SORTS else "priority"
@@ -1477,8 +1497,10 @@ def _api_backlog(qs):
             or f["project"] in want["project"],
             "owner": want["owner"] is None
             or f["owner"].casefold() in want["owner"],
-            "asked": not want["asked"] or f["asked"],
-            "stale": not want["stale"] or f["ages"].get("stale") is True,
+            "asked": want["asked"] is None or (
+                want["asked"] and f["asked"]),
+            "stale": want["stale"] is None or (
+                want["stale"] and f["ages"].get("stale") is True),
             "q": not terms or all(t in _backlog_hay(row) for t in terms)}
 
     facets = {"status": {}, "priority": {}, "project": {}, "owner": {},

@@ -687,6 +687,85 @@ class TheDeadlineTest(Base):
         self.assertEqual(len([x for x in woken if ROW in x]), 1)
 
 
+def _sender_calls():
+    """(file, call, [(sender expression, its label or None)]) for every
+    post/dm call site under helm/. The sender is read as `who=` or as the
+    third positional argument, through module constants (plain or
+    annotated); anything else has no label."""
+    import ast
+    import glob
+    for path in sorted(glob.glob(os.path.join(REPO, "helm", "**", "*.py"),
+                                 recursive=True)):
+        rel = os.path.relpath(path, REPO)
+        with open(path, encoding="utf-8") as f:
+            tree = ast.parse(f.read())
+        consts = {}
+        for n in tree.body:
+            targets = (n.targets if isinstance(n, ast.Assign) else
+                       [n.target] if isinstance(n, ast.AnnAssign) else [])
+            value = getattr(n, "value", None)
+            for t in targets:
+                if isinstance(t, ast.Name) and isinstance(value, ast.Constant) \
+                        and isinstance(value.value, str):
+                    consts[t.id] = value.value
+        for node in ast.walk(tree):
+            fn = getattr(node, "func", None)
+            name = getattr(fn, "attr", None) or getattr(fn, "id", "")
+            if not isinstance(node, ast.Call) \
+                    or name not in ("post", "dm", "_dm_canonical"):
+                continue
+            exprs = [kw.value for kw in node.keywords if kw.arg == "who"]
+            exprs += node.args[2:3]
+            yield rel, node, [
+                (v, v.value if isinstance(v, ast.Constant) else
+                 consts.get(v.id) if isinstance(v, ast.Name) else None)
+                for v in exprs]
+
+
+class TheSigningClassTest(unittest.TestCase):
+    """EVERY SUBSYSTEM LABEL HAS A SIGNING CLASS, AND NO CALL SITE ARGUES
+    WITH IT (task/3851). A signed chat send costs the chat node about 25
+    CPU-seconds of proving. chat.post gives a subsystem's row its class's
+    `sign`: a VERIFY row (a land announcement, a verdict's nudge) stays
+    signed, a STATUS row (a census, a health line, a gc tally, an alarm)
+    posts unsigned, as pressure-watch always did. The walk above keeps every
+    literal label in the table; this keeps the table one arm per class, and
+    fails on a call site whose own `sign=` contradicts its label's class."""
+
+    def test_every_label_has_one_class_and_every_class_one_arm(self):
+        from helm import machine_senders as ms
+        self.assertEqual(ms.SIGNING, {ms.VERIFY: None, ms.STATUS: False})
+        self.assertEqual(set(ms.SENDERS.values()), set(ms.SIGNING))
+        self.assertEqual(ms.SUBSYSTEMS, frozenset(ms.SENDERS))
+        self.assertEqual([k for k in ms.SENDERS if k != k.strip().casefold()],
+                         [])
+        for name in ("auto-land", "dispatches"):
+            self.assertIsNone(ms.sign_for(name), name)
+        for name in ("beacons", "proxywatch", "worktree-gc", "pressure-watch",
+                     "idle-dispatch", " Beacons "):
+            self.assertIs(ms.sign_for(name), False, name)
+        for person in ("seat-a", "daria", "agent", "helm-agent", "", None):
+            self.assertIsNone(ms.sign_for(person), person)
+
+    def test_no_call_site_signs_against_its_labels_class(self):  # noqa: VACUOUS_ASSERTION — an empty list is the contract; the walk's control asserts it read pressure-watch's own sign=False
+        import ast
+        from helm import machine_senders as ms
+        seen, against = set(), []
+        for rel, node, labels in _sender_calls():
+            sign = [kw.value for kw in node.keywords if kw.arg == "sign"]
+            if not sign or not isinstance(sign[0], ast.Constant):
+                continue
+            for _v, label in labels:
+                cls = ms.SENDERS.get(str(label).casefold())
+                if cls is None:
+                    continue
+                seen.add(label)
+                if (cls == ms.STATUS) != (sign[0].value is False):
+                    against.append((rel, node.lineno, label, sign[0].value))
+        self.assertIn("pressure-watch", seen, "control: the walk read a sign=")
+        self.assertEqual(against, [])
+
+
 class TheBoundaryCarriesPeopleNotMachinesTest(Base):
     """task/2980 lane 7: the tool-boundary hook keeps the seat's home room,
     less the plain rows a SUBSYSTEM posts. The designer measured machine
@@ -779,17 +858,18 @@ class TheBoundaryCarriesPeopleNotMachinesTest(Base):
         ("helm/remote_relay.py", "seat_name"),
         ("helm/seats_ack.py", "seat"),
         ("helm/seats_catchup.py", "seat"),
-        ("helm/seats_cli.py", "actor"),
         ("helm/seats_cli.py", "sender"),
+        ("helm/seats_cli_council.py", "actor"),
         ("helm/seats_delivery.py", "sender"),
         ("helm/seats_delivery.py", "who"),
+        ("helm/seatshout.py", "actor"),
         ("helm/takeover.py", "record['successor']"),
         ("helm/telegram.py", "who"),
         ("helm/todos.py", "seat"),
         ("helm/web_chat.py", "str(payload.get('name') or seats.owner_name())"),
     ))
 
-    def test_every_label_helm_posts_under_is_a_known_subsystem(self):
+    def test_every_label_helm_posts_under_is_a_known_subsystem(self):  # noqa: VACUOUS_ASSERTION — the walk's controls assert it found proxywatch and worktree-gc, the labels `missing` is computed from
         """The set is derived from the tree, and this keeps it so: a new
         literal sender at a post or dm call site must be named in
         machine_senders, or its plain rows would be pushed to every seat.
@@ -797,42 +877,17 @@ class TheBoundaryCarriesPeopleNotMachinesTest(Base):
         through module constants (plain or annotated); anything else, a
         `**kw` splat included, is UNRESOLVED and must be named above."""
         import ast
-        import glob
         from helm import machine_senders
         found, unresolved = {}, set()
-        for path in sorted(glob.glob(os.path.join(REPO, "helm", "**", "*.py"),
-                                     recursive=True)):
-            rel = os.path.relpath(path, REPO)
-            with open(path, encoding="utf-8") as f:
-                tree = ast.parse(f.read())
-            consts = {}
-            for n in tree.body:
-                targets = (n.targets if isinstance(n, ast.Assign) else
-                           [n.target] if isinstance(n, ast.AnnAssign) else [])
-                value = getattr(n, "value", None)
-                for t in targets:
-                    if isinstance(t, ast.Name) and isinstance(value, ast.Constant) \
-                            and isinstance(value.value, str):
-                        consts[t.id] = value.value
-            for node in ast.walk(tree):
-                fn = getattr(node, "func", None)
-                name = getattr(fn, "attr", None) or getattr(fn, "id", "")
-                if not isinstance(node, ast.Call) \
-                        or name not in ("post", "dm", "_dm_canonical"):
-                    continue
-                exprs = [kw.value for kw in node.keywords if kw.arg == "who"]
-                exprs += node.args[2:3]
-                for kw in node.keywords:
-                    if kw.arg is None:
-                        unresolved.add((rel, "**" + ast.unparse(kw.value)))
-                for v in exprs:
-                    label = (v.value if isinstance(v, ast.Constant) else
-                             consts.get(v.id) if isinstance(v, ast.Name)
-                             else None)
-                    if isinstance(label, str):
-                        found.setdefault(label, set()).add(rel)
-                    else:
-                        unresolved.add((rel, ast.unparse(v)))
+        for rel, node, labels in _sender_calls():
+            for kw in node.keywords:
+                if kw.arg is None:
+                    unresolved.add((rel, "**" + ast.unparse(kw.value)))
+            for v, label in labels:
+                if isinstance(label, str):
+                    found.setdefault(label, set()).add(rel)
+                else:
+                    unresolved.add((rel, ast.unparse(v)))
         self.assertIn("proxywatch", found, "control: the walk saw a label")
         self.assertIn("worktree-gc", found, "the gc summary names itself")
         missing = {k: sorted(v) for k, v in found.items()

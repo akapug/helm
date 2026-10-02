@@ -574,6 +574,19 @@ class BlendTest(unittest.TestCase):
 
 
 class DataTest(unittest.TestCase):
+    def setUp(self):
+        # Built-in rungs fallback: point at an empty HELM_HOME, so the real
+        # seat-rungs.json the mentor wrote is not read by these arms.
+        self._tmp = tempfile.mkdtemp(prefix="helm-rungs-")
+        self._env = os.environ.get("HELM_HOME")
+        os.environ["HELM_HOME"] = self._tmp
+
+    def tearDown(self):
+        if self._env is None:
+            os.environ.pop("HELM_HOME", None)
+        else:
+            os.environ["HELM_HOME"] = self._env
+
     def test_every_prior_names_its_benchmark_source_date_and_harness(self):
         self.assertTrue(scorecard.PRIORS)
         for key, p in scorecard.PRIORS.items():
@@ -595,7 +608,8 @@ class DataTest(unittest.TestCase):
             self.assertTrue(r["source"], seat)
         self.assertEqual(sorted(scorecard.SEAT_RUNGS), ["bonsai", "qwen27", "qwenlocal"])
         rungs = run_board()["rungs"]
-        self.assertEqual(rungs["ladder"], list(scorecard.RUNGS))
+        self.assertEqual(rungs["ladder"], list(scorecard.RUNGS))   # the web page joins this list
+        self.assertEqual(rungs["ladders"], {"reader": list(scorecard.RUNGS)})
         self.assertIn("owner", rungs["who_admits"])
 
 
@@ -622,6 +636,19 @@ class GradeCardWordsTest(unittest.TestCase):
                    "not memory"),
     }
 
+    def setUp(self):
+        # The built-in grade cards are the fallback; point at an empty
+        # HELM_HOME so the data file the mentor wrote is not read here.
+        self._tmp = tempfile.mkdtemp(prefix="helm-rungs-")
+        self._env = os.environ.get("HELM_HOME")
+        os.environ["HELM_HOME"] = self._tmp
+
+    def tearDown(self):
+        if self._env is None:
+            os.environ.pop("HELM_HOME", None)
+        else:
+            os.environ["HELM_HOME"] = self._env
+
     def test_each_seat_reads_its_cards_rung_step_and_next(self):  # noqa: VACUOUS_ASSERTION — an exact equality with the non-empty CARD table is the unconditional structural assertion
         got = {seat: (r["rung"], r["step"], r["next"]) for seat, r in scorecard.SEAT_RUNGS.items()}
         self.assertEqual(got, self.CARD)
@@ -634,7 +661,157 @@ class GradeCardWordsTest(unittest.TestCase):
         self.assertIn("each claimed fab log quoted", rows["qwenlocal"]["next"])
         self.assertNotIn("test log", rows["qwenlocal"]["next"])
         text = "\n".join(scorecard.board_lines(run_board()))
-        self.assertIn("bonsai — non-door reviewer on briefed tables", text)
+        self.assertIn("bonsai [reader] — non-door reviewer on briefed tables", text)
+
+
+class DataFileRungsTest(unittest.TestCase):
+    """THE RUNGS CAN LIVE IN <global dir>/seat-rungs.json: the data file the
+    mentor edits, the code only reads it. The board shows the source line under
+    the rungs, each seat's own track and its model, and a rung taken from the
+    seat's OWN track's ladder (qwenlocal's next reader rung is "non-door
+    reviewer", the builder's is the builder ladder's next). A file the board
+    cannot use is one honest fallback line: missing, unreadable, or a step off
+    its ladder.
+    """
+
+    def _home_with(self, text):
+        tmp = tempfile.mkdtemp(prefix="helm-rungs-file-")
+        old = os.environ.get("HELM_HOME")
+        os.environ["HELM_HOME"] = tmp
+        self.addCleanup(lambda old=old: os.environ.__setitem__("HELM_HOME", old)
+                        if old is not None else os.environ.pop("HELM_HOME", None))
+        os.makedirs(os.path.join(tmp, "_global"), exist_ok=True)
+        with open(os.path.join(tmp, "_global", "seat-rungs.json"), "w") as f:
+            f.write(text)
+        return tmp
+
+    def test_a_valid_file_shows_its_seats_with_track_model_and_own_track_rung(self):
+        self._home_with(json.dumps({
+            "ladders": {"reader": ["input", "non-door reviewer", "admitted"],
+                        "builder": ["supervised slices", "clean slices", "admitted"]},
+            "seats": [
+                {"seat": "qwenlocal", "track": "reader", "rung": "input",
+                 "step": "input", "model": "Ornith", "by": "m", "date": "2026-09-30",
+                 "next": "3 non-door reads", "evidence": "x", "source": "s"},
+                {"seat": "qwenlocal", "track": "builder", "rung": "supervised slices",
+                 "step": "supervised slices", "model": "Ornith", "by": "m",
+                 "date": "2026-09-30", "next": "1 in 5", "evidence": "y", "source": "s"},
+            ]}))
+        b = run_board()
+        src = b["rungs"]["source_line"]
+        self.assertIn("seat-rungs.json", src)
+        self.assertNotIn("built-in", src)
+        rows = {(r["seat"], r["track"]): r for r in b["rungs"]["seats"]}
+        self.assertEqual(rows[("qwenlocal", "reader")]["next_rung"], "non-door reviewer")
+        self.assertEqual(rows[("qwenlocal", "builder")]["next_rung"], "clean slices")
+        self.assertEqual(rows[("qwenlocal", "reader")]["model"], "Ornith")
+        text = "\n".join(scorecard.board_lines(b))
+        self.assertIn("Ornith", text)
+
+    def test_a_missing_file_falls_back_to_builtin_and_says_missing(self):
+        tmp = tempfile.mkdtemp(prefix="helm-rungs-miss-")
+        old = os.environ.get("HELM_HOME")
+        os.environ["HELM_HOME"] = tmp
+        self.addCleanup(lambda old=old: os.environ.__setitem__("HELM_HOME", old)
+                        if old is not None else os.environ.pop("HELM_HOME", None))
+        lad, seats, src = scorecard.load_rungs()
+        self.assertEqual(lad, {"reader": list(scorecard.RUNGS)})
+        self.assertIn("missing", src)
+        self.assertTrue(seats)  # built-in seats still load
+
+    def test_a_garbage_file_falls_back_and_says_unreadable(self):
+        self._home_with("{ not json")
+        _, _, src = scorecard.load_rungs()
+        self.assertIn("unreadable", src)
+        self.assertEqual(scorecard.load_rungs()[0], {"reader": list(scorecard.RUNGS)})
+
+    def test_a_seat_off_its_ladder_is_skipped_but_the_others_show(self):
+        self._home_with(json.dumps({
+            "ladders": {"reader": ["input", "admitted"], "builder": ["clean slices", "admitted"]},
+            "seats": [
+                {"seat": "qwenlocal", "track": "reader", "rung": "input",
+                 "step": "input", "model": "Ornith", "by": "m", "date": "2026-09-30",
+                 "next": "n", "evidence": "e", "source": "s"},
+                # step "admitted" is on the ladder, but this one names a rung NOT on it
+                {"seat": "qwen27", "track": "builder", "rung": "peer-reviewed",
+                 "step": "peer-reviewed", "model": "Opus", "by": "m", "date": "2026-09-30",
+                 "next": "n", "evidence": "e", "source": "s"},
+            ]}))
+        b = run_board()
+        rows = {r["seat"]: r for r in b["rungs"]["seats"]}
+        self.assertIn("qwenlocal", rows)
+        self.assertNotIn("qwen27", rows)
+        # the file was used, not the built-in fallback
+        self.assertNotIn("built-in", b["rungs"]["source_line"])
+
+    def _one(self, **seat):
+        base = {"seat": "qwen27", "track": "reader", "rung": "input", "step": "input", "model": "M",
+                "by": "m", "date": "2026-09-30", "next": "n", "evidence": "e", "source": "s"}
+        return dict(base, **seat)
+
+    def test_the_web_ladder_stays_a_list_and_the_tracks_ride_beside_it(self):
+        # the console's Models page does rungs.ladder.join(" → "); a dict there breaks the page
+        self._home_with(json.dumps({"ladders": {"reader": ["input", "admitted"], "builder": ["b1", "b2"]},
+                                    "seats": [self._one()]}))
+        b = run_board()
+        self.assertEqual(b["rungs"]["ladder"], ["input", "admitted"])
+        self.assertEqual(sorted(b["rungs"]["ladders"]), ["builder", "reader"])
+
+    def test_a_seat_on_the_top_rung_has_no_next_rung_and_the_board_still_renders(self):
+        self._home_with(json.dumps({"ladders": {"reader": ["input", "admitted"]},
+                                    "seats": [self._one(rung="admitted", step="admitted")]}))
+        b = run_board()
+        self.assertIsNone(b["rungs"]["seats"][0]["next_rung"])
+        self.assertIn("none (the top rung)", "\n".join(scorecard.board_lines(b)))
+
+    def test_the_text_board_names_each_rows_track(self):
+        self._home_with(json.dumps({"ladders": {"reader": ["input", "admitted"], "builder": ["b1", "b2"]},
+                                    "seats": [self._one(), self._one(track="builder", rung="b1", step="b1")]}))
+        text = "\n".join(scorecard.board_lines(run_board()))
+        self.assertIn("qwen27 [reader]", text)
+        self.assertIn("qwen27 [builder]", text)
+
+    def test_skipped_seats_are_counted_and_a_file_with_none_left_says_so(self):
+        self._home_with(json.dumps({"ladders": {"reader": ["input", "admitted"]},
+                                    "seats": [self._one(), self._one(seat="bonsai", step="nowhere")]}))
+        self.assertIn("1 seat entry off its ladder skipped", scorecard.load_rungs()[2])
+        self._home_with(json.dumps({"ladders": {"reader": ["input", "admitted"]},
+                                    "seats": [self._one(step="nowhere")]}))
+        src = scorecard.load_rungs()[2]
+        self.assertIn("no seat on its ladders: 1 skipped", src)
+        self.assertNotIn("missing", src)
+
+    def test_a_seat_entry_that_is_not_a_mapping_is_skipped_and_counted(self):
+        # a ladder keyed "" is the track a non-mapping entry reads as; the
+        # entry must be skipped and counted, never raise out of load_rungs
+        self._home_with(json.dumps({"ladders": {"reader": ["input", "admitted"], "": ["input"]},
+                                    "seats": [self._one(), "not-a-seat"]}))
+        lad, seats, src = scorecard.load_rungs()
+        self.assertEqual([s["seat"] for s in seats], ["qwen27"])
+        self.assertIn("1 seat entry off its ladder skipped", src)
+
+    def test_the_json_form_carries_the_source_line(self):
+        self._home_with(json.dumps({
+            "ladders": {"reader": ["input", "admitted"]},
+            "seats": [{"seat": "qwenlocal", "track": "reader", "rung": "input",
+                       "step": "input", "model": "Ornith", "by": "m", "date": "2026-09-30",
+                       "next": "n", "evidence": "e", "source": "s"}]
+        }))
+        tmp = tempfile.mkdtemp(prefix="helm-scorecard-")
+        path = os.path.join(tmp, "dispatches.jsonl")
+        with open(path, "w") as f:
+            for row in ledger():
+                f.write(json.dumps(row) + "\n")
+        out = io.StringIO()
+        with mock.patch.dict(scorecard._CACHE, clear=True), \
+                mock.patch.object(scorecard, "ledger_path", return_value=path), \
+                mock.patch.object(scorecard, "trunk_lanes", return_value=(TRUNK, None)), \
+                mock.patch.object(scorecard.time, "time", return_value=NOW), redirect_stdout(out):
+            from helm import evalpin
+            rc = evalpin.cmd_eval(["board", "--json", "--window", "30d"])
+        self.assertEqual(rc, 0)
+        got = json.loads(out.getvalue())
+        self.assertIn("seat-rungs.json", got["rungs"]["source_line"])
 
 
 class CliTest(unittest.TestCase):

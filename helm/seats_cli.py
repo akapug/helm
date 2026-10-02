@@ -26,6 +26,7 @@ from .seats_mute import mutes, set_mute
 from .seats_roster import (disown_session, rehome_seat,
                            rename_seat, roster_checked)
 from .seats_delivery import deliver_any, dm, receipt_cli
+from .seats_roomscan import QuietRooms
 from .seats_catchup import catchup, render_catchup
 from .seats_join import (_beacon_identity_refusal, _emit_line, join, paid_join,
                          join_cli, wait)
@@ -38,6 +39,14 @@ from .seats_gc import gc_roster
 from .seats_report import render_roster, render_status, set_status
 from .seats_stop_guard import stop_guard
 from .hookstdin import HOOK_STDIN_MAX, _UNPARSED, _parsed  # noqa: F401
+# THE COUNCIL VERBS AND `_flag` live in seats_cli_council (this file passed
+# its 1000-line budget); every name stays importable from here, and
+# `_OWNER_NAMES` declares the move so the retired-name rung reads it as one.
+from .seats_cli_council import (  # noqa: F401
+    _COUNCIL_FLAGS, _cmd_council, _council_positionals, _flag)
+_OWNER_NAMES = (("seats_cli_council", (
+    "_COUNCIL_FLAGS", "_cmd_council", "_council_positionals",
+    "_flag")),)  # moved; bound here
 
 HOOK_STDIN_DEADLINE_S = 2.0   # generous: the harness writes its JSON at once
 _HOOK_STDIN_STALL = "hook-stdin-stall"   # the receipt a silent pass never left
@@ -124,28 +133,6 @@ def _hook_stall_note(nbytes):
                        HOOK_STDIN_DEADLINE_S, nbytes, home.chat_name() or "?"))
     except Exception:                        # noqa: BLE001
         pass
-def _flag(args, name, default=None):
-    # A FLAG IS NEVER A VALUE: `--seat --apply` minted a seat "--apply".
-    i = args.index(name) if name in args else -1
-    if i >= 0 and i + 1 < len(args) and not str(args[i + 1]).startswith("-"):
-        return args[i + 1]
-    return default
-_COUNCIL_FLAGS = ("--tip", "--evidence", "--seat", "--threshold")
-def _council_positionals(args):
-    """Positional args with every known flag AND its value removed — a bare
-    split would read `--tip`'s value as the verdict."""
-    out, skip = [], False
-    for a in args:
-        if skip:
-            skip = False
-            continue
-        if a in _COUNCIL_FLAGS:
-            skip = True
-            continue
-        if a.startswith("--"):
-            continue
-        out.append(a)
-    return out
 def _cmd_claims(args):
     """`helm chat claims [--json]` — the live lease board, with THIS seat's own
     tokens joined in.
@@ -210,93 +197,6 @@ def _cmd_claims(args):
             claim_marks(c, snap),
             ("  lease %s (yours)" % c["lease"]) if c["lease"] else ""))
     return 0
-def _cmd_council(verb, args):
-    """The council verbs — the FORMAL convergence species (0.3's N-of-M, now
-    landed). Identity is AMBIENT (chat._seat_actor): a signal binds MEMBER
-    IDENTITY, so a claimed --seat would let one seat cast another's sealed
-    judgment — the exact footgun 1f6e5bb ("dm/ack actor-binding: --seat
-    asserts ambient, never selects the signer") closed for signing."""
-    from . import council
-    rest = _council_positionals(args)
-    room = rest[0] if rest else None
-    if not room:
-        print("helm chat %s: needs a council room (helm chat council invite "
-              "<members> <topic>)" % verb, file=sys.stderr)
-        return 2
-    # READS AND CHEAP REFUSALS FIRE BEFORE ANYBODY IS ASKED WHO THEY ARE:
-    # admission ahead of dispatch is the regression this lane shipped twice.
-    if verb == "council-status":
-        print("\n".join(council.status_lines(room)))
-        return 0
-    if verb == "verdict" and council.registry(room) is None:
-        print("helm chat verdict: no council convened for room %s" % room,
-              file=sys.stderr)
-        return 2
-    actor, serr = chat._seat_actor(args)
-    if serr:
-        print("helm chat %s: %s" % (verb, serr), file=sys.stderr)
-        return 2
-    # THE CAPABILITY AUTHORIZES, the name only addresses.
-    seat = actor.canonical_name
-    if verb == "council-abort":
-        reason = " ".join(x for x in rest[1:] if not x.startswith("--"))
-        reg, err = council.abort(room, seat, reason)
-        if err:
-            print("helm chat council-abort: " + err, file=sys.stderr)
-            return 2
-        chat.post("[COUNCIL %s] ABORTED by %s — %s. The embargo is permanent; "
-                  "collaborate in a standup, then reconvene on the superseding "
-                  "tip." % (room, chat._dsan(seat), reg.get("abort_reason")),
-                  room=room, who=actor, sign=False)
-        print("COUNCIL %s ABORTED — no reveal, ever (an aborted council's "
-              "judgments were not formed independently)" % room)
-        return 0
-    if verb == "reveal":
-        signals, err = council.reveal(room)
-        if err:
-            print("helm chat reveal: " + err, file=sys.stderr)
-            return 2
-        label, counts = council.outcome(signals)
-        print("COUNCIL %s REVEALED — %d sealed judgment(s), embargo lifted:"
-              % (room, len(signals)))
-        for s in signals:
-            print("  %s: %s @ %s — %s" % (chat._dsan(s["seat"]), s["verdict"],
-                                          s["tip"][:12], s["evidence"] or "(no evidence ref)"))
-        # quorum is a REVEAL bar, not a decision — say what the judgments add
-        # up to rather than let "quorum reached" be misread as "ratified"
-        print("OUTCOME: %s (%s)" % (label, ", ".join(
-            "%s %d" % (v, counts[v]) for v in council.VERDICTS)))
-        chat.post("[COUNCIL %s] QUORUM — embargo lifted, %d judgment(s) on the "
-                  "record: %s" % (room, len(signals),
-                                  ", ".join("%s %s" % (chat._dsan(s["seat"]), s["verdict"])
-                                            for s in signals)),
-                  room=room, who=actor, sign=False)
-        return 0
-    # verdict = SIGNAL (sealed)
-    verdict = rest[1] if len(rest) > 1 else None
-    tip = _flag(args, "--tip")
-    evidence = _flag(args, "--evidence")
-    reg, err = council.signal(room, seat, verdict, tip, evidence)
-    if err:
-        print("helm chat verdict: " + err, file=sys.stderr)
-        return 2
-    n, k, is_open = council.tally(room)
-    print("SEALED — your judgment is recorded and EMBARGOED (%d of %d)" % (n, k))
-    # NO PUBLIC PRE-QUORUM PROGRESS ROW — deleted, not patched (a re-gate).
-    # Two rounds of trying to publish progress "safely" both leaked:
-    #   r1: posted as who=signer — the row's own from field named the seat the
-    #       text promised to hide.
-    #   r2: posted as who=convener — better, but chat.post still touches the
-    #       CALLING seat's presence cross-seat, and a public "1 of 2" identifies
-    #       the other signer by elimination anyway.
-    # The count was never worth it: `helm chat council-status <room>` already
-    # serves the tally on demand to anyone entitled to ask. A guarantee you have
-    # to keep narrowing is not a guarantee — so the embargo is now enforced by
-    # NOT EMITTING, which is the only version of "zero WHO" that is true.
-    # The signer still gets their private local confirmation above.
-    if is_open:
-        print("QUORUM REACHED — reveal: helm chat reveal %s" % room)
-    return 0
 def _env_session():
     return home.session_id()
 def _hook_emit(event):
@@ -335,7 +235,7 @@ def _cmd_wait(args, room):
     from .cli import guard_tail
     grc = guard_tail("helm chat wait", args, valued=("--seat", "--timeout"),
                      flags=("--any", "--follow", "--replace", "--ambient",
-                            "--on-behalf", "--per-row"),
+                            "--on-behalf", "--per-row", "--once"),
                      usage=chat.HELP["wait"].splitlines()[0])
     if grc is not None:
         return grc
@@ -368,6 +268,21 @@ def _cmd_wait(args, room):
         print("helm chat wait: --replace requires --seat S so the process "
               "proves whose beacon it may rotate", file=sys.stderr)
         return 2
+    # THE ONE-SHOT BEACON ENDS AFTER ONE RING, so it is the doorbell shape
+    # only: `--any` watches a room with no cursor and `--per-row` streams a
+    # line per row, and neither has one ring to end on.
+    once = "--once" in args
+    if once and not follow:
+        print("helm chat wait: --once requires --follow — it is the one-shot "
+              "beacon; a bare wait is a delivery, not a beacon",
+              file=sys.stderr)
+        return 2
+    for clash in ("--any", "--per-row"):
+        if once and clash in args:
+            print("helm chat wait: --once cannot take %s — the one-shot "
+                  "beacon ends after one doorbell ring" % clash,
+                  file=sys.stderr)
+            return 2
     _behalf, _ = actors.grant_on_behalf("beacon", named,
                                         stated="--on-behalf" in args)
     # THE SESSION IS THE SECOND IDENTITY SOURCE AND IT WAS ALREADY IN HAND,
@@ -441,7 +356,7 @@ def _cmd_wait(args, room):
             from . import beacons
             spec = beacons.requested_waiter_spec(
                 room, any_row=any_row, ambient=ambient, timeout=timeout,
-                per_row="--per-row" in args)
+                per_row="--per-row" in args, once=once)
             armed = beacons.arm(claimed, session=session, replace=replace,
                                 reap=may_reap, waiter=spec)
         except Exception:               # noqa: BLE001
@@ -476,6 +391,7 @@ def _cmd_wait(args, room):
               "--replace to accept that scope change."
               % incumbent["pid"], file=sys.stderr)
         return 2
+    line = None
     try:
         line = wait(seat=claimed, room=room, any_row=any_row, timeout=timeout,
                     # --follow (beacon) + --any-watch must use wait()'s
@@ -489,15 +405,21 @@ def _cmd_wait(args, room):
                     # (quiet rooms); absent, wait() resolves the shape
                     # default (--follow ⇒ mention-only, single-shot ⇒ full).
                     ambient=True if ambient else None,
-                    doorbell="--per-row" not in args)   # beacon_doorbell
+                    doorbell="--per-row" not in args,   # beacon_doorbell
+                    once=once)
     finally:
         # The row names a PROCESS, so it must die with the process. A beacon
         # SIGTERMed mid-life never reaches here, which is why the census prunes
         # rows whose pid is proven gone rather than trusting this as the only
-        # drain.
+        # drain. A ONE-SHOT THAT RANG is the exception: its row is stamped,
+        # not dropped, because the seat is re-arming in the turn the ring
+        # starts and the census reads that gap as WAKING (beacons.once_age).
         if armed and armed.get("registered"):
             try:
-                beacons.release(claimed)
+                if once and line:
+                    beacons.mark_ended(claimed)
+                else:
+                    beacons.release(claimed)
             except Exception:           # noqa: BLE001
                 pass
     if follow:               # --follow streams via emit; returns on timeout
@@ -525,13 +447,13 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
             hooklatency.bind(d.get("session_id"))
             behalf, _ = actors.grant_on_behalf("delivery", _flag(args, "--seat"),
                                                stated="--on-behalf" in args)
-            _, err = _assert_own_seat(_flag(args, "--seat"), on_behalf=behalf,
-                                      session=d.get("session_id")
-                                      or _env_session())
+            own, err = _assert_own_seat(_flag(args, "--seat"), on_behalf=behalf,
+                                        session=d.get("session_id")
+                                        or _env_session())
             if err:
                 pair.failure("identity refused: %s" % err)
             else:
-                pair.prepare(d.get("session_id"))
+                pair.prepare(d.get("session_id"), own, d)
         except Exception as exc:
             pair.failure("whisper preparation failed (%s: %s)" % (type(exc).__name__, exc))
         return 0
@@ -632,10 +554,15 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
             # destination classifier is the same one `join` uses; a caller
             # whose emitter cannot be resolved still answers UNKNOWN and
             # consumes exactly as before.
+            # ONE BOUNDARY, ONE PASS, AND NO LISTING OF ITS OWN (task/3848):
+            # this process ends with the boundary, so it keeps no quiet proof
+            # (remember=False) and only reads the room listing the last pass
+            # made, while the room set has not moved.
             deliver_any(session=session, room=room, seat=claimed, emit=emit,
                         cwd=cwd, channel="hook" if "--hook-json" in args else None,
                         **foreign, sink_usable=not (agent or unread)
-                        and _seats_join.destination_usable(emit, follower=False))
+                        and _seats_join.destination_usable(emit, follower=False),
+                        quiet=QuietRooms(remember=False))
             getattr(emit, "flush_owed", lambda: None)()
             if pair:
                 pair.finish()           # after receipt, still under delivery's timer
@@ -647,8 +574,8 @@ def cmd(verb, args, room="main", room_explicit=False, room_source=None):
             # hook order, so the edit destination it just logged is on disk.
             # Never outside helm (a helm steer), never at a delivery's cost.
             try:
-                from . import toolwhisper
-                line = None if foreign else toolwhisper.for_hook(session)
+                from . import stop_early, toolwhisper  # stop_early: the owed-row line
+                line = None if foreign else (toolwhisper.for_hook(session) or stop_early.for_hook(session, claimed, agent))
                 if line:
                     emit(line)
             except Exception:

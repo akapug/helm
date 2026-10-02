@@ -26,6 +26,7 @@ import unittest
 from unittest import mock
 
 from tests import _tmphome  # noqa: F401 — plants the tmp config roots first
+from tests import _launchrecipe
 
 from helm import (harness, home, orcaadopt, pk, seat, seat_exit_owner,
                   seat_resume_all, seats, sessions)
@@ -179,7 +180,9 @@ class SweepFixture(unittest.TestCase):
         os.makedirs(d, exist_ok=True)
         launch = os.path.join(d, "launch.sh")
         with open(launch, "w") as f:
-            f.write("#!/bin/sh\nexec env FAKE=1 claude \"$@\"\n")
+            # a launch helm itself would mint: the resume restores the recipe
+            # a launch states and refuses a stub that states none (task/3695)
+            f.write(_launchrecipe.launch_sh(family, seat_name))
         os.chmod(launch, 0o700)
         return d, launch
 
@@ -693,8 +696,8 @@ class AdoptedSeatTest(SweepFixture):
                 "evidence": "no live process claims it"}
         calls = []
 
-        def resume(name, force=False, session=None):
-            calls.append((name, force, session))
+        def resume(name, force=False, session=None, unattended=False):
+            calls.append((name, force, session, unattended))
             return 0, ["resumed %s" % name]
 
         for patch in (_plant_resolve(info),
@@ -717,7 +720,11 @@ class AdoptedSeatTest(SweepFixture):
         # the SESSION is pinned on the adopted branch too (a FIX on
         # the managed-seat pin: this branch had dropped it and
         # orcaadopt.resume reselected newest)
-        self.assertEqual(calls, [(self.ADOPTED, False, SID)])
+        # and the call is the sweep's own, naming it as the unattended
+        # caller, so a recipe missing only fields the defaults never carried
+        # resumes on the defaults
+        self.assertEqual(calls, [(self.ADOPTED, False, SID,
+                                  seat_resume_all.SWEEP)])
         self.assertEqual(fake.sent, [], "an adopted seat has no pane to type into")
 
     def test_the_adopted_pin_reaches_newest_session_row(self):  # noqa: VACUOUS_ASSERTION — positive controls: rc 1 and the refusal naming the pinned session; the uncalled spawn double is the never-another-session contract, proven non-vacuous by the sibling arm whose pinned session has a row
@@ -809,6 +816,122 @@ class SidPinnedTest(SweepFixture):
         self.assertEqual(fake.sent, [])
         self.assertEqual(fake.spawned, [])
         self.assertEqual(self._register(d)["handle"], "old")
+
+
+class UnknownRecipeSweepTest(SweepFixture):
+    """The reboot sweep never leaves a seat DOWN for a recipe field the
+    defaults resume never took from the seat's past run: it resumes such a
+    seat on today's defaults and says so in one loud line naming the
+    fields. The operator's `helm seat resume` still refuses it."""
+
+    def _states_no_recipe(self, d):
+        """A launch.sh whose claude line names no `--model`: it states no
+        launch recipe (a script written before the recipe was read, or by
+        hand)."""
+        with open(os.path.join(d, "launch.sh"), "w") as f:
+            f.write('#!/bin/sh\nexec claude "$@"\n')
+
+    def _loud(self, text):
+        return [l for l in text.splitlines()
+                if "reboot sweep" in l and "TODAY'S defaults" in l]
+
+    def test_the_sweep_resumes_a_seat_whose_launch_states_no_recipe(self):
+        """MUTATION: refuse as the operator's resume does — the seat is left
+        down, where a resume on today's defaults brought it back."""
+        d, fake = self._dead_pane_seat()
+        self._states_no_recipe(d)
+        rc, out, err = self._sweep(["--all", "--apply"], fake)
+        self.assertEqual(rc, 0, out + err)
+        self.assertGreaterEqual(len(fake.sent), 2, out + err)
+        self.assertIn("--resume %s" % SID, fake.sent[1][1])
+        loud = self._loud(out + err)
+        self.assertEqual(len(loud), 1, out + err)
+        for field in ("model", "window", "identity_env"):
+            self.assertIn(field, loud[0])
+
+    def test_the_sweep_resumes_an_uncaptured_session_on_todays_defaults(self):
+        """A session no capture names (a cv-pruned copy, or one a /clear
+        opened inside the capture interval): its transcript states the model
+        and mode it ran, and launch.sh is bound to no launch of it, so its
+        recipe is not one launch's. MUTATION: refuse as the operator's
+        resume does — the seat is left down."""
+        d, fake = self._dead_pane_seat()
+        path = os.path.join(d, "claude", "projects", "-spot", SID + ".jsonl")
+        model = seat.FAMILIES["codex"]["model"]
+        with open(path, "a") as f:
+            f.write(json.dumps({"type": "permission-mode", "sessionId": SID,
+                                "permissionMode": "bypassPermissions"}) + "\n")
+            f.write(json.dumps({"type": "attachment", "sessionId": SID,
+                                "attachment": {"type": "model", "identity": {
+                                    "modelId": model}}}) + "\n")
+        rc, out, err = self._sweep(["--all", "--apply"], fake)
+        self.assertEqual(rc, 0, out + err)
+        self.assertGreaterEqual(len(fake.sent), 2, out + err)
+        loud = self._loud(out + err)
+        self.assertEqual(len(loud), 1, out + err)
+        self.assertIn("window", loud[0])
+
+    def test_the_sweep_never_changes_the_model_a_seat_ran(self):  # noqa: VACUOUS_ASSERTION — rc 1 and the one line naming the model are the positive controls; the empty sent log is the leave-down contract, and the sibling arm on the same fixture with today's model sends
+        """The session states the model it ran, and today's defaults would
+        launch another: a KNOWN model mismatch, so the unattended sweep
+        leaves the seat down and says why in one line. MUTATION: fall back
+        to today's defaults anyway — the seat comes back on a model it never
+        ran and only the change lines under the row say so."""
+        from helm import seat_catalog
+        d, fake = self._dead_pane_seat()
+        fam = seat.FAMILIES["codex"]
+        other = next(m for m in seat_catalog.family_catalogued_models(fam)
+                     if m != fam["model"])
+        path = os.path.join(d, "claude", "projects", "-spot", SID + ".jsonl")
+        with open(path, "a") as f:
+            f.write(json.dumps({"type": "permission-mode", "sessionId": SID,
+                                "permissionMode": "bypassPermissions"}) + "\n")
+            f.write(json.dumps({"type": "attachment", "sessionId": SID,
+                                "attachment": {"type": "model", "identity": {
+                                    "modelId": other}}}) + "\n")
+        rc, out, err = self._sweep(["--all", "--apply"], fake)
+        self.assertEqual(rc, 1, out + err)
+        self.assertEqual(fake.sent, [])
+        why = [l for l in (out + err).splitlines()
+               if "refusing to resume codex" in l]
+        self.assertEqual(len(why), 1, out + err)
+        self.assertIn("the reboot sweep leaves it down", why[0])
+        self.assertIn("the model it ran [transcript", why[0])
+
+    def test_the_sweep_never_relaunches_a_persisted_model_it_did_not_run(self):  # noqa: VACUOUS_ASSERTION — rc 1 and the line naming the model's source are the positive controls; the empty sent log is the leave-down contract
+        """codex's input: the register persists an explicit model A, and
+        the session last ran B. The defaults fallback would relaunch A, a
+        model the session did not run: the sweep leaves it down. MUTATION:
+        compare the recipe's model with the catalog alone — the persisted
+        choice relaunches silently."""
+        from helm import seat_catalog
+        d, fake = self._dead_pane_seat()
+        fam = seat.FAMILIES["codex"]
+        chosen = next(m for m in seat_catalog.family_catalogued_models(fam)
+                      if m != fam["model"])
+        self._record(d, model=chosen, model_source="explicit")
+        path = os.path.join(d, "claude", "projects", "-spot", SID + ".jsonl")
+        with open(path, "a") as f:
+            f.write(json.dumps({"type": "attachment", "sessionId": SID,
+                                "attachment": {"type": "model", "identity": {
+                                    "modelId": fam["model"]}}}) + "\n")
+        rc, out, err = self._sweep(["--all", "--apply"], fake)
+        self.assertEqual(rc, 1, out + err)
+        self.assertEqual(fake.sent, [])
+        why = [l for l in (out + err).splitlines()
+               if "refusing to resume codex" in l]
+        self.assertEqual(len(why), 1, out + err)
+        self.assertIn("the model it ran [transcript", why[0])
+
+    def test_the_operator_resume_still_refuses_a_launch_that_states_none(self):  # noqa: VACUOUS_ASSERTION — rc 1 and the named fields are the positive controls; the empty sent log is the refusal's contract, and the sweep arm on the same fixture sends
+        """The control: the interactive resume refuses the same seat and
+        names what its recipe lacks."""
+        d, fake = self._dead_pane_seat()
+        self._states_no_recipe(d)
+        rc, out, err = self._sweep(["codex"], fake)
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn("saved only", err)
+        self.assertEqual(fake.sent, [])
 
 
 class PositionalTest(SweepFixture):
@@ -1502,6 +1625,28 @@ class HeldFleetTitleTest(SweepFixture):
         self.assertIn("FLEET HOLD in effect", out)
         self.assertEqual(fake.sent, [], "the hold still forbids a pane write")
         self.assertEqual(fake.renamed, [("shell-1", LIVE_TITLE)])
+
+
+class CubicleTickTest(SweepFixture):
+    """THE CUBICLE MOVER RIDES THIS WAKE (task/3900), as the vendor-dialog
+    escape does: the sweep hands it the adapter it already detected and its
+    own write flag, and prints what it says. A dry sweep moves no tab.
+    MUTATION: drop the call, or pass apply=True on a dry sweep."""
+
+    def test_the_sweep_hands_the_mover_its_adapter_and_its_write_flag(self):
+        from helm import cubicles
+        fake = FakeOrca(rows=[])
+        seen = []
+        for args in (["--all", "--apply"], ["--all"]):
+            with mock.patch.object(cubicles, "tick",
+                                   return_value=["cubicle mover: probe"]) \
+                    as tick:
+                rc, out, err = self._sweep(args, fake)
+            seen.append((rc, tick.call_args_list,
+                         "cubicle mover: probe" in out, out + err))
+        self.assertEqual([s[:3] for s in seen], [
+            (0, [mock.call(fake, apply=True)], True),
+            (0, [mock.call(fake, apply=False)], True)], seen)
 
 
 class AdoptedTitleTest(SweepFixture):

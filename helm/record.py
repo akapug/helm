@@ -36,6 +36,12 @@ State, under <helm home>/_global/.state/reflex-state/<session_id>/:
   todos.json          the seat todo mirror (todos.py): the CURRENT todo list
                       off TodoWrite/Task*, pull-read by `helm todos` and the
                       roster — digest+pull, never a firehose
+  working-set.jsonl   the working-set ring (workingset.py): one row per
+                      main-thread call (tool, ok, paths, verb and flag NAMES,
+                      ids, background task id), read back after a compaction
+                      by `helm now show --hook-json`; never command text
+  precompact-nag.txt  the PreCompact handoff nag (handoff.py), kept for the
+                      SessionStart after the compaction and removed there
 
 Laws:
   * SESSION-keyed from the payload's session_id, never pane/env — sessions are
@@ -88,13 +94,13 @@ DIRTYING = EDITS + ("Bash",)         # the only tools worth a git-status probe
 # is credited; the cost is one missed stall, the silent direction.
 COORD_WRITES = {
     "chat": ("post", "dm", "reply", "react", "claim"),
-    "task": ("add", "claim", "release", "update", "close", "comment",
-             "standdown", "takeover"),
+    "task": ("add", "claim", "release", "handoff", "update", "close",
+             "comment", "standdown", "takeover"),
     "store": ("add", "revise", "supersede", "retire", "rescope", "keywords",
               "gates", "gloss", "evidence", "confirm", "reject", "xrev-clear",
               "demote"),
     "dispatch": ("send", "add", "verdict", "cancel", "rebind", "retip",
-                 "hold", "release"),
+                 "hold", "release", "attach-task"),
     "reflex": ("add", "retire", "rescope"),
     "premise": None,
 }
@@ -647,11 +653,10 @@ def _sidechain(event):
 # they never raise turn-calls; its forward ops still credit the turn, since
 # delegated work landing is the seat's work moving.
 #
-# THE RECORDER'S EVIDENCE GATES IT. turn_open writes only where counters.json
-# already exists, and closes only a turn it opened, so a session no recorder
-# has seen gets no state from a prompt, and the turns before a session's first
-# call are not counted: the silent direction, and the recorder census
-# (`helm record status`) still reads only what the PostToolUse hook wrote.
+# A genuine UserPromptSubmit hook may initialize counters before the first
+# PostToolUse. A programmatic injection cannot mint a session record; only an
+# existing counters file lets it open another turn. A turn with no calls still
+# leaves the stalled count unchanged (_closed).
 # ---------------------------------------------------------------------------
 
 def _closed(c):
@@ -713,21 +718,40 @@ def _counters_locked(sd):
             os.close(fd)                # closing the fd releases the lock
 
 
-def turn_open(session, prompt):
-    """Close the session's open turn and open this one. Never raises and
-    never prints: it runs first in the per-turn hook."""
+def turn_open(session, prompt, hook=None):
+    """Close the open turn and open this one. A real prompt hook may initialize
+    counters before the first tool call; an ordinary caller cannot. Fail-open
+    and silent on the hook path."""
     try:
         sid = str(session or "")
         if not sid:
             return
+        # session_key otherwise aliases/truncates IDs. A prompt hook only
+        # mints a fresh file when its own session, event and prompt agree, and
+        # it is not a subagent hook. This is payload consistency, not a claim
+        # that JSON supplied by an arbitrary CLI caller is cryptographically
+        # authenticated.
+        fresh = isinstance(hook, dict) and "agent_id" not in hook \
+            and hook.get("hook_event_name") == "UserPromptSubmit" \
+            and hook.get("session_id") == sid \
+            and isinstance(hook.get("prompt"), str) \
+            and hook["prompt"] == prompt \
+            and re.fullmatch(r"[A-Za-z0-9_-]{1,80}", sid) is not None \
+            and ("transcript_path" not in hook or (
+                isinstance(hook["transcript_path"], str)
+                and os.path.basename(hook["transcript_path"]) == sid + ".jsonl"))
+        if hook is not None and not fresh:
+            return
         sd = session_dir(sid)
         path = os.path.join(sd, "counters.json")
-        if not os.path.exists(path):
-            return                      # no recorder evidence: write nothing
+        if not fresh and not os.path.exists(path):
+            return
         from . import promptshape
         notice = int(promptshape.is_notice(prompt))
         with _counters_locked(sd) as held:
-            c = pk.read_json(path, None) if held else None
+            if not held or (not fresh and not os.path.exists(path)):
+                return
+            c = pk.read_json(path, None, strict=True) if os.path.exists(path) else {}
             if not isinstance(c, dict):
                 return
             c["stalled-turns"] = _closed(c)
@@ -1157,6 +1181,18 @@ def _record(event):
                     os.path.basename(str(fp)) + "\n")
             _append(os.path.join(sd, "edit-paths.log"),
                     _home_relative(str(fp)) + "\n")
+
+    # THE WORKING-SET RING (task/4054): one small row per MAIN-thread call,
+    # handed back to the seat after its next compaction (helm/workingset.py).
+    # A subagent's calls are its own working set, never its seat's. Names
+    # only: paths, verb and flag names, ids. Never command text, flag values
+    # or output. One append, no subprocess, its own try.
+    if not sidechain:
+        try:
+            from . import workingset
+            workingset.note(sd, tool, tin, resp, rtext, failed, cmd)
+        except Exception as _swallowed:     # noqa: BLE001 — fail-open
+            swallow("record._record.workingset", _swallowed)
 
     # THE COUNTERS, read-to-write under the session dir's lock (see
     # _counters_locked): turn_open and every other call write this file too.

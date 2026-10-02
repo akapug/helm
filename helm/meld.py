@@ -30,6 +30,12 @@ DONE/ABORT (@peer). Mid-meld YIELD/HOLD chunks carry NO mention: both
 parties sit inside recv polling the room directly at MELD_POLL, so a meld
 never floods the peer's delivery cursor with stale nudges (post-meld
 boundary spam / stop-guard blocks — the mention-backlog class).
+A TASK'S PAIR MELD is the exception (task/3743): its turns run longer than
+any recv bound, so nobody sits in recv. There a YIELD @mentions every peer
+in the round and is an owed row; recv retires only the addressed YIELD it
+actually returned from the reader's session inbox. A [HOLD] whose text says
+`HOLDING: <what>` keeps the round open past recv's timeout (`hold_reason`),
+not past the real exchange cap.
 
 Protocol (the predecessor's meld script lineage, scars kept):
   * every protocol row is epoch-fenced `[MELD e:<epoch>]` — a reused room
@@ -85,6 +91,10 @@ EXIT_BOUND, EXIT_ABORT = 3, 4
 _MARKER_RE = re.compile(r"\[(YIELD|HOLD|DONE|ABORT)\]\s*$")
 _EPOCH_RE = re.compile(r"\[MELD(?:-INVITE)? e:(\d+)\]")
 _READY_RE = re.compile(r"\bREADY:(\d+)\b")
+#: What a [HOLD] says its holder is doing: the rest of the line after the
+#: label. Upper case only, like `MELD OUTCOME:`, so prose never reads as one.
+_HOLDING_RE = re.compile(r"(?m)\bHOLDING:[ \t]*(.*)$")
+HOLD_HINT = '--marker HOLD "HOLDING: <what you are doing>"'
 # the seed's pinned-SET fields — findall[-1] so a topic that EMBEDS a fake
 # `convener=… invited=…` run can never outrank the real fields (they are
 # appended AFTER the topic, so the last match is always the seed's own).
@@ -1186,6 +1196,17 @@ def _opening_lock_name(room):
         str(room).encode("utf-8"), digest_size=16).hexdigest()
 
 
+def _persistent_room(room):
+    """May `invite` open a ROUND in `room`: a `meld-<n>-<slug>` room, or a
+    task's pair meld, whose `<scope>-<N>` name carries no `meld-` prefix
+    (`review_door.is_pair_room`)?"""
+    from . import review_door
+    room = str(room)
+    return pk.slug(room) == room and bool(
+        re.fullmatch(r"meld-\d+-[a-z0-9-]{1,64}", room)
+        or review_door.is_pair_room(room))
+
+
 def invite(peer, topic, seat=None, via="meld", room=None, ring=None,
            _round_topic=None, _opened=None, _round_marker=None):
     """(room, lines) — open a meld/standup: seed the problem ([HOLD], discipline
@@ -1228,8 +1249,7 @@ def invite(peer, topic, seat=None, via="meld", room=None, ring=None,
     members = set(invited) | {seat}
     epoch = int(time.time())
     prior_rounds = 0
-    if room is not None and (not re.fullmatch(
-            r"meld-\d+-[a-z0-9-]{1,64}", str(room)) or pk.slug(room) != room):
+    if room is not None and not _persistent_room(room):
         raise SystemExit("helm chat %s: --room %r is not a meld room name"
                          % (via, room))
     if _round_topic is not None and (room is None or not callable(_round_topic)):
@@ -1302,12 +1322,19 @@ def invite(peer, topic, seat=None, via="meld", room=None, ring=None,
         if isinstance(_opened, dict):
             _opened.update(epoch=epoch, prior_rounds=prior_rounds, topic=topic,
                            reused=reused)
+        # A TASK'S PAIR MELD KEEPS ITS ROUND OPEN (task/3743): its work
+        # outlasts any recv bound, and a DONE there made every later YIELD
+        # bounce MELD-PEER-CLOSED into a re-invite and a READY handshake.
+        later = ("longer work is a [HOLD] whose text says HOLDING: and what "
+                 "you are doing, which keeps this round open for the peer's "
+                 "next [YIELD]; [DONE] leaves the round" if _pair(room) else
+                 "a fork that needs research is NOT a meld — close [DONE] "
+                 "with the async continuation")
         seed = ("[MELD e:%d] PROBLEM: %s | convener=%s invited=%s cap=%d "
                 "recv-timeout=%ds | MELD DISCIPLINE: reply FAST with what you "
-                "already know; a fork that needs research is NOT a meld — close "
-                "[DONE] with the async continuation. [HOLD]"
+                "already know; %s. [HOLD]"
                 % (epoch, topic, seat, ",".join(invited), _cap(),
-                   int(_recv_timeout())))
+                   int(_recv_timeout()), later))
         if not reused:
             _post(seed, room, seat)
         # peers validated above; laundering the EMITTED copies stays as
@@ -1462,17 +1489,47 @@ def _quiet_lines(room, bound, st, via="meld"):
     its peer was still answering.
 
     It stays EXIT_BOUND: the bound really did fire. Only the next action
-    changes. The exchange CAP is a real end and keeps `_fall_lines`."""
+    changes. The exchange CAP is a real end and keeps `_fall_lines`.
+
+    In a task's pair meld it also prints the HOLD that keeps the round open
+    while its seat works (task/3743), before the close it would otherwise
+    reach for."""
+    hold = ["  to keep this round open while you work, say what you are "
+            "doing:", "    helm chat %s say %s %s" % (via, room, HOLD_HINT)] \
+        if _pair(room) else []
     return [
         "MELD-BOUND room=%s reason=timeout waited=%ds exchanges=%d/%d"
         % (room, int(bound), st.get("exchanges", 0), st.get("cap", _cap())),
         "no reply yet: recv again. The meld is still open and nothing was "
         "consumed; a peer reply can take several minutes.",
         "    helm chat %s recv %s" % (via, room),
+    ] + hold + [
         "  only if the peer is genuinely out, close it as async:",
         "    helm chat %s say %s --marker DONE \"<state + next action>\""
         % (via, room),
     ]
+
+
+def _held_lines(room, bound, st, holders, seat, via="meld"):
+    """The recv timeout in a task's pair meld while a member HOLDS and says
+    what it is doing (task/3743).
+
+    A pair round is a task's conversation: a review or a cure takes longer
+    than any recv bound. The fast-meld discipline closed such a round with
+    [DONE], and every later YIELD then bounced MELD-PEER-CLOSED and paid a
+    re-invite and a READY handshake, four times in one measured round. A
+    HOLD that names its work keeps the round open instead, so this line
+    offers no close. The next YIELD reaches its peer as an addressed row, so
+    nobody has to sit in recv. It stays EXIT_BOUND: the bound fired."""
+    return ["MELD-HELD room=%s waited=%ds exchanges=%d/%d"
+            % (room, int(bound), st.get("exchanges", 0), st.get("cap", _cap()))] \
+        + ["%s HOLDING: %s" % ("you are" if who == seat else
+                               "%s is" % chat._dsan(who), holders[who])
+           for who in sorted(holders)] + [
+        "the round stays open past this bound, and nothing was consumed. Do "
+        "the work: the next YIELD in this room reaches its peer as an "
+        "addressed row (tool boundary or beacon), and recv returns it:",
+        "    helm chat %s recv %s" % (via, room)]
 
 
 def _nojoin_lines(room, bound, unjoined, st, via="meld"):
@@ -1771,6 +1828,12 @@ def recv(room, timeout=None, seat=None, poll=MELD_POLL, via="meld"):
                            % (room, st["epoch"], chat._dsan(frm), text),
                            tail] + _ignored_note(ignored, accept)
             st = _transition(room, seat, "peer-" + marker.lower(), st, cause=frm)
+            if marker == "YIELD" and _pair(room):
+                # This addressed row was shown by recv, not the boundary hook.
+                # Retire its physical occurrence for THIS session only; the
+                # cursor offset stays put so earlier and later rows stay owed.
+                from . import seats_delivery_yield
+                seats_delivery_yield.mark_meld_yield_seen(room, seat, m)
             floor = _floor_line(marker, frm, accept, st, room, via)
             return 0, ["[meld %s e:%d] %s: %s" % (room, st["epoch"], chat._dsan(frm), text),
                        floor] + _ignored_note(ignored, accept)
@@ -1799,9 +1862,119 @@ def recv(room, timeout=None, seat=None, poll=MELD_POLL, via="meld"):
             if unjoined and not st.get("exchanges"):
                 return EXIT_BOUND, _nojoin_lines(room, bound, unjoined, st, via) \
                     + _ignored_note(ignored, accept)
+            # A HELD PAIR ROUND IS OPEN, NOT QUIET (task/3743): a member whose
+            # newest turn is a HOLD naming its work keeps it past this bound.
+            turns = _round_turns(room, st, seat) if _pair(room) else {}
+            holders = {who: why for who, (mk, text) in turns.items()
+                       if mk == "HOLD" and (why := hold_reason(text))}
+            if holders:
+                return EXIT_BOUND, _held_lines(room, bound, st, holders, seat,
+                                               via) \
+                    + _ignored_note(ignored, accept)
             return EXIT_BOUND, _quiet_lines(room, bound, st, via) \
                 + _ignored_note(ignored, accept)
         time.sleep(min(poll, deadline - now))   # the last nap ends AT the bound
+
+
+def hold_reason(text):
+    """What a [HOLD] row says its holder is doing, or None.
+
+    The words after its `HOLDING:` label, to the end of that line and
+    without the floor marker. A HOLD with no label, or an empty one, names
+    nothing, and a round's seed holds nothing: its [HOLD] means the invite
+    follows."""
+    text = str(text or "")
+    if _SEED_RE.match(text):
+        return None
+    m = _HOLDING_RE.search(_MARKER_RE.sub("", text))
+    if not m:
+        return None
+    return " ".join(m.group(1).split())[:160] or None
+
+
+def _pair(room):
+    """Is `room` a task's pair meld (`review_door.is_pair_room`)?"""
+    from . import review_door
+    return review_door.is_pair_room(room)
+
+
+def _round_turns(room, st, seat):
+    """{member: (marker, text)} — each member's NEWEST turn in this round.
+
+    A turn is a floor chunk, a READY, or the round's seed (the convener's
+    `PROBLEM`), at this round's epoch. It reads the whole room, consumed
+    rows included, with recv's filters: reactions, unattributed rows, other
+    epochs and non-members never count. A later READY never hides a chunk."""
+    members = set(st.get("peers") or ()) | {seat}
+    out = {}
+    for m in chat.read(room)[0]:
+        text, frm = m.get("text") or "", str(m.get("from") or "")
+        em = _EPOCH_RE.search(text)
+        if m.get("react") or frm not in members or not em \
+                or int(em.group(1)) != st["epoch"]:
+            continue
+        mk = _MARKER_RE.search(text)
+        if _SEED_RE.match(text):
+            out[frm] = ("PROBLEM", text)
+        elif mk:
+            out[frm] = (mk.group(1), text)
+        elif _READY_RE.search(text) and frm not in out:
+            out[frm] = ("READY", text)
+    return out
+
+
+def _applied_confirmed_tips(room, text, seat):
+    """{reviewer: tips} — the tips `text` names that a `diff-applied` event
+    confirmed on a row `seat` SENT to that reviewer, whose frozen proof
+    still passes the CURRENT approval tier (task/3937).
+
+    A YIELD naming such a tip is a NOTE to that reviewer, not an owed row:
+    the reviewer holds the receipt and authority for those bytes. THE PROOF
+    IS ONE REVIEWER'S ON ONE ROW (`proof.actor` is the row's recipient), so
+    it answers only that row's author speaking to that reviewer. A reviewer
+    who speaks still owes the author its wake, and another peer in the round
+    (a third reader) holds no proof here at all. An unproven or newly
+    disallowed tip stays owed. The ledger is scanned by the handoff's
+    recorded ROOM, never by this room's name, so a renamed or legacy room
+    binds the same rows. An unreadable ledger answers the empty map: every
+    mention then stands, which is the safe direction (over-wake, never
+    under).
+    """
+    from . import dispatches, dispatches_tier
+    out = {}
+    if not re.search(r"(?<![0-9a-f])[0-9a-f]{7,40}(?![0-9a-f])", text):
+        # NO 40-HEX SHA IS NAMED, so no row can carry a confirmed tip the text
+        # holds; a YIELD's note-to-reviewer is empty without a snapshot. The
+        # named-sha scan is cheap and skips the cold snapshot on the common
+        # mention-free YIELD, which never names a tip.
+        return out
+    try:
+        current, unavailable = dispatches.snapshot()
+    except Exception:                                   # noqa: BLE001
+        return out
+    if unavailable:
+        return out
+    for row in current.values():
+        receipt = row.get("diff_handoff")
+        if not isinstance(receipt, dict) or receipt.get("room") != room \
+                or row.get("sender") != seat:
+            continue
+        reviewer = row.get("recipient")
+        applied = row.get("diff_applied")
+        proof = applied.get("hold_approval") \
+            if isinstance(applied, dict) else None
+        if not isinstance(proof, dict) or proof.get("actor") != reviewer:
+            continue
+        tip = dispatches.applied_tip(row)
+        if tip and tip in text:
+            try:
+                approved, _why = dispatches_tier.applied_approval(
+                    row, row.get("repo_root"), current=True)
+            except Exception:                              # noqa: BLE001 — unread wakes
+                continue
+            if approved:
+                out.setdefault(reviewer, set()).add(tip)
+    return out
 
 
 def _peers_closed(room, st, seat):
@@ -1836,7 +2009,9 @@ def say(room, marker, text, seat=None, via="meld"):
     say generated, so a diff's literal trailing [DONE] remains distinguishable.
     DONE/ABORT @mention the peer (the
     act-moments — a closing that lands silently strands the peer's bound);
-    YIELD/HOLD stay mention-free (the peer is inside recv; no cursor spam)."""
+    YIELD/HOLD stay mention-free (the peer is inside recv; no cursor spam),
+    except a YIELD in a task's pair meld, which @mentions every peer in the
+    round (task/3743)."""
     seat = seat or _self_seat()
     marker = (marker or "").upper()
     if marker not in MARKERS:
@@ -1911,6 +2086,29 @@ def say(room, marker, text, seat=None, via="meld"):
     # fleet-wide, so a hostile peer would reshape every reader's terminal. Raw
     # stays in state (only this mention emits it; recv matches on frm==seat).
     mention = "@%s " % chat._dsan(st["peer"]) if marker in ("DONE", "ABORT") else ""
+    if marker == "YIELD" and _pair(room):
+        # A TASK'S PAIR MELD: THE YIELD IS AN OWED ROW (task/3743). Its
+        # turns outlast any recv bound, so the peer is not in recv, and a
+        # mention-free YIELD waited for a beacon that had lapsed (48 min,
+        # measured). The @mention rides the one delivery path: the
+        # doorbell, the tool boundary and the stop guard. Only a peer IN
+        # the round is addressed: one that never joined was woken by the
+        # dispatch ring, and the room is never a wall for it.
+        #
+        # EXCEPT the one reviewer whose applied tip, on a row THIS seat sent
+        # it, carries CURRENT frozen approval (task/3937): its author's YIELD
+        # naming only those tips drops that reviewer's @mention, and no
+        # other. Patch identity alone cannot silence an owed review: a
+        # pre-tier, damaged, or demoted proof keeps the wake, as does an
+        # unconfirmed or changed tip, a reviewer speaking, or another peer.
+        turns = _round_turns(room, st, seat)
+        proven = _applied_confirmed_tips(room, text, seat)
+        named = set(re.findall(r"(?<![0-9a-f])[0-9a-f]{7,40}(?![0-9a-f])",
+                               text))
+        mention = "".join(
+            "@%s " % chat._dsan(p) for p in st.get("peers") or ()
+            if turns.get(p, ("DONE",))[0] not in ("DONE", "ABORT")
+            and not (named and named <= proven.get(p, set())))
     row = "%s[MELD e:%d] %s [%s]" % (mention, st["epoch"], text, marker)
     if marker == "DONE":
         # THE DOOR'S WORD, SAID BEFORE THE SEAL (task/3223). A sealed room

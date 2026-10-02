@@ -10,10 +10,12 @@ import re
 import shlex
 import shutil
 import tempfile
+import time
 import unittest
 from unittest import mock
 
 from tests._tmphome import pin_suite_guard
+from tests import _launchrecipe
 from helm import cli, harness, pk, seat, seat_exit_owner, seat_paths
 from helm import seat_lifecycle_runtime as seat_runtime
 
@@ -232,11 +234,11 @@ class SpawnBase(unittest.TestCase):
         d = seat._instance_dir(family, seat_name)
         os.makedirs(d, exist_ok=True)
         launch = os.path.join(d, "launch.sh")
-        homing = " HELM_CHAT_ROOM=%s" % room if room else ""
-        pin = "" if multi else " CLAUDE_CODE_SUBAGENT_MODEL=gpt-5.6-sol"
         with open(launch, "w") as f:
-            f.write("#!/bin/sh\nexec env FAKE=1%s%s claude \"$@\"\n"
-                    % (homing, pin))
+            # a launch helm itself would mint: the resume restores the recipe
+            # a launch states and refuses a stub that states none (task/3695)
+            f.write(_launchrecipe.launch_sh(family, seat_name, room=room,
+                                            multi=multi))
         os.chmod(launch, 0o700)
         return d, launch
 
@@ -313,25 +315,30 @@ class HeadlessSpawnTest(SpawnBase):
         self.assertIn("HEADLESS", out)
         self.assertIn("pid %d" % _FAKE_PID, out)
 
-    def test_headless_lead_gets_ultracode_and_process_role(self):
+    def test_headless_lead_gets_the_process_role_and_no_ultracode(self):
+        """A lead starts at the home's effort like every agent (owner ruling:
+        ultracode is not special): its argv is launch.sh and the onboarding,
+        with no --settings flag; the role rides the env."""
         d, launch = self._mint()
         rc, _, err, _, popen = self._spawn(
             ["codex", "--role", "lead"], None)
         self.assertEqual(rc, 0, err)
         argv = popen.call_args[0][0]
-        self.assertEqual(argv[:3],
-                         [launch, "--settings", '{"ultracode":true}'])
-        self.assertIn("helm chat wait --seat codex --follow", argv[3])
-        self.assertIn("explicit FLEET LEAD", argv[3])
-        self.assertIn("helm task list", argv[3])
-        self.assertIn("subagents", argv[3])
-        self.assertIn("workflows", argv[3])
+        self.assertEqual(len(argv), 2, argv)
+        self.assertEqual(argv[0], launch)
+        self.assertNotIn("--settings", argv)
+        self.assertNotIn("ultracode", argv[1])
+        self.assertIn("helm chat wait --seat codex --follow", argv[1])
+        self.assertIn("explicit FLEET LEAD", argv[1])
+        self.assertIn("helm task list", argv[1])
+        self.assertIn("subagents", argv[1])
+        self.assertIn("workflows", argv[1])
         self.assertIn("post progress and STOP instead of holding the parent turn open",
-                      argv[3])
-        self.assertIn("positive live/recent delegation evidence", argv[3])
-        self.assertIn("UNKNOWN still blocks", argv[3])
-        self.assertNotIn("keep the master active while delegates run", argv[3])
-        self.assertIn("Do not park while eligible work queues", argv[3])
+                      argv[1])
+        self.assertIn("positive live/recent delegation evidence", argv[1])
+        self.assertIn("UNKNOWN still blocks", argv[1])
+        self.assertNotIn("keep the master active while delegates run", argv[1])
+        self.assertIn("Do not park while eligible work queues", argv[1])
         self.assertEqual(popen.call_args[1]["env"]["HELM_SEAT_ROLE"], "lead")
         with open(os.path.join(d, "spawn.json")) as f:
             self.assertEqual(json.load(f)["role"], "lead")
@@ -516,8 +523,8 @@ class AdapterSpawnTest(SpawnBase):
         # the register this spawn published.
         self.assertEqual(command, self._launch_line(d, launch, role="lead"))
         self.assertIn("env HELM_SEAT_ROLE=lead ", command)
-        self.assertTrue(command.endswith(" --settings %s"
-                                         % shlex.quote('{"ultracode":true}')))
+        self.assertTrue(command.endswith(shlex.quote(launch)), command)
+        self.assertNotIn("--settings", command)
         self.assertEqual(title, "codex")
         self.assertEqual(wla.call_args.kwargs["model"],
                          "gpt-5.3-codex-spark")
@@ -1799,8 +1806,10 @@ class SparkModelPersistenceTest(SpawnBase):
         refresh DOES write the family default (gpt-6.1-sol + 220k) — which is what
         makes the spark arm's assertNotIn(320000) a measurement and not a
         vacuous absence — and the record persists model None. Only an
-        explicit choice is sticky: a default-following seat must keep
-        tracking the family so a catalog default change still propagates."""
+        explicit choice is sticky IN THE RECORD. A plain resume restores the
+        launch the seat ran with (task/3695), so a catalog default change
+        reaches a parked default-following seat through `seat resume
+        --defaults` (ExactResumeTest pins both)."""
         d, launch = self._mint()
         rc, _, err = self._drive(["spawn", "codex", "--cwd", self.home],
                                  FakeAdapter())
@@ -1817,6 +1826,311 @@ class SparkModelPersistenceTest(SpawnBase):
         self.assertIn("--model gpt-6.1-sol", refreshed)
         self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=220000", refreshed)
         self.assertNotIn("76000", refreshed)
+
+
+class ExactResumeTest(SpawnBase):
+    """task/3695: a parked seat resumes EXACTLY as it ran.
+
+    The fixture is the measured helm-codex case: a seat whose model was the
+    family default when it launched (gpt-5.6-sol, window 320000), and whose
+    catalog default has since moved (`NOW`, window 220000). The record
+    says the model was a DEFAULT, so today's refresh follows the catalog; the
+    seat's own transcript says what it actually ran. These arms drive the
+    real verb and the real `_write_launch_assets` and assert the EFFECT: the
+    model and window in the launch.sh the relaunched pane executes."""
+
+    OLD = "gpt-5.6-sol"
+    SID = "22222222-2222-2222-2222-222222222222"
+
+    @property
+    def NOW(self):
+        """The codex default the catalog teaches today, read, not spelled."""
+        return seat.FAMILIES["codex"]["model"]
+
+    def _drive(self, argv, adapter):
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(harness, "detect", return_value=adapter), \
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(err):
+            rc = seat.cmd_seat(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    def _parked_seat(self, captured=True, cwd=None):
+        """spawn on the old model, then record it as the default it was (so
+        the catalog outranks it), and give the session a transcript that
+        says what the seat ran: Claude Code's model attachment, a reply on
+        that model at xhigh effort, and the permission mode. `captured` adds
+        what the reboot sweep keeps of the seat's process while it ran: its
+        launch words and allow-listed environ, for this session. `cwd` is
+        the directory the session ran in (the seat home by default)."""
+        cwd = cwd or self.home
+        d, launch = self._mint()
+        rc, _, err = self._drive(
+            ["spawn", "codex", "--model", self.OLD, "--cwd", cwd],
+            FakeAdapter())
+        self.assertEqual(rc, 0, err)
+        path = os.path.join(d, "spawn.json")
+        with open(path) as f:
+            rec = json.load(f)
+        rec.update(session=self.SID, model_source="default")
+        with open(path, "w") as f:
+            json.dump(rec, f)
+        project = os.path.join(d, "claude", "projects", "test")
+        os.makedirs(project, exist_ok=True)
+        rows = [
+            {"type": "permission-mode", "permissionMode": "bypassPermissions",
+             "sessionId": self.SID},
+            {"type": "attachment", "sessionId": self.SID, "cwd": cwd,
+             "attachment": {"type": "model",
+                            "identity": {"modelId": self.OLD}}},
+            {"type": "assistant", "sessionId": self.SID, "cwd": cwd,
+             "version": "2.1.282", "effort": "xhigh",
+             "message": {"model": self.OLD, "role": "assistant",
+                         "content": [{"type": "text", "text": "ok"}]}}]
+        with open(os.path.join(project, self.SID + ".jsonl"), "w") as f:
+            f.write("".join(json.dumps(r) + "\n" for r in rows))
+        with open(launch) as f:
+            minted = f.read()
+        # the positive control: the launch it ran IS the old model and window
+        self.assertIn("--model %s" % self.OLD, minted)
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=320000", minted)
+        if captured:
+            # taken while the process the spawn launched held the session:
+            # at the spawn's own stamp, so no launch follows it
+            self._capture(minted, rec["ts"])
+        return d, launch
+
+    def _capture(self, minted, when):
+        from helm import seat_recipe, seat_resume_all
+        ran = seat_recipe.launch_capture(minted)
+        line, failed = seat_resume_all.record_live_set(
+            [], True, False, "boot-a", 1, recipes={
+                "codex": seat_recipe.capture_record(
+                    ran["argv"], ran["env"], pid=4242, start="100",
+                    sessions=[self.SID], captured=when)})
+        self.assertFalse(failed, line)
+
+    def _remint(self):
+        """`seat remint codex --apply`: the catalog default the record
+        follows has moved, so launch.sh is re-minted to it and nothing is
+        launched."""
+        d = seat._instance_dir("codex", "codex")
+        rc, out, err = self._drive(["remint", "codex", "--apply"],
+                                   FakeAdapter())
+        self.assertEqual(rc, 0, out + err)
+        with open(os.path.join(d, "launch.sh")) as f:
+            reminted = f.read()
+        # the positive control: the re-mint moved the script to today's line
+        self.assertIn("--model %s" % self.NOW, reminted)
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=220000", reminted)
+
+    def _resume_adapter(self):
+        return FakeAdapter(rows=[{"handle": "pane-1", "title": "codex",
+                                  "status": "idle"}])
+
+    def test_a_parked_proxy_seat_resumes_on_the_model_it_ran(self):
+        """MUTATION: re-mint from `_persisted_model` (today's behaviour) —
+        the default record yields None, the catalog's default and 220000
+        land in launch.sh, and the seat comes back on another model with a
+        smaller window."""
+        d, launch = self._parked_seat()
+        fake = self._resume_adapter()
+        rc, out, err = self._drive(["resume", "codex"], fake)
+        self.assertEqual(rc, 0, out + err)
+        with open(launch) as f:
+            relaunched = f.read()
+        self.assertIn("--model %s" % self.OLD, relaunched)
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=320000", relaunched)
+        self.assertNotIn("--model %s" % self.NOW, relaunched)
+        self.assertIn("resuming EXACTLY as it ran", out)
+        # the effort it ran at rides the pane command
+        self.assertIn("--effort xhigh", fake.spawned[-1][0])
+
+    def test_a_resume_whose_pane_never_started_writes_no_launch_row(self):  # noqa: VACUOUS_ASSERTION — no row is the contract: the row is the relaunched process's own SessionStart hook's; rc 1 is the positive control that no pane started
+        """The launch record holds only launches that really started: a
+        resume whose pane the metaharness refused to create (Orca still
+        booting) writes no row, so the capture still describes the
+        session's last launch. MUTATION: write the row before the spawn —
+        the failed launch unbinds a good capture."""
+        from helm import eventledger, home
+
+        class Booting(FakeAdapter):
+            def spawn(self, command, title=None, cwd=None):
+                raise harness.HarnessError("orca is still booting")
+        self._parked_seat()
+        rc, out, err = self._drive(["resume", "codex"], Booting(rows=[
+            {"handle": "pane-1", "title": "codex", "status": "idle"}]))
+        self.assertEqual(rc, 1, out + err)
+        rows, unread = eventledger.checked_events(
+            os.path.join(home.global_dir(), "seat-launches.jsonl"))
+        self.assertIsNone(unread)
+        self.assertEqual(rows, [])
+
+    def test_defaults_flag_prints_each_field_it_changes(self):
+        """`--defaults` is the explicit choice of today's defaults, and it
+        says what moves, field by field, before it moves it. MUTATION: drop
+        the change lines — the resume still lands on today's default but the
+        operator is never told the model and window moved."""
+        d, launch = self._parked_seat()
+        rc, out, err = self._drive(["resume", "codex", "--defaults"],
+                                   self._resume_adapter())
+        self.assertEqual(rc, 0, out + err)
+        self.assertRegex(out, r"model\s+%s -> %s" % (re.escape(self.OLD),
+                                                     re.escape(self.NOW)))
+        self.assertRegex(out, r"window\s+320000 -> 220000")
+        with open(launch) as f:
+            relaunched = f.read()
+        self.assertIn("--model %s" % self.NOW, relaunched)
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=220000", relaunched)
+
+    def test_a_refusal_stops_nothing_and_rewrites_nothing(self):  # noqa: VACUOUS_ASSERTION — rc 1 and the named refusal are positive controls, and the same fixture on --defaults stops pane-1 in this arm
+        """The recipe is judged BEFORE the reap and the re-mint: a seat that
+        ran a model its family no longer catalogues refuses with its pane
+        still up and its launch.sh byte-identical. MUTATION: judge the plan
+        after `_reap_stale` — the pane is stopped, and the refusal leaves the
+        seat with no pane at all. The positive control is the same fixture on
+        `--defaults`, whose resume does stop that pane."""
+        d, launch = self._parked_seat()
+        transcript = os.path.join(d, "claude", "projects", "test",
+                                  self.SID + ".jsonl")
+        with open(transcript, "a") as f:
+            f.write(json.dumps({
+                "type": "attachment", "sessionId": self.SID,
+                "attachment": {"type": "model",
+                               "identity": {"modelId": "gpt-0-retired"}}})
+                + "\n")
+        with open(launch, "rb") as f:
+            before = f.read()
+        fake = self._resume_adapter()
+        rc, out, err = self._drive(["resume", "codex"], fake)
+        self.assertEqual(rc, 1, out + err)
+        # named by field, never by value (task/3695): a model the catalog
+        # does not know is not printed
+        self.assertIn("a model the catalog does not know", err)
+        self.assertNotIn("gpt-0-retired", out + err)
+        self.assertEqual(fake.stopped, [])
+        self.assertEqual(fake.spawned, [])
+        with open(launch, "rb") as f:
+            self.assertEqual(f.read(), before, "a refused resume re-minted")
+        fake = self._resume_adapter()
+        rc, out, err = self._drive(["resume", "codex", "--defaults"], fake)
+        self.assertEqual(rc, 0, out + err)
+        self.assertEqual(fake.stopped, ["pane-1"])
+
+    def test_seat_recipe_says_the_parked_seat_resumes_exactly(self):
+        """The read-only verb: every field with its source, and the Asleep
+        answer, beside what `--defaults` would change."""
+        d, launch = self._parked_seat()
+        with open(launch, "rb") as f:
+            before = f.read()
+        rc, out, err = self._drive(["recipe", "codex"], FakeAdapter())
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("resume: resumes exactly", out)
+        self.assertRegex(out, r"model\s+%s\s+\[transcript \(model attachment"
+                         % re.escape(self.OLD))
+        self.assertRegex(out, r"window\s+320000")
+        self.assertIn("window 320000 -> 220000", out)
+        with open(launch, "rb") as f:
+            self.assertEqual(f.read(), before, "a read-only verb re-minted")
+
+    def test_after_a_remint_an_uncaptured_seat_refuses_naming_each_source(self):  # noqa: VACUOUS_ASSERTION — rc 1 and the refusal naming each field's source are the positive controls; the empty stop/spawn logs and the unchanged script are the refusal's contract, and the captured sibling arm resumes the same fixture
+        """A re-mint rewrites launch.sh with no launch after it, so launch.sh
+        is bound to no launch this session ran: its window beside the
+        transcript's model is two launches' recipe, not one. MUTATION: read
+        launch.sh as the launch the session ran — the seat resumes on the
+        model it ran plus the re-minted window while printing that it
+        resumes EXACTLY."""
+        d, launch = self._parked_seat(captured=False)
+        self._remint()
+        with open(launch, "rb") as f:
+            before = f.read()
+        fake = self._resume_adapter()
+        rc, out, err = self._drive(["resume", "codex"], fake)
+        self.assertEqual(rc, 1, out + err)
+        self.assertNotIn("EXACTLY", out + err)
+        self.assertIn("helm seat: refusing to resume codex", err)
+        self.assertRegex(err, r"window \[last launch \(launch\.sh\)")
+        self.assertRegex(err, r"model \[transcript")
+        self.assertIn("--defaults", err)
+        # the refusal names fields, sources and a flag, never a command
+        self.assertNotIn("`", err)
+        self.assertNotIn("helm seat resume", err)
+        self.assertEqual((fake.stopped, fake.spawned), ([], []))
+        with open(launch, "rb") as f:
+            self.assertEqual(f.read(), before, "a refused resume re-minted")
+
+    def test_a_capture_a_later_launch_followed_binds_nothing(self):  # noqa: VACUOUS_ASSERTION — rc 1 and the refusal naming each source are the positive controls; the empty spawn log is the refusal's contract, and the headline arm resumes the same capture exactly when no launch follows it
+        """The capture holds this session, but a `--defaults` launch of the
+        seat followed it, so it no longer describes the LAST launch: it
+        binds nothing, and the resume refuses as for an uncaptured seat.
+        MUTATION: bind by session id alone — the seat resumes EXACTLY on the
+        recipe of a launch that is no longer its last."""
+        d, launch = self._parked_seat()          # captured at the spawn's stamp
+        path = os.path.join(d, "spawn.json")
+        with open(path) as f:
+            taken = pk.parse_ts_epoch(json.load(f)["ts"])
+        rc, out, err = self._drive(["resume", "codex", "--defaults"],
+                                   self._resume_adapter())
+        self.assertEqual(rc, 0, out + err)
+        # that launch's stamp, a minute after the capture was taken
+        with open(path) as f:
+            rec = json.load(f)
+        rec["ts"] = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                  time.gmtime(taken + 60))
+        with open(path, "w") as f:
+            json.dump(rec, f)
+        fake = self._resume_adapter()
+        rc, out, err = self._drive(["resume", "codex"], fake)
+        self.assertEqual(rc, 1, out + err)
+        self.assertNotIn("EXACTLY", out + err)
+        self.assertRegex(err, r"window \[last launch \(launch\.sh\)")
+        self.assertEqual(fake.spawned, [])
+
+    def test_after_a_remint_a_captured_seat_still_resumes_exactly(self):
+        """The control: the capture is the process the session ran in, so a
+        re-mint does not move what it resumes on, and the resume prints what
+        today's defaults would have changed."""
+        d, launch = self._parked_seat()
+        self._remint()
+        fake = self._resume_adapter()
+        rc, out, err = self._drive(["resume", "codex"], fake)
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("resuming EXACTLY as it ran", out)
+        self.assertIn("(today's defaults would change: model %s -> %s"
+                      % (self.OLD, self.NOW), out)
+        with open(launch) as f:
+            relaunched = f.read()
+        self.assertIn("--model %s" % self.OLD, relaunched)
+        self.assertIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS=320000", relaunched)
+
+    def test_seat_recipe_names_a_cwd_that_no_longer_exists(self):
+        """The directory a session resumes in is checked like any field: one
+        that is gone is unknown, named with its source. MUTATION: take the
+        cwd on trust — `seat recipe` says the seat resumes exactly into a
+        directory that is not there."""
+        gone = os.path.join(self.tmp, "gone-work")
+        os.makedirs(gone)
+        self._parked_seat(cwd=gone)
+        shutil.rmtree(gone)
+        rc, out, err = self._drive(["recipe", "codex"], FakeAdapter())
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn("resume: saved only: cwd unknown", out)
+        self.assertIn("%s [transcript] no longer exists" % gone, out)
+
+    def test_a_resume_into_a_cwd_that_no_longer_exists_refuses(self):
+        """The control: the resume itself refuses that cwd before anything
+        is stopped or re-minted, naming it. The fixture's tmp tree is not a
+        throwaway root here, so the cwd is not moved to the seat home."""
+        gone = os.path.join(self.tmp, "gone-work")
+        os.makedirs(gone)
+        d, launch = self._parked_seat(cwd=gone)
+        shutil.rmtree(gone)
+        fake = self._resume_adapter()
+        with mock.patch("helm.seats_roster.TEMP_ROOTS", ("/dev/shm",)):
+            rc, out, err = self._drive(["resume", "codex"], fake)
+        self.assertEqual(rc, 1, out + err)
+        self.assertIn(gone, err)
+        self.assertEqual((fake.stopped, fake.spawned), ([], []))
 
 
 class DryRunTest(SpawnBase):
@@ -1863,17 +2177,17 @@ class DryRunTest(SpawnBase):
         self.assertIn("role:  worker", out)
         self.assertIn("first-prompt", out)
 
-    def test_dry_run_lead_shows_role_and_ultracode_invocation(self):
+    def test_dry_run_lead_shows_the_role_and_no_ultracode(self):
         _, launch = self._mint()
         rc, out, err, wla, popen = self._spawn(
             ["codex", "--role", "lead", "--dry-run"], None)
         self.assertEqual(rc, 0, err)
         popen.assert_not_called()
         wla.assert_not_called()
-        self.assertIn("role:  lead", out)
-        self.assertIn("HELM_SEAT_ROLE=lead", out)
-        self.assertIn("--settings %s" % shlex.quote('{"ultracode":true}'), out)
+        self.assertIn("role:  lead (HELM_SEAT_ROLE=lead)\n", out)
         self.assertIn(shlex.quote(launch), out)
+        self.assertNotIn("--settings", out)
+        self.assertNotIn("ultracode", out)
 
 
 class HomeWorktreeSpawnTest(SpawnBase):
@@ -3310,14 +3624,15 @@ class ProjectSeatLifecycleTest(ProjectRegistryBase):
             self.assertEqual(json.load(f),
                              {"v": 1, "seat": "other-claude", "sentinel": True})
 
-    def test_native_lead_carries_ultracode_and_the_role_env(self):
+    def test_native_lead_carries_the_role_env_and_no_ultracode(self):
         """FINDING 7 — --role lead was recorded and never applied.
 
-        CONTROL: the worker arm below drives the identical call with the default
-        role and asserts BOTH markers absent, so this arm cannot pass on a
-        command that always carries them. Blast radius: `_native_launch_command`
-        — take the lead branch out and this arm's two asserts fail while the
-        worker arm stays green.
+        The role rides the env; no role adds a --settings flag (owner ruling:
+        every agent starts at high effort, and ultracode is not special).
+        CONTROL: `_launched_role` below runs the exact command and reads the
+        role the child receives, for a lead and a worker. Blast radius:
+        `_native_launch_command` — take the lead branch out and this arm's
+        env assert fails.
         """
         self._register("proj-a")
         fake = FakeAdapter()
@@ -3326,8 +3641,9 @@ class ProjectSeatLifecycleTest(ProjectRegistryBase):
         self.assertEqual(rc, 0, err)
         command = fake.spawned[0][0]
         self.assertTrue(command.startswith("env HELM_SEAT_ROLE=lead "), command)
-        self.assertIn("-- --settings", command)
-        self.assertIn('{"ultracode":true}', command)
+        self.assertIn("launch --seat proj-a-claude", command)
+        self.assertNotIn("--settings", command)
+        self.assertNotIn("ultracode", command)
         with open(os.path.join(
                 seat._instance_dir("claude", "proj-a-claude"), "spawn.json"),
                 encoding="utf-8") as fh:
@@ -3405,7 +3721,7 @@ class ProjectSeatLifecycleTest(ProjectRegistryBase):
                 self.assertEqual(rec["role"] == "lead", expect == "lead")
 
     def test_native_worker_carries_no_lead_settings_flag(self):  # noqa: VACUOUS_ASSERTION — the absence assert is the CONTROL for the lead arm above and sits beside an unconditional assert on the full launch command
-        """The lead arm's argv control: only a lead gets ultracode."""
+        """The worker's argv: no --settings flag, as for the lead."""
         self._register("proj-a")
         fake = FakeAdapter()
         rc, _out, err, _wla, _popen = self._spawn(["proj-a-claude"], fake)

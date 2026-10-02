@@ -876,6 +876,40 @@ class CmdTest(ChatBase):
         self.assertNotIn("one", out)
         self.assertIn("two", out)
 
+    def test_read_since_past_the_end_prints_no_rows(self):
+        chat.post("one", who="a1")
+        chat.post("two", who="a1")
+        rc, out, err = self.run_cmd(["read", "--since", "9"])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("a1: one", out)
+        self.assertNotIn("a1: two", out)
+        self.assertIn("past room", err)
+        self.assertIn("--limit", err)
+        # CONTROL: the room's own end is an empty read with no warning
+        rc, out, err = self.run_cmd(["read", "--since", "2"])
+        self.assertEqual((rc, err), (0, ""))
+        self.assertNotIn("a1: two", out)
+        rc, out, _e = self.run_cmd(["read", "--since", "1"])
+        self.assertIn("a1: two", out)                     # positive control
+
+    def test_read_since_with_limit_past_the_end_prints_the_note(self):
+        chat.post("one", who="a1")
+        chat.post("two", who="a1")
+        # positive control: the newest row under --limit
+        rc, out, err = self.run_cmd(["read", "--limit", "1"])
+        self.assertEqual((rc, err), (0, ""))
+        self.assertIn("a1: two", out)
+        # past the end under --limit: no rows, and the same stderr note
+        rc, out, err = self.run_cmd(["read", "--since", "9", "--limit", "5"])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("a1: one", out)
+        self.assertNotIn("a1: two", out)
+        self.assertIn("past room", err)
+        # CONTROL: the room's own end under --limit is quiet
+        rc, out, err = self.run_cmd(["read", "--since", "2", "--limit", "5"])
+        self.assertEqual((rc, err), (0, ""))
+        self.assertNotIn("a1: two", out)
+
     def test_rooms_listing(self):
         chat.post("hi", who="a1")
         chat.post("ops talk", room="ops", who="a2")

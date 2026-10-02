@@ -492,7 +492,7 @@ def credhome_for(sid, latch=True):
     return found
 
 
-def resume_command(row, home=None, launch=None):
+def resume_command(row, home=None, launch=None, extra=()):
     """The harness's own resume invocation. claude resume is cwd-scoped, so the
     command carries the cd; codex resume is global-by-UUID (the cd is comfort).
     A paste-for-human command must be safe in a STAMPED shell: an inherited
@@ -507,7 +507,8 @@ def resume_command(row, home=None, launch=None):
     carried. A silent re-home is worse than an error, because nothing ever
     reports it."""
     cwd = os.path.expanduser(row.get("cwd") or "") or "."
-    return "cd %r && %s" % (cwd, resume_exec(row, home=home, launch=launch))
+    return "cd %r && %s" % (cwd, resume_exec(row, home=home, launch=launch,
+                                             extra=extra))
 
 
 def trust_blocked(row, home):
@@ -535,7 +536,7 @@ def trust_blocked(row, home):
     return None
 
 
-def resume_exec(row, home=None, skip_permissions=False, launch=None):
+def resume_exec(row, home=None, skip_permissions=False, launch=None, extra=()):
     """The resume invocation WITHOUT the cd prefix — the part that is safe to
     hand to `exec`.
 
@@ -545,15 +546,22 @@ def resume_exec(row, home=None, skip_permissions=False, launch=None):
     dies immediately, and the spawn still returns a handle — a resume that
     reports success and delivers nothing.
 
-    `launch` is a PROXY seat's own launch script and the model it records
-    (`orcaadopt.proxy_launch`), and it outranks `home`: the resume runs
-    THROUGH that script, because it is what sets the proxy URL, reads the
-    token file and names the family, while the native line below unsets the
-    first two and passes no model."""
+    `launch` is a PROXY seat's own launch script and the model it passes
+    (`orcaadopt.proxy_launch`, planned by seat_recipe.adopted_proxy_plan),
+    and it outranks `home`: the resume runs THROUGH that script, because it
+    is what sets the proxy URL, reads the token file and names the family,
+    while the native line below unsets the first two and passes no model;
+    `extra` (the effort it ran at) rides before `--resume` there too.
+
+    `extra` is an exact resume's claude flags (helm/seat_recipe.py
+    `adopted_words`: model, permission, effort, denied tools, appended
+    instructions), shell-quoted and placed BEFORE `--resume`, so the variadic
+    --disallowedTools ends at an option and never swallows the session id."""
     if launch:
-        return "%s --model %s --resume %s" % (
+        words = "".join(shlex.quote(str(w)) + " " for w in extra or ())
+        return "%s --model %s %s--resume %s" % (
             shlex.quote(launch["launch_sh"]), shlex.quote(launch["model"]),
-            shlex.quote(row["i"]))
+            words, shlex.quote(row["i"]))
     from . import seat
     unset = seat.paste_unset_prefix()
     if row["h"] != "claude":
@@ -562,7 +570,8 @@ def resume_exec(row, home=None, skip_permissions=False, launch=None):
         home = credhome_for(row["i"])
     pin = ("CLAUDE_CONFIG_DIR=%s " % home) if is_pinnable(home) else ""
     skip = " --dangerously-skip-permissions" if skip_permissions else ""
-    return "%s%sclaude --resume %s%s" % (unset, pin, row["i"], skip)
+    words = "".join(shlex.quote(str(w)) + " " for w in extra or ())
+    return "%s%sclaude %s--resume %s%s" % (unset, pin, words, row["i"], skip)
 
 
 def is_pinnable(home):
@@ -589,7 +598,7 @@ RESUME_DIR = os.path.expanduser("~/.helm/_global/resumes")
 
 
 def mint_resume_script(row, home=None, skip_permissions=False, env=None,
-                       launch=None):
+                       launch=None, extra=()):
     """Write the resume as an executable SCRIPT and return its path.
 
     TOKEN LAW (borrowed intact from seat.py's resume): what crosses the
@@ -607,11 +616,14 @@ def mint_resume_script(row, home=None, skip_permissions=False, env=None,
     herdr's spawn happens in a daemon helm cannot reach — so the script is the
     one vehicle that behaves identically on all three metaharness cases.
     Values are shell-quoted; NOTHING SECRET may be passed here, same as every
-    other consumer of this seam."""
+    other consumer of this seam. A None value UNSETS the name: an exact resume
+    names what the seat ran WITHOUT as well as what it ran with, so the pane
+    shell's own export cannot ride in (task/3695). `extra` is resume_exec's."""
     os.makedirs(RESUME_DIR, exist_ok=True)
     path = os.path.join(RESUME_DIR, "%s.sh" % row["i"])
     cwd = os.path.expanduser(row.get("cwd") or "") or "."
-    exports = "".join("export %s=%s\n" % (k, shlex.quote(str(v)))
+    exports = "".join(("export %s=%s\n" % (k, shlex.quote(str(v)))
+                       if v is not None else "unset %s\n" % k)
                       for k, v in sorted((env or {}).items()))
     # cd on its own line, and FAIL LOUD if it cannot: resuming claude from the
     # wrong directory does not error, it forks a fresh session — so a silent
@@ -624,7 +636,7 @@ def mint_resume_script(row, home=None, skip_permissions=False, env=None,
                 "%sexec %s\n"
                 % (shlex.quote(cwd), cwd, exports,
                    resume_exec(row, home=home, skip_permissions=skip_permissions,
-                               launch=launch)))
+                               launch=launch, extra=extra)))
     os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR)
     return path
 
@@ -652,7 +664,7 @@ def resume_identity_env(sid):
 
 
 def spawn_resume(row, title=None, home=None, skip_permissions=False, env=None,
-                 launch=None):
+                 launch=None, extra=()):
     """Actually resume the session in a pane. (path, handle, adapter) on
     success; raises harness.HarnessError when no metaharness is reachable.
 
@@ -684,7 +696,7 @@ def spawn_resume(row, title=None, home=None, skip_permissions=False, env=None,
                                  "the credhome", cred._display_path(home)))
     path = mint_resume_script(row, home=home,
                               skip_permissions=skip_permissions, env=env,
-                              launch=launch)
+                              launch=launch, extra=extra)
     cwd = os.path.expanduser(row.get("cwd") or "") or os.path.expanduser("~")
     if not os.path.isdir(cwd):
         cwd = os.path.expanduser("~")

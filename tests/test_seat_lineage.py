@@ -443,10 +443,12 @@ class RenameCarriesHoldingsTest(Base):
         from helm import dispatches
         repo, tip = self.dispatch_repo()
         self.rostered("Worker", "s-worker-2529")
+        from tests._tmphome import review_task
+        task = review_task(self, "rename inbound", owner="integrator")
         with mock.patch.dict(os.environ, {"HELM_CHAT_NAME": "integrator"}):
             row, why, _s = dispatches.send(
                 "Worker", "inbound-lane", "a brief", tip, kind="review",
-                new_work=True, repo=repo)
+                new_work=True, repo=repo, task=task)
         self.assertIsNotNone(row, "fixture: inbound send refused (%s)" % why)
         man, unread = seat_reassign.holdings("Worker")
         self.assertEqual(unread, [])
@@ -475,10 +477,12 @@ class RenameCarriesHoldingsTest(Base):
         repo, tip = self.dispatch_repo()
         self.rostered("Worker", "s-worker-2529")
         self.rostered("integrator", "s-integrator-2529")
+        from tests._tmphome import review_task
+        task = review_task(self, "rename outbound", owner="integrator")
         with mock.patch.dict(os.environ, {"HELM_CHAT_NAME": "Worker"}):
             row, why, _s = dispatches.send(
                 "integrator", "outbound-lane", "a brief", tip, kind="review",
-                new_work=True, repo=repo)
+                new_work=True, repo=repo, task=task)
         self.assertIsNotNone(row, "fixture: outbound send refused (%s)" % why)
         man, unread = seat_reassign.holdings("Worker")
         self.assertEqual(unread, [])
@@ -522,10 +526,12 @@ class RenameCarriesHoldingsTest(Base):
         self.rostered("Worker", "s-worker-2529b")
         self.rostered("integrator", "s-integrator-2529b")
         self.rostered("third", "s-third-2529b")
+        from tests._tmphome import review_task
+        task = review_task(self, "rename outbound", owner="integrator")
         with mock.patch.dict(os.environ, {"HELM_CHAT_NAME": "Worker"}):
             row, why, _s = dispatches.send(
                 "integrator", "outbound-lane", "a brief", tip, kind="review",
-                new_work=True, repo=repo)
+                new_work=True, repo=repo, task=task)
         self.assertIsNotNone(row, "fixture: outbound send refused (%s)" % why)
         man, unread = seat_reassign.holdings("Worker")
         self.assertEqual(unread, [])

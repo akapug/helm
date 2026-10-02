@@ -30,7 +30,7 @@ import sys
 import threading
 import time
 
-from . import catalog, freetext, home
+from . import catalog, cvcompat, freetext, home
 from .providers import ProviderError
 from . import pk
 
@@ -291,7 +291,8 @@ def deep_search(query, limit=40, scope=None, include_synthetic=False):
                     env=home.cv_env())
         if p.returncode == 0 and p.stdout.strip().startswith("["):
             hits = [{"harness": h.get("harness", "?"), "id8": (h.get("id") or "")[:8],
-                     "date": (h.get("updatedAt") or "")[:10], "title": (h.get("title") or "")[:120],
+                     "date": (cvcompat.field(h, "updated_at") or "")[:10],
+                     "title": (h.get("title") or "")[:120],
                      "snippet": (h.get("snippet") or "")[:300], "sid_full": h.get("id")}
                     for h in json.loads(p.stdout)]
             rows = get_catalog()["rows"]
@@ -339,6 +340,7 @@ def deep_search(query, limit=40, scope=None, include_synthetic=False):
 # ------------------------------------------------------------- transcript reads
 
 def _cv_show(sid, rng=None, harness=None):
+    """`cv show --json` over messages [start, end) when rng = (start, end)."""
     import subprocess as _sp
     # sid/harness can arrive raw from a GET param (non-catalog sessions read via
     # cv directly): both must LOOK like ids, and the sid rides after `--` so it
@@ -347,7 +349,7 @@ def _cv_show(sid, rng=None, harness=None):
         raise ProviderError(f"invalid session id {sid!r}")
     if harness and not _SAFE_TOKEN.match(harness):
         raise ProviderError(f"invalid harness {harness!r}")
-    args = ["cv", "show", "--json"] + (["--range", rng] if rng else []) \
+    args = ["cv", "show", "--json"] + (["--range", cvcompat.window(*rng)] if rng else []) \
         + (["--harness", harness] if harness else []) + ["--", sid]
     p = _sp.run(args, capture_output=True, text=True, timeout=60,
                 env=home.cv_env())
@@ -356,30 +358,53 @@ def _cv_show(sid, rng=None, harness=None):
     return json.loads(p.stdout)
 
 
+_MAX_SESSION_MESSAGES = 1 << 20  # refuse implausibly unbounded cv windows
+
+
 def _session_total(sid, line_bound, harness=None):
-    """True IR message count via bisect of 1-message windows (windowed reads are cheap;
-    line count is a guaranteed upper bound). Cached per (sid, line_bound)."""
+    """True IR message count via bisect of 1-message windows (windowed reads are cheap).
+    line_bound starts the search: cv 0.10 never lists more messages than it, but
+    cv 0.11+ also lists injected context. Grow up to the hard ceiling; if cv
+    still returns a message there, refuse rather than claim an invented total.
+    Cached per (sid, line_bound, harness)."""
     key = f"total:{sid}:{line_bound}:{harness}"
     with _lock:
         if key in _state:
             return _state[key][1]
-    lo, hi = 0, max(1, line_bound)  # invariant: total in (lo, hi]
-    if not _cv_show(sid, f"{hi-1}-{hi}", harness=harness)["messages"]:
-        while hi - lo > 1:
-            mid = (lo + hi) // 2
-            if _cv_show(sid, f"{mid}-{mid+1}", harness=harness)["messages"]:
-                lo = mid
-            else:
-                hi = mid
+
+    def has(i):
+        return bool(_cv_show(sid, (i, i + 1), harness=harness)["messages"])
+    lo, hi = -1, min(_MAX_SESSION_MESSAGES, max(1, line_bound))
+    if has(hi - 1):
+        lo = hi - 1
+        while has(hi):
+            if hi == _MAX_SESSION_MESSAGES:
+                raise ProviderError("cv show session message limit exceeded (%d)"
+                                    % _MAX_SESSION_MESSAGES)
+            lo, hi = hi, min(_MAX_SESSION_MESSAGES, hi * 2)
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        if has(mid):
+            lo = mid
+        else:
+            hi = mid
     total = hi
     with _lock:
         _state[key] = (time.time(), total)
     return total
 
 
+# cv 0.11+ lists what the harness appended to a prompt (hook output, reminders)
+# as messages of their own; cv 0.10 did not list them at all. The drawer keeps
+# showing the conversation, not that context.
+_NOT_A_TURN = frozenset(("injected_context",))
+
+
 def _simplify_msg(m):
     """One IR message -> display items (the same simplification the drawer renders)."""
     items = []
+    if m.get("kind") in _NOT_A_TURN:
+        return items
     def _flatten(c):
         if isinstance(c, str):
             return c
@@ -389,7 +414,7 @@ def _simplify_msg(m):
             return c.get("text") or _flatten(c.get("content")) or ""
         return "" if c is None else str(c)
     for b in m.get("content", []):
-        k = b.get("kind")
+        k = cvcompat.block_type(b)
         if k == "text" and (b.get("text") or "").strip():
             items.append({"k": "text", "t": b["text"]})
         elif k == "thinking" and (b.get("text") or "").strip():
@@ -444,7 +469,7 @@ def get_session(sid, before=None, limit=60, find=None, harness=None):
             wend = total
             for _ in range(FIND_MAX_WINDOWS):
                 wstart = max(0, wend - FIND_WINDOW)
-                wmsgs = _cv_show(sid, f"{wstart}-{wend}", harness=None if row else harness).get("messages", [])
+                wmsgs = _cv_show(sid, (wstart, wend), harness=None if row else harness).get("messages", [])
                 partial = None
                 for j in range(len(wmsgs) - 1, -1, -1):
                     m = _items_match(_simplify_msg(wmsgs[j]), needle)
@@ -468,7 +493,7 @@ def get_session(sid, before=None, limit=60, find=None, harness=None):
         else:
             end = min(before if before is not None else total, total)
             start = max(0, end - limit)
-        ir = _cv_show(sid, f"{start}-{end}", harness=None if row else harness)
+        ir = _cv_show(sid, (start, end), harness=None if row else harness)
     except ProviderError as e:
         return {"error": str(e)}
     except Exception as e:
@@ -663,7 +688,7 @@ def make_cmd(account, sid, model=None):
 
 PRUNE_PRESETS = {
     # preset -> (cv prune flags, one line on what it drops)
-    "lean": (["--thinking"],
+    "lean": ([cvcompat.DROP_THINKING],
              "snips tool payloads >2KB into a retrievable sidecar ([PRUNED] markers, tool pairs intact)"
              " + flattens old thinking; last 25 turns stay verbatim; lossless"),
     "window20k": (["--window", "20000"],
@@ -709,7 +734,11 @@ def prune_session(sid, preset="lean", dry=False, tokens=None):
         flags, note = PRUNE_PRESETS[preset]
     else:
         return {"error": f"unknown preset {preset!r} (lean | window20k | window+tokens)"}
-    missing = [f for f in flags if f.startswith("--") and f not in _cv_prune_help()]
+    flags = [cvcompat.drop_thinking() if f == cvcompat.DROP_THINKING else f
+             for f in flags]
+    have = _cv_prune_help()
+    missing = [f for f in flags if f.startswith("--")
+               and not re.search(r"(?<![\w-])%s(?![\w-])" % re.escape(f), have)]
     if missing:
         return {"error": f"preset unavailable in installed cv (needs {' '.join(missing)})"}
     cmd = ["cv", "prune", sid] + flags

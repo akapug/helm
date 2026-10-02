@@ -56,13 +56,12 @@ def _merge_state(root, branch):
     WORK reach the trunk? THE authority; `_merged` is its boolean projection
     (the `_dirty`/`_room_status` pattern: one question, one authority).
 
-    FOUR states, not three, and the fourth is why every well-behaved lane used
-    to accumulate. This asked `ancestry` alone, which is SHA IDENTITY, while
-    our protocol lands work REBASED — the integrator rebases the chain onto
-    current trunk and gates the rebased tree, so the landed commit carries a
-    different object id. Ancestry then answers "no" TRUTHFULLY, the lane reads
-    unlanded, and the agent that followed the rule correctly keeps its branch
-    forever. Measured on this repo 2026-08-03: of 107 `lane/*` branches, 20
+    FOUR states, not three. This once asked `ancestry` alone, which is SHA
+    IDENTITY: today's exact-sha train merge keeps the reviewed tip reachable,
+    but historical rebases and cherry-picks carried the same content under a
+    different object id. Ancestry then truthfully answered "no", the lane read
+    unlanded, and the agent kept its branch forever. Measured on this repo
+    2026-08-03: of 107 `lane/*` branches, 20
     were ancestry-reachable and 7 more were entirely on trunk under other
     shas — invisible here, uncollectable by any reaper.
 
@@ -78,7 +77,17 @@ def _merge_state(root, branch):
     return vcs.backend(root).landed_state(root, branch, _trunk(root))
 
 
-RETIRABLE = (vcs.ANCESTOR, vcs.PATCH_EQUIVALENT)
+# A SWEEP'S STATE, NEVER A `_merge_state` ANSWER (task/1026): the lane's tip
+# is not on the trunk and whole-branch patch identity says no, yet EVERY commit
+# past the trunk is on it under another sha, and `_landed_equivalent` can
+# print the proof of each one. Ancestry and `git cherry` miss two shapes the
+# fleet makes all the time: a lane that merged the trunk back in (cherry skips
+# the merge and compares against the moved merge-base) and a lane whose work
+# landed as its `-rN` rebuild. Retired like patch identity: the tip is
+# preserved at `refs/helm-retired/` before the branch goes.
+LANDED_EQUIVALENT = "landed-equivalent"
+
+RETIRABLE = (vcs.ANCESTOR, vcs.PATCH_EQUIVALENT, LANDED_EQUIVALENT)
 
 # A SWEEP'S STATE, NEVER A `_merge_state` ANSWER: the branch sits at the trunk
 # and no commit of its own is proven, so ancestry is true of it vacuously —
@@ -97,6 +106,22 @@ UNSTARTED = "unstarted"
 # unstarted room holds nothing the trunk lacks, so keeping one longer costs a
 # sidebar row, never work.
 _UNSTARTED_GRACE_S = 24 * 3600
+
+# HOW LONG A SWEEP LEAVES THE CHECKOUT OF A CLEAN, UNLANDED, IDLE LANE
+# (task/4061). Removing a checkout and KEEPING its branch loses nothing the
+# branch does not hold, and `helm work claim <lane>` re-opens the room on that
+# branch ("a parked lane branch re-opens"), so the only cost of a wrong park is
+# one claim. The grace is 3 x the unstarted grace: it outlasts a weekend away
+# (Friday evening to Monday morning is about 64h) and many 5h session-limit
+# resets, so a paused builder comes back to its room. Without it TRIAGE has no
+# exit while the work waits, and every unlanded room stays on disk forever.
+_PARK_IDLE_S = 72 * 3600
+
+# IGNORED PATHS A REMOVAL MAY DELETE: caches the next run rebuilds. Every
+# other ignored path (an `.env`, a screenshot, a nested `.claude/worktrees/`
+# room, a never-track skill) is bytes the branch does not hold, and keeps the
+# checkout.
+_REGENERABLE = ("__pycache__", ".pytest_cache")
 
 
 def _proof_word(state):
@@ -118,6 +143,11 @@ def _proof_word(state):
                      "cherry` cannot speak for, or a range past the cap)",
         UNSTARTED: "UNSTARTED (the branch sits at the trunk and no commit of "
                    "its own is proven — an empty branch is not a landed one)",
+        LANDED_EQUIVALENT: "LANDED-EQUIVALENT (every commit is on the trunk "
+                           "under another sha: its own patch-id, a train "
+                           "merge of this lane or its -rN rebuild that "
+                           "carried it, or a merge that adds nothing; "
+                           "ancestry and whole-branch patch identity say no)",
     }.get(state, "landedness UNKNOWN")
 
 
@@ -132,6 +162,15 @@ def _merged(root, branch):
 
 
 _REFLOG_STAMP = re.compile(r"@\{(\d+)\}$")
+
+
+_EMPTY_HEAD_REFLOG = "its HEAD reflog is empty"
+
+# THE ADMIN-DIR FILES THE ACTS THAT MOVE A ROOM WRITE: checkout and switch
+# (HEAD), commit (COMMIT_EDITMSG), reset, rebase and merge (ORIG_HEAD,
+# MERGE_HEAD), fetch and pull (FETCH_HEAD), and `helm work claim` (locked).
+_ROOM_CLOCKS = ("HEAD", "COMMIT_EDITMSG", "ORIG_HEAD", "MERGE_HEAD",
+                "FETCH_HEAD", "locked")
 
 
 def _room_moved_ago(path, now=None):
@@ -308,7 +347,445 @@ def _on_trunk(root, shas):
     return any(sha not in listed for sha in shas)
 
 
-def _sweep_state(root, path, branch, now=None):
+# THE TRUNK FACTS A LANDED-EQUIVALENCE READ ASKS, one walk each, kept per
+# trunk sha: the same sha is the same history, so an entry never goes stale,
+# and a sweep over every room pays for each walk once.
+_EQUIV_LOCK = threading.Lock()
+_EQUIV_MEMO = {}
+_EQUIV_MEMO_CAP = 8
+# How many commits a line names per kind before it counts the rest.
+_EQUIV_SHOWN = 3
+_RETRY = re.compile(r"\A(?P<base>.+?)-r(?P<n>[0-9]+)\Z")
+
+
+def _equivalence_facts(v, root, trunk):
+    """(facts, None) or (None, why): the trunk's sha, its non-merge commits by
+    (author email, author time), and its train car merges by lane name.
+
+    A REBASE KEEPS THE AUTHOR AND THE AUTHOR TIME. Cherry-pick, rebase and
+    amend all carry them over, so a copy of a lane commit on the trunk has
+    the lane commit's author line; the index finds the copies without a
+    patch walk over the whole trunk, and patch-id then decides. A copy made
+    some other way (a squash, a hand re-apply) is not found, which keeps a
+    room and never removes one.
+
+    A TRAIN CAR MERGE IS A FIRST-PARENT MERGE WHOSE SUBJECT NAMES THE LANE
+    (`<train>: merge lane <lane>`, the shape `helm train`, auto-land and the
+    integrator write, read by `brief._MERGE_SUBJECT`)."""
+    from ..brief import _MERGE_SUBJECT
+    rc, sha, err = v.text(root, "rev-parse", "--verify", "-q",
+                          "%s^{commit}" % trunk)
+    if rc != 0 or not sha:
+        return None, "the trunk %s could not be read (%s)" % (
+            trunk, err or "rc %s" % rc)
+    key = (os.path.realpath(root), sha)
+    with _EQUIV_LOCK:
+        if key in _EQUIV_MEMO:
+            return _EQUIV_MEMO[key], None
+    rc, out, err = v.text(root, "log", "--no-merges", "--no-show-signature",
+                          "--format=%H%x00%ae%x00%at", sha, timeout=60)
+    if rc != 0:
+        return None, "the trunk's commits could not be read (%s)" % (
+            (err or "rc %s" % rc)[:120])
+    copies = {}
+    for line in out.splitlines():
+        parts = line.split("\0")
+        if len(parts) != 3:
+            return None, "the trunk's commit list was not in the asked format"
+        copies.setdefault((parts[1], parts[2]), []).append(parts[0])
+    rc, out, err = v.text(root, "log", "--first-parent", "--merges",
+                          "--no-show-signature",
+                          "--format=%H%x00%P%x00%ct%x00%s", sha, timeout=60)
+    if rc != 0:
+        return None, "the trunk's merges could not be read (%s)" % (
+            (err or "rc %s" % rc)[:120])
+    trains = {}
+    for line in out.splitlines():
+        parts = line.split("\0", 3)
+        if len(parts) != 4 or not parts[2].isdigit():
+            return None, "the trunk's merge list was not in the asked format"
+        merge, parents, when, subject = parts
+        m = _MERGE_SUBJECT.match(subject)
+        parents = parents.split()
+        if not m or len(parents) != 2:
+            continue
+        lane = m.group("lane").rstrip(",;")
+        lane = lane[len("lane/"):] if lane.startswith("lane/") else lane
+        trains.setdefault(lane, []).append(
+            {"merge": merge, "base": parents[0], "tip": parents[1],
+             "when": int(when), "train": m.group("train"), "lane": lane})
+    facts = {"sha": sha, "copies": copies, "trains": trains, "carried": {}}
+    with _EQUIV_LOCK:
+        if len(_EQUIV_MEMO) >= _EQUIV_MEMO_CAP:
+            _EQUIV_MEMO.clear()
+        _EQUIV_MEMO[key] = facts
+    return facts, None
+
+
+def _rebuilds(name, lane):
+    """Does a train merge of `lane` speak for lane `name`? Yes for the lane
+    itself and for a later rebuild of it (`<base>-rN`, N past `name`'s own
+    number, which is 1 without a suffix). Never for a predecessor: a rebuild
+    made after its predecessor landed carries work that landing did not."""
+    if lane == name:
+        return True
+    mine, theirs = _RETRY.match(name), _RETRY.match(lane)
+    base, n = (mine.group("base"), int(mine.group("n"))) if mine else (name, 1)
+    return bool(theirs) and theirs.group("base") == base \
+        and int(theirs.group("n")) > n
+
+
+def _train_carried(v, root, facts, car):
+    """{(author email, author time): [commit]} for the non-merge commits the
+    train merge `car` brought onto the trunk, or None when unreadable."""
+    with _EQUIV_LOCK:
+        if car["merge"] in facts["carried"]:
+            return facts["carried"][car["merge"]]
+    rc, out, _err = v.text(root, "log", "--no-merges", "--no-show-signature",
+                           "--max-count=%d" % (vcs.CHERRY_RANGE_CAP + 1),
+                           "--format=%H%x00%ae%x00%at", car["tip"],
+                           "^" + car["base"])
+    got = {}
+    for line in out.splitlines() if rc == 0 else ():
+        parts = line.split("\0")
+        if len(parts) != 3:
+            got = None
+            break
+        got.setdefault((parts[1], parts[2]), []).append(parts[0])
+    if rc != 0 or got is None or sum(map(len, got.values())) \
+            > vcs.CHERRY_RANGE_CAP:
+        got = None
+    with _EQUIV_LOCK:
+        facts["carried"][car["merge"]] = got
+    return got
+
+
+def _patch_ids(v, root, shas):
+    """{sha: `--verbatim` patch-id} for the non-merge `shas`, or None when
+    the read failed. A commit that changes no file has no patch and no
+    entry. The pretty format and the diff drivers are pinned, because the
+    patch-id parser reads the commit header out of the diff stream (see
+    `vcs._verbatim_map`); `--binary` puts a binary change's bytes in the
+    stream, so two different binary changes to one path never share an id."""
+    if not shas:
+        return {}
+    rc, diff, _err = v.run(root, "log", "--no-walk=unsorted", "-p", "--binary",
+                           "--no-color", "--no-ext-diff", "--no-textconv",
+                           "--no-show-signature", "--pretty=format:commit %H",
+                           *shas, timeout=60)
+    if rc != 0:
+        return None
+    if not diff.strip():
+        return {}
+    rc, out, _err = v.text(root, "patch-id", "--verbatim", stdin=diff,
+                           timeout=60)
+    if rc != 0:
+        return None
+    got = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2:
+            got[parts[1]] = parts[0]
+    return got
+
+
+def _clean_merge(v, root, sha):
+    """True when the two-parent merge `sha` records exactly what git's own
+    merge of its parents makes (`git show --remerge-diff` prints nothing),
+    so it carries no change of its own; False otherwise or unreadable."""
+    rc, out, _err = v.text(root, "show", "--remerge-diff", "--no-color",
+                           "--no-ext-diff", "--no-show-signature",
+                           "--format=", sha, timeout=60)
+    return rc == 0 and not out
+
+
+def _pairs(pairs):
+    shown = ", ".join("%s as %s" % (a[:12], b[:12])
+                      for a, b in pairs[:_EQUIV_SHOWN])
+    more = len(pairs) - _EQUIV_SHOWN
+    return shown + (", and %d more" % more if more > 0 else "")
+
+
+def _landed_equivalent(root, branch, path=None):
+    """(evidence, None) when every commit `branch` carries past the trunk is
+    on the trunk under another sha, else (None, why). Both are one line the
+    sweep prints: the evidence names each proof, the reason names the first
+    commits it could not prove and why.
+
+    A COMMIT IS PROVEN THREE WAYS AND NO OTHER:
+      * its own `--verbatim` patch-id is a trunk commit's that has its author
+        line (the rebased copy);
+      * a train car merge that names this lane, or a later `-rN` rebuild of
+        it (`_rebuilds`), carried a commit with its author line, and the
+        commit was not rewritten after that merge (its committer time is not
+        later than the merge's);
+      * it is a two-parent merge that adds nothing of its own
+        (`_clean_merge`), so its parents' commits speak for it.
+    A subject match or a share of lines found on the trunk proves nothing: a
+    rebase that resolved a conflict can drop a line, and only the patch or
+    the train record says the change itself landed. Any unproven commit, any
+    read that failed and a range past the cap keep the room."""
+    v = vcs.backend(root)
+    facts, blind = _equivalence_facts(v, root, _trunk(root))
+    if facts is None:
+        return None, "landed-equivalence UNKNOWN: " + blind
+    cap = vcs.CHERRY_RANGE_CAP
+    rc, out, err = v.text(root, "log", "--no-show-signature",
+                          "--max-count=%d" % (cap + 1),
+                          "--format=%H%x00%P%x00%ae%x00%at%x00%ct",
+                          "%s..%s" % (facts["sha"], branch), timeout=60)
+    commits = [line.split("\0") for line in out.splitlines()] \
+        if rc == 0 else None
+    if commits is None or any(len(c) != 5 for c in commits):
+        return None, ("landed-equivalence UNKNOWN: the lane's commits could "
+                      "not be read (%s)" % ((err or "rc %s" % rc)[:120]))
+    if not commits:
+        return None, ("landed-equivalence UNKNOWN: the lane carries no "
+                      "commit past the trunk to judge")
+    if len(commits) > cap:
+        return None, ("landed-equivalence UNKNOWN: more than %d commits "
+                      "past the trunk, the most a sweep reads" % cap)
+    single = [c for c in commits if len(c[1].split()) <= 1]
+    copies = {c[0]: facts["copies"].get((c[2], c[3]), []) for c in single}
+    ids = _patch_ids(v, root, list(dict.fromkeys(
+        [c[0] for c in single] + [d for ds in copies.values() for d in ds])))
+    if ids is None:
+        return None, ("landed-equivalence UNKNOWN: the patch-ids could not "
+                      "be read")
+    names = {branch[len("lane/"):] if branch.startswith("lane/") else branch}
+    if path:
+        names.add(os.path.basename(os.path.normpath(path)))
+    cars = [car for lane, got in sorted(facts["trains"].items())
+            if any(_rebuilds(name, lane) for name in names) for car in got]
+    carried = []
+    for car in cars:
+        got = _train_carried(v, root, facts, car)
+        if got is None:
+            return None, ("landed-equivalence UNKNOWN: what %s %s carried "
+                          "could not be read" % (car["train"],
+                                                 car["merge"][:12]))
+        carried.append((car, got))
+    by_patch, by_train, merges, unproven, used = [], {}, [], [], set()
+    for sha, parents, email, authored, committed in commits:
+        if len(parents.split()) > 1:
+            if len(parents.split()) == 2 and _clean_merge(v, root, sha):
+                merges.append(sha)
+            else:
+                unproven.append((sha, "a merge that carries a change of its "
+                                      "own (`git show --remerge-diff` is not "
+                                      "empty)"))
+            continue
+        mine = ids.get(sha)
+        if mine is None:
+            unproven.append((sha, "it changes no file, so it has no patch "
+                                  "to match"))
+            continue
+        same = [d for d in copies[sha] if ids.get(d) == mine]
+        if same:
+            by_patch.append((sha, same[0]))
+            continue
+        found = [(car, d) for car, got in carried
+                 for d in got.get((email, authored), ()) if d not in used]
+        timely = [(car, d) for car, d in found if int(committed) <= car["when"]]
+        if timely:
+            car, d = timely[0]
+            used.add(d)
+            by_train.setdefault(car["merge"], (car, []))[1].append((sha, d))
+        elif found:
+            car = found[0][0]
+            unproven.append((sha, "rewritten after %s %s merged its copy %s"
+                                  % (car["train"], car["merge"][:12],
+                                     found[0][1][:12])))
+        elif copies[sha]:
+            unproven.append((sha, "its copy on the trunk %s (same author "
+                                  "and author time) carries a different "
+                                  "patch" % copies[sha][0][:12]))
+        elif cars:
+            unproven.append((sha, "no trunk commit carries its patch, and "
+                                  "%s %s merged this lane without it"
+                                  % (cars[0]["train"],
+                                     cars[0]["merge"][:12])))
+        else:
+            unproven.append((sha, "no trunk commit carries its patch"))
+    if unproven:
+        shown = "; ".join("%s: %s" % (sha[:12], why)
+                          for sha, why in unproven[:_EQUIV_SHOWN])
+        more = len(unproven) - _EQUIV_SHOWN
+        return None, ("landed-equivalence UNPROVEN, kept for triage: %d of %d "
+                      "commits past the trunk are on it under another sha; "
+                      "%s%s" % (len(commits) - len(unproven), len(commits),
+                                shown, "; and %d more" % more if more > 0
+                                else ""))
+    said = []
+    if by_patch:
+        said.append("%d by patch-id (%s)" % (len(by_patch), _pairs(by_patch)))
+    for car, pairs in by_train.values():
+        said.append("%d carried by %s %s merging lane %s (%s)"
+                    % (len(pairs), car["train"], car["merge"][:12],
+                       car["lane"], _pairs(pairs)))
+    if merges:
+        said.append("%d merge%s adding nothing of %s own" % (
+            len(merges), "" if len(merges) == 1 else "s",
+            "its" if len(merges) == 1 else "their"))
+    return ("LANDED-EQUIVALENT — all %d commits past the trunk are on it "
+            "under another sha: %s" % (len(commits), ", ".join(said))), None
+
+
+# THE KEEP VERDICTS A SWEEP REMEMBERS ACROSS RUNS (task/4061). Without them a
+# dry `helm worktree gc` over a few hundred lanes spends most of its time
+# asking the same unlanded lanes the same per-commit questions every hour.
+# Only one answer is remembered: NOT landed by ancestry, patch identity or per-commit
+# equivalence (`_landed_equivalent` UNPROVEN). It is a KEEP answer, so a stale
+# one can only keep a room or branch longer, never remove one; a retiring
+# answer is always computed fresh. It is reused while the lane's tip is the
+# same commit and either the trunk is the same commit, or the trunk only moved
+# forward and the commits it gained carry no author line of the lane's and no
+# train merge naming the lane or a rebuild of it — the only ways
+# `_landed_equivalent` and ancestry learn a commit landed. `git cherry` can
+# also match a copy made under ANOTHER author line (a squash); that is missed
+# for at most `_LANDED_CARRY_S`, after which the answer is computed again.
+_LANDED_MEMO_V = 1
+_LANDED_CARRY_S = 24 * 3600
+_LANDED_MEMO_CAP = 4096
+_LANDED_DELTA_CAP = 5000
+
+
+class LandedMemo:
+    """One repository's remembered keep verdicts, read once, saved once."""
+
+    def __init__(self, root, now=None):
+        import hashlib
+        from .. import registry
+        self.root, self.v = root, vcs.backend(root)
+        self.now = time.time() if now is None else now
+        common = self.v.common_dir(root) or root
+        self.path = os.path.join(registry.cache_root(), "gc-landed-%s.json"
+                                 % hashlib.sha256(os.fsencode(
+                                     os.path.realpath(common))).hexdigest()[:16])
+        got = pk.read_json(self.path, {})
+        got = got.get("entries") \
+            if isinstance(got, dict) and got.get("v") == _LANDED_MEMO_V else {}
+        self.entries = {k: e for k, e in got.items() if self._sound(e)} \
+            if isinstance(got, dict) else {}
+        self.changed, self.hits, self.misses = False, 0, 0
+        self.trunk = self._sha(_trunk(root))
+        self._deltas = {}
+
+    def _sha(self, ref):
+        rc, out, _e = self.v.text(self.root, "rev-parse", "--verify", "-q",
+                                  "%s^{commit}" % ref)
+        return out if rc == 0 and out else None
+
+    @staticmethod
+    def _sound(e):
+        """True when `e` has the one shape `put` writes: a NOT-landed keep.
+        Anything else read from the file is dropped, so it is asked again."""
+        return isinstance(e, dict) and e.get("state") == vcs.NOT_ANCESTOR \
+            and isinstance(e.get("why"), str) \
+            and isinstance(e.get("trunk"), str) \
+            and isinstance(e.get("at"), (int, float)) \
+            and not isinstance(e.get("at"), bool) \
+            and isinstance(e.get("authors"), list) \
+            and all(isinstance(a, list) and len(a) == 2
+                    and all(isinstance(x, str) for x in a)
+                    for a in e["authors"])
+
+    @staticmethod
+    def _names(branch, path):
+        names = {branch[len("lane/"):] if branch.startswith("lane/")
+                 else branch}
+        if path:
+            names.add(os.path.basename(os.path.normpath(path)))
+        return sorted(names)
+
+    def _delta(self, old):
+        """(author lines, train lanes) the trunk gained since `old`, or None
+        when the trunk did not only move forward or the read failed."""
+        if old in self._deltas:
+            return self._deltas[old]
+        from ..brief import _MERGE_SUBJECT
+        got = None
+        if self.v.ancestry(self.root, old, self.trunk) == vcs.ANCESTOR:
+            rc, out, _e = self.v.text(
+                self.root, "log", "--no-show-signature",
+                "--max-count=%d" % (_LANDED_DELTA_CAP + 1),
+                "--format=%ae%x00%at%x00%s", "%s..%s" % (old, self.trunk),
+                timeout=60)
+            rows = [line.split("\0", 2) for line in out.splitlines()] \
+                if rc == 0 else None
+            if rows is not None and len(rows) <= _LANDED_DELTA_CAP \
+                    and all(len(r) == 3 for r in rows):
+                lanes = set()
+                for _ae, _at, subject in rows:
+                    m = _MERGE_SUBJECT.match(subject)
+                    if m:
+                        lane = m.group("lane").rstrip(",;")
+                        lanes.add(lane[len("lane/"):]
+                                  if lane.startswith("lane/") else lane)
+                got = ({(r[0], r[1]) for r in rows}, lanes)
+        self._deltas[old] = got
+        return got
+
+    def get(self, branch, path):
+        """(state, why) remembered for `branch`, or None (ask git)."""
+        tip = self._sha("refs/heads/" + branch) if self.trunk else None
+        names = self._names(branch, path)
+        e = self.entries.get("%s %s" % (tip, " ".join(names))) if tip else None
+        if not self._sound(e) \
+                or not 0 <= self.now - e["at"] <= _LANDED_CARRY_S:
+            self.misses += 1
+            return None
+        if e["trunk"] != self.trunk:
+            delta = self._delta(e["trunk"])
+            if delta is None or {tuple(a) for a in e["authors"]} & delta[0] \
+                    or any(_rebuilds(n, lane) for n in names
+                           for lane in delta[1]):
+                self.misses += 1
+                return None
+            e["trunk"], self.changed = self.trunk, True
+        self.hits += 1
+        return e["state"], e["why"]
+
+    def put(self, branch, path, state, why):
+        """Remember a NOT-landed verdict; any other answer is not kept."""
+        if state != vcs.NOT_ANCESTOR or "landed-equivalence UNPROVEN" \
+                not in (why or "") or not self.trunk:
+            return
+        tip = self._sha("refs/heads/" + branch)
+        if not tip:
+            return
+        rc, out, _e = self.v.text(
+            self.root, "log", "--no-show-signature",
+            "--max-count=%d" % (vcs.CHERRY_RANGE_CAP + 1),
+            "--format=%ae%x00%at", "%s..%s" % (self.trunk, tip), timeout=60)
+        authors = [line.split("\0") for line in out.splitlines()] \
+            if rc == 0 else []
+        if not authors or len(authors) > vcs.CHERRY_RANGE_CAP \
+                or any(len(a) != 2 for a in authors):
+            return
+        self.entries["%s %s" % (tip, " ".join(self._names(branch, path)))] = {
+            "trunk": self.trunk, "at": self.now, "authors": authors,
+            "state": state, "why": why}
+        self.changed = True
+
+    def save(self):
+        """Write the memo when it changed: entries past the carry window go,
+        and the newest `_LANDED_MEMO_CAP` stay. A failed write is a slow next
+        run, never an error."""
+        if not self.changed:
+            return
+        live = sorted(((k, e) for k, e in self.entries.items()
+                       if 0 <= self.now - e.get("at", 0) <= _LANDED_CARRY_S),
+                      key=lambda kv: kv[1]["at"])[-_LANDED_MEMO_CAP:]
+        try:
+            pk.write_json(self.path, {"v": _LANDED_MEMO_V,
+                                      "entries": dict(live)})
+        except OSError:
+            pass
+        self.changed = False
+
+
+def _sweep_state(root, path, branch, now=None, memo=None):
     """(state, why) — the landedness an AUTONOMOUS sweep may spend on the room
     at `path` holding `branch`. A state in RETIRABLE retires the room and the
     branch; anything else keeps both. `why` is the sentence the row prints, or
@@ -352,7 +829,9 @@ def _sweep_state(root, path, branch, now=None):
     whatever the age. A reflog git reads but the file says it could not read
     whole keeps too (`_reflog_rows`).
 
-    PATCH IDENTITY needs commits in the range, so it is proof of work already.
+    PATCH IDENTITY needs commits in the range, so it is proof of work already,
+    and so is LANDED_EQUIVALENT, which judged every commit in the range one by
+    one (`_landed_equivalent`); its evidence is the sentence the row prints.
     `release_lane` asks with `path` None for the branch, and `_room_state` for
     the room: the holder's request replaces the age grace, never this rule.
 
@@ -360,10 +839,27 @@ def _sweep_state(root, path, branch, now=None):
     grace protects a room's floor, and there is none, so an unstarted branch
     reads as its ancestry says; deleting it deletes no commit. The reflog-only
     rule applies unchanged, because the branch's reflog is still the only
-    place such a commit lives."""
+    place such a commit lives.
+
+    `memo` (a `LandedMemo`) is offered by the SCANS only: it can answer
+    nothing but a keep, and every removal re-asks without it."""
+    hit = memo.get(branch, path) if memo is not None else None
+    if hit is not None:
+        return hit
     state = _merge_state(root, branch)
+    evidence = None
     if state not in RETIRABLE:
-        return state, None
+        # THE PER-COMMIT READ, asked only where both whole-branch proofs said
+        # no (task/1026). A proven lane goes on through every reflog rule
+        # below exactly as a patch-identical one does; an unproven one keeps,
+        # and the line says which commit and why.
+        evidence, unproven = _landed_equivalent(root, branch, path)
+        if evidence is None:
+            kept = state, "%s; %s" % (_proof_word(state), unproven)
+            if memo is not None:
+                memo.put(branch, path, *kept)
+            return kept
+        state = LANDED_EQUIVALENT
     v = vcs.backend(root)
     logs = [(root, "refs/heads/" + branch, "the reflog of " + branch)]
     if path:
@@ -390,6 +886,8 @@ def _sweep_state(root, path, branch, now=None):
     if dropped is not None:
         return dropped, why
     ours = [sha for sha in where if sha in mine]
+    if evidence:
+        return state, evidence + ("; " + why if why else "")
     if state == vcs.PATCH_EQUIVALENT or set(ours) & set(landed) \
             or _on_trunk(root, ours):
         return state, why
@@ -422,6 +920,144 @@ def _sweep_state(root, path, branch, now=None):
     return state, ("%s, and its room has not moved for %s, past the %s grace "
                    "— an abandoned claim" % (head, _age_word(ago),
                                              _age_word(_UNSTARTED_GRACE_S)))
+
+
+def _room_idle(path, branch, now=None):
+    """(seconds, None) since anybody last put the room at `path` on something,
+    or (None, why). The newest of git's own clock (`_room_moved_ago`: every
+    checkout, commit, reset and rebase moves it), the files those same acts
+    write in the room's admin dir (`_ROOM_CLOCKS`, and the lease lock `helm
+    work claim` writes there). Idleness licenses removing the checkout, so it
+    is read, never assumed.
+
+    AN EMPTY HEAD REFLOG IS NOT A BLIND ROOM HERE. `git gc --auto` expires
+    reflog lines past `gc.reflogExpire`/`gc.reflogExpireUnreachable`, so the
+    oldest rooms are exactly the ones whose HEAD reflog reads empty; the
+    admin files still date the last act, and the committer time of
+    `branch`'s tip joins them as the clock git itself kept. The index is not a
+    clock: `git status` (this sweep's own dirty check) may rewrite it. An
+    UNREADABLE reflog, or an admin dir that cannot be read, is still None."""
+    now = time.time() if now is None else now
+    ago, blind = _room_moved_ago(path, now)
+    if ago is None and blind != _EMPTY_HEAD_REFLOG:
+        return None, blind
+    v = vcs.backend(path)
+    rc, admin, err = v.text(path, "rev-parse", "--absolute-git-dir")
+    if rc != 0 or not admin:
+        return None, "its admin dir could not be read (%s)" % (
+            err or "rc %s" % rc)
+    clocks = [] if ago is None else [ago]
+    for name in _ROOM_CLOCKS:
+        try:
+            clocks.append(now - os.stat(os.path.join(admin, name)).st_mtime)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            return None, "its %s could not be read (%s)" % (name, exc)
+    if ago is None:
+        if not clocks:
+            return None, blind
+        rc, out, _e = v.text(path, "log", "-1", "--format=%ct",
+                             "refs/heads/%s" % branch, "--")
+        if rc != 0 or not out.isdigit():
+            return None, "%s, and the committer time of %s could not be " \
+                "read" % (blind, branch)
+        clocks.append(now - int(out))
+    return min(clocks), None
+
+
+def _ignored_keepsakes(path):
+    """([ignored path], None) the removal of the room at `path` would delete
+    that are not caches (`_REGENERABLE`), or (None, why) when git cannot say.
+    `git worktree remove` refuses a room with untracked bytes and deletes its
+    ignored ones, so these are the only bytes a clean room can lose."""
+    rc, out, err = vcs.backend(path).run(
+        path, "status", "--porcelain=v1", "-z", "--ignored=matching",
+        "--untracked-files=normal")
+    if rc != 0:
+        return None, "git status --ignored failed (rc %s: %s)" % (
+            rc, os.fsdecode(err or b"")[:120])
+    kept = []
+    for entry in out.split(b"\0"):
+        if not entry.startswith(b"!! "):
+            continue
+        rel = os.fsdecode(entry[3:])
+        parts = [p for p in rel.split("/") if p]
+        if any(p in _REGENERABLE for p in parts) or rel.endswith(".pyc"):
+            continue
+        kept.append(rel)
+    return kept, None
+
+
+def _park_state(root, path, branch, now=None, state=vcs.NOT_ANCESTOR):
+    """(None, why) when the CHECKOUT at `path` may be retired and `branch`
+    kept, else (why kept, None). Asked only of a room every other rule has
+    already kept for triage: attached, clean, unleased, unlocked, unoccupied,
+    and not landed (so its branch must stay). `state` is the landedness the
+    scan read; only a clean NOT-landed answer parks — UNKNOWN is a read that
+    failed, and keeps the room as it keeps everything else.
+
+    THE BRANCH IS THE WORK, THE CHECKOUT IS A CACHE OF IT. Removing the room
+    deletes three things the branch does not hold, and each is asked: its HEAD
+    reflog, its ignored bytes (`_ignored_keepsakes`) and its place on disk for
+    a builder still coming back (`_room_idle` past `_PARK_IDLE_S`). Everything
+    else is on the branch, which nothing here deletes: the branch retires
+    later only on the landed proof `_sweep_state` asks of every orphan branch.
+
+    THE BRANCH'S TIP, NOT ITS REFLOG, IS WHAT THE BRANCH HOLDS. A commit the
+    lane wrote and then reset or rebased away lives only in the reflogs; the
+    branch's reflog survives a park, but expires, and the room is the one
+    place a builder sees that work was dropped. So a room parks only when no
+    commit EITHER reflog records is off the trunk and unreachable from every
+    ref (`_reflog_only`, the rule `_sweep_state` applies before any
+    retirement), and a reflog that cannot be read whole keeps it."""
+    if state != vcs.NOT_ANCESTOR:
+        return "its landedness reads %s, not a clean NOT landed" \
+            % _proof_word(state), None
+    if not branch or not _has_branch(root, branch):
+        return "its branch %s cannot be read, so nothing would hold its work" \
+            % (branch or "(none)"), None
+    idle, blind = _room_idle(path, branch, now)
+    if idle is None:
+        return "its idle time could not be read (%s)" % blind, None
+    if idle < _PARK_IDLE_S:
+        return ("last moved %s ago, inside the %s park grace"
+                % (_age_word(idle), _age_word(_PARK_IDLE_S))), None
+    v, where = vcs.backend(root), {}
+    for cwd, ref, label in ((root, "refs/heads/" + branch,
+                             "the reflog of " + branch),
+                            (path, "HEAD", "the room's HEAD reflog")):
+        rows, blind = _reflog_rows(v, cwd, ref)
+        if rows is None:
+            return ("%s cannot be read whole (%s), so a commit only it "
+                    "records cannot be ruled out" % (label, blind)), None
+        for sha, _what in rows:
+            if sha:
+                where.setdefault(sha, label)
+    dropped, why, _landed = _reflog_only(root, where)
+    if dropped is not None:
+        return why or _proof_word(dropped), None
+    keepsakes, blind = _ignored_keepsakes(path)
+    if keepsakes is None:
+        return "its ignored files could not be listed (%s)" % blind, None
+    if keepsakes:
+        return ("it holds %d ignored path%s the branch does not (%s)"
+                % (len(keepsakes), "" if len(keepsakes) == 1 else "s",
+                   ", ".join(keepsakes[:3])
+                   + (", ..." if len(keepsakes) > 3 else ""))), None
+    return None, "idle %s, past the %s park grace" % (
+        _age_word(idle), _age_word(_PARK_IDLE_S))
+
+
+def _reopen_hint(root, row):
+    """The one command that brings a parked checkout back."""
+    if row.get("harness_minted"):
+        return "git -C %s worktree add %s %s" % (root, row["path"],
+                                                 row["branch"])
+    branch = row.get("branch")
+    if branch and branch != ("lane/" + row["lane"]):
+        return "git -C %s worktree add %s %s" % (root, row["path"], branch)
+    return "helm work claim %s" % row["lane"]
 
 
 def _room_state(root, path, keep=()):
@@ -588,9 +1224,9 @@ def _delete_lane_branch(root, branch, state=None, why=None, held=None):
     rc, sha, _err = v.text(root, "rev-parse", "--verify", "-q", branch)
     sha = (sha or "").strip()
     if rc != 0 or not sha:
-        return ["KEPT branch %s — patch-identical to the trunk, but its tip "
-                "sha is UNREADABLE, so it could not be preserved and no "
-                "forced delete was attempted" % branch]
+        return ["KEPT branch %s — %s, but its tip sha is UNREADABLE, so it "
+                "could not be preserved and no forced delete was attempted"
+                % (branch, _proof_word(state))]
     keep_ref = RETIRED_NS + branch
     rc, _out, err = v.text(root, "update-ref", keep_ref, sha)
     if rc != 0:
@@ -985,7 +1621,7 @@ def trunk_sync(root, enforcing):
 
 
 def format_gc_summary(root, removed, kept, triage, planned=None, blocked=None,
-                      unrowed=None):
+                      unrowed=None, parked=None):
     """The one-line estate verdict, and it must distinguish CLEAN from JAMMED.
 
     "removed=0 kept=40" is literally true of an estate with nothing to remove
@@ -1015,6 +1651,11 @@ def format_gc_summary(root, removed, kept, triage, planned=None, blocked=None,
         line += " (%d planned, %d blocked: %s)" % (
             planned if planned is not None else removed + len(blocked),
             len(blocked), "; ".join(why))
+    if parked:
+        # CHECKOUTS RETIRED WITH THEIR BRANCHES KEPT (task/4061): not counted
+        # in `removed` (no lane retired) nor in `kept` (no checkout stands),
+        # and still in `triage`, because the unlanded work still waits.
+        line += " parked=%d" % parked
     line += " kept=%d triage=%d" % (kept, triage)
     if unrowed is not None:
         line += " (unrowed=%s)" % unrowed
@@ -1344,7 +1985,105 @@ def _wip_commit(path, msg, autonomous=True):
                 "door is open and unchanged: `helm work release --park` names "
                 "this write instead of guessing at it"
                 % (branch or "this room's branch", why))
+    if branch:
+        root = find_root(path)
+        be = vcs.backend(root or path)
+        rc_h, head_sha, _ = be.text(path, "rev-parse", "--verify", "-q", "HEAD")
+        head_sha = (head_sha or "").strip()
+        if head_sha and _is_branch_protected(root or path, path, branch, head_sha):
+            side_ref = _side_ref(branch)
+            rc_s, commit_sha, err_s = be.wip_commit_side_ref(path, msg, side_ref)
+            if rc_s == 0:
+                return 0, side_ref, ""
+            return rc_s, "", err_s
     return vcs.backend(path).wip_commit(path, msg)
+
+
+def _side_ref(branch):
+    """Side ref for rescue: refs/helm-rescue/<lane>/<ts>"""
+    name = _branch_name(branch)
+    if name.startswith("lane/"):
+        name = name[len("lane/"):]
+    ts = pk.now_ts().replace(":", "-")
+    return "refs/helm-rescue/%s/%s" % (name, ts)
+
+
+def _is_branch_protected(root, path, branch, head_sha):
+    """Is branch's current head_sha pushed or named by a live dispatch row or hold?"""
+    if not branch or not head_sha:
+        return False
+    be = vcs.backend(root or path)
+    short = _branch_name(branch)
+    lane_name = short[len("lane/"):] if short.startswith("lane/") else short
+
+    # 1. Pushed check:
+    rc, up_sha, _ = be.text(path, "rev-parse", "--verify", "-q", "@{upstream}^{commit}")
+    if rc == 0 and up_sha.strip():
+        up_sha = up_sha.strip()
+        if up_sha == head_sha or be.ancestry(path, head_sha, up_sha) == vcs.ANCESTOR:
+            return True
+
+    for ref in ("refs/remotes/origin/" + short,
+                "refs/remotes/origin/lane/" + lane_name,
+                "refs/remotes/origin/" + lane_name,
+                "refs/remotes/origin/main",
+                "refs/remotes/origin/master"):
+        rc, remote_sha, _ = be.text(root or path, "rev-parse", "--verify", "-q", ref + "^{commit}")
+        if rc == 0 and remote_sha.strip():
+            remote_sha = remote_sha.strip()
+            if remote_sha == head_sha:
+                return True
+            if be.ancestry(root or path, head_sha, remote_sha) == vcs.ANCESTOR:
+                return True
+
+    # 2. Named by a live dispatch row (fail closed on unreadable ledger or error, task/4018):
+    try:
+        from .. import dispatches
+        snap, unavail = dispatches.snapshot()
+        if unavail:
+            return True
+        for r in dispatches.open_rows(snap):
+            for k in ("ref", "tip", "held_tip", "patch_tip", "source_clean_tip"):
+                val = r.get(k)
+                if isinstance(val, str) and val.strip():
+                    val = val.strip().lower()
+                    if head_sha.lower().startswith(val) or val.startswith(head_sha[:12].lower()):
+                        return True
+            r_lane = r.get("lane")
+            if isinstance(r_lane, str) and r_lane.strip():
+                r_short = _branch_name(r_lane)
+                r_name = r_short[len("lane/"):] if r_short.startswith("lane/") else r_short
+                if r_name == lane_name:
+                    return True
+    except Exception:
+        return True
+
+    # 3. Named by a live land request / hold (fail closed on unreadable ledger or error, task/4018):
+    try:
+        from .. import landreq
+        lrs, unavail = landreq.project()
+        if unavail:
+            return True
+        for lr in (lrs or []):
+            for k in ("tip", "held_tip", "source_clean_tip"):
+                val = lr.get(k)
+                if isinstance(val, str) and val.strip():
+                    val = val.strip().lower()
+                    if head_sha.lower().startswith(val) or val.startswith(head_sha[:12].lower()):
+                        return True
+            rb = lr.get("ref_branch")
+            if isinstance(rb, str) and _branch_name(rb) in (short, "lane/" + lane_name):
+                return True
+            lr_lane = lr.get("lane")
+            if isinstance(lr_lane, str) and lr_lane.strip():
+                lr_short = _branch_name(lr_lane)
+                lr_name = lr_short[len("lane/"):] if lr_short.startswith("lane/") else lr_short
+                if lr_name == lane_name:
+                    return True
+    except Exception:
+        return True
+
+    return False
 
 
 def _branch_name(ref):
@@ -1540,7 +2279,7 @@ def _retire_disposable_occupants(path):
 # housekeeping — the four-row verdict table (the dumpster is not in it)
 # ---------------------------------------------------------------------------
 
-def gc_scan(root, registered=None):
+def gc_scan(root, registered=None, memo=None):
     """One row per room, verdict ∈ keep|triage|rescue|remove.
 
     Removal requires the complete retirement proof: no live lease, no meaningful
@@ -1549,7 +2288,24 @@ def gc_scan(root, registered=None):
     worktree and carries owner-facing triage evidence. Dirty work is rescue-
     committed but also kept: the rescue itself makes the branch unlanded.
 
-    Harness-minted rooms use the same proof. Seeing more never means doing more."""
+    Harness-minted rooms use the same proof. Seeing more never means doing more.
+
+    ONE READ AT ONE INSTANT (task/4061): the scan runs inside one
+    `projscope.scope()`, so a question many rooms ask (the trunk's sha, its
+    patch-id map) is asked once, and `memo` remembers the keep verdicts of
+    unchanged lanes across runs. Both serve the scan only: `gc_enact`
+    re-asks every premise outside the scope, without the memo."""
+    from .. import projscope
+    own = memo is None
+    memo = LandedMemo(root) if own else memo
+    with projscope.scope():
+        rows = _gc_scan(root, registered, memo)
+    if own:
+        memo.save()
+    return rows
+
+
+def _gc_scan(root, registered, memo):
     live = _live()
     rows = []
     rooms = lane_rows(root, registered=registered) \
@@ -1564,6 +2320,8 @@ def gc_scan(root, registered=None):
         disposable = [pid for pid in occupied if _disposable_worktree_occupant(pid)]
         blocking = [pid for pid in occupied if pid not in disposable]
         r = {"lane": lane, "path": w["path"], "branch": branch}
+        if w.get("harness_minted"):
+            r["harness_minted"] = True
         if held:
             r.update(verdict="keep", why="lease live — %s holds it, %ds left"
                      % (held["holder"], held["remaining"]))
@@ -1607,7 +2365,8 @@ def gc_scan(root, registered=None):
                     # negative and can never authorize deleting room or branch.
                     # UNSTARTED is a room nobody has committed in yet: kept,
                     # and not triage — there is no work in it to integrate.
-                    anc, said = _sweep_state(root, w["path"], branch)
+                    anc, said = _sweep_state(root, w["path"], branch,
+                                             memo=memo)
                     if anc in RETIRABLE:
                         r.update(verdict="remove", proof=anc,
                                  why="lease-less + clean + %s — remove room + "
@@ -1618,10 +2377,28 @@ def gc_scan(root, registered=None):
                         r.update(verdict="keep", proof=anc,
                                  why="lease-less + clean + " + said)
                     else:
-                        r.update(verdict="triage", proof=anc,
+                        # NOT LANDED, SO THE BRANCH STAYS; THE CHECKOUT MAY
+                        # NOT (task/4061). An idle clean room whose removal
+                        # loses nothing the branch lacks is PARKED: the
+                        # checkout goes, the branch stays for triage, and one
+                        # claim re-opens it. A disposable shell stays a
+                        # blocker here, as it is for rescue: nothing landed.
+                        kept, parked = ("an idle Orca shell is in it", None) \
+                            if occupied else _park_state(root, w["path"],
+                                                         branch, state=anc)
+                        r.update(verdict="park" if parked else "triage",
+                                 proof=anc,
                                  why=_branch_triage(
                                      root, lane, branch,
-                                     state=None if said else anc)
+                                     state=None if said else anc,
+                                     disposition=(
+                                         "PARK the checkout (%s), keep the "
+                                         "branch — `%s` re-opens it"
+                                         % (parked, _reopen_hint(
+                                            root, dict(w, branch=branch)))
+                                         if parked else
+                                         "worktree + branch kept (not parked: "
+                                         "%s)" % kept))
                                  + ("; " + said if said else ""))
         rows.append(r)
     return rows
@@ -1633,6 +2410,8 @@ def gc_enact(root, row):
     Triage rows are report-only. Every destructive premise is re-read."""
     if row["verdict"] in ("keep", "triage"):
         return []
+    if row["verdict"] == "park":
+        return _park_enact(root, row)
     if row["verdict"] == "rescue":
         blocked = _removal_blocker(root, row["path"], row["lane"],
                                    stale_lease_ok=True)
@@ -1649,7 +2428,8 @@ def gc_enact(root, row):
             row["path"], "wip: rescued %s %s" % (row["lane"], pk.now_ts()))
         if rc != 0:
             return ["SKIPPED %s (%s) — room kept" % (row["path"], err)]
-        return ["rescued dirty work -> %s; room kept" % row["branch"],
+        dest = _out if isinstance(_out, str) and _out.startswith("refs/") else row["branch"]
+        return ["rescued dirty work -> %s; room kept" % dest,
                 _branch_triage(root, row["lane"], row["branch"])]
 
     # ASK FIRST WITH THE PANE DEFERRED, so a room blocked for some OTHER reason
@@ -1708,19 +2488,56 @@ def gc_enact(root, row):
     return got
 
 
-def _remove_room(root, row, seen, anc, said, held):
+def _park_enact(root, row):
+    """Enforce ONE park row -> [lines]: retire the checkout, keep the branch.
+
+    The remove path's order, re-reads and section (`gc_enact`), with the park
+    question asked fresh in place of the landed one: a room that moved,
+    dirtied, was leased, or stopped being idle and lossless after the scan
+    keeps. `git worktree remove` without --force is the last line: it refuses
+    a room that has untracked or modified bytes at that instant."""
+    path, branch = row["path"], row.get("branch")
+    blocked = _removal_blocker(root, path, row["lane"], stale_lease_ok=True)
+    if blocked:
+        return ["SKIPPED %s (%s) — kept" % (path, blocked)]
+    seen = _room_fingerprint(path)
+    moved = _moved_under_scan(path, branch)
+    if moved:
+        return ["SKIPPED %s (%s) — kept" % (path, moved)]
+    if _dirty(path):
+        return ["SKIPPED %s (became DIRTY after scan) — kept for triage"
+                % path]
+    kept, _why = _park_state(root, path, branch)
+    if kept:
+        return ["SKIPPED %s (%s) — kept" % (path, kept)]
+    got, refused = _unleased(
+        resource(root, row["lane"]),
+        lambda held: _remove_room(root, row, seen, None, None, held,
+                                  park=True))
+    if refused:
+        return ["SKIPPED %s (%s) — kept" % (path, refused)]
+    return got
+
+
+def _remove_room(root, row, seen, anc, said, held, park=False):
     """[lines]: gc_enact's destructive acts and the last check before the
-    removal — run only inside `_unleased`, whose claims lock is `held`."""
+    removal — run only inside `_unleased`, whose claims lock is `held`.
+    `park` keeps the branch: only the checkout goes (`_park_enact`)."""
     # PANE BEFORE SHELL, and both before any removal. The pane is the object
     # the owner SEES; hanging up the shell first would leave a live pane on a
     # room we are about to delete, which is the 2026-07-30 incident in the
     # order that causes it.
-    closed, pane_error = _retire_bound_panes(row["path"])
+    # A PARK CLOSES NOTHING AND STOPS NOTHING: no proof says the work in a
+    # pane or a shell is done, so either one keeps the room (the unrelaxed
+    # blocker below refuses on both).
+    closed, pane_error = ([], None) if park else \
+        _retire_bound_panes(row["path"])
     lines = (["closed metaharness pane(s) %s" % ",".join(closed)]
              if closed else [])
     if pane_error:
         return lines + ["SKIPPED %s (%s) — kept" % (row["path"], pane_error)]
-    stopped, stop_error = _retire_disposable_occupants(row["path"])
+    stopped, stop_error = ([], None) if park else \
+        _retire_disposable_occupants(row["path"])
     if stopped:
         lines.append("stopped disposable Orca shell pid(s) %s" % ",".join(stopped))
     if stop_error:
@@ -1740,6 +2557,14 @@ def _remove_room(root, row, seen, anc, said, held):
     rc, _out, err = v.remove_worktree(root, row["path"])
     if rc != 0:
         return lines + ["SKIPPED %s (%s)" % (row["path"], err)]
+    if park:
+        rc, tip, _e = v.text(root, "rev-parse", "--verify", "-q",
+                             "refs/heads/%s^{commit}" % row["branch"])
+        return lines + ["parked %s — checkout retired, branch %s kept at %s; "
+                        "`%s` re-opens it"
+                        % (row["path"], row["branch"],
+                           tip[:12] if rc == 0 and tip else "UNREADABLE",
+                           _reopen_hint(root, row))]
     # The branch delete carries the FRESH state (`anc`), never the scan's — and
     # it names which of the two proofs retired the lane, so the decision is
     # auditable after the fact instead of an unexplained disappearance.
@@ -2639,7 +3464,7 @@ def seam_candidates(root, mine, holder=None, registered=None, green=None,
          sha-identity case only: if the peer's tip is an ancestor of mine,
          merge-tree returns MY tree and my tree is green, so no row forms. An
          integrator's compose train is the case that breaks it — it carries
-         both halves REBASED, so its commits are patch-identical and
+         both halves at other object ids, so its commits are patch-identical and
          object-different, merge-base is no longer the branch point, and
          merge-tree composes a tree nobody ever gated. Measured: FIVE
          collisions on one seat, every one of them against a compose train
@@ -2783,8 +3608,8 @@ def seam_candidates(root, mine, holder=None, registered=None, green=None,
         It is the boolean projection of `_merge_state`, which `helm work
         release` already trusts to print LANDED by ancestry and LANDED by patch
         identity — ancestry first, then `git cherry` with a count cross-check,
-        because our protocol lands work REBASED so almost nothing arrives under
-        the sha its author wrote. A second implementation of one question is
+        because historical rebases and cherry-picks do not preserve the sha
+        while today's exact-sha train merges do. A second implementation of one question is
         exactly the defect class this rung exists to police, and shipping the
         rung committing it would be the joke writing itself.
 
@@ -3542,6 +4367,9 @@ _GATESLICE_MUTABLE = {
     "_ROWED": (
         "the dispatch ledger's lane labels once per process; the arms that "
         "read them (test_work) reset it first"),
+    "_EQUIV_MEMO": (
+        "keyed by repository and trunk sha, and what a train merge carried "
+        "by its merge sha, none of which ever change meaning"),
 }
 _LANDED_CAP = 4096
 
@@ -3858,11 +4686,15 @@ def landed_leases(root, registered=None):
     a DIRTY room, and a lane the trunk carries only part of (`_carried_at`),
     whose room holds commits beyond the landed ones.
 
-    IT RELEASES NOTHING. A lease is bound to its holder's token, and the
-    claims ledger publishes no token but the caller's own; a land that
-    released the leases it carried would need an authority over every seat's
-    lease that no verb has, and should not. So this names each lease and its
-    exact command, and the holder spends it."""
+    IT RELEASES NOTHING, and no verb gives a seat an authority over another
+    seat's lease: the claims ledger publishes no token but the caller's own.
+    The one release that is not the holder's is auto-land's, for the lanes
+    of the cars it landed (task/3674, the owner's ask: the land is the
+    lease's natural end): `helm train auto` reads each car's lease off the
+    ledger and releases it through `helm work release` when the lane's tip
+    is on the trunk. A lane landed any other way, and a lane auto-land's
+    release refused, is named here with its exact command, and its holder
+    spends it."""
     rows = [r for r in list_rows(root, registered=registered, gc=False,
                                  only_held=True) if not r.get("stale")]
     v = vcs.backend(root)
@@ -3920,9 +4752,11 @@ def release_command(row):
 def list_rows(root, registered=None, gc=True, only_held=False):
     """The shadow board: registry ⋈ claims, computed — lane, holder,
     remaining, dirty, ahead/behind the base, `landed` (the `lanes_landed`
-    verdict, held rows only; None elsewhere), and `lease` for the rows THIS
-    seat holds (seats.own_leases — never another holder's; see its docstring
-    for why that is a strand-fix and not a disclosure). The lease join is
+    verdict, held rows only; None elsewhere), `lease_ts` (the stored `ts` of
+    a held row's grant, re-stamped by each extension; None elsewhere), and
+    `lease` for the rows THIS seat holds (seats.own_leases — never another
+    holder's; see its docstring for why that is a strand-fix and not a
+    disclosure). The lease join is
     keyed on the stored resource name, so the token printed here is the exact
     token `helm work release` will accept.
 
@@ -3997,6 +4831,8 @@ def list_rows(root, registered=None, gc=True, only_held=False):
                      "holder": held["holder"] if held else None,
                      "remaining": held["remaining"] if held else None,
                      "lease": own.get(res) if held else None,
+                     "lease_ts": (swept[0].get(res) or {}).get("ts")
+                     if held else None,
                      "liveness": liveness_by.get(res),
                      "stale": liveness_by.get(res) == "stale",
                      "landed": landed.get(w["lane"]),

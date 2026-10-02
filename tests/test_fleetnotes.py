@@ -30,7 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from tests._tmphome import home as _tmp_home  # noqa: E402
 _tmp_home(prefix="helm-test-notes-home-", var="HELM_HOME")
 
-from helm import fleetnotes, web  # noqa: E402
+from helm import chat, chatnode, fleetnotes, web  # noqa: E402
 
 
 class FleetNotesFreshnessTest(unittest.TestCase):
@@ -712,7 +712,17 @@ class WebNotesTest(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.mkdtemp(prefix="helm-test-webnotes-")
         cls.prior = os.environ.get("HELM_FLEET_NOTES")
+        env = mock.patch.dict(os.environ, {
+            "HELM_CHAT_NODE_URL": "http://127.0.0.1:8898"})
+        env.start()
+        cls.addClassCleanup(env.stop)
         os.environ["HELM_FLEET_NOTES"] = os.path.join(cls.tmp, "fleet-notes.json")
+        head = mock.patch.object(chat, "node_head", return_value=None)
+        head.start()
+        cls.addClassCleanup(head.stop)
+        unit = mock.patch.object(chatnode, "_systemctl", return_value=(1, ""))
+        cls.unit_show = unit.start()
+        cls.addClassCleanup(unit.stop)
         cls.srv = web.make_server(0)
         cls.port = cls.srv.server_address[1]
         # shutdown() waits one serve_forever poll (stdlib 0.5s)
@@ -866,7 +876,7 @@ class WebNotesTest(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertEqual([s for s in d.get("seats", []) if s.get("owner")], [])
 
-    def test_poll_stamp_is_bracketed(self):
+    def test_poll_stamp_is_bracketed(self):  # noqa: VACUOUS_ASSERTION — the same wire response proves HTTP 200 and exactly one owner row before checking its absent session
         """TWO CLAIMS, SPLIT SO NEITHER RACES A CLOCK.
 
         The poll must STAMP the beat, and a fresh beat must RENDER as "fresh".
@@ -895,7 +905,10 @@ class WebNotesTest(unittest.TestCase):
         import time as _t
         web._COCKPIT_BEAT[0] = 0.0                  # the stamp below must be OURS
         before = _t.time()
-        self.get("/api/chat?room=main&since=0")     # the poll EVERY open page runs
+        self.unit_show.reset_mock()
+        status, _ = self.get("/api/chat?room=main&since=0")
+        self.assertEqual(status, 200)
+        self.unit_show.assert_called_once()
         after = _t.time()
         stamp = web._COCKPIT_BEAT[0]
         # BRACKET, not overwrite. My first cut re-stamped the beat with now(),
@@ -982,7 +995,10 @@ class WebNotesTest(unittest.TestCase):
         raced the 30s TTL by accumulation until the row vanished entirely
         (a review on 6024baa2f2ad). The contract calls for the graft to be the
         only thing under test here."""
-        self.get("/api/chat?room=main&since=0")
+        self.unit_show.reset_mock()
+        status, _ = self.get("/api/chat?room=main&since=0")
+        self.assertEqual(status, 200)
+        self.unit_show.assert_called_once()
         with mock.patch.object(web.time, "time",
                                return_value=web._COCKPIT_BEAT[0]):
             for read in range(2):

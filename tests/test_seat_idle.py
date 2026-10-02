@@ -152,8 +152,25 @@ class BusySeatTest(_IdleWorld):
         ended = self.end_turn()
         with mock.patch("time.time", return_value=ended + MIN):
             record.turn_open(SID, "a chat wake")
-        r = _si().reading(SEAT, now=ended + 20 * MIN)
+        r = _si().reading(SEAT, now=ended + 9 * MIN)
         self.assertEqual(r["state"], _si().BUSY, r)
+        stale = _si().reading(SEAT, now=ended + 12 * MIN)
+        self.assertEqual(stale["state"], _si().UNKNOWN, stale)
+        self.assertIn("without a call", stale["why"])
+
+    def test_first_hook_turn_with_no_call_is_bounded_busy(self):
+        t = time.time()
+        hook = {"session_id": SID, "prompt": "first turn",
+                "hook_event_name": "UserPromptSubmit"}
+        with mock.patch("time.time", return_value=t):
+            record.turn_open(SID, "first turn", hook=hook)
+        si = _si()
+        r = si.reading(SEAT, now=t + 9 * MIN)
+        self.assertEqual(r["state"], si.BUSY, r)
+        self.assertIsNone(r["last_call"])
+        late = si.reading(SEAT, now=t + 11 * MIN)
+        self.assertEqual(late["state"], si.UNKNOWN, late)
+        self.assertIn("turn start", late["why"])
 
     def test_no_turn_end_reads_busy_only_while_the_call_is_recent(self):
         """A session that never recorded a turn end: in flight, or ended

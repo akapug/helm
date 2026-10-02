@@ -24,7 +24,7 @@ import unittest
 from unittest import mock
 
 from helm import (dispatches, gate, gateauthority, gateimport,
-                  gatechild, gatetestrecord, landreq, vcs)
+                  gatechild, gatetestrecord, landreq, tasks, vcs)
 from tests._gate_receipt import serial_process
 from tests import _gate_supervisor
 from tests import HostAdmissionAsked, HostAdmissionRefused
@@ -154,6 +154,15 @@ class GateBase(unittest.TestCase):
     def _git(self, *args):
         return subprocess.run(("git",) + args, cwd=self.repo, text=True,
                               capture_output=True).stdout.strip()
+
+    def review_task(self):
+        """One genuine open task for positive review roots in this case."""
+        if not hasattr(self, "_review_task"):
+            row, why = tasks.add("review the gate fixture", "gate-fixture",
+                                 project="helm-test", force_new=True)
+            self.assertIsNone(why, why)
+            self._review_task = row["id"]
+        return self._review_task
 
     def _dirty(self):
         with open(os.path.join(self.repo, "a.txt"), "a") as fh:
@@ -4352,7 +4361,8 @@ class VerdictBinding(GateBase):
     def _dispatch(self, tip):
         os.makedirs(os.environ["HELM_HOME"], exist_ok=True)
         row, err = dispatches.add("reviewer", "a-lane", tip, kind="review",
-                                  repo=self.repo, notify=False, _reason=True, new_work=True)
+                                  repo=self.repo, notify=False, _reason=True,
+                                  new_work=True, task=self.review_task())
         self.assertIsNone(err, err)
         self.assertIsNotNone(row, "fixture dispatch was not persisted")
         return row
@@ -4661,7 +4671,8 @@ class ApprovalTierAtLandTest(GateBase):
     def _dispatch(self, tip, recipient="reviewer"):
         os.makedirs(os.environ["HELM_HOME"], exist_ok=True)
         row, err = dispatches.add(recipient, "a-lane", tip, kind="review",
-                                  repo=self.repo, notify=False, _reason=True, new_work=True)
+                                  repo=self.repo, notify=False, _reason=True,
+                                  new_work=True, task=self.review_task())
         self.assertIsNone(err, err)
         return row
 
@@ -4750,7 +4761,8 @@ class LandPathEnforcement(GateBase):
     def _dispatch(self, tip):
         os.makedirs(os.environ["HELM_HOME"], exist_ok=True)
         row, err = dispatches.add("reviewer", "a-lane", tip, kind="review",
-                                  repo=self.repo, notify=False, _reason=True, new_work=True)
+                                  repo=self.repo, notify=False, _reason=True,
+                                  new_work=True, task=self.review_task())
         self.assertIsNone(err, err)
         return row
 

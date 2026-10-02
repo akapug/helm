@@ -50,7 +50,7 @@ OBSERVER = "python-cli-entry-v1"
 #: One stage per installed hook entry beside the PostToolUse internals; the
 #: entry table is `cli._HOOK_SPANS`, held to `hooks.SPECS` by a test.
 HANDLER_STAGES = ("inject", "delegation-stop", "saguide", "join", "resume-turn",
-                  "stop-guard", "argv-guard", "handoff")
+                  "working-set", "stop-guard", "argv-guard", "handoff")
 STAGES = frozenset(("event", "input", "record-registry", "delivery-registry",
                     "record", "prepare", "delivery", "lock-seats", "lock-proxywatch",
                     "lock-room", "lock-whisper", "lock-send") + HANDLER_STAGES)

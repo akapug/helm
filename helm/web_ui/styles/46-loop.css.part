@@ -1,0 +1,61 @@
+/* the Loop editor — one seat's request loop in the Config seat detail. Built
+   on the console's own tokens (dark-first; the light theme is the same rules
+   with the palette swapped), so it reads as a part of the pane it sits in. */
+.loopsec{margin:0 0 16px;border-top:2px solid var(--accent);padding-top:8px}
+.loopsec>h3{font-size:var(--f4);font-weight:var(--w-med);margin:0 0 2px}
+.loopsec>.loopintro{font-size:var(--f1);color:var(--mut);margin:0 0 12px;max-width:80ch}
+.loopline{font-size:var(--f1);color:var(--mut);margin:0 0 8px;max-width:90ch}
+.loopline b{color:var(--fg)}
+.looprow{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin:0 0 6px}
+.loopgap{flex:0 0 10px}
+.looplegend{display:flex;flex-wrap:wrap;gap:12px;font-size:var(--f0);color:var(--mut);margin:0 0 4px}
+.loopsw{display:inline-block;width:16px;height:3px;vertical-align:middle;margin-right:5px;border-radius:2px}
+.loopchart{position:relative;width:100%;height:300px}
+.loopchart.small{height:210px}
+.loopchart canvas{display:block;width:100%;height:100%}
+#looptip{position:absolute;pointer-events:none;background:var(--elev);border:1px solid var(--line2);
+  border-radius:var(--r-sm);padding:5px 8px;font-size:var(--f1);white-space:nowrap;z-index:2}
+.loopknobs{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:12px 18px;margin:12px 0}
+.loopknob{display:grid;gap:2px;align-content:start}
+.looplab{font-size:var(--f0);text-transform:uppercase;letter-spacing:.06em;color:var(--mut)}
+.loopv{font-family:var(--mono);font-size:var(--f3)}
+.looph{font-size:var(--f0);color:var(--sub);line-height:1.4}
+.looph b{color:var(--fg)}
+.loopknob input[type=range]{width:100%;min-width:0;accent-color:var(--accent)}
+/* the comparison scrolls INSIDE its own box: the table's tabular numbers
+   outrun a narrow detail panel (measured 477px of table in a 336px section),
+   and a sideways-scrolling panel hides the knob sliders beside it. */
+.loopcmpwrap{overflow-x:auto}
+.looptab{width:100%;border-collapse:collapse;font-size:var(--f1);margin:0 0 6px}
+.looptab th{text-align:right;font-weight:600;color:var(--mut);font-size:var(--f0);text-transform:uppercase;
+  letter-spacing:.04em;padding:4px 6px;border-bottom:1px solid var(--line)}
+.looptab th:first-child,.looptab td:first-child{text-align:left}
+.looptab td{padding:4px 6px;border-bottom:1px solid var(--line);vertical-align:top}
+.looptab td.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.looptab td.good{color:var(--ok)}
+.looptab td.bad{color:var(--bad)}
+.loopsub{display:block;font-size:var(--f0);color:var(--mut)}
+.loopfoot{font-size:var(--f0);color:var(--mut)}
+.loopsrc{font-family:var(--mono);font-size:var(--f0);border:1px solid var(--line2);border-radius:4px;
+  padding:0 4px;color:var(--mut)}
+.loopsrc.ok{color:var(--ok);border-color:var(--ok)}
+.loopsrc.bad{color:var(--bad);border-color:var(--bad)}
+.loopkv{display:grid;grid-template-columns:max-content max-content 1fr;gap:3px 12px;font-size:var(--f1);
+  margin:0 0 8px;align-items:baseline}
+.loopkv>span{color:var(--mut)}
+.loopkv>b{font-variant-numeric:tabular-nums}
+.loopkv>i{font-style:normal;color:var(--mut);font-size:var(--f0)}
+.loopnote{font-size:var(--f0);color:var(--mut);margin:4px 0 8px;max-width:90ch}
+@media(max-width:560px){.loopkv{grid-template-columns:max-content 1fr}.loopkv>i{grid-column:1/-1;margin-bottom:4px}
+  .loopchart{height:240px}}
+/* the exact injected text of one turn, behind its toggle in the pack */
+.ipktxt{white-space:pre-wrap;word-break:break-word;font-family:var(--mono);font-size:var(--f0);
+  background:var(--code);color:var(--codefg);border-radius:var(--r-sm);padding:6px 8px;margin:4px 0 6px;
+  max-height:320px;overflow:auto}
+.ipkdiff{display:grid;grid-template-columns:max-content 1fr;gap:2px 8px;font-size:var(--f0);margin-top:4px}
+.ipkdiff>span{color:var(--mut)}
+.ipkdiff>del{color:var(--bad);text-decoration:line-through;word-break:break-word}
+.ipkdiff>ins{color:var(--ok);text-decoration:none;word-break:break-word}
+.ipkdiff>i{font-style:normal;color:var(--mut)}
+.ipkform textarea{flex:1 1 100%;min-height:96px;font:inherit;font-size:var(--f0);padding:4px 6px;
+  border:1px solid var(--line);border-radius:6px;background:var(--card);color:inherit}

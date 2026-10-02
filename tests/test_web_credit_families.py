@@ -143,14 +143,14 @@ class BillingReadingTest(unittest.TestCase):
 
     def test_the_catalog_names_each_familys_groups(self):
         """MEASURED against the catalog: ds4flash's one pool row is the
-        OpenCode Go subscription (billed by opencode), ds4pro's is the
-        DeepSeek direct key and nothing else (the owner's one-token-source
-        ruling in its entry), and cursor's provider is its local bridge while
-        its bill is Cursor."""
+        OpenCode Go subscription (billed by opencode), ds4pro's rows are the
+        DeepSeek direct key (its default, so first) and the Go subscription,
+        a seat carrying one of them, and cursor's provider is its local
+        bridge while its bill is Cursor."""
         from helm import burnflags, seat
         got = seat.billing_groups
         self.assertEqual(got("ds4flash"), ["opencode"])
-        self.assertEqual(got("ds4pro"), ["deepseek"])
+        self.assertEqual(got("ds4pro"), ["deepseek", "opencode"])
         self.assertEqual(got("cursor"), ["cursor"])
         self.assertEqual(got("kimi"), ["moonshot"])
         self.assertEqual(got(burnflags.NATIVE_FAMILY), ["anthropic"])

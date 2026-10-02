@@ -25,7 +25,9 @@ the isSidechain lines of the main file and each `<session>/subagents/`
 transcript (a Workflow's agents one level down) touched in the ten minutes
 before it: another model named there is UNKNOWN, because the read may have
 been that model's. This is a window, not the agent that ran the command.
-ROUTING reads the seat alone.
+ROUTING reads the seat alone. A reader that admits by FAMILY asks
+`native_turn_candidates` instead, for the seat's answer and the other models
+apart, and judges whether they could change its answer (task/4055).
 
 Like its sibling it is SELF-REPORTED, never MEASURED: the seat's own process
 wrote the file. It lives outside `seats_runtime` because that module sits at
@@ -55,6 +57,8 @@ _TURN_READ_BYTES = _TRANSCRIPT_READ_BYTES
 _TURN_CHUNK_BYTES = 1 << 20
 #: What the backward walk yields when the byte bound ends it early.
 _CUT = object()
+#: No subagent named another model.
+_NONE = frozenset()
 #: A `"timestamp"` key and its instant, in a line's raw bytes. An escaped
 #: occurrence inside a string (`\"timestamp\"`) does not match.
 _STAMP = re.compile(rb'"timestamp"\s*:\s*"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d'
@@ -197,12 +201,12 @@ def _subagent_transcripts(path, sid, floor):
     return found
 
 
-def _other_model_in(path, moment, answer):
-    """True when one transcript holds an assistant entry stamped within
-    `_TURN_UNAMBIGUOUS_S` before `moment` that names a model other than
-    `answer`, False when it holds none, None when the byte bound ends the
-    walk first. Read backwards like the main file, stopping at the first
+def _models_in(path, moment):
+    """Every model one transcript's assistant entries name, stamped within
+    `_TURN_UNAMBIGUOUS_S` before `moment`, or None when the byte bound ends
+    the walk first. Read backwards like the main file, stopping at the first
     line older than the window."""
+    found = set()
     with open(path, "rb") as handle:
         for line in _lines_newest_first(handle):
             if line is _CUT:
@@ -212,10 +216,10 @@ def _other_model_in(path, moment, answer):
             if epoch is None or epoch > moment:
                 continue
             if moment - epoch > _TURN_UNAMBIGUOUS_S:
-                return False
-            if got and got[1] != answer:
-                return True
-    return False
+                return found
+            if got:
+                found.add(got[1])
+    return found
 
 
 def _answer(name):
@@ -226,23 +230,28 @@ def _answer(name):
     return name, MODEL_SELF_REPORTED
 
 
-def _acted_in_seats_name(path, sid, moment, answer, sidechain):
-    """True when ANOTHER model than `answer` may have made a read recorded at
-    `moment` in the seat's name: a subagent's turn stamped within
-    `_TURN_UNAMBIGUOUS_S` before it names one, in the main file's
-    isSidechain lines (`sidechain`, the models the walk collected there) or
-    in a subagent transcript touched in that window. Also True when that
-    could not be settled: a transcript that cannot be listed or read, or a
-    walk the byte bound ends first. Only files touched in the window are
-    opened, each read backwards under the main file's bound."""
-    if any(name != answer for name in sidechain):
-        return True
+def _acted_in_seats_name(path, sid, moment, sidechain):
+    """Every model a SUBAGENT of the seat named in a turn stamped within
+    `_TURN_UNAMBIGUOUS_S` before `moment`, when a read recorded then may have
+    been made in the seat's name: the main file's isSidechain lines
+    (`sidechain`, the models the walk collected there) and each subagent
+    transcript touched in that window. None when that could not be settled:
+    a transcript that cannot be listed or read, or a walk the byte bound ends
+    first. Only files touched in the window are opened, each read backwards
+    under the main file's bound."""
+    found = set(sidechain)
     try:
         files = _subagent_transcripts(path, sid, moment - _TURN_UNAMBIGUOUS_S)
-        return files is None or any(
-            _other_model_in(f, moment, answer) is not False for f in files)
+        if files is None:
+            return None
+        for name in files:
+            more = _models_in(name, moment)
+            if more is None:
+                return None
+            found |= more
     except OSError:
-        return True
+        return None
+    return found
 
 
 def native_turn_model(session, at=None, root=None):
@@ -266,29 +275,62 @@ def native_turn_model(session, at=None, root=None):
     ROUTING never reads a subagent. ABSENT when there is no transcript or it
     names no model at all.
     """
+    model, source, others = _turn_reading(session, at, root)
+    if model is not None and others != _NONE:
+        return None, MODEL_UNKNOWN
+    return model, source
+
+
+def native_turn_candidates(session, at, root=None):
+    """(answer, others) for one ADMISSION moment, or None (task/4055).
+
+    `answer` is what `native_turn_model` would answer were no subagent
+    acting in the seat's name; `others` is every OTHER model a subagent
+    named within `_TURN_UNAMBIGUOUS_S` before the moment, possibly empty.
+    The reader that judges a read by FAMILY needs the set, not a refusal:
+    when every candidate admits it the same way, the ambiguity cannot
+    change admission. None wherever `native_turn_model` fails closed for any
+    reason but those other models: an answer it cannot pin, a set it cannot
+    read (a transcript that cannot be listed or read, a walk the byte bound
+    cuts), and a candidate whose id is not a model id. ROUTING (`at=None`)
+    has no candidates."""
+    if at is None:
+        return None
+    model, _source, others = _turn_reading(session, at, root)
+    if model is None or others is None \
+            or not all(_RUNTIME_MODEL.fullmatch(name) for name in others):
+        return None
+    return model, others
+
+
+def _turn_reading(session, at, root):
+    """(model, source, others): `native_turn_model`'s walk, with the models
+    the seat's subagents named in the window kept apart from its answer.
+    `others` is None when they could not be settled, and empty when the
+    answer is None or the read is ROUTING."""
     sid = str(session or "")
     if not sid:
-        return None, MODEL_ABSENT
+        return None, MODEL_ABSENT, _NONE
     moment, placed = _moment(at)
     if not placed:
-        return None, MODEL_UNKNOWN
+        return None, MODEL_UNKNOWN, _NONE
     path, err = turnresponse.transcript_path(sid, root)
     if err:
         # AMBIGUOUS OR UNUSABLE, never absent: two files carrying one session
         # id is a record this reader refuses to choose between.
-        return None, MODEL_UNKNOWN
+        return None, MODEL_UNKNOWN, _NONE
     if not path:
-        return None, MODEL_ABSENT
+        return None, MODEL_ABSENT, _NONE
     best, seen, sidechain = None, False, set()
     try:
         with open(path, "rb") as handle:
             for line in _lines_newest_first(handle):
                 if line is _CUT:
-                    return None, MODEL_UNKNOWN
+                    return None, MODEL_UNKNOWN, _NONE
                 got = _turn_entry(line)
                 own = got is not None and not got[2]
                 if own and moment is None:
-                    return _answer(got[1])
+                    return _answer(got[1]) + (_NONE,)
                 seen = seen or own
                 if moment is None:
                     continue
@@ -308,7 +350,7 @@ def native_turn_model(session, at=None, root=None):
                     # No entry within 30 min before the moment is UNKNOWN;
                     # past the 10-min window of a found answer, it is settled.
                     if best is None:
-                        return None, MODEL_UNKNOWN
+                        return None, MODEL_UNKNOWN, _NONE
                     break
                 if name is None:
                     continue
@@ -321,18 +363,19 @@ def native_turn_model(session, at=None, root=None):
                 if best is None:
                     best = name
                 elif name != best:
-                    return None, MODEL_UNKNOWN
+                    return None, MODEL_UNKNOWN, _NONE
     except OSError:
-        return None, MODEL_UNKNOWN
+        return None, MODEL_UNKNOWN, _NONE
     if best is None:
         # Entries exist and none lies at or before the moment: a record this
         # reader could not reduce, never a seat with nothing to say.
-        return None, MODEL_UNKNOWN if seen else MODEL_ABSENT
+        return None, MODEL_UNKNOWN if seen else MODEL_ABSENT, _NONE
     model, source = _answer(best)
-    if model is not None and \
-            _acted_in_seats_name(path, sid, moment, best, sidechain):
-        return None, MODEL_UNKNOWN
-    return model, source
+    if model is None:
+        return None, source, _NONE
+    others = _acted_in_seats_name(path, sid, moment, sidechain)
+    return model, source, None if others is None \
+        else frozenset(others - {best})
 
 
 def evidence_turn_model(evidence, at=None):
@@ -348,12 +391,37 @@ def evidence_turn_model(evidence, at=None):
     SessionStart bind is what names its current session. A stamp is the
     caller's to read first and is never replaced here. A proxy route, a
     sessionless (v4) record and any other family answer None, unchanged."""
-    if not isinstance(evidence, dict) or evidence.get("v") != 5:
-        return None
-    runtime = evidence.get("runtime")
-    if not isinstance(runtime, dict) or runtime.get("family") != "claude" \
-            or runtime.get("backend") not in (None, "native") \
-            or runtime.get("model"):
+    if not reads_transcript(evidence):
         return None
     model, _source = native_turn_model(evidence.get("session"), at)
     return model
+
+
+def evidence_turn_candidates(evidence, at):
+    """`native_turn_candidates` for one family-evidence record that
+    `reads_window` admits, on the session it is bound to, and None for every
+    other record."""
+    if not reads_window(evidence):
+        return None
+    return native_turn_candidates(evidence.get("session"), at)
+
+
+def reads_window(evidence):
+    """True for a record whose subagent WINDOW is its seat's: one
+    `reads_transcript` admits, run by the Claude harness itself. The window
+    is the Claude harness's `subagents/` layout, so a runtime labelled with
+    another harness (pi) proves nothing about who wrote it, even where a
+    transcript of that session exists."""
+    return reads_transcript(evidence) \
+        and evidence["runtime"].get("agent_harness") == "claude"
+
+
+def reads_transcript(evidence):
+    """True for the one family-evidence record whose model is its seat's
+    transcript: a session-bound (v5) native claude runtime stamping none."""
+    if not isinstance(evidence, dict) or evidence.get("v") != 5:
+        return False
+    runtime = evidence.get("runtime")
+    return isinstance(runtime, dict) and runtime.get("family") == "claude" \
+        and runtime.get("backend") in (None, "native") \
+        and not runtime.get("model")

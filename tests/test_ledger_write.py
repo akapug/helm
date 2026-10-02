@@ -314,7 +314,7 @@ class AColdFoldDoesNotStallAConcurrentSendTest(LedgerWriteBase):
             results["send"] = dispatches.send(
                 "ghost-reviewer", "lane/concurrent-send", "review this tip",
                 self.side, repo=self.repo, sign=False, kind="review",
-                new_work=True)
+                new_work=True, task=self.review_task["id"])
         with mock.patch.dict(os.environ, {"HELM_CHAT_NAME": "ghost-author"}), \
                 mock.patch.object(dispatches, "_ledger_fold", side_effect=fold), \
                 mock.patch.object(dispatches, "snapshot", side_effect=snapshot):

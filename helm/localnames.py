@@ -50,6 +50,25 @@ KEYS = {
                             "families' hardware, the only seat that may "
                             "certify them, from its own roster-bound session "
                             "(burnflags, seat_catalog)"),
+    "cred-steward-seat": ("text", "the seat that owns the fleet's "
+                          "credentials: each credential wall, unblock, reset "
+                          "and default-home switch row in #seats @mentions it "
+                          "(seatevents)"),
+    "friction-steward-seat": ("text", "the seat that owns helm's guard "
+                              "friction: each row the friction autopilot "
+                              "files, raises or refiles is posted to #seats "
+                              "@mentioning it (seatevents, frictionpilot)"),
+    "tick-steward-seat": ("text", "the seat that owns helm's timer ticks: a "
+                          "tick leg that fails 3 passes in a row posts one "
+                          "#seats row @mentioning it (tickalarm, doctor)"),
+    "dark-seat-mover": ("text", "\"off\" makes the idle-dispatch tick's "
+                        "dark-seat mover report only; unset, it moves a "
+                        "confirmed-dark seat's work (darkmove, doctor)"),
+    "builder-seats": ("words", "the seats of the builder role: a dark one's "
+                      "build rows and tasks move to a live one (darkmove)"),
+    "reviewer-seats": ("words", "the seats of the reviewer role: a dark "
+                       "one's build rows and tasks move to a live one "
+                       "(darkmove)"),
     "deploy-dir": ("text", "the directory a deployed gate's scripts run from, "
                    "compared with their committed source (doctor)"),
     "deploy-project": ("text", "the registered project whose checkout owns "
@@ -64,6 +83,16 @@ KEYS = {
                          "treats as a topic (store)"),
     "public-names": ("words", "extra names the private-name advisory treats "
                      "as public, beside its shipped allowlist (classify)"),
+    "lead-denied-mcp-servers": ("words", "MCP servers a LEAD seat never calls, "
+                               "so its lean profile denies them; unset, the "
+                               "profile denies only the servers named here "
+                               "by canonical use (seat_catalog)"),
+    "cubicle-floor": ("text", "the Orca workspace path whose first three "
+                      "panes are the cubicles: 1 walled, 2 working, 3 local; "
+                      "unset, no seat tab moves (cubicles, doctor)"),
+    "cubicle-mover": ("text", "\"off\" stops the seat resume tick's cubicle "
+                      "mover and \"dry-run\" makes it plan only; unset, it "
+                      "moves (cubicles, doctor)"),
 }
 
 #: A predecessor's name becomes an environment prefix and a path component,

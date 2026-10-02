@@ -1398,6 +1398,66 @@ class CursorDashboardReaderTest(unittest.TestCase):
                 self.assertEqual(rows[0]["longest_pct"], 100.0)
                 self.assertEqual(axis["colour"], burnflags.RED)
 
+    def test_on_demand_off_high_pool_is_orange_not_red(self):  # noqa: VACUOUS_ASSERTION — the ORANGE colour and spend-down cause_id below are the FIX's own new assertion for the based-off family
+        """THE FIX (task/3863): a family whose catalog claims on-demand off
+        WITH a basis and is high on its billed pool is NOT a MONEY wall — the
+        money axis reads ORANGE, "spending down, keep a steady pace until the
+        vendor refuses", so the family stays dispatchable at the dispatch door
+        until the vendor itself refuses on the reach axis. The measured pool
+        percent is carried on the axis. A claim that is on, absent, `off` with
+        no basis, or `off` with an empty basis keeps the included window and
+        fails closed to RED."""
+        self.mint()
+        based = self.cursor_fam()["on_demand"]
+        self.assertEqual(based["state"], "off")
+        self.assertTrue(based["basis"].strip())
+        # OFF + BASIS: high pool -> ORANGE, not RED, and the family dispatchable
+        _snap, rows, axis = self.probe_as(
+            self.spent_with_bonus(autoPercentUsed=99))
+        self.assertEqual([w["label"] for w in rows[0]["windows"]],
+                         [moneyread.AUTO_POOL])
+        self.assertEqual(rows[0]["longest_pct"], 99)
+        self.assertEqual(axis["colour"], burnflags.ORANGE)
+        self.assertEqual(axis["cause_id"], "money:ondemand-off-spend-down")
+        self.assertNotEqual(axis["cause_id"], "money:window-wall")
+        flag = burnflags.compose(_CURSOR, {"money": axis})
+        self.assertEqual(flag["axes"]["money"], burnflags.ORANGE)
+        self.assertIn("keep working at a steady pace", flag["behaviour"]["say"])
+        self.assertNotIn("critical path only", flag["behaviour"]["say"])
+        self.assertIn("keep working at a steady pace",
+                      burnflags.render_why(flag)[1])
+        notice, _colours = burnflags.watch_notice(
+            {_CURSOR: flag}, {_CURSOR: burnflags.YELLOW})
+        self.assertIn("keep working at a steady pace", notice)
+        from helm import dispatches, reviewer_eligibility
+        with mock.patch.object(burnflags, "family_flag", return_value=flag):
+            ok, refusal, warning = dispatches._validate_recipient_budget(
+                "cursor", False, family=_CURSOR)
+        self.assertTrue(ok)
+        self.assertIsNone(refusal)
+        self.assertIn("keep working at a steady pace", warning)
+        status, explanation = reviewer_eligibility._rung_budget(
+            "cursor", _CURSOR, {_CURSOR: flag}, None)
+        self.assertEqual(status, "pass")
+        self.assertIn("keep working at a steady pace", explanation)
+        # The measured high pool is carried on the axis, not erased.
+        self.assertGreater(rows[0]["longest_pct"], 90)
+        # Every closed-claim family still fails closed to RED at the high pool.
+        on = {"state": "on", "basis": "a test's claim"}
+        bare = {"state": "off"}
+        empty = {"state": "off", "basis": "   "}
+        for name, claim in (("claim on", on), ("claim absent", "absent"),
+                            ("claim without basis", bare),
+                            ("claim off with empty basis", empty)):
+            with self.subTest(name):
+                _snap, rows, axis = self.probe_as(
+                    self.spent_with_bonus(autoPercentUsed=99),
+                    on_demand=claim)
+                self.assertEqual(rows[0]["windows"][0]["label"],
+                                 moneyread.INCLUDED)
+                self.assertEqual(rows[0]["longest_pct"], 100.0)
+                self.assertEqual(axis["colour"], burnflags.RED)
+
     def test_an_omitted_spend_is_zero_and_an_omitted_limit_is_unread(self):  # noqa: VACUOUS_ASSERTION — the fresh-cycle half asserts the included window at 0.0 and the overflow's numbers unconditionally before the limitless half asserts an unread window
         """The same rule from the other side: a fresh cycle's reply omits
         includedSpend and bonusSpend (both zero), which reads 0% spent and no

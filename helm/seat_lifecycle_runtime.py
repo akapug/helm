@@ -16,7 +16,6 @@ import time
 from .seat_role import (
     SEAT_ROLES,
     SPAWN_ATTEMPT_ENV,
-    _LEAD_SETTINGS,
     _ROLE_ENV,
     _launch_argv,
     _launch_command,
@@ -1507,9 +1506,10 @@ def _headless_spawn(launch_sh, onboarding, cwd, log_path, role="worker",
     `claude … "$@"`, so the prompt lands as the seat's first turn at boot —
     the launch-time delivery, since headless has no pane to inject into.
 
-    Lead posture is launch state, not a family default: a lead gets Claude
-    Code's durable ultracode setting plus HELM_SEAT_ROLE=lead; a worker strips
-    any marker inherited from the operator launching it.
+    Lead posture is launch state, not a family default: a lead gets
+    HELM_SEAT_ROLE=lead and no settings flag (every agent starts at its
+    home's high effort); a worker strips any marker inherited from the
+    operator launching it.
 
     `token` is the spawn ATTEMPT TOKEN; it is SET (never inherited) in the
     child's env, because the process running `seat spawn` may itself be a
@@ -2322,7 +2322,7 @@ def _spawn_plan(seat_name, d, launch_sh, room, cwd, onboard, ad,
     print("  mint:  refresh %s (child-stamp stripped => persistence ON, "
           "--dangerously canonical, skills linked, hooks wired)" % launch_sh)
     print("  role:  %s%s" % (
-        role, " (HELM_SEAT_ROLE=lead + Claude ultracode)"
+        role, " (HELM_SEAT_ROLE=lead)"
         if role == "lead" else " (ordinary worker)"))
     q = _launch_command(launch_sh, role)
     if ad is None:

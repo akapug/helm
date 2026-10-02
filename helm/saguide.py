@@ -117,15 +117,23 @@ helm physics (you are a subagent; this is your initial context):
   each later finding is the first one's class on another surface. Store:
   curing-a-defect-owes-a-sweep-for-siblings-asking-the-same-question.
 - A REVIEWER FIXES ITS OWN MECHANICAL FINDINGS IN THE ROW'S REVIEW FIX MODE.
-  PATCH: commit the cure in a scratch clone off the exact reviewed tip, never
-  push, and return that patch tip beside the FIX verdict. A subagent has no
-  room of its own: `git clone --shared <repo> <scratch>/wt`, detach at the
+  PATCH: commit the cure off the exact reviewed tip, never push, and return
+  that patch tip beside the FIX verdict. A reviewer SUBAGENT has NO room of
+  its own — that is the default, and the only route generic reviewer
+  authority grants: `git clone --shared <repo> <scratch>/wt`, detach at the
   reviewed tip, commit there, then
   `git -C <repo> fetch --no-write-fetch-head <scratch>/wt <sha>` (no refspec,
   so no ref moves); a commit left in the clone does not resolve in the repo
-  and --patch-tip refuses it. Never `git worktree add` or a branch in the
-  shared checkout. MELD-DIFF: post the exact mechanical diff in the pair meld
-  for the author to apply; use FIX --diff-handoff ROOM/MSGID with a validated
+  and --patch-tip refuses it. For an explicit BUILD, a parent may instead
+  assign its sole delegate a REGISTERED lane room (`helm work claim`); the
+  PARENT owns the lease through completion or accepted handoff, then returns
+  the room (`helm work release`); unfinished work is not released. That
+  narrower build allocation is never general reviewer authority. Never raw
+  `git worktree add`, an unregistered shared worktree, an unleased shared
+  branch, a protected or shared ref write, a permission bypass, a config/canon
+  edit, a test-home leak, or a publication. MELD-DIFF: post the exact mechanical
+  diff in the pair meld for the author to apply; use FIX --diff-handoff ROOM/MSGID
+  with a validated
   pair-message receipt and --no-patch-because, without a reviewer patch tip.
   A reason or --meld outcome alone proves no cure, even on historical rows:
   its child remains an ordinary round and T1 design nudge. Only the first

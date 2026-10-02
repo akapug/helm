@@ -1,0 +1,1 @@
+fleet [--json] — composition truth: every live claude process -> seat/sid/daemon/stamps/home, all live-probed; ANSWER FLEET QUESTIONS BY RUNNING THIS, never from memory

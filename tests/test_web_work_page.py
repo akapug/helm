@@ -163,6 +163,42 @@ def _world(dispatch=None, seats=None, **over):
                     trains=_trains())
 
 
+def _story_world():
+    """0.3.3 criterion 5.1, node fixture: ONE story, whole. task/1 is the
+    root; task/2, task/3 and task/4 continue it, one of them closed. The
+    tasks section is read over the whole ledger (the board's other sections
+    stay read but empty), so every task is a To do card and the card face,
+    the drawer's children checklist and the home tile all have one story to
+    count."""
+    ledger = {
+        "task/1": W._task(1),
+        "task/2": W._task(2, continues="task/1"),
+        "task/3": W._task(3, status="closed", continues="task/1"),
+        "task/4": W._task(4, continues="task/1")}
+    tasks = {"rows": ledger, "history": {k: [dict(r)] for k, r in ledger.items()},
+             "unavailable": None}
+    return W._wm().build(W._inp(W._board([]), tasks=tasks))
+
+
+def _stories_world():
+    """0.3.3 criterion 5.1, the List-lens story GROUP, node fixture: two
+    stories (task/5 has two children, one closed, so its root reads 1 of 2;
+    task/1 and task/2 have one child each, so 0 of 1) and task/6, a story of
+    one. Every task is open and a To do card, so the group splits the list
+    on the story each card belongs to, and the closed child under task/5
+    is not a To do card: the group holds its root and its one open child."""
+    ledger = {
+        "task/1": W._task(1),
+        "task/2": W._task(2, continues="task/1"),
+        "task/5": W._task(5),
+        "task/6": W._task(6, continues="task/5"),
+        "task/7": W._task(7, status="closed", continues="task/5"),
+        "task/8": W._task(8)}
+    tasks = {"rows": ledger, "history": {k: [dict(r)] for k, r in ledger.items()},
+             "unavailable": None}
+    return W._wm().build(W._inp(W._board([]), tasks=tasks))
+
+
 def _bodies():
     """{name: /api/work body}: the whole world, one with beta not read yet,
     one the reader could not read at all, a restart (no project's pipeline
@@ -174,6 +210,8 @@ def _bodies():
                                       measured_at=None, age_s=None))
     body = wm.view(whole, NOW)
     return {"whole": body,
+            "story": wm.view(_story_world(), NOW),
+            "storiesGroup": wm.view(_stories_world(), NOW),
             "unread": wm.view(beta_unread, NOW),
             "restart": wm.view(_world(lands={"loading": True, "scope": None},
                                       fleet={"loading": True}), NOW),
@@ -685,6 +723,127 @@ out.words = B.events4.events.map(e => wkEvWords(e, by("task/4"), B.events4.event
 
     def test_a_drawer_says_it_is_reading_before_its_crossings_arrive(self):
         self.assertIn("reading where it has been", self.out["reading"])
+
+
+class StoryRenderTest(unittest.TestCase):
+    """0.3.3 criterion 5.1: one story (task/1, three children, one closed)
+    reads "1 of 3 done" on the card face and in the drawer's checklist, and
+    the Home tile counts it as the one open story the page holds."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bodies = _bodies()
+        cls.out = _run("""
+const d = B.story, cards = wkCards(d, NOW), by = k => cards.find(c => c.key === k);
+out.face = wkCardHTML(by("task/1"), wkDefault(), null, d, NOW);
+out.child_face = wkCardHTML(by("task/4"), wkDefault(), null, d, NOW);
+out.root = by("task/1");
+out.child = by("task/4");
+out.drawer = wkDrawerHTML(Object.assign(wkInst("main"), {ev: {key: "task/1", rev: d.rev, events: []}}), d, by("task/1"), NOW);
+out.home = wkHomeTile(d, 0);
+out.counts = d.counts;
+""", cls.bodies)
+
+    def test_the_root_card_face_reads_done_of_total(self):
+        # the root's own story: done of total over its children, all depths
+        self.assertIn('class="wkstory"', self.out["face"])
+        self.assertIn("1 of 3 done", _text(self.out["face"]))
+        self.assertEqual(self.out["root"]["story"]["done"], 1)
+        self.assertEqual(self.out["root"]["story"]["total"], 3)
+
+    def test_a_leaf_child_shows_no_rollup_of_its_own(self):
+        # task/4 continues task/1 but holds nothing below itself: its own
+        # count is 0 of 0, so the face's "when total>0" gate keeps it from
+        # faking a story roll-up of its own. (The positive control for
+        # "wkstory appears" is the root's face in the arm above.)
+        self.assertEqual(self.out["child"]["story"]["total"], 0)
+        self.assertIn(self.out["child"]["title"], self.out["child_face"])
+        self.assertNotIn('class="wkstory"', self.out["child_face"])
+
+    def test_the_drawer_lists_the_story_as_a_checklist(self):
+        t = self.out["drawer"]
+        self.assertIn('class="wkchild"', t)
+        self.assertEqual(t.count('class="wkchild"'), 3)
+        self.assertIn("1 of 3 done", _text(t))
+        # the one closed child is ticked; the open ones are not
+        self.assertEqual(t.count('class="wkcheck on"'), 1)
+        self.assertIn("task/3", t)
+        self.assertIn("task/2", t)
+        self.assertIn("task/4", t)
+        self.assertIsNone(FORBIDDEN.search(t))
+
+    def test_the_home_tile_counts_the_open_story(self):
+        self.assertIn("1 open story", _text(self.out["home"]))
+        self.assertEqual(self.out["counts"]["stories_open"], 1)
+
+
+class StoryGroupTest(unittest.TestCase):
+    """0.3.3 criterion 5.1, the List-lens story GROUP: a story's members
+    (the root and its open children, one card each) sit under a single group
+    keyed by the story's root, and the group's head names the story's OWN
+    roll-up — "1 of 2 done" — not the group's row count. A story of one (a
+    task with no children) is still a story: it forms a group of its own,
+    keyed by its own root, and, holding no roll-up, sorts after every story
+    that has one."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bodies = _bodies()
+        cls.out = _run("""
+const d = B.storiesGroup, cards = wkCards(d, NOW), by = k => cards.find(c => c.key === k);
+const inst = (view) => Object.assign(wkInst("main"), {view: Object.assign(wkDefault(), view)});
+out.list = wkListHTML(inst({lens: "list", group: "story"}), d, cards, NOW);
+out.groups = [...out.list.matchAll(/data-g="([^"]*)"/g)].map(m => m[1]);
+out.root = by("task/5").story;
+out.child = by("task/6").story;
+out.singleton = by("task/8").story;
+out.roots = {
+  "task/1": (by("task/1").story || {}).root,
+  "task/2": (by("task/2").story || {}).root,
+  "task/5": (by("task/5").story || {}).root,
+  "task/6": (by("task/6").story || {}).root,
+  "task/8": (by("task/8").story || {}).root
+};
+out.menu = wkMenusHTML(inst({lens: "list", group: "story"}), cards);
+""", cls.bodies)
+
+    def test_the_members_share_one_group_keyed_by_the_story_root(self):
+        # task/5 (the root) and task/6 (its open child) share one group,
+        # keyed by the root; the closed child task/7 is not a To do card,
+        # so the group holds the root and its one open child.
+        self.assertIn("task/5", self.out["groups"])
+        self.assertEqual(self.out["roots"]["task/5"], "task/5")
+        self.assertEqual(self.out["roots"]["task/6"], "task/5")
+        self.assertNotIn("task/7", self.out["groups"])
+
+    def test_the_story_head_names_the_root_rollup_not_the_row_count(self):
+        # the group holds two cards (the root and its open child); the head
+        # must read the root's own "1 of 2 done" — the roll-up span — and
+        # carry no row-count span at all, so the number it owns is the
+        # story's, not a count of the two members.
+        m = re.search(r'data-g="task/5".*?</summary>', self.out["list"])
+        self.assertIsNotNone(m, self.out["list"])
+        raw = m.group(0)
+        head = _text(raw)
+        self.assertIn('class="cfgmut"', raw)
+        self.assertIn("1 of 2 done", head)
+        self.assertNotIn('class="blcnt"', raw)
+
+    def test_a_story_of_one_sorts_after_every_story_with_a_rollup(self):
+        # task/8 has no children: a story of one, its own root (task/8) with
+        # no roll-up. It forms a group of its own and, holding no roll-up,
+        # sorts after every story that has one.
+        self.assertEqual(self.out["singleton"]["root_total"], 0)
+        self.assertEqual(self.out["singleton"]["root"], "task/8")
+        self.assertIn("task/8", self.out["groups"])
+        self.assertEqual(self.out["groups"][-1], "task/8")
+        self.assertLess(self.out["groups"].index("task/5"),
+                        self.out["groups"].index("task/8"))
+
+    def test_the_group_menu_offers_story_and_says_so(self):
+        self.assertIn('data-m="group"', self.out["menu"])
+        self.assertIn("Group: story", _text(self.out["menu"]))
+        self.assertIsNone(FORBIDDEN.search(self.out["list"]))
 
 
 class LinkWordsTest(unittest.TestCase):

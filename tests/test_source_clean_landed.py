@@ -52,8 +52,10 @@ import time
 import unittest
 from unittest import mock
 
-from helm import (dispatches, dispatches_close, eventledger, gate, landreq,
-                  landreq_close, rowstate)
+from helm import (autoland, dispatches, dispatches_close, dispatches_tier,
+                  eventledger, foldcheck, gate, home, landreq, landreq_cli,
+                  landreq_close, landwindow,
+                  rowstate, seats, store)
 # The module, never its TestCase: tests/test_suite_collection.py says why.
 from tests import test_landwindow as _lw
 from tests import test_lr_close as _close
@@ -109,25 +111,65 @@ class SourceCleanBase(_close.CloseBase):
     SENDER of every row — so the integrator is a lane author here, exactly as
     it so often is on the live board."""
 
+    READER_SESSION = "source-clean-reader-session"
+
+    def setUp(self):
+        super().setUp()
+        # A real exact-session native runtime and a real owner policy are the
+        # hold-time authority; an actor-name mock alone no longer proves a
+        # source-clean DOOR holder. Keep legacy planted holds unproven.
+        with mock.patch.dict(os.environ, {"HELM_CHAT_NAME": READER}):
+            seats.write_roster(
+                READER, session=self.READER_SESSION,
+                runtime={"family": "claude", "agent_harness": "claude",
+                         "backend": "native", "model": "claude-opus-5-5"},
+                presence_beat=False)
+        prior = store.write_prior({
+            "id": "source-clean-approval-tier",
+            "statement": "Claude-family fixture readers may approve doors.",
+            "confidence": 1.0, "stated_ts": "2026-07-29T00:00:00Z",
+            "source": "human", "policy_kind": "approval-tier",
+            "policy_members": ["family:claude"],
+            "policy_reason": "owner approval for fixture reviewers"},
+            root_dir=os.path.join(home.global_dir(), "premises"))
+        self.assertTrue(os.path.isfile(prior))
+
+    def dispatch(self, ref=None, **kw):
+        kw.setdefault("new_work", "supersedes" not in kw)
+        kw.setdefault("notify", False)
+        if kw["new_work"]:
+            kw.setdefault("task", self.review_task["id"])
+        row = dispatches.add(READER, kw.pop("lane", "lane/foo"),
+                             ref=ref or self.side, repo=self.repo, **kw)
+        self.assertIsNotNone(row)
+        return row
+
     def row(self, tip, lane, recipient=READER, supersedes=None):
         row, why = dispatches.add(
             recipient, lane, ref=tip, repo=self.repo, kind="review",
             notify=False, new_work=supersedes is None, supersedes=supersedes,
-            force=True, _reason=True)
+            force=True, _reason=True,
+            task=self.review_task["id"] if supersedes is None else None)
         self.assertIsNone(why, why)
         return row
 
-    def hold(self, row, tip, actor=READER, reason="SOURCE-CLEAN: read clean"):
+    def hold(self, row, tip, actor=READER,
+             reason="SOURCE-CLEAN: read clean; fab Ran 5 tests in 0.1s OK"):
         """Hold `row` source-clean at `tip` THROUGH THE DOOR, as a process
         whose CORROBORATED identity is `actor` — the answer
         `dispatches._acting_author` gives, which is what the hold door binds
         and what the APPROVE a source-clean land stands in for binds too."""
         with mock.patch.object(dispatches, "_acting_author",
-                               return_value=(actor, None)):
+                               return_value=(actor, None)), \
+                mock.patch.object(home, "session_id",
+                                  return_value=self.READER_SESSION):
             out, why = dispatches.mark_hold(row["id"], reason,
                                             source_clean_tip=tip)
         self.assertIsNone(why, why)
         self.assertEqual(out["status"], "held")
+        if actor == READER:
+            self.assertIn("hold_approval", self.state(row["id"]),
+                          "the positive hold lacks frozen holder authority")
         return out
 
     def held(self, tip, lane, actor=READER, recipient=READER):
@@ -136,14 +178,15 @@ class SourceCleanBase(_close.CloseBase):
         return row
 
     def planted(self, row, tip, actor=None, ts=None,
-                reason="SOURCE-CLEAN: read clean"):
+                reason="SOURCE-CLEAN: read clean", proven=False):
         """A source-clean hold appended the way one written BEFORE the hold
         door bound its holder and its lineage reads -> the folded row.
 
         The door now refuses every such shape, so these arms reach the CLOSE
         door and the projection the only way the live ledger does: ~31 held
         source-clean rows carry no `hold_actor` at all. `actor` None records
-        no holder; any other name is a hand that is not the recipient."""
+        no holder; other planted rows remain unproven unless the lineage-only
+        refusal explicitly requests real hold-time authority."""
         state = self.state(row["id"])
         event = {"v": 3, "event": "hold", "seq": int(state["seq"]) + 1,
                  "id": row["id"], "ts": ts or dispatches.pk.now_ts(),
@@ -151,6 +194,16 @@ class SourceCleanBase(_close.CloseBase):
                  "source_clean_tip": tip}
         if actor:
             event["hold_actor"] = actor
+        if proven:
+            # Only the unrelated-tip arm needs a proven holder while keeping
+            # its intentionally pre-lineage-door hold; other planted rows
+            # remain legacy/unproven, with their old refusal intact.
+            self.assertEqual(actor, READER)
+            with mock.patch.object(home, "session_id",
+                                   return_value=self.READER_SESSION):
+                event["hold_approval"] = dispatches_tier.record_hold_approval(
+                    state, actor, tip, event["ts"])
+            self.assertIsNotNone(event["hold_approval"])
         self.assertTrue(eventledger.append(dispatches.ledger_path(), event))
         folded = self.state(row["id"])
         self.assertEqual(folded["status"], "held")
@@ -425,7 +478,7 @@ class EachConditionRefusesAloneTest(SourceCleanBase):
         token = self.mint(self.c)
         self.control(token)
         row = self.row(self.side, "lane/sc-unrelated-close")
-        self.planted(row, self.b, actor=READER)
+        self.planted(row, self.b, actor=READER, proven=True)
         err = self.refused(row, token, "condition 2 (ancestry)",
                            "does not descend from the dispatched ref")
         self.assertIn(self.b[:12], err)
@@ -501,7 +554,7 @@ class EachConditionRefusesAloneTest(SourceCleanBase):
         token = self.mint(self.c)
         self.control(token)
         row = self.verdict_row(polarity="approve", ref=self.b,
-                               lane="lane/sc-verdict")
+                               lane="lane/sc-verdict", recipient=READER)
         _out, err = self.close(row, token)
         self.assertIn("carries no source-clean hold", err or "")
 
@@ -698,7 +751,8 @@ class TheHoldDoorBindsItsRecipientTest(SourceCleanBase):
                 mock.patch.object(seats, "seat_for_session",
                                   return_value=READER):
             out, why = dispatches.mark_hold(row["id"], "SOURCE-CLEAN: read "
-                                            "clean", source_clean_tip=self.b)
+                                            "clean; fab Ran 5 tests OK",
+                                            source_clean_tip=self.b)
         self.assertIsNone(why, why)
         self.assertEqual(self.state(row["id"])["hold_actor"], READER)
 
@@ -840,6 +894,13 @@ class FoldcheckListsThenClosesTest(SourceCleanBase):
                                  self.repo, "--no-fetch", *extra])
         return rc, out.getvalue(), err.getvalue()
 
+    def foldstage(self, head, token, cars):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = landreq_cli._print_source_clean_landings(
+                self.repo, head, token, apply=True, train_car_ids=set(cars))
+        return rc, out.getvalue()
+
     def line(self, text, rid):
         found = [l for l in text.splitlines() if rid[:12] in l]
         self.assertTrue(found, "row %s is not in the listing:\n%s"
@@ -896,6 +957,100 @@ class FoldcheckListsThenClosesTest(SourceCleanBase):
         self.assertEqual(self.history(), before + 2)
         for row in (by_author, legacy, elsewhere):
             self.assertEqual(self.state(row["id"])["status"], "held")
+
+    def test_train_scope_reports_foreign_refusal_but_stops_on_own_failure(self):
+        own = self.held(self.b, "lane/fc-own")
+        foreign = self.held_before(self.b, "lane/fc-foreign", actor=None)
+        token = self.mint(self.b)
+        rc, text = self.foldstage(self.b, token, [own["id"]])
+        self.assertEqual(rc, 0, text)
+        self.assertIn("CLOSED", self.line(text, own["id"]))
+        self.assertIn("REPORTED", self.line(text, foreign["id"]))
+        self.assertIn("REFUSED:", self.line(text, foreign["id"]))
+        self.assertEqual(self.state(foreign["id"])["status"], "held")
+        rc, text = self.foldstage(self.b, token, [foreign["id"]])
+        self.assertEqual(rc, 0, text)
+        self.assertIn("REFUSED", self.line(text, foreign["id"]))
+        self.assertNotIn("REPORTED", self.line(text, foreign["id"]))
+
+    def test_own_hold_outside_the_head_stops_but_foreign_hold_does_not(self):
+        own = self.held(self.side, "lane/fc-outside-head")
+        token = self.mint(self.b)
+        rc, text = self.foldstage(self.b, token, [])
+        self.assertEqual(rc, 0, text)
+        self.assertIn("NOT-IN-HEAD", self.line(text, own["id"]))
+        rc, text = self.foldstage(self.b, token, [own["id"]])
+        self.assertEqual(rc, 1, text)
+        self.assertIn("REFUSED", self.line(text, own["id"]))
+        self.assertIn("NOT-IN-HEAD", self.line(text, own["id"]))
+        self.assertEqual(self.state(own["id"])["status"], "held")
+
+    def test_a_prior_source_clean_close_is_proven_by_its_exact_row_and_tip(self):
+        own = self.held(self.b, "lane/fc-prior-close")
+        token = self.mint(self.b)
+        rc, text = self.foldstage(self.b, token, [own["id"]])
+        self.assertEqual(rc, 0, text)
+        self.assertIn("CLOSED", self.line(text, own["id"]))
+        ops = autoland.Ops()
+        self.assertTrue(ops.source_clean_closed(
+            self.repo, own["id"], self.b, self.b))
+        self.assertFalse(ops.source_clean_closed(
+            self.repo, own["id"], self.b, self.side))
+        self.assertFalse(ops.source_clean_closed(
+            self.repo, own["id"], self.side, self.b))
+
+    def test_foldcheck_cli_passes_exact_car_ids_to_the_sweep(self):
+        own = self.held(self.b, "lane/fc-cli-own")
+        foreign = self.held_before(self.b, "lane/fc-cli-foreign", actor=None)
+        token = self.mint(self.b)
+        rungs = [foldcheck.Rung(name, foldcheck.PASS, "proved") for name in
+                 ("tip-exists", "tree-vs-gate", "ff-able", "head-clean",
+                  "origin-has-it")]
+        with mock.patch.object(foldcheck, "check", return_value=rungs), \
+                mock.patch.object(landreq_cli, "_fold_proven", return_value=0), \
+                mock.patch.object(landreq_cli, "_print_landed_leases"), \
+                mock.patch("helm.postland.take"):
+            rc, text, err = self.foldcheck(
+                self.b, token, "--apply", "--train-cars", own["id"])
+        self.assertEqual(rc, 0, (text, err))
+        self.assertIn("CLOSED", self.line(text, own["id"]))
+        self.assertIn("REPORTED", self.line(text, foreign["id"]))
+        self.assertEqual(self.state(own["id"])["status"], "closed")
+        self.assertEqual(self.state(foreign["id"])["status"], "held")
+
+    def test_a_foreign_failed_write_does_not_mask_an_own_failed_write(self):
+        own, foreign = "a" * 32, "b" * 32
+        entries = [{"id": rid, "tip": self.b, "holder": "reader-seat",
+                    "verdict": "FAILED", "why": "write refused"}
+                   for rid in (own, foreign)]
+        with mock.patch.object(landreq, "source_clean_landings",
+                               return_value=(entries, None)):
+            rc, text = self.foldstage(
+                self.b, "gate:" + "c" * 16, ["c" * 32])
+            self.assertEqual(rc, 0, text)
+            self.assertIn("REPORTED", self.line(text, own))
+            self.assertIn("REPORTED", self.line(text, foreign))
+            rc, text = self.foldstage(
+                self.b, "gate:" + "c" * 16, [own])
+            self.assertEqual(rc, 1, text)
+            self.assertIn("FAILED", self.line(text, own))
+            self.assertIn("REPORTED", self.line(text, foreign))
+            rc, text = self.foldstage(
+                self.b, "gate:" + "c" * 16, [foreign])
+            self.assertEqual(rc, 1, text)
+            self.assertIn("REPORTED", self.line(text, own))
+            self.assertIn("FAILED", self.line(text, foreign))
+
+    def test_train_car_option_refuses_abbreviated_and_duplicate_ids(self):
+        row = self.held(self.b, "lane/fc-option")
+        before = self.history()
+        for ids in (row["id"][:12], row["id"] + "," + row["id"], ""):
+            rc, text, err = self.foldcheck(
+                self.b, "gate:" + "c" * 16, "--apply", "--train-cars", ids)
+            self.assertEqual(rc, 2, (text, err))
+            self.assertIn("distinct full dispatch row IDs", err)
+        self.assertEqual(self.history(), before)
+        self.assertEqual(self.state(row["id"])["status"], "held")
 
     def test_the_cli_close_verb_requires_its_gate_and_keeps_it_to_itself(self):
         row = self.held(self.b, "lane/cli-gate")
@@ -1372,6 +1527,29 @@ class SourceCleanCarsTest(SourceCleanBase, _lw.TrainBase):
         self.assertIsNone(err, err)
         self.assertEqual(landreq.source_clean_car(lr), (tip, None))
 
+    def test_a_held_source_clean_car_is_unchanged_beside_a_land_first_car(self):
+        """task/4223's control: a row dispatched long ago and held
+        source-clean still rides as that hold, at its held tip and with its
+        own word; land-first takes only the open, unread row beside it."""
+        tip = self.lane("sc-old", "sc-old")
+        row = self.row(tip, "lane/sc-old")
+        self.age(row["id"], landwindow.LAND_FIRST_WAIT_S + 60)
+        self.hold(row, tip)
+        unread_tip = self.lane("unread", "unread")
+        unread = self.row(unread_tip, "lane/unread")
+        self.age(unread["id"], landwindow.LAND_FIRST_WAIT_S + 60)
+        text = self.plan()
+        self.assertIn("merge order, 2 cars (0 approve-ready, 1 source-clean, "
+                      "1 landed before review):", text)
+        self.assertIn("held tip %s  SOURCE-CLEAN — held by @%s, no approve "
+                      "owed" % (tip[:12], READER), self.listed(text,
+                                                                row["id"]))
+        self.assertIn("unread tip %s  UNREAD" % unread_tip[:12],
+                      self.listed(text, unread["id"]))
+        lr, err = landreq.get(row["id"])
+        self.assertIsNone(err, err)
+        self.assertEqual(landreq.source_clean_car(lr), (tip, None))
+
     def test_an_unstamped_an_authors_and_a_non_descending_hold_each_stay_out_by_name(self):  # noqa: VACUOUS_ASSERTION — the control car is asserted positively in the train, and each excluded row's line and reason are asserted by value
         control, ctip = self.car("sc-ok")
         legacy_tip = self.lane("sc-legacy", "sc-legacy")
@@ -1791,6 +1969,243 @@ class ACopyOnTrunkNamesNoLandDoorTest(SourceCleanBase):
         self.assertIsNone(err, err)
         self.assertEqual(lr_b["trunk_contains_proof"], landreq.PROOF_ANCESTOR)
         self.assertEqual(lr_b["owed_by"], "integrator")
+
+
+#: A passing fab line as a hold reason carries it (task/4103).
+FAB_RAN = "fab Ran 63 tests in 4.2s OK"
+
+
+class AHoldCarriesItsFabReceiptTest(SourceCleanBase):
+    """A `--source-clean` hold names the fab run behind it (task/4103).
+
+    MEASURED: seats held rows source-clean 1-3 minutes after dispatch with
+    reasons that carried no fab line, and about nine landed through auto-land
+    on those holds alone. A source-clean hold is now refused unless its
+    reason carries a passing `Ran N` line or the fab LOG of a run on exactly
+    the held tip -- or, for a hold over a standing CONCUR at that tip, the
+    CONCUR's own evidence carries one. A hold on a row whose recorded read
+    is a FIX is refused by its verdict's name. A hold with no claim is
+    unchanged. Every refusal asserts the effect: nothing appended, the row
+    not held."""
+
+    def attempt(self, row, tip, reason):
+        with mock.patch.object(dispatches, "_acting_author",
+                               return_value=(READER, None)), \
+                mock.patch.object(home, "session_id",
+                                  return_value=self.READER_SESSION):
+            return dispatches.mark_hold(row["id"], reason,
+                                        source_clean_tip=tip)
+
+    def log(self, tip):
+        """A fab LOG path in the shape fab writes: its job name carries the
+        first 11 hex chars of the tip the run tested."""
+        return ("LOG node-a:~/fab/logs/lane-hold-%s-1790920203-44782e44-"
+                "2454861.log" % tip[:11])
+
+    def test_a_hold_with_no_receipt_is_refused_and_names_the_shape(self):  # noqa: VACUOUS_ASSERTION — the same row is then held through the same door with a Ran line and asserted HELD at the tip, so the refusal is the missing receipt and not a door that refuses everything
+        row = self.row(self.side, "lane/sc-receipt-none")
+        before = self.history()
+        out, why = self.attempt(row, self.side, "SOURCE-CLEAN: read clean")
+        self.assertIsNone(out)
+        self.assertIn("no fab receipt", str(why))
+        self.assertIn("Ran N tests", str(why))
+        self.assertIn(self.side[:11], str(why))
+        self.assertIn("--source-clean %s" % self.side[:12], str(why))
+        self.assertEqual(self.history(), before)
+        self.assertEqual(self.state(row["id"])["status"], "open")
+        out, why = self.attempt(row, self.side,
+                                "SOURCE-CLEAN: read clean; " + FAB_RAN)
+        self.assertIsNone(why, why)
+        self.assertEqual(self.state(row["id"])["source_clean_tip"], self.side)
+
+    def test_a_LOG_for_another_tip_is_refused(self):  # noqa: VACUOUS_ASSERTION — the matching-LOG arm below holds through the same door on the same fixture, and the refusal names both tips
+        row = self.row(self.side, "lane/sc-receipt-foreign")
+        before = self.history()
+        out, why = self.attempt(row, self.side,
+                                "SOURCE-CLEAN: read clean, " + self.log(self.b))
+        self.assertIsNone(out)
+        self.assertIn(self.b[:11], str(why))
+        self.assertIn("another tip", str(why))
+        self.assertEqual(self.history(), before)
+        self.assertEqual(self.state(row["id"])["status"], "open")
+        # AND ITS COUNT IS THAT RUN'S: a passing Ran line beside only a LOG
+        # of another tip is a run on another tree, cited as this one's.
+        out, why = self.attempt(row, self.side, "SOURCE-CLEAN: fab Ran 63 "
+                                "tests OK, " + self.log(self.b))
+        self.assertIsNone(out)
+        self.assertIn("another tip", str(why))
+        self.assertEqual(self.history(), before)
+
+    def test_a_LOG_of_the_held_tip_is_accepted(self):  # noqa: VACUOUS_ASSERTION — the hold is read back from the fold by status and tip
+        row = self.row(self.side, "lane/sc-receipt-log")
+        out, why = self.attempt(row, self.side,
+                                "SOURCE-CLEAN: read clean, " + self.log(self.side))
+        self.assertIsNone(why, why)
+        folded = self.state(row["id"])
+        self.assertEqual((folded["status"], folded["source_clean_tip"]),
+                         ("held", self.side))
+
+    def test_a_passing_Ran_line_is_accepted_and_a_FAILED_one_is_not(self):  # noqa: VACUOUS_ASSERTION — the FAILED arm and the passing arm run through the same door on the same row, and the passing hold is read back from the fold
+        row = self.row(self.side, "lane/sc-receipt-ran")
+        before = self.history()
+        out, why = self.attempt(row, self.side, "SOURCE-CLEAN: fab Ran 63 "
+                                "tests in 4.2s FAILED (failures=1)")
+        self.assertIsNone(out)
+        self.assertIn("no fab receipt", str(why))
+        self.assertEqual(self.history(), before)
+        out, why = self.attempt(row, self.side, "SOURCE-CLEAN: read the "
+                                "delta; Ran 63 tests in 4.2s ... OK")
+        self.assertIsNone(why, why)
+        self.assertEqual(self.state(row["id"])["status"], "held")
+
+    def concur(self, lane, evidence):
+        row = self.row(self.side, lane)
+        out, why = self.mark_verdict(row["id"], self.side, evidence,
+                                     polarity="concur")
+        self.assertIsNone(why, why)
+        self.assertEqual(out["status"], "verdict")
+        return row
+
+    def test_a_held_CONCUR_whose_evidence_carries_the_receipt_is_accepted(self):  # noqa: VACUOUS_ASSERTION — a CONCUR whose evidence carries none is refused through the same door first, so the admission is the CONCUR's receipt
+        bare = self.concur("lane/sc-receipt-concur-bare", "read clean")
+        before = self.history()
+        out, why = self.attempt(bare, self.side, "SOURCE-CLEAN: the CONCUR")
+        self.assertIsNone(out)
+        self.assertIn("no fab receipt", str(why))
+        self.assertEqual(self.history(), before)
+        self.assertEqual(self.state(bare["id"])["status"], "verdict")
+        row = self.concur("lane/sc-receipt-concur",
+                          "read clean; " + self.log(self.side))
+        out, why = self.attempt(row, self.side, "SOURCE-CLEAN: the CONCUR")
+        self.assertIsNone(why, why)
+        folded = self.state(row["id"])
+        self.assertEqual((folded["status"], folded["source_clean_tip"],
+                          folded.get("polarity")),
+                         ("held", self.side, "concur"))
+
+    def test_a_FIX_verdict_row_is_refused_by_its_verdict(self):  # noqa: VACUOUS_ASSERTION — the refusal names FIX, the ledger is unchanged and the row is still the FIX verdict
+        row = self.row(self.side, "lane/sc-receipt-fix")
+        out, why = self.mark_verdict(row["id"], self.side, "a finding",
+                                     polarity="fix")
+        self.assertIsNone(why, why)
+        before = self.history()
+        out, why = self.attempt(row, self.side,
+                                "SOURCE-CLEAN: read clean; " + FAB_RAN)
+        self.assertIsNone(out)
+        self.assertIn("FIX verdict", str(why))
+        self.assertIn("--supersedes %s" % row["id"][:12], str(why))
+        self.assertEqual(self.history(), before)
+        folded = self.state(row["id"])
+        self.assertEqual((folded["status"], folded.get("polarity")),
+                         ("verdict", "fix"))
+
+    def test_a_plain_hold_needs_no_receipt(self):  # noqa: VACUOUS_ASSERTION — the hold is read back from the fold with no source-clean claim
+        row = self.row(self.side, "lane/sc-receipt-plain")
+        with mock.patch.object(dispatches, "_acting_author",
+                               return_value=(READER, None)):
+            out, why = dispatches.mark_hold(row["id"], "waiting on a build box")
+        self.assertIsNone(why, why)
+        folded = self.state(row["id"])
+        self.assertEqual(folded["status"], "held")
+        self.assertNotIn("source_clean_tip", folded)
+
+
+class AHoldAutoLandTakesWakesNobodyTest(SourceCleanBase, _lw.TrainBase):
+    """task/4215: a source-clean hold DMed the integrator "the next move is
+    YOURS: land <tip>" even when auto-land's switch was ON and its planner
+    would take the car by itself, so every such hold cost a wake turn for a
+    move nobody had to make. With the switch ON and the planner admitting
+    the car, the hold posts one retained, NON-WAKING row instead and sends no
+    DM. With the switch ON and the planner turning the car away, the DM is
+    sent and names the planner's own reason. With the switch OFF the DM is
+    today's, word for word."""
+
+    car = SourceCleanCarsTest.car
+    plan = SourceCleanCarsTest.plan
+
+    def root_of(self, row):
+        """The checkout the row is bound to, as the planner resolves it."""
+        lr, err = landreq.get(row["id"])
+        self.assertIsNone(err, err)
+        gitdir, why = landreq_close._close_repo(lr, None)
+        self.assertIsNone(why, why)
+        return gitdir[:-5] if gitdir.endswith("/.git") else gitdir
+
+    def nudge(self, row):
+        """Run the hold's notice on the folded row -> (DMs, room posts), with
+        auto-land's timer reported installed so only the switch decides."""
+        from helm import chat, dispatches_cli
+        dms, posts = [], []
+        with mock.patch.object(dispatches, "_nudge",
+                               lambda to, body, ctx: dms.append(
+                                   (to, body, ctx))), \
+                mock.patch.object(chat, "post",
+                                  lambda text, **kw: posts.append(
+                                      (text, kw)) or {"id": "x"}), \
+                mock.patch.object(autoland, "timer_installed",
+                                  return_value=True):
+            dispatches_cli._hold_holder_nudge(self.state(row["id"]))
+        return dms, posts
+
+    def test_switch_on_and_an_admitted_car_sends_no_dm_and_posts_one_ambient_row(self):  # noqa: VACUOUS_ASSERTION — the empty DM list is paired with one ambient row asserted by value (room, class, sender, row id, held tip) and the plan listing the same car
+        row, tip = self.car("sc-auto-take")
+        # PRECONDITION: `helm train` itself lists this row as a car.
+        self.assertIn("held tip %s" % tip[:12],
+                      SourceCleanCarsTest.listed(self, self.plan(),
+                                                 row["id"]))
+        dms, posts = self.nudge(row)
+        self.assertEqual(dms, [], "a car auto-land takes woke the integrator")
+        self.assertEqual(len(posts), 1, posts)
+        text, kw = posts[0]
+        self.assertTrue(kw.get("ambient"), kw)
+        self.assertEqual(kw.get("room"), autoland.ROOM)
+        self.assertEqual(kw.get("who"), "dispatches")
+        self.assertIn(row["id"][:12], text)
+        self.assertIn(tip[:12], text)
+        self.assertIn("auto-land", text.lower())
+        self.assertNotIn("@", text)
+
+    def test_switch_on_and_an_ejected_car_dms_the_planners_reason(self):  # noqa: VACUOUS_ASSERTION — the DM is asserted by value to carry the planner's ejection clause; the empty post list pairs with it
+        row, tip = self.car("sc-auto-ejected")
+        _row, err = landwindow.record_ejection(self.root_of(row), {
+            "tip": tip, "train": "train77", "gate": "feedface",
+            "tests": ["tests.test_x.T.test_y"]})
+        self.assertIsNone(err, err)
+        # PRECONDITION: the planner now excludes it, for that ejection.
+        self.assertIn("ejected from train77",
+                      SourceCleanCarsTest.listed(self, self.plan(),
+                                                 row["id"]))
+        dms, posts = self.nudge(row)
+        self.assertEqual(posts, [])
+        self.assertEqual(len(dms), 1, dms)
+        _to, body, ctx = dms[0]
+        self.assertIn("The next move is YOURS", body)
+        self.assertIn("AUTO-LAND IS ON BUT WILL NOT TAKE THIS CAR", body)
+        self.assertIn("ejected from train77", body)
+        self.assertIn("auto-land will not take it", ctx)
+
+    def test_switch_off_dms_as_before(self):  # noqa: VACUOUS_ASSERTION — the DM is asserted by value against the full pre-change text; the empty post list pairs with it
+        row, tip = self.car("sc-auto-off")
+        _control, why = autoland.pause(self.root_of(row), "tester", "drill")
+        self.assertIsNone(why, why)
+        lane = self.state(row["id"])["lane"]
+        dms, posts = self.nudge(row)
+        self.assertEqual(posts, [])
+        self.assertEqual(len(dms), 1, dms)
+        _to, body, ctx = dms[0]
+        self.assertEqual(body, (
+            "SOURCE-CLEAN HOLD on %s (%s) — @%s read the delta and found "
+            "nothing, and cannot mint an approve because one binds a "
+            "whole-suite token only your land gate produces. The next move is "
+            "YOURS: land %s under a whole-suite gate, then `helm lr foldcheck "
+            "<head> --gate gate:<id> --apply`, naming a verified whole-suite "
+            "receipt on a commit containing the tip, closes this row "
+            "(--reason source-clean-landed) — no approve is needed."
+            % (row["id"][:12], lane, READER, tip[:12])))
+        self.assertEqual(ctx, "%s: SOURCE-CLEAN at %s — review complete, "
+                              "awaiting your whole-suite gate"
+                         % (lane, tip[:12]))
+
 
 if __name__ == "__main__":
     unittest.main()

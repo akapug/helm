@@ -33,7 +33,7 @@ from unittest import mock
 import os as _os, sys as _sys  # noqa: E402
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
-from helm import dispatches as D, eventledger, seats  # noqa: E402
+from helm import dispatches as D, eventledger, seats, tasks  # noqa: E402
 from helm import seats_stop_signals as signals  # noqa: E402
 
 # THE SEAT THIS HARNESS RUNS THE GATE AS. Named once so the meld fixture
@@ -78,6 +78,10 @@ class SpiralBase(unittest.TestCase):
         os.environ["HELM_STOP_GUARD_WHISPER"] = "0"
         os.environ["HELM_STOP_GUARD_WIRING"] = "0"
         os.makedirs(os.path.dirname(D.ledger_path()), exist_ok=True)
+        self.review_task, why = tasks.add(
+            "resolve the fixture review spiral", SEAT, project="helm",
+            force_new=True)
+        self.assertIsNone(why, why)
         # THE STOP GUARD READS A RESIDENT'S FACTS, the spiral count among
         # them; this stands in one that is exactly up to date at every stop
         # (tests/_stopfacts.py).
@@ -110,6 +114,8 @@ class SpiralBase(unittest.TestCase):
                "deadline_s": 2700}
         if kind is not None:
             row["kind"] = kind
+        if kind == "review":
+            row["task"] = self.review_task["id"]
         if supersedes is not None:
             row["supersedes"] = supersedes
         if chain_root is not None:
@@ -232,6 +238,9 @@ class FindingTrajectoryTest(SpiralBase):
         # literal UNKNOWN, which the row records as declared.
         argv += ["--finding-count", "UNKNOWN" if count is None else str(count),
                  "--prior-relation", relation or "UNKNOWN"]
+        for i in range(count or 0):
+            argv += ["--finding", "Review defect %s in helm/dispatches.py, case %d"
+                     % (rid[:12], i + 1)]
         argv += ["Explicit reviewer observation; no count inferred from prose."]
         with contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
@@ -396,7 +405,9 @@ class FindingTrajectoryTest(SpiralBase):
         self.assertIn("UNKNOWN", self.outcome("MELD", "pending"))
         out, err = D.mark_verdict(rid, self.rows[-1][1], "different count",
                                  polarity="fix", finding_count=2,
-                                 prior_relation="regression-of-cure")
+                                 prior_relation="regression-of-cure",
+                                 findings=["First independent defect in helm/dispatches.py",
+                                           "Second independent defect in helm/dispatches.py"])
         self.assertIsNone(err)
         self.assertEqual(out["finding_count"], 2)
         self.assertIn("UNKNOWN", self.outcome("MELD", "conflict"))
@@ -465,7 +476,8 @@ class FindingTrajectoryTest(SpiralBase):
         # than the compatibility this arm is about.
         self.assertEqual(old, {k: v for k, v in current.items()
                                if k not in ("finding_count", "prior_relation",
-                                            "no_patch_because")})
+                                            "no_patch_because", "findings",
+                                            "findings_task")})
         self.assertEqual(current["no_patch_because"],
                          "a design finding for a meld",
                          "the control on that exclusion: the NEW reducer does "
@@ -510,11 +522,17 @@ class FindingTrajectoryTest(SpiralBase):
         kwargs = dict(polarity="fix", basis="measured",
                       worse_than_main_paths=["helm/dispatches.py"],
                       no_patch_because="a design finding for a meld",
-                      finding_count=6, prior_relation="new")
+                      finding_count=6, prior_relation="new",
+                      findings=["Review defect %s in helm/dispatches.py, case %d"
+                                % (rid[:12], i + 1) for i in range(6)])
         out, err = D.mark_verdict(*args, **kwargs)
         self.assertIsNone(err)
         self.assertEqual(out["finding_count"], 6)
-        for changes in ({"finding_count": 5}, {"prior_relation": "uncured"}):
+        out, err = D.mark_verdict(*args, **dict(kwargs, finding_count=5))
+        self.assertIsNone(out)
+        self.assertIn("disagrees with", err)
+        for changes in ({"finding_count": 5, "findings": kwargs["findings"][:5]},
+                        {"prior_relation": "uncured"}):
             out, err = D.mark_verdict(*args, **dict(kwargs, **changes))
             self.assertIsNone(out)
             self.assertIn("already has a verdict", err)
@@ -2203,12 +2221,31 @@ class UnansweredDispatchesAreNotRoundsTest(SpiralBase):
         self.assertIsNotNone(info, "the unread chain went silent entirely")
         self.assertEqual(info["prescription"], D.SPIRAL_UNREAD)
         self.assertEqual(info["rounds"], 3)
-        self.assertIn("0 with a recorded read", info["finding_evidence"])
+        self.assertIn(
+            "3 dispatches and ZERO reads; the reviewer is the missing "
+            "thing, go find one", info["finding_evidence"])
+        self.assertNotIn("helm dispatch verdict", info["finding_evidence"])
         block, warn = self.text()
         self.assertEqual(block, "", "an unread chain was walled for a meld")
         self.assertIn("UNREAD", warn)
-        self.assertIn("helm dispatch verdict <row> <tip>", warn)
-        self.assertIn("an answer given only in chat does not count", warn)
+        self.assertIn("go find one", warn)
+        self.assertNotIn("helm dispatch verdict", warn)
+
+    def test_one_recorded_read_still_says_record_the_verdict(self):
+        """A recorded read is the other population: someone looked. ZERO
+        reads is the missing reviewer, and that sentence must not replace
+        the record-the-verdict fix once a read exists."""
+        tips = [os.urandom(20).hex() for _ in range(3)]
+        rids = [self.round(tip=tip, age_s=3000 - i * 600)
+                for i, tip in enumerate(tips)]
+        self.verdict(rids[2], tips[2], "fix")
+        info, err = D.review_spiral(SEAT)
+        self.assertIsNone(err)
+        self.assertEqual(info["prescription"], D.SPIRAL_UNREAD)
+        self.assertIn("1 with a recorded read", info["finding_evidence"])
+        self.assertIn("helm dispatch verdict <row> <tip>",
+                      info["finding_evidence"])
+        self.assertNotIn("ZERO reads", info["finding_evidence"])
 
     def test_the_same_unread_chain_reads_MELD_once_the_reads_are_recorded(self):
         """THE FIX THE ADVISORY NAMES, carried out on the same rows: the

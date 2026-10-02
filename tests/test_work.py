@@ -24,7 +24,7 @@ from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tests._tmphome import declaring as _tmp_declaring  # noqa: E402
+from tests._tmphome import declaring as _tmp_declaring, import_home_freezers  # noqa: E402
 from tests import _pids  # noqa: E402
 from tests import _roomclock  # noqa: E402
 
@@ -35,14 +35,15 @@ from helm.work import _cli as _work_cli  # noqa: E402
 from helm.work import _common as _work_common  # noqa: E402
 from helm.work import _gc as _work_gc  # noqa: E402
 
-ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
+ENV_KEYS = ("HELM_HOME", "HOME", "HELM_PROC", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_CHAT_NODE_URL",
             "MELD_CHAT_NODE_URL", "HELM_CHAT_LOG", "MELD_CHAT_LOG",
             "HELM_CHAT_OWNER_NAMES", "HELM_CELL_BIN", "HELM_ADOPTED_DIR",
             "CLAUDE_CODE_SESSION_ID", "CLAUDE_SESSION_ID", "CODEX_SESSION_ID",
             "CLAUDECODE", "CLAUDE_CODE_SUBAGENT_MODEL", "ANTHROPIC_MODEL",
             "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "HELM_WORK_INTEGRATOR",
-            "HELM_WORK_CLAIM", "HELM_TEST_HOOK_LOG", "HELM_PRIVATE_NEEDLES")
+            "HELM_WORK_CLAIM", "HELM_TEST_HOOK_LOG", "HELM_PRIVATE_NEEDLES",
+            "HELM_CACHE_DIR")
 
 
 def _sh(cwd, *args):
@@ -134,12 +135,18 @@ def _bytes(path):
 
 class WorkBase(unittest.TestCase):
     def setUp(self):
+        import_home_freezers()
         self.tmp = tempfile.mkdtemp(prefix="helm-test-work-")
         self.env_prior = {k: os.environ.get(k) for k in ENV_KEYS}
         for k in ENV_KEYS:
             os.environ.pop(k, None)
         os.environ["HELM_HOME"] = os.path.join(self.tmp, "helm")
+        os.environ["HOME"] = self.tmp
+        os.environ["HELM_PROC"] = "/proc"
         os.environ["HELM_CHAT_DIR"] = os.path.join(self.tmp, "chat")
+        # the sweep's keep-verdict memo (`_gc.LandedMemo`) lives in the cache
+        # root, so it is the test's own too
+        os.environ["HELM_CACHE_DIR"] = os.path.join(self.tmp, "cache")
         os.environ["HELM_CHAT_NODE_URL"] = ""
         os.environ["HELM_CHAT_LOG"] = "0"
         os.environ["HELM_CHAT_OWNER_NAMES"] = "daria"
@@ -174,7 +181,17 @@ class WorkBase(unittest.TestCase):
                     # helm-the-shared-checkout; an undeclared PROJECT repo
                     # now defaults to the leak legs (task/2441).
                     ("git", "config", "--local",
-                     "helm.guard.profile", "rail")):
+                     "helm.guard.profile", "rail"),
+                    # NO DETACHED GIT IN A ROOM (task/4172). Every commit
+                    # runs `git maintenance run --auto --quiet --detach`, and
+                    # git (2.51 and 2.53, measured) daemonizes BEFORE it
+                    # checks whether any task is due, so each commit leaves a
+                    # child whose cwd is the room. On a loaded box it outlives
+                    # the gap before release's occupancy census: whole-suite
+                    # receipt 9e91128ef4f00749 refused a release as OCCUPIED
+                    # by exactly that process. The room's census is the
+                    # thing under test; git's housekeeping is not.
+                    ("git", "config", "--local", "maintenance.auto", "false")):
             r = _sh(root, *cmd)
             if r.returncode != 0:
                 raise AssertionError((cmd, r.stderr))
@@ -267,6 +284,48 @@ class WorkBase(unittest.TestCase):
             target = os.path.join(os.fsencode(path), rel)
             if os.path.lexists(target) and not os.path.islink(target):
                 os.utime(target, (cutoff, cutoff))
+
+
+class HomeFreezerOrderTest(unittest.TestCase):
+    def test_fixture_homes_do_not_freeze_lazy_modules_in_deleted_paths(self):
+        """Both HOME-moving bases preserve import-time roots in a fresh worker."""
+        for module, name in (("tests.test_work", "WorkBase"),
+                             ("tests.test_webserve", "WebServeBase")):
+            with self.subTest(fixture=name), \
+                    tempfile.TemporaryDirectory(prefix="helm-test-home-order-") as scratch:
+                original = os.path.join(scratch, "original-home")
+                os.makedirs(original)
+                env = dict(os.environ, HOME=original,
+                           HELM_HOME=os.path.join(scratch, "original-helm"))
+                code = (
+                    "import json, os, sys\n"
+                    "from %s import %s as Base\n"
+                    "assert 'helm.envtidy' not in sys.modules, 'not a lazy import'\n"
+                    "case = Base()\n"
+                    "case.setUp()\n"
+                    "fixture = getattr(case.tmp, 'name', case.tmp)\n"
+                    "try:\n"
+                    "    from helm import envtidy\n"
+                    "    during = os.path.expanduser('~')\n"
+                    "finally:\n"
+                    "    case.tearDown()\n"
+                    "    case.doCleanups()\n"
+                    "print(json.dumps([fixture, during, os.environ['HOME'],\n"
+                    "                  envtidy.BACKUP_ROOT, envtidy.MCPS_PRIVATE]))\n"
+                    % (module, name))
+                r = subprocess.run([sys.executable, "-c", code], env=env,
+                                   cwd=os.path.dirname(os.path.dirname(
+                                       os.path.abspath(__file__))),
+                                   capture_output=True, text=True, timeout=120)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                fixture, during, restored, backup, mcps = json.loads(r.stdout)
+                self.assertEqual(during, fixture, "fixture did not move HOME")
+                self.assertFalse(os.path.exists(fixture), "fixture was not deleted")
+                self.assertEqual(restored, original, "fixture did not restore HOME")
+                self.assertTrue(os.path.isdir(restored), "original HOME is gone")
+                self.assertEqual(backup, os.path.join(original, ".env-premerge-backup"))
+                self.assertEqual(mcps, os.path.join(original, ".config", "helm",
+                                                    "mcps-canonical.json"))
 
 
 class ClaimTest(WorkBase):
@@ -930,6 +989,81 @@ class ReleaseTest(WorkBase):
             proc.terminate()
             proc.wait()
 
+    def _release_with_planted(self, rows):
+        """Release a fresh (landed) lane while the PLANTED table holds `rows`
+        — (argv, ppid, comm, in_room) per dead pid — for every census the
+        release reads, its gc removal checks included."""
+        rc, out, _err = self.work("claim", "demo", "--seat", "s1")
+        path, _branch, lease, _ttl = out.strip().split("\t")
+        table = os.path.join(self.tmp, "proc")
+        for n, (argv, ppid, comm, in_room) in enumerate(rows):
+            _plant_process(table, _NO_SUCH_PID + n, argv, ppid=ppid,
+                           comm=comm, cwd=path if in_room else None)
+        with _planted_readers(_work_claims, table), \
+                _planted_readers(_work_gc, table):
+            rc, out, err = self.work("release", "demo", "--seat", "s1",
+                                     "--lease", lease)
+        return path, rc, out, err
+
+    def test_release_ignores_gits_detached_maintenance(self):  # noqa: VACUOUS_ASSERTION — rc 0 and the removed room are the positive observables; the control test below asserts OCCUPIED on the same err
+        """git 2.51+ forks `git maintenance run --auto --quiet --detach` after
+        every commit, cwd in the room; it and the `git gc --auto` and repack
+        it runs are git's own and exit by themselves, so a release right
+        after a commit is not refused as OCCUPIED."""
+        m, g = _NO_SUCH_PID, _NO_SUCH_PID + 1
+        path, rc, out, err = self._release_with_planted([
+            (["git", "maintenance", "run", "--auto", "--quiet", "--detach"],
+             1, "git", True),
+            (["git", "gc", "--auto", "--quiet", "--no-detach",
+              "--skip-foreground-tasks"], m, "git", True),
+            (["git", "repack", "-d", "-l"], g, "git", True)])
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("OCCUPIED", out + err)
+        self.assertFalse(os.path.exists(path))
+        self.assertEqual(seats.claims_list(), [])
+
+    def test_release_still_refuses_a_live_occupant_beside_maintenance(self):
+        """CONTROL: the same maintenance process plus anything else in the
+        room still refuses, and the refusal names only the other one."""
+        path, rc, _out, err = self._release_with_planted([
+            (["git", "maintenance", "run", "--auto", "--quiet", "--detach"],
+             1, "git", True),
+            (["sleep", "30"], 1, "sleep", True)])
+        self.assertEqual(rc, 1, err)
+        self.assertIn("OCCUPIED", err)
+        self.assertIn("`sleep 30`", err)
+        self.assertNotIn("maintenance", err)
+        self.assertTrue(os.path.isdir(path))
+        self.assertEqual(len(seats.claims_list()), 1)
+
+    def test_census_excludes_only_gits_own_housekeeping(self):
+        """The census drops exactly git's auto-housekeeping and the git
+        processes it runs. A person's `git gc`, a `git repack` under a shell,
+        any other git verb and a non-git child of maintenance (a pre-auto-gc
+        hook) still count as occupants."""
+        from helm.work import _lanes
+        room = os.path.join(self.tmp, "room")
+        os.makedirs(room)
+        table = os.path.join(self.tmp, "proc")
+        p = _NO_SUCH_PID
+        rows = {
+            p: (["/usr/bin/git", "maintenance", "run", "--auto", "--detach"], 1),
+            p + 1: (["git", "gc", "--auto", "--quiet"], 1),
+            p + 2: (["git", "pack-objects", "--all"], p + 1),
+            p + 3: (["git", "gc"], 1),
+            p + 4: (["bash"], 1),
+            p + 5: (["git", "repack", "-d"], p + 4),
+            p + 6: (["git", "log", "--", "maintenance", "run"], 1),
+            p + 7: (["sh", ".git/hooks/pre-auto-gc"], p),
+            p + 8: (["vim", "git", "maintenance", "run"], 1),
+        }
+        for pid, (argv, ppid) in rows.items():
+            _plant_process(table, pid, argv, ppid=ppid, comm="x", cwd=room)
+        occ, complete = _lanes._occupants_many([room], proc_root=table)
+        self.assertTrue(complete)
+        self.assertEqual(occ[room], [str(n) for n in (p + 3, p + 4, p + 5,
+                                                      p + 6, p + 7, p + 8)])
+
     def test_release_wrong_lease_removes_nothing(self):
         rc, out, _err = self.work("claim", "demo", "--seat", "s1")
         path = out.split("\t")[0]
@@ -971,6 +1105,30 @@ class ReleaseTest(WorkBase):
         self.assertTrue(work._has_branch(self.root, "lane/demo"))
         self.assertRegex(out, r"TRIAGE demo .*tip [0-9a-f]{12}, age .*\(git committer, shared across seats: Bob Committer <bob@example.com> — not seat provenance\)")
         self.assertEqual(seats.claims_list(), [])
+
+    def test_a_commit_in_a_fixture_room_spawns_no_detached_git_maintenance(self):
+        """The fixture's half of task/4172: a room's commits must not leave
+        `git maintenance run --auto --detach` behind for the census to find.
+        Read through the ROOM, so the shared worktree config is what is
+        checked, and through git's own per-command decision (trace2), so the
+        arm fails if the key is dropped or stops reaching the worktree."""
+        rc, out, err = self.work("claim", "demo", "--seat", "s1")
+        self.assertEqual(rc, 0, err)
+        path = out.strip().split("\t")[0]
+        self.assertEqual(_sh(path, "git", "config", "--get",
+                             "maintenance.auto").stdout.strip(), "false")
+        with open(os.path.join(path, "f.txt"), "w") as f:
+            f.write("x\n")
+        _sh(path, "git", "add", "-A")
+        trace = os.path.join(self.tmp, "trace2.txt")
+        proc = subprocess.run(["git", "commit", "-q", "-m", "x"], cwd=path,
+                              env=dict(os.environ, GIT_TRACE2=trace),
+                              capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(trace) as f:
+            seen = f.read()
+        self.assertIn("cmd_name commit", seen)    # control: the trace saw the commit
+        self.assertNotIn("maintenance run", seen)
 
 
 class SupersededReleaseRetiresTheRoomAndKeepsTheWorkTest(WorkBase):
@@ -2074,6 +2232,145 @@ class GcTest(WorkBase):
                         % (lines,))
         self.assertEqual(self._tip("unreadable-registry"), before,
                          "an unreadable registry must not authorize the write")
+
+    def test_rescue_on_pushed_branch_leaves_branch_unmoved_and_recovers_to_side_ref(self):
+        """task/4002: a rescue in a room whose branch tip is pushed leaves
+        refs/heads/lane/<x> unmoved and the work recoverable from the side ref."""
+        lane = "pushed-lane"
+        room = self.room(lane, dirty="precious.txt")
+        branch = work.lane_branch(lane)
+        before_tip = self._tip(lane)
+        # Simulate that this branch is pushed to origin
+        r = subprocess.run(["git", "update-ref", "refs/remotes/origin/" + branch, before_tip],
+                           cwd=self.root, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        row = self._rescue_row(room)
+        lines = work.gc_enact(self.root, row)
+        self.assertEqual(self._tip(lane), before_tip,
+                         "a rescue on a pushed branch must leave refs/heads/%s unmoved" % branch)
+        # The work must be recoverable from the side ref
+        r = subprocess.run(["git", "for-each-ref", "--format=%(refname) %(objectname)",
+                            "refs/helm-rescue/" + lane],
+                           cwd=self.root, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        refs = [line.split() for line in r.stdout.splitlines() if line.strip()]
+        self.assertEqual(len(refs), 1, "expected 1 side ref under refs/helm-rescue/%s, got %r" % (lane, refs))
+        side_ref, side_commit = refs[0]
+        # Check that the commit on the side ref holds precious.txt
+        r_show = subprocess.run(["git", "show", "--name-only", side_commit],
+                                cwd=self.root, capture_output=True, text=True)
+        self.assertIn("precious.txt", r_show.stdout, "the dirty work must be preserved in the side ref")
+        self.assertTrue(any("rescued dirty work -> %s" % side_ref in l for l in lines), lines)
+
+    def test_held_source_clean_car_still_rides_after_rescue_sweep(self):
+        """task/4002: a held source-clean car still rides after a rescue sweep
+        because the branch tip is not advanced past the held tip."""
+        lane = "held-car-lane"
+        room = self.room(lane, dirty="scratch.log")
+        branch = work.lane_branch(lane)
+        held_tip = self._tip(lane)
+        # Record a live hold on held_tip
+        from helm import landreq
+        with mock.patch.object(landreq, "project", return_value=([
+            {"tip": held_tip, "held_tip": held_tip, "ref_branch": "refs/heads/" + branch, "lane": lane}
+        ], None)):
+            row = self._rescue_row(room)
+            lines = work.gc_enact(self.root, row)
+        self.assertEqual(self._tip(lane), held_tip,
+                         "held branch must not move during rescue sweep")
+        r = subprocess.run(["git", "for-each-ref", "--format=%(refname)",
+                            "refs/helm-rescue/" + lane],
+                           cwd=self.root, capture_output=True, text=True)
+        self.assertTrue(len(r.stdout.strip()) > 0, "rescue must be written to side ref")
+
+    def test_unpushed_unheld_lane_keeps_today_behaviour(self):
+        """task/4002: an unpushed, unheld lane keeps today's behaviour:
+        the rescue commit is written directly onto the lane branch."""
+        lane = "unpushed-unheld"
+        room = self.room(lane, dirty="precious.txt")
+        branch = work.lane_branch(lane)
+        before_tip = self._tip(lane)
+        row = self._rescue_row(room)
+        lines = work.gc_enact(self.root, row)
+        after_tip = self._tip(lane)
+        self.assertNotEqual(after_tip, before_tip,
+                            "unpushed unheld lane MUST advance branch with rescue commit")
+        self.assertTrue(any("rescued dirty work -> %s" % branch in l for l in lines), lines)
+
+    def test_rescue_fails_closed_on_unreadable_dispatch_ledger(self):  # noqa: VACUOUS_ASSERTION — positive control on side ref presence and rescue output
+        """task/4018: when the dispatch ledger cannot be read, _is_branch_protected
+        fails closed, leaving the lane branch unmoved and rescuing to a side ref."""
+        lane = "unreadable-dispatch-ledger"
+        room = self.room(lane, dirty="precious.txt")
+        branch = work.lane_branch(lane)
+        before_tip = self._tip(lane)
+        row = self._rescue_row(room)
+        from helm import dispatches
+        with mock.patch.object(dispatches, "snapshot", return_value=({}, "unreadable dispatch ledger: simulated error")):
+            lines = work.gc_enact(self.root, row)
+        self.assertEqual(self._tip(lane), before_tip,
+                         "unreadable dispatch ledger must fail closed: branch %s must not move" % branch)
+        r = subprocess.run(["git", "for-each-ref", "--format=%(refname)",
+                            "refs/helm-rescue/" + lane],
+                           cwd=self.root, capture_output=True, text=True)
+        refs = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+        self.assertEqual(len(refs), 1, "expected rescue commit on side ref, got: %r" % refs)
+        self.assertTrue(any("rescued dirty work -> %s" % refs[0] in l for l in lines), lines)
+
+    def test_rescue_fails_closed_on_unreadable_landreq_ledger(self):  # noqa: VACUOUS_ASSERTION — positive control on side ref presence and rescue output
+        """task/4018: when the landreq ledger cannot be read, _is_branch_protected
+        fails closed, leaving the lane branch unmoved and rescuing to a side ref."""
+        lane = "unreadable-landreq-ledger"
+        room = self.room(lane, dirty="precious.txt")
+        branch = work.lane_branch(lane)
+        before_tip = self._tip(lane)
+        row = self._rescue_row(room)
+        from helm import landreq
+        with mock.patch.object(landreq, "project", return_value=([], "unreadable landreq ledger: simulated error")):
+            lines = work.gc_enact(self.root, row)
+        self.assertEqual(self._tip(lane), before_tip,
+                         "unreadable landreq ledger must fail closed: branch %s must not move" % branch)
+        r = subprocess.run(["git", "for-each-ref", "--format=%(refname)",
+                            "refs/helm-rescue/" + lane],
+                           cwd=self.root, capture_output=True, text=True)
+        refs = [l.strip() for l in r.stdout.splitlines() if l.strip()]
+        self.assertEqual(len(refs), 1, "expected rescue commit on side ref, got: %r" % refs)
+        self.assertTrue(any("rescued dirty work -> %s" % refs[0] in l for l in lines), lines)
+
+    def test_is_branch_protected_fails_closed_on_unreadable_ledgers_and_exceptions(self):
+        """task/4018: _is_branch_protected fails closed (True) when dispatch or
+        landreq ledger is unreadable or raises an exception."""
+        from helm.work._gc import _is_branch_protected
+        from helm import dispatches, landreq
+        root = self.root
+        path = self.room("direct-protect-test", dirty="test.txt")
+        branch = work.lane_branch("direct-protect-test")
+        head_sha = self._tip("direct-protect-test")
+
+        # Control: healthy empty ledgers on unpushed unheld branch -> False
+        with mock.patch.object(dispatches, "snapshot", return_value=({}, None)), \
+             mock.patch.object(landreq, "project", return_value=([], None)):
+            self.assertFalse(_is_branch_protected(root, path, branch, head_sha))
+
+        # 1. Dispatch ledger unavailable reason -> True
+        with mock.patch.object(dispatches, "snapshot", return_value=({}, "unreadable dispatch ledger")), \
+             mock.patch.object(landreq, "project", return_value=([], None)):
+            self.assertTrue(_is_branch_protected(root, path, branch, head_sha))
+
+        # 2. Dispatch ledger exception -> True
+        with mock.patch.object(dispatches, "snapshot", side_effect=OSError("disk read failed")), \
+             mock.patch.object(landreq, "project", return_value=([], None)):
+            self.assertTrue(_is_branch_protected(root, path, branch, head_sha))
+
+        # 3. Landreq ledger unavailable reason -> True
+        with mock.patch.object(dispatches, "snapshot", return_value=({}, None)), \
+             mock.patch.object(landreq, "project", return_value=([], "unreadable landreq ledger")):
+            self.assertTrue(_is_branch_protected(root, path, branch, head_sha))
+
+        # 4. Landreq ledger exception -> True
+        with mock.patch.object(dispatches, "snapshot", return_value=({}, None)), \
+             mock.patch.object(landreq, "project", side_effect=OSError("disk read failed")):
+            self.assertTrue(_is_branch_protected(root, path, branch, head_sha))
 
     def test_enact_rechecks_occupancy_after_scan(self):
         if not os.path.isdir("/proc"):
@@ -10852,8 +11149,8 @@ class AnUnknownFlagIsRefusedNotDroppedTest(WorkBase):
         # the empty one is asked to mean anything.
         drift = []
         drift.extend(sorted(set(_work_common._VALUE_FLAGS) - passed))
-        self.assertEqual(["--drop", "--lease", "--superseded", "--task",
-                          "--ttl"], drift,
+        self.assertEqual(["--because", "--drop", "--lease", "--start-anyway",
+                          "--superseded", "--task", "--ttl"], drift,
                          "the verb-specific valued flags are not what this "
                          "file declares, so the emptiness below is about a "
                          "table that changed rather than about drift")
@@ -10928,7 +11225,7 @@ class LanesLandedTest(LandedWorld):
     `helm work list`, the web board and the land report read.
 
     THE OWNER'S OBSERVABLE: "about half the listed lanes already landed ...
-    why werent they listed as landed in helm?" A land releases no lease, so a
+    why werent they listed as landed in helm?" A hand land releases no lease, so a
     board that does not ask the ancestry `helm work release` prints draws a
     landed lane as building."""
 

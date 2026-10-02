@@ -593,8 +593,9 @@ def _carriage(gitdir, base, tip, trunk_ref):
     weakening. The first cut of this relation was replay-only and read a
     conflict as a measured refusal. Measured against the ledger's own
     landed-with-proof rows: 98 of 105 askable came back FALSE — a 93%
-    false-negative rate — because this fleet lands work REBASED, and a
-    rebase-landed delta conflicts precisely BECAUSE HEAD already carries it.
+    false-negative rate — historical rebases and cherry-picks carried content
+    under different shas, and a rebase-landed delta conflicts precisely
+    BECAUSE HEAD already carries it. Exact-sha train merges preserve ancestry.
     A relation that inverts on its main case is worse than no relation, and
     since affirmative carriage gates every door to LANDED, that reached
     `derive` estate-wide.

@@ -283,6 +283,12 @@ class SurfacesTest(unittest.TestCase):
             "HELM_CACHE_DIR": os.path.join(self.tmp, "cache")})
         patcher.start()
         self.addCleanup(patcher.stop)
+        # the pass never reads this machine's default home or its census
+        for name in ("_default_key", "_census_tiers"):
+            patch = mock.patch.object(cp, name, return_value=None
+                                      if name == "_default_key" else {})
+            patch.start()
+            self.addCleanup(patch.stop)
         from helm import brief
         path = brief.usage_history_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -311,7 +317,7 @@ class SurfacesTest(unittest.TestCase):
 
     def test_burn_prints_one_line_per_account(self):
         cp.watch_pass(now=at(18, 52))
-        lines = cp.burn_lines(now=at(18, 53))
+        lines = [l for l in cp.burn_lines(now=at(18, 53)) if "5h pace" in l]
         self.assertEqual(len(lines), 2)
         mine = [l for l in lines if accounts.mask_identity(ACCT) in l][0]
         self.assertIn("5h WATCH: 80%", mine)
@@ -345,6 +351,14 @@ class SurfacesTest(unittest.TestCase):
         text = out.getvalue()
         self.assertIn("5h WATCH: 80%", text)
         self.assertIn("resets 19:50Z", text)
+
+
+def room(**extra):
+    """A record the watcher can switch onto: a Max account, OK at 40% of its
+    5h window and 30% of its week."""
+    return dict({"state": cp.OK, "used_pct": 40.0, "reset_at": RESET,
+                 "since": 1.0, "pool": True, "weekly_pct": 30.0,
+                 "label": "b…@example.com"}, **extra)
 
 
 def _claude_home(root, email):
@@ -390,17 +404,21 @@ class SteerTest(unittest.TestCase):
         # and OK says nothing
         self.assertIsNone(cp.steer(self.ctx, tight[1], snap=self.snap(cp.OK)))
 
-    def test_a_seat_hears_nothing_while_another_claude_account_has_room(self):
+    def test_a_seat_hears_the_switch_while_another_account_has_room(self):
         """THE WATCHER MOVES A SEAT'S CREDENTIAL when a window caps, so a
-        pressed account's seat is told nothing while any other Claude account
-        is not pressed; only when every account is pressed does it hear the
-        routing line (the owner: "why bother them with it unless they are in
-        a situation where they need the information")."""
+        pressed account's seat is never told to route away while the watcher
+        can switch it; it hears that the switch is coming, with the pool's
+        pace (task/3871, reversing the silence of task/3718: the owner wants
+        the pace said). Only when no account is switchable does it hear the
+        routing line."""
         snap = self.snap(cp.TIGHT)
-        room = dict(snap["accounts"][accounts.measured_key(ACCT)],
-                    state=cp.OK, label="b…@example.com")
-        snap["accounts"][accounts.measured_key(OTHER)] = room
-        self.assertIsNone(cp.steer(self.ctx, None, snap=snap))
+        snap["accounts"][accounts.measured_key(OTHER)] = room(
+            label="b…@example.com")
+        said = cp.steer(self.ctx, None, snap=snap)
+        self.assertIsNotNone(said)
+        self.assertIn("watcher will switch", said[0])
+        self.assertIn("5h TIGHT at 81%", said[0])
+        self.assertNotIn("route NEW", said[0])
         # CONTROL: every account pressed, so the seat hears it
         snap["accounts"][accounts.measured_key(OTHER)]["state"] = cp.WATCH
         said = cp.steer(self.ctx, None, snap=snap)
@@ -424,9 +442,11 @@ class SteerTest(unittest.TestCase):
             self.assertIn("keep your own work going", said[0])
         snap["accounts"][other]["state"] = cp.UNKNOWN
         self.assertIsNotNone(cp.steer(self.ctx, None, snap=snap))
-        # CONTROL: an OK account is room, so the seat hears nothing
-        snap["accounts"][other]["state"] = cp.OK
-        self.assertIsNone(cp.steer(self.ctx, None, snap=snap))
+        # CONTROL: a switchable OK account is room: the switch, no routing
+        snap["accounts"][other] = room()
+        said = cp.steer(self.ctx, None, snap=snap)
+        self.assertIn("watcher will switch", said[0])
+        self.assertNotIn("known to have room", said[0])
 
     def test_a_seat_homed_to_the_account_hears_it_even_when_another_has_room(self):
         """A seat HOMED to one credential (a named credhome) is not moved by
@@ -434,8 +454,7 @@ class SteerTest(unittest.TestCase):
         state while other accounts have room, and is asked to pace to the
         reset, never to stop."""
         snap = self.snap(cp.TIGHT)
-        snap["accounts"][accounts.measured_key(OTHER)] = dict(
-            snap["accounts"][accounts.measured_key(ACCT)], state=cp.OK)
+        snap["accounts"][accounts.measured_key(OTHER)] = room()
         from helm import cred
         with mock.patch.object(cred, "is_credhome", return_value=True):
             said = cp.steer(self.ctx, None, snap=snap)
@@ -443,9 +462,10 @@ class SteerTest(unittest.TestCase):
         self.assertIn("homed to this account", said[0])
         self.assertIn("pace", said[0])
         self.assertNotIn("finish what you are doing", said[0])
-        # CONTROL: the same seat on the baseload home hears nothing
+        # CONTROL: the same seat on the baseload home hears the switch
         with mock.patch.object(cred, "is_credhome", return_value=False):
-            self.assertIsNone(cp.steer(self.ctx, None, snap=snap))
+            said = cp.steer(self.ctx, None, snap=snap)
+        self.assertIn("watcher will switch", said[0])
 
     def test_a_WATCH_that_returns_in_the_same_window_is_not_said_again(self):
         """THE FLAP (review P2-1): WATCH, then OK, then WATCH again early in
@@ -678,13 +698,17 @@ class InFlightTest(unittest.TestCase):
     """Nothing here posts, stops, pauses or refuses: every output is a line,
     a record or an ordering."""
 
-    def test_the_pass_and_the_steer_touch_no_seat_room_or_dispatch(self):
+    def test_the_pass_and_the_steer_touch_no_seat_room_or_dispatch(self):  # noqa: VACUOUS_ASSERTION — posting nothing is the product law; the pass's steer and pressed map are asserted positively first
         from helm import chat
         tmp = tempfile.mkdtemp(prefix="helm-test-claudepace-flight-")
         self.addCleanup(shutil.rmtree, tmp, True)
         path = os.path.join(tmp, "snap.json")
         boom = mock.Mock(side_effect=AssertionError("posted"))
-        with mock.patch.object(chat, "post", boom):
+        with mock.patch.object(chat, "post", boom), \
+                mock.patch.object(cp, "_default_key", return_value=None), \
+                mock.patch.object(cp, "_census_tiers", return_value={}), \
+                mock.patch.dict(os.environ, {
+                    "HELM_HOME": os.path.join(tmp, "helm")}):
             reading = cp.watch_pass(now=at(18, 52), rows=rows_of(series(HOT)),
                                     path=path)
             snap = dict(reading)
@@ -701,6 +725,579 @@ class InFlightTest(unittest.TestCase):
         for verb in ("chat.post", "dispatches", "interrupt", "kill(",
                      "send_keys", "notify"):
             self.assertNotIn(verb, source)
+
+
+# ------------------------------------------------------------ task/3871
+
+NOW = at(21, 7)
+WEEK_RESET = at(19, 50) + 3 * 86400
+
+
+def wrow(account, ts, five, week, five_reset=RESET, week_reset=WEEK_RESET,
+         tier="Max 20x", status="allowed"):
+    """A history row with both account-wide gauges and the plan, as the creds
+    probe writes it once rows name their tier."""
+    gauges = [{"label": "5h", "kind": "session", "utilization": five / 100.0,
+               "reset": five_reset, "limit": None, "remaining": None},
+              {"label": "7d", "kind": "period", "utilization": week / 100.0,
+               "reset": week_reset, "limit": None, "remaining": None}]
+    row = {"provider": "anthropic", "account": account, "probed_at": iso(ts),
+           "status": status, "primary": "5h", "gauges": gauges,
+           "source_at": None}
+    if tier:
+        row["tier"] = tier
+    return row
+
+
+class WrongSteerTest(unittest.TestCase):
+    """THE MEASURED BUG (task/3871). At 21:07Z a baseload seat on a TIGHT
+    account was told "no other Claude account is known to have room, so
+    route NEW builds and reviews to codex" while the account the watcher
+    then switched to sat idle with 94% of its week: an idle account has no
+    open 5h window, so it read UNKNOWN, and task/3718 made UNKNOWN not room."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-claudepace-3871-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.ctx = {"harness": "claude", "config_home": _claude_home(
+            os.path.join(self.tmp, "claude-a"), ACCT)}
+        patcher = mock.patch.dict(os.environ, {"HELM_CHAT_NAME": ""})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def world(self, other_rows):
+        """This seat's account TIGHT at 86-93% of a window resetting 23:20Z,
+        beside the other account's rows, read at 21:07Z."""
+        mine = [wrow(ACCT, at(20, 30) + i * 300, 86 + i, 60 + i * 0.2,
+                     five_reset=at(23, 20)) for i in range(8)]
+        return cp.read(mine + other_rows, NOW)
+
+    def test_an_idle_pool_account_is_room_and_the_seat_hears_the_switch(self):
+        snap = self.world([wrow(OTHER, at(20, 50), 0, 6, five_reset=None)])
+        said = cp.steer(self.ctx, None, snap=snap)
+        self.assertIsNotNone(said)
+        self.assertIn("watcher will switch", said[0])
+        self.assertNotIn("route NEW", said[0])
+        self.assertNotIn("known to have room", said[0])
+        rec = snap["accounts"][accounts.measured_key(OTHER)]
+        self.assertEqual(rec["state"], cp.UNKNOWN)
+        self.assertTrue(rec["idle"])
+        self.assertIn("no 5h window is open", rec["why"])
+
+    def test_an_account_in_use_that_nothing_can_pace_is_still_not_room(self):  # noqa: VACUOUS_ASSERTION — each arm asserts the routing line positively on the same line it checks for the switch
+        """task/3718's intent, kept: an OPEN window with one reading (in use,
+        no pace yet) and a probe that did not read are not room."""
+        for other in ([wrow(OTHER, at(21, 0), 12, 6,
+                            five_reset=at(23, 55))],
+                      [hrow(OTHER, at(21, 0), None, status="http_429")],
+                      []):
+            said = cp.steer(self.ctx, None, snap=self.world(other))
+            self.assertIn("known to have room", said[0], other)
+            self.assertNotIn("watcher will switch", said[0])
+        # CONTROL: the same account idle is room
+        said = cp.steer(self.ctx, None, snap=self.world(
+            [wrow(OTHER, at(21, 0), 0, 6, five_reset=None)]))
+        self.assertIn("watcher will switch", said[0])
+
+    def test_the_watchers_candidate_rule_bounds_room(self):
+        """Only an account the watcher would pick: a Max plan, under 90% of
+        its week, idle within a day or OK under 70% of its 5h window."""
+        stale = NOW - cp.IDLE_MAX_AGE_S - 60
+        for label, other in (
+                ("walled week", [wrow(OTHER, at(20, 50), 0, 95,
+                                      five_reset=None)]),
+                ("Team plan", [wrow(OTHER, at(20, 50), 0, 6, five_reset=None,
+                                    tier="Team")]),
+                ("no plan", [wrow(OTHER, at(20, 50), 0, 6, five_reset=None,
+                                  tier=None)]),
+                ("idle a day ago", [wrow(OTHER, stale, 0, 6,
+                                         five_reset=None)])):
+            said = cp.steer(self.ctx, None, snap=self.world(other))
+            self.assertIn("known to have room", said[0], label)
+        snap = self.world([])
+        key = accounts.measured_key(OTHER)
+        snap["accounts"][key] = room(used_pct=75.0)
+        self.assertIn("known to have room",
+                      cp.steer(self.ctx, None, snap=snap)[0])
+        # CONTROL: the same account under 70% of its window is room
+        snap["accounts"][key] = room(used_pct=65.0)
+        self.assertIn("watcher will switch",
+                      cp.steer(self.ctx, None, snap=snap)[0])
+
+    def test_the_switch_line_carries_the_pool_pace_and_the_project(self):
+        snap = self.world([wrow(OTHER, at(20, 50), 0, 6, five_reset=None)])
+        snap["pool"] = dict(POOL, state=cp.EASE, colour="ORANGE",
+                            advice="ease off about 55%")
+        with mock.patch.object(cp, "_project_light", return_value=(
+                "helm", "yellow", "only release blockers and P0s")):
+            line = cp.steer(dict(self.ctx, cwd="/w"), None, snap=snap)[0]
+        self.assertIn("Claude pool ORANGE: ease off about 55%", line)
+        self.assertIn("horizon", line)
+        # review P2-2: ONE meaning per light, the registry's, and the kind
+        # of work the project wants rides its authored reason
+        from helm import registry
+        self.assertIn(" helm is YELLOW: %s." % registry.LIGHT_SAYS["yellow"],
+                      line)
+        self.assertIn("only release blockers and P0s", line)
+        from helm.inject._common import STEER_CAP
+        self.assertLessEqual(len(line), STEER_CAP)
+
+    def test_an_idle_reading_is_not_room_once_a_newer_row_did_not_read_it(self):
+        """review P2-1: an idle row stays idle only while nothing newer was
+        written for that account. A later row that did not read it (a 429, a
+        lapsed copy's refresh-due row) may be the account in use."""
+        idle = wrow(OTHER, at(20, 30), 0, 6, five_reset=None)
+        key = accounts.measured_key(OTHER)
+        for later in (hrow(OTHER, at(20, 55), None, status="http_429"),
+                      hrow(OTHER, at(20, 55), None,
+                           status="keepalive due (helm's token lapsed)")):
+            snap = self.world([idle, later])
+            self.assertFalse(snap["accounts"][key]["idle"], later["status"])
+            said = cp.steer(self.ctx, None, snap=snap)
+            self.assertIn("known to have room", said[0])
+        # CONTROL: a newer row that reads it idle again keeps it room
+        snap = self.world([idle, wrow(OTHER, at(20, 55), 0, 6,
+                                      five_reset=None)])
+        self.assertTrue(snap["accounts"][key]["idle"])
+        self.assertIn("watcher will switch",
+                      cp.steer(self.ctx, None, snap=snap)[0])
+
+    def test_an_idle_reading_past_eight_hours_takes_the_stale_bound(self):
+        """review P2-1: past IDLE_FRESH_S an idle reading counts only under
+        the watcher's own bound for a remembered reading (80% of the week)."""
+        old = NOW - cp.IDLE_FRESH_S - 60
+        for week, verdict in ((85, "known to have room"),
+                              (75, "watcher will switch")):
+            snap = self.world([wrow(OTHER, old, 0, week, five_reset=None)])
+            self.assertIn(verdict, cp.steer(self.ctx, None, snap=snap)[0],
+                          week)
+        # CONTROL: a fresh idle reading at 85% is under the 90% bound
+        snap = self.world([wrow(OTHER, at(20, 50), 0, 85, five_reset=None)])
+        self.assertIn("watcher will switch",
+                      cp.steer(self.ctx, None, snap=snap)[0])
+
+
+class CensusTierTest(unittest.TestCase):
+    """review P3-1: a row that names no plan (every row written before rows
+    carried one) takes the plan from the providers' account census, a read
+    of home and Orca metadata files with no vendor call."""
+
+    def test_a_row_with_no_plan_takes_the_census_plan(self):
+        key = accounts.measured_key(OTHER)
+        rows = [wrow(OTHER, at(20, 50), 0, 6, five_reset=None, tier=None)]
+        self.assertFalse(cp.read(rows, NOW)["accounts"][key]["pool"])
+        snap = cp.read(rows, NOW, census={OTHER: "Max 5x"})
+        self.assertTrue(snap["accounts"][key]["pool"])
+        # a row's own plan outranks the census
+        team = [wrow(OTHER, at(20, 50), 0, 6, five_reset=None, tier="Team")]
+        self.assertFalse(cp.read(team, NOW, census={OTHER: "Max 5x"})
+                         ["accounts"][key]["pool"])
+
+    def test_the_pass_asks_the_census_only_when_a_row_names_no_plan(self):
+        tmp = tempfile.mkdtemp(prefix="helm-test-claudepace-census-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "snap.json")
+        untiered = [wrow(OTHER, at(20, 50), 0, 6, five_reset=None, tier=None)]
+        with mock.patch.object(cp, "_default_key", return_value=None), \
+                mock.patch.dict(os.environ, {
+                    "HELM_HOME": os.path.join(tmp, "helm")}):
+            with mock.patch.object(cp, "_census_tiers",
+                                   return_value={OTHER: "Max 20x"}) as ask:
+                snap = cp.watch_pass(now=NOW, rows=untiered, path=path)
+            ask.assert_called_once_with()
+            self.assertTrue(
+                snap["accounts"][accounts.measured_key(OTHER)]["pool"])
+            with mock.patch.object(cp, "_census_tiers",
+                                   side_effect=AssertionError("asked")):
+                snap = cp.watch_pass(now=NOW, rows=[wrow(
+                    OTHER, at(20, 50), 0, 6, five_reset=None)], path=path)
+            self.assertTrue(
+                snap["accounts"][accounts.measured_key(OTHER)]["pool"])
+
+
+#: A pool record as `pool_reading` writes one (the EASE example below).
+POOL = {"state": "EASE", "colour": "ORANGE", "advice": "ease off about 55%",
+        "why": None, "accounts": 3, "read": 3, "left_pct": 105.0,
+        "pct_per_hour": 4.0, "span_s": 6 * 3600,
+        "runout_at": NOW + 26.25 * 3600, "horizon_at": NOW + 57 * 3600,
+        "horizon_from": "reset", "ratio": 2.17}
+
+
+def wrec(weekly, spent, reset, frm=NOW - 6 * 3600, pool=True):
+    """One account's record with its weekly fields."""
+    return {"pool": pool, "weekly_pct": weekly, "weekly_spent_pct": spent,
+            "weekly_spent_from": frm, "weekly_reset_at": reset}
+
+
+class PaceAdviceTest(unittest.TestCase):
+    """THE STOPLIGHT ADVICE: the pool's burn against its horizon."""
+
+    #: The owner's measured day: a Max 20x at 70% resetting Tuesday, a
+    #: second account at 25% after its reset, a third walled until
+    #: Saturday, and a project-homed Team account with room that is not the
+    #: pool's.
+    def owners_day(self, spend=12.0):
+        return {"a": wrec(70.0, spend, NOW + 5 * 86400),
+                "c": wrec(25.0, spend, NOW + 6 * 86400),
+                "d": wrec(100.0, 0.0, NOW + 57 * 3600),
+                "t": wrec(10.0, 30.0, NOW + 3600, pool=False)}
+
+    def test_the_owners_day_reads_ORANGE_ease_off(self):
+        pool = cp.pool_reading(self.owners_day(), NOW)
+        self.assertEqual(pool["accounts"], 3)            # the Team one is out
+        self.assertEqual(pool["left_pct"], 105.0)
+        self.assertEqual(pool["pct_per_hour"], 4.0)
+        # the default horizon: david's reset, the soonest returning half a week
+        self.assertEqual(pool["horizon_at"], NOW + 57 * 3600)
+        self.assertEqual(pool["horizon_from"], "reset")
+        self.assertEqual(pool["state"], cp.EASE)
+        self.assertEqual(pool["colour"], "ORANGE")
+        self.assertEqual(pool["advice"], "ease off about 55%")
+        self.assertAlmostEqual(pool["runout_at"], NOW + 26.25 * 3600)
+        text = cp.pool_clause(pool)
+        for part in ("Claude pool ORANGE: ease off about 55%",
+                     "4.0%/h of a week over 6h", "105% left",
+                     "out ~", "before horizon"):
+            self.assertIn(part, text)
+
+    def test_the_owners_horizon_outranks_the_reset(self):
+        pool = cp.pool_reading(self.owners_day(), NOW,
+                               horizon={"at": NOW + 20 * 3600})
+        self.assertEqual(pool["horizon_from"], "owner")
+        self.assertEqual((pool["state"], pool["colour"], pool["advice"]),
+                         (cp.EVEN, "YELLOW", "on pace"))
+        # a horizon already past is no horizon
+        past = cp.pool_reading(self.owners_day(), NOW,
+                               horizon={"at": NOW - 60})
+        self.assertEqual(past["horizon_from"], "reset")
+
+    def test_a_slow_burn_can_go_faster_and_an_imminent_run_out_is_RED(self):
+        slow = cp.pool_reading(self.owners_day(spend=1.0), NOW)
+        self.assertEqual((slow["state"], slow["colour"]), (cp.FASTER, "GREEN"))
+        self.assertTrue(slow["advice"].startswith("can go faster (about "))
+        near = cp.pool_reading({"a": wrec(99.0, 12.0, NOW + 57 * 3600),
+                                "b": wrec(98.0, 12.0, NOW + 90 * 3600)}, NOW)
+        self.assertEqual((near["state"], near["colour"]), (cp.EASE, "RED"))
+        spent = cp.pool_reading({"a": wrec(100.0, 0.0, NOW + 57 * 3600)}, NOW)
+        self.assertEqual(spent["colour"], "RED")
+        self.assertIn("spent until", spent["advice"])
+
+    def test_the_pace_holds_with_hysteresis(self):  # noqa: VACUOUS_ASSERTION — every arm asserts one exact state
+        """One account at 50% with the owner's horizon 50h out needs 1%/h:
+        a spend of 6.3 over 6h is ratio 1.05, and 4.5 is 0.75."""
+        horizon = {"at": NOW + 50 * 3600}
+
+        def pace(spent, prior=None):
+            return cp.pool_reading({"a": wrec(50.0, spent, NOW + 99 * 3600)},
+                                   NOW, horizon, prior)["state"]
+        self.assertEqual(pace(6.3), cp.EVEN)
+        self.assertEqual(pace(6.3, {"state": cp.EASE}), cp.EASE)
+        self.assertEqual(pace(5.7, {"state": cp.EASE}), cp.EVEN)
+        self.assertEqual(pace(4.5), cp.EVEN)
+        self.assertEqual(pace(4.5, {"state": cp.FASTER}), cp.FASTER)
+        self.assertEqual(pace(6.9), cp.EASE)
+        self.assertEqual(pace(4.0), cp.FASTER)
+
+    def test_too_short_a_span_or_no_reading_is_UNKNOWN(self):
+        short = cp.pool_reading({"a": wrec(50.0, 3.0, NOW + 99 * 3600,
+                                           frm=NOW - 1800)}, NOW)
+        self.assertEqual(short["state"], cp.UNKNOWN)
+        self.assertIn("a burn needs 60m", short["why"])
+        none = cp.pool_reading({"t": wrec(10.0, 1.0, NOW + 3600,
+                                          pool=False)}, NOW)
+        self.assertEqual(none["state"], cp.UNKNOWN)
+        self.assertIn("UNKNOWN", cp.pool_clause(none))
+
+    def test_a_reset_before_the_horizon_adds_a_whole_week(self):  # noqa: VACUOUS_ASSERTION — one exact ratio and one exact instant
+        """review P3-5: an account resetting before the horizon has its
+        headroom until the reset AND a whole new week after it."""
+        recs = {"a": wrec(80.0, 6.0, NOW + 10 * 3600),
+                "b": wrec(80.0, 6.0, NOW + 99 * 3600)}
+        pool = cp.pool_reading(recs, NOW, horizon={"at": NOW + 50 * 3600})
+        # 40% left now, and a's reset adds a whole week: 140 over 50h
+        self.assertAlmostEqual(pool["ratio"], round(2.0 / (140 / 50.0), 2))
+        # an owner horizon past a week is read at a week, so no account
+        # resets twice before it
+        far = cp.pool_reading(recs, NOW, horizon={"at": NOW + 10 * 86400})
+        self.assertEqual(far["horizon_at"], NOW + cp.HORIZON_MAX_S)
+
+    def test_the_week_reading_spends_only_the_open_week(self):  # noqa: VACUOUS_ASSERTION — the open week's numbers are asserted exactly first; the None is the closed week's contract
+        pts = [(NOW - 7 * 3600, 40.0, WEEK_RESET),      # before the span
+               (NOW - 5 * 3600, 42.0, WEEK_RESET),
+               (NOW - 3600, 47.0, WEEK_RESET)]
+        rec = cp.week_reading(pts, NOW)
+        self.assertEqual((rec["weekly_pct"], rec["weekly_spent_pct"]),
+                         (47.0, 5.0))
+        self.assertEqual(rec["weekly_spent_from"], NOW - 5 * 3600)
+        # a week already reset is no reading of this one
+        self.assertIsNone(cp.week_reading(
+            [(NOW - 3600, 47.0, NOW - 60)], NOW)["weekly_pct"])
+
+    def test_a_week_not_started_reads_zero(self):  # noqa: VACUOUS_ASSERTION — exact 0.0 and an exact pool count and headroom
+        """review P3-2: 0% with no reset is a week nobody has used, read as
+        0%, never as no reading."""
+        rec = cp.week_reading([(NOW - 3600, 0.0, None)], NOW)
+        self.assertEqual(rec["weekly_pct"], 0.0)
+        pool = cp.pool_reading({"a": dict(wrec(40.0, 6.0, NOW + 99 * 3600)),
+                                "b": dict(rec, pool=True)}, NOW)
+        self.assertEqual((pool["read"], pool["left_pct"]), (2, 160.0))
+
+
+class HorizonVerbTest(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-claudepace-horizon-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        patcher = mock.patch.dict(os.environ, {
+            "HELM_HOME": os.path.join(self.tmp, "helm"),
+            "HELM_CHAT_NAME": "seat-a"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def run_verb(self, *args):
+        from helm import burnflags
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = burnflags.cmd_burn(["horizon"] + list(args))
+        return rc, out.getvalue() + err.getvalue()
+
+    def test_set_show_and_clear(self):  # noqa: VACUOUS_ASSERTION — the set horizon is asserted exactly before the clear empties it
+        import time
+        at_ = time.time() + 2 * 86400
+        rc, text = self.run_verb("anthropic", iso(at_), "until", "d", "resets")
+        self.assertEqual(rc, 0, text)
+        rec = cp.load_horizon()
+        self.assertEqual(rec["at"], float(int(at_)))
+        self.assertEqual((rec["by"], rec["why"]), ("seat-a", "until d resets"))
+        rc, text = self.run_verb()
+        self.assertEqual(rc, 0)
+        self.assertIn("until d resets", text)
+        self.assertEqual(self.run_verb("anthropic", "--clear")[0], 0)
+        self.assertIsNone(cp.load_horizon())
+        self.assertIn("no owner horizon", self.run_verb()[1])
+
+    def test_a_bad_horizon_is_refused(self):  # noqa: VACUOUS_ASSERTION — a refusal writes nothing, and each arm asserts exit 2
+        import time
+        for args in (("anthropic", iso(time.time() - 60)),
+                     ("anthropic", iso(time.time() + 8 * 86400)),
+                     ("anthropic", iso(time.time() + 30 * 86400)),
+                     ("anthropic", "saturday"),
+                     ("codex", iso(time.time() + 86400)),
+                     ("anthropic",)):
+            rc, text = self.run_verb(*args)
+            self.assertEqual(rc, 2, (args, text))
+        self.assertIsNone(cp.load_horizon())
+
+    def test_the_verb_is_named_in_the_usage_the_help_and_the_docs(self):
+        from helm import burnflags, cli_help
+        for text in (burnflags._USAGE, cli_help._VERB_HELP["burn"]):
+            self.assertIn("burn horizon [anthropic <utc-iso>", text)
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "docs", "VERBS.md"),
+                  encoding="utf-8") as fh:
+            self.assertIn("helm burn horizon", fh.read())
+
+    def test_burn_prints_the_pool_and_each_projects_advice(self):
+        from helm import registry
+        snap = {"v": cp.V, "ts": NOW, "accounts": {
+            "a": wrec(70.0, 12.0, NOW + 5 * 86400),
+            "c": wrec(25.0, 12.0, NOW + 6 * 86400),
+            "d": wrec(100.0, 0.0, NOW + 57 * 3600)}, "pool": None}
+        lights = {"proj-a": {"colour": "green", "authored": True,
+                             "reason": "ship v1"},
+                  "helm": {"colour": "yellow", "authored": True,
+                           "reason": ""},
+                  "dev": {"colour": "active", "authored": False}}
+        with mock.patch.object(cp, "cached", return_value=snap), \
+                mock.patch.object(registry, "load", return_value={}), \
+                mock.patch.object(registry, "lights", return_value=lights):
+            lines = cp.burn_lines(now=NOW)
+        pool = [l for l in lines if "claude pool pace" in l]
+        self.assertEqual(len(pool), 1, lines)
+        self.assertIn("Claude pool ORANGE: ease off about 55%", pool[0])
+        self.assertIn("3 of 3 pool account(s) read", pool[0])
+        projects = [l for l in lines if "claude pace for" in l]
+        self.assertEqual(projects, [
+            "  claude pace for proj-a (GREEN): %s (reason: ship v1)"
+            % registry.LIGHT_SAYS["green"],
+            "  claude pace for helm (YELLOW): %s"
+            % registry.LIGHT_SAYS["yellow"]])
+
+
+class HandoffTest(unittest.TestCase):
+    """THE SPLIT AT THE HANDOFF: when the default home's account changes,
+    every native Claude seat taking a turn hears one line for that switch."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-claudepace-handoff-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.home = _claude_home(os.path.join(self.tmp, "claude-a"), ACCT)
+        self.ctx = {"harness": "claude", "config_home": self.home}
+        patcher = mock.patch.dict(os.environ, {"HELM_CHAT_NAME": ""})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def rows(self, end):
+        """Six hours of both pool accounts spending 2%/h of a week each."""
+        out = []
+        for i in range(13):
+            t = end - 6 * 3600 + i * 1800
+            out += [wrow(ACCT, t, 30, 58 + i, five_reset=end + 3600),
+                    wrow(OTHER, t, 0, 13 + i, five_reset=None)]
+        return out
+
+    def switched(self):
+        t1, t2 = NOW - 600, NOW
+        first = cp.read(self.rows(t1), t1, None, default_key="m-a")
+        self.assertIsNone(first["switch"])
+        return cp.read(self.rows(t2), t2, first, default_key="m-b")
+
+    def test_a_switch_is_heard_once_per_seat_with_the_pace(self):
+        snap = self.switched()
+        self.assertEqual(snap["switch"], {"at": NOW, "from": "m-a",
+                                          "to": "m-b"})
+        line, heard = cp.handoff(self.ctx, None, now=NOW + 60, snap=snap)
+        for part in ("switched accounts at 21:07Z", "Claude pool",
+                     "%/h of a week over 6h", "% left",
+                     "horizon", "ease off about"):
+            self.assertIn(part, line)
+        from helm.inject._common import STEER_CAP
+        self.assertLessEqual(len(line), STEER_CAP)
+        self.assertIsNone(cp.handoff(self.ctx, heard, now=NOW + 120,
+                                     snap=snap))
+        # every native seat hears it once, in its own context
+        other = _claude_home(os.path.join(self.tmp, "claude-b"), OTHER)
+        self.assertIsNotNone(cp.handoff(dict(self.ctx, config_home=other),
+                                        None, now=NOW + 60, snap=snap))
+        self.assertIsNone(cp.handoff(dict(self.ctx, harness="codex"), None,
+                                     now=NOW + 60, snap=snap))
+        # a later pass on the same account carries the switch, said once
+        later = cp.read(self.rows(NOW + 300), NOW + 300, snap,
+                        default_key="m-b")
+        self.assertEqual(later["switch"]["at"], NOW)
+        self.assertIsNone(cp.handoff(self.ctx, heard, now=NOW + 360,
+                                     snap=later))
+        # an unread home carries both forward
+        blind = cp.read(self.rows(NOW + 600), NOW + 600, later)
+        self.assertEqual((blind["default"]["key"], blind["switch"]["at"]),
+                         ("m-b", NOW))
+        # the next switch is news
+        back = cp.read(self.rows(NOW + 900), NOW + 900, later,
+                       default_key="m-a")
+        self.assertIsNotNone(cp.handoff(self.ctx, heard, now=NOW + 960,
+                                        snap=back))
+        # CONTROL: a switch older than HANDOFF_SAY_S is not said
+        self.assertIsNone(cp.handoff(self.ctx, None,
+                                     now=NOW + cp.HANDOFF_SAY_S + 60,
+                                     snap=snap))
+
+    def test_a_seat_homed_off_the_pool_does_not_hear_it(self):
+        snap = self.switched()
+        snap["accounts"][accounts.measured_key(ACCT)]["pool"] = False
+        from helm import cred
+        with mock.patch.object(cred, "is_credhome", return_value=True):
+            self.assertIsNone(cp.handoff(self.ctx, None, now=NOW + 60,
+                                         snap=snap))
+        # CONTROL: the same seat on the baseload home hears it
+        with mock.patch.object(cred, "is_credhome", return_value=False):
+            self.assertIsNotNone(cp.handoff(self.ctx, None, now=NOW + 60,
+                                            snap=snap))
+
+    def test_the_line_names_the_projects_advice(self):
+        snap = self.switched()
+        from helm import registry
+        with mock.patch.object(cp, "_project_light",
+                               return_value=("proj-a", "green", "")):
+            line = cp.handoff(dict(self.ctx, cwd="/w"), None, now=NOW + 60,
+                              snap=snap)[0]
+        self.assertIn(" proj-a is GREEN: %s." % registry.LIGHT_SAYS["green"],
+                      line)
+
+    def test_a_homed_seat_whose_account_is_unknown_does_not_hear_it(self):
+        """review P3-3: a homed seat whose account the snapshot does not
+        read is not known to spend the pool, so it is not told."""
+        from helm import cred
+        snap = self.switched()
+        del snap["accounts"][accounts.measured_key(ACCT)]
+        with mock.patch.object(cred, "is_credhome", return_value=True):
+            self.assertIsNone(cp.handoff(self.ctx, None, now=NOW + 60,
+                                         snap=snap))
+        # CONTROL: a homed seat on a pool account hears it
+        with mock.patch.object(cred, "is_credhome", return_value=True):
+            self.assertIsNotNone(cp.handoff(self.ctx, None, now=NOW + 60,
+                                            snap=self.switched()))
+
+    def test_the_worst_case_lines_fit_and_the_cap_cuts_only_the_reason(self):  # noqa: VACUOUS_ASSERTION — each list holds two built lines, and each is asserted to carry the light and the advice
+        """review P3-4: a FASTER pool and an 18-character project key on the
+        longest light fit the steer cap; a long reason rides last, so the cap
+        cuts the reason and never the advice."""
+        import importlib
+        from helm import registry
+        from helm.inject._common import STEER_CAP
+        _whisper = importlib.import_module("helm.inject._whisper")
+        faster = dict(POOL, state="FASTER", colour="GREEN", runout_at=None,
+                      advice="can go faster (about 200% more)",
+                      pct_per_hour=0.3)
+        snap = dict(self.switched(), pool=faster)
+        rec = {"state": cp.TIGHT, "used_pct": 93.0, "reset_at": RESET}
+        key18 = "eighteen-chars-key"
+        ctx = dict(self.ctx, cwd="/w")
+        with mock.patch.object(cp, "_project_light",
+                               return_value=(key18, "green", "")):
+            lines = [cp.handoff(ctx, None, now=NOW + 60, snap=snap)[0],
+                     cp.switch_line(rec, snap, "/w")]
+        for line in lines:
+            self.assertLessEqual(len(line), STEER_CAP, line)
+            self.assertIn(registry.LIGHT_SAYS["green"], line)
+            self.assertIn("can go faster (about 200% more)", line)
+        with mock.patch.object(cp, "_project_light", return_value=(
+                key18, "green", "the owner wants this shipped " * 6)):
+            lines = [_whisper._cap_steer(cp.handoff(
+                ctx, None, now=NOW + 60, snap=snap)[0]),
+                _whisper._cap_steer(cp.switch_line(rec, snap, "/w"))]
+        for line in lines:
+            self.assertIn(registry.LIGHT_SAYS["green"], line)
+            self.assertIn("can go faster (about 200% more)", line)
+
+    def test_the_pass_reads_the_default_home_and_the_horizon(self):
+        path = os.path.join(self.tmp, "snap.json")
+        hpath = os.path.join(self.tmp, "helm")
+        with mock.patch.dict(os.environ, {"HELM_HOME": hpath}):
+            ok, _err = cp.set_horizon(NOW + 20 * 3600, now=NOW)
+            self.assertTrue(ok)
+            with mock.patch.object(cp, "_default_key", return_value="m-a"):
+                cp.watch_pass(now=NOW - 600, rows=self.rows(NOW - 600),
+                              path=path)
+            with mock.patch.object(cp, "_default_key", return_value="m-b"):
+                snap = cp.watch_pass(now=NOW, rows=self.rows(NOW), path=path)
+        self.assertEqual(snap["switch"]["to"], "m-b")
+        self.assertEqual(snap["pool"]["horizon_from"], "owner")
+
+    def test_the_handoff_rides_inject_once_per_switch(self):
+        import importlib
+        import time
+        from helm import inject, injection_schema
+        _whisper = importlib.import_module("helm.inject._whisper")
+        env = {"HELM_HOME": os.path.join(self.tmp, "helm"),
+               "HELM_ADOPTED_DIR": os.path.join(self.tmp, "adopted"),
+               "HELM_CACHE_DIR": os.path.join(self.tmp, "cache"),
+               "HELM_CHAT_DIR": os.path.join(self.tmp, "chat"),
+               "HELM_SEAT_NAMES": os.path.join(self.tmp, "seat-names.txt")}
+        os.makedirs(env["HELM_ADOPTED_DIR"])
+        context = (injection_schema.V3, dict(self.ctx, session="s-2"), {},
+                   None, None)
+        now = time.time()
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(_whisper, "_sample_context",
+                                  return_value=context):
+            self.assertTrue(cp.write_snapshot({
+                "v": cp.V, "ts": now, "accounts": {}, "pool": POOL,
+                "switch": {"at": now - 60, "from": "m-a", "to": "m-b"}}))
+            said = [inject.gather("carry on with the build", session="s-2")
+                    ["reflex"] for _ in range(3)]
+        hits = [[l for l in lane if "switched accounts" in l] for lane in said]
+        self.assertEqual(len(hits[0]), 1, said[0])
+        self.assertEqual(hits[1:], [[], []])
 
 
 if __name__ == "__main__":

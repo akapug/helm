@@ -89,7 +89,8 @@ class PinBackfillBase(_close.CloseBase):
     def send(self, tip, lane):
         row, why, _sent = dispatches.send(
             READER, lane, "review " + lane, tip, repo=self.repo,
-            key="key-" + lane, sign=False, new_work=True)
+            key="key-" + lane, sign=False, new_work=True,
+            task=self.review_task["id"])
         self.assertIsNone(why)
         return row
 
@@ -97,7 +98,7 @@ class PinBackfillBase(_close.CloseBase):
         """A source-clean hold by the row's own recipient (task/3053)."""
         with mock.patch.object(dispatches, "_acting_author",
                                return_value=(row["recipient"], None)):
-            return dispatches.mark_hold(row["id"], "awaiting the land gate",
+            return dispatches.mark_hold(row["id"], "awaiting the land gate; fab Ran 5 tests OK",
                                         source_clean_tip=tip)
 
     def rebind(self, rid, repo_id, repo_root):

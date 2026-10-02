@@ -81,6 +81,17 @@ def _mint_providers(family, fam, base_url):
                  for route in proxy_routes(family))
 
 
+def _chosen_pool_provider(fam, args):
+    """The pool row `--provider` names, else the family's default; None for a
+    family without a pool or a `--provider` with no value (refused below)."""
+    if not fam.get("pool_providers"):
+        return None
+    if "--provider" in args:
+        index = args.index("--provider") + 1
+        return args[index] if index < len(args) else None
+    return fam.get("pool_default")
+
+
 def _add_proxy_key(family, fam, args, room=None, room_source=None):
     """mode "proxy-key": an API-key provider behind the same local proxy via
     its openai-compatibility block. No OAuth, no auth-dir. Key source order:
@@ -118,6 +129,14 @@ def _add_proxy_key(family, fam, args, room=None, room_source=None):
     # before any keyless branch below could be reached.
     key_vars = ((key_env,) if key_env else ()) \
         + tuple(fam.get("key_env_fallbacks") or ())
+    # THE FAMILY'S KEY VARIABLES ARE ITS DEFAULT ROW'S. The pro family's
+    # DS4PRO_API_KEY is the DeepSeek direct key; a seat minted on another pool
+    # row (the Go subscription) reads that row's own credential, and the env var and
+    # --key-from lines named after the family are never consulted for it, or
+    # the direct key would be sent to the other vendor.
+    chosen = _chosen_pool_provider(fam, args)
+    if fam.get("pool_providers") and chosen != fam.get("pool_default"):
+        key_vars = ()
     key_var = next((v for v in key_vars if os.environ.get(v)), None)
     api_key = os.environ.get(key_var) if key_var else None
     # provider selection + outbound routing. Non-pool families (kimi) carry the
@@ -170,6 +189,14 @@ def _add_proxy_key(family, fam, args, room=None, room_source=None):
                   "(https, or plain http to a literal private or loopback "
                   "address)" % base_url, file=sys.stderr)
             return 1
+    elif "--key-from" in args and not key_vars:
+        # the file's lines are named after the family's variables, which are
+        # the default row's; the chosen row reads its own credential store
+        print("helm seat: --key-from reads %s's own key lines, which belong "
+              "to its default provider %s; provider %s reads its key from %s "
+              "or %s" % (family, fam.get("pool_default"), pool_provider,
+                         OPENCODE_AUTHSTORE, HERMES_AUTH), file=sys.stderr)
+        return 2
     elif not api_key and "--key-from" in args:
         path = os.path.expanduser(args[args.index("--key-from") + 1])
         for v in key_vars:
@@ -203,6 +230,13 @@ def _add_proxy_key(family, fam, args, room=None, room_source=None):
                 # authstore is the PREFERRED path, so masking its error behind
                 # the hermes one hides the reason the operator most needs.
                 pool_err = "; ".join(e for e in (as_err, hermes_err) if e)
+    if not api_key and not keyless and not key_vars:
+        print("helm seat: no outbound key for %s provider %s — ensure %s or "
+              "%s carries a live %s bearer (%s), then re-run `helm seat add "
+              "%s --provider %s`" % (family, pool_provider, OPENCODE_AUTHSTORE,
+                                     HERMES_AUTH, pool_provider, pool_err,
+                                     family, pool_provider), file=sys.stderr)
+        return 1
     if not api_key and not keyless:
         pool_hint = ""
         if pool_provider:
@@ -234,7 +268,12 @@ def _add_proxy_key(family, fam, args, room=None, room_source=None):
                                     api_keys=(KEYLESS_API_KEY_PLACEHOLDER,)
                                     if keyless else None,
                                     providers=_mint_providers(family, fam,
-                                                              base_url)))
+                                                              base_url),
+                                    # OpenCode Go's per-conversation header
+                                    # (GO_SESSION_HEADER), named by the row
+                                    session_header=prov_cfg.get(
+                                        "session_header")
+                                    if pool_provider else None))
     # MINT-ONLY DOOR: nonfatal on a shortened contract (the seat and config
     # are still created, and the minted launch.sh refuses to start a session
     # until the guard resolves). A surface refusal is still fatal.
@@ -249,9 +288,12 @@ def _add_proxy_key(family, fam, args, room=None, room_source=None):
               "carries the declared placeholder the proxy requires; "
               "provider %s -> %s" % (provider, base_url))
     else:
+        # a non-default row's key never came from the family's variables,
+        # so the line names the provider it was read for, not key_env
         print("  outbound %s key baked into config.yaml (0600 — value never "
-              "printed); provider %s -> %s" % (key_var or key_env, provider,
-                                               base_url))
+              "printed); provider %s -> %s"
+              % (key_var or (key_env if key_vars else pool_provider),
+                 provider, base_url))
     print("  proxy port %d; next: `helm seat up %s`, then `helm seat launch %s`"
           % (fam["port"], family, family))
     sidecar = fam.get("sidecar")

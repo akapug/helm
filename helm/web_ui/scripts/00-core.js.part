@@ -803,8 +803,7 @@ function foot(reg) {
   const ts = reg.generated_ts ? new Date(reg.generated_ts) : null;
   const when = ts && !isNaN(ts) ? age(ts.getTime() / 1000) : null;
   $("#foot").innerHTML = '<span class="fmark">⎈</span> ~/.helm' +
-    (when ? " · synced " + (when === "0d" ? "today" : when + " ago") : " · never synced") +
-    " · localhost surface — the CLI is the helm";
+    (when ? " · synced " + (when === "0d" ? "today" : when + " ago") : " · never synced");
 }
 
 
@@ -1239,14 +1238,38 @@ if ($("#stalehide")) $("#stalehide").onclick = () => {
   BUILD_DISMISSED = BUILD_SEEN;
   if (bar) bar.hidden = true;
 };
+/* ── THE OFFICE WEATHER (task/3902) ─────────────────────────────────────
+   The whole floor in one line, sunny, cloudy or stormy: the line his phone
+   gets when the word changes and `helm brief` opens with. The server
+   composes the words (`shown`, from the weather pass's state file); this
+   only draws them, coloured by the word, and says so when it was not read.
+   PURE. */
+function weatherStripHTML(w) {
+  if (!w || w.unavailable) return `<span class="wx wx-unread">office weather: not read</span>`;
+  const word = ["sunny", "cloudy", "stormy"].includes(w.word) ? w.word : "unread";
+  return `<span class="wx wx-${word}">${esc(w.shown || w.line || "office weather: not read")}</span>`;
+}
+function weatherShow(w) {
+  const el = $("#navweather");
+  if (!el) return;
+  el.innerHTML = weatherStripHTML(w);
+  el.title = (w && !w.unavailable && w.shown) || "";
+  el.hidden = false;
+  // the nav just changed height: the sticky offsets under it must follow
+  publishNavHeight();
+}
 async function pollReady() {
   try {
     const d = await j("/api/ready", READY_FETCH_MS);
     readyShow(d);
+    weatherShow(d && d.weather);
     BUILD_SEEN = (d && d.build) || "";
     staleBuildShow(BUILD_SEEN);
   }
-  catch (e) { readyShow({unavailable: "/api/ready did not answer — the console cannot see the gauge"}); }
+  catch (e) {
+    readyShow({unavailable: "/api/ready did not answer — the console cannot see the gauge"});
+    weatherShow({unavailable: true});
+  }
 }
 
 /* ================= LAND PIPELINE card (GET /api/lr) =================

@@ -9,10 +9,13 @@ launch: which account pays, and whether today's pace allows the spend.
 THE READING. The vendor's usage endpoint (the one helm/providers.py already
 probes for every Claude home) reports the promotional credit under the key
 `CREDIT_KEY`, with limit, used and remaining dollars and the expiry as its
-reset time. The read is one GET with the home's live access token, which is
-never printed or stored. An expired token cannot be read until Claude Code
-refreshes it, so the last reading of that account stands in when it is at
-most READING_MAX_AGE_S old, and says it is remembered.
+reset time. The read is one GET with a LIVE access token of the home's
+account, which is never printed or stored: the home's own when it is live,
+else the freshest live copy helm can see (helm/livecred.py: another helm home,
+or Orca's managed copy, read-only). A home whose own copy expired is not an
+account helm cannot read. With no live copy anywhere, the last reading of that
+account stands in when it is at most READING_MAX_AGE_S old, and says it is
+remembered.
 
 THE PACE. `daily_budget` is how much may be spent today, and by default it is
 NOT CAPPED: the owner never asked for promo credit to be rationed per day, and
@@ -62,7 +65,8 @@ def _num(value):
 def home_email(home):
     """The account a Claude home is logged into, from its own .claude.json,
     or None. The file is read, never written."""
-    data = pk.read_json(os.path.join(home or "", ".claude.json"), {}) or {}
+    home = os.path.expanduser(home or "")
+    data = pk.read_json(os.path.join(home, ".claude.json"), {}) or {}
     account = data.get("oauthAccount") if isinstance(data, dict) else None
     email = (account or {}).get("emailAddress") if isinstance(account, dict) \
         else None
@@ -72,11 +76,32 @@ def home_email(home):
 def token_live(home, margin_s=120):
     """Whether the home holds an access token that will outlive `margin_s`.
     The token is looked at, never returned."""
-    oauth = providers._claude_oauth(home)
+    oauth = providers._claude_oauth(os.path.expanduser(home or ""))
     if not providers._token_live(oauth):
         return False
     exp = providers._expires_ms(oauth)
     return exp is None or exp / 1000 > time.time() + margin_s
+
+
+def _live_copy(home, account):
+    """The copy `account` is read through for `home`: the freshest LIVE copy
+    of it among the home itself, the other copies helm can see and Orca's
+    managed copy (helm/livecred.py; read-only), or None. With no account the
+    home's metadata could name, only the home's own copy is a candidate."""
+    if not account:
+        oauth = providers._claude_oauth(home)
+        return {"path": home, "source": "credhome"} \
+            if providers._token_live(oauth) else None
+    from . import livecred
+    return livecred.live_copy(account, [home])
+
+
+def readable(home):
+    """Whether a credit reading of `home`'s account can be taken now: some
+    live copy of that account exists. A MEASUREMENT gate; whether a seat can
+    LAUNCH in the home is `token_live`, a different question."""
+    home = os.path.expanduser(home or "")
+    return _live_copy(home, home_email(home)) is not None
 
 
 def parse_credit(data):
@@ -98,10 +123,15 @@ def read_credit(home, get_json=None):
     `get_json(url, headers)` is the HTTP seam; the default is the native
     provider's own reader, so helm keeps one way of asking this endpoint."""
     at = pk.now_ts()
+    home = os.path.expanduser(home or "")
     account = home_email(home)
-    oauth = providers._claude_oauth(home)
-    if not providers._token_live(oauth):
-        return {"at": at, "account": account, "error": "no live access token"}
+    copy = _live_copy(home, account)
+    if copy is None:
+        from . import livecred
+        return {"at": at, "account": account,
+                "error": livecred.no_live_copy(account, [home]) if account
+                else "no live access token in %s" % home}
+    oauth = providers._claude_oauth(copy["path"])
     get_json = get_json or providers.NativeQuotaProvider._get_json
     try:
         data = get_json(providers.ANTHROPIC_USAGE_URL, {
@@ -115,7 +145,7 @@ def read_credit(home, get_json=None):
     if credit is None:
         return {"at": at, "account": account,
                 "error": "the account carries no cloud-session credit"}
-    credit.update(at=at, account=account)
+    credit.update(at=at, account=account, via=copy["source"])
     return credit
 
 

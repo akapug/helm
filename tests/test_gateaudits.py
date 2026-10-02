@@ -233,7 +233,7 @@ class TheLineRunsAsSlicesWhenTheSlicedPathIsEnabled(unittest.TestCase):
         self.assertNotIn("gateslice leak", proc.stderr)
 
 
-#: The checks a lane-on-lane composition made relevant through 09-25 while
+#: The checks a lane-on-lane composition made relevant through 09-30 while
 #: the standing list did not guarantee them. Named here, not read from
 #: `gateaudits`, so a list that loses one reddens instead of agreeing with
 #: itself. The receipts and cure commits that name each are in
@@ -241,7 +241,7 @@ class TheLineRunsAsSlicesWhenTheSlicedPathIsEnabled(unittest.TestCase):
 _COMPOSITION_CHECKS = ("test_world_literals", "test_assertion_hygiene",
                        "test_no_private_names", "test_delivery_truth",
                        "test_chat_reply", "test_trailer_rung",
-                       "test_burnflags")
+                       "test_burnflags", "test_change_notes")
 
 #: Modules that went red at a train gate in the same window and read only
 #: their own fixtures, so no other lane's change can redden them. Listing one

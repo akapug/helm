@@ -71,7 +71,7 @@ class ReplayAuthorCostIsLinearTest(_sc.SourceCleanBase):
         ids = []
         for i in range(n):
             row = self.row(self.b, "lane/%s-%d" % (prefix, i))
-            self.planted(row, self.b, actor=_sc.READER)
+            self.hold(row, self.b)
             ids.append(row["id"])
         rows, unavailable = dispatches.snapshot()
         self.assertIsNone(unavailable, unavailable)

@@ -244,6 +244,12 @@ _OWNER_SAY = {
                                   "a lead repairs that record's file"),
 }
 _OWNER_SAY_DEFAULT = ("signing failed for %s", "its lead repairs it")
+# A NODE THAT IS BOOTING IS NOT ONE TO RESTART (task/3891): the node
+# failures' words while chatnode's classifier reads the node BOOTING.
+_OWNER_SAY_BOOTING = ("the chat node is still starting up, so %s's posts "
+                      "went out unsigned", "nobody restarts it: a restart "
+                      "throws its startup work away and begins again, and it "
+                      "answers when the startup finishes")
 _OWNER_EXPECTED = (
     "%s posts unsigned: it runs outside helm's launcher, in a session that "
     "carries the profile '%s' and none of its own, and helm never signs a "
@@ -320,7 +326,8 @@ def _owner_say(f):
         else "a seat"
     if _expected_unsigned(f):
         return _OWNER_EXPECTED % (who, f["inherited_profile"])
-    fact, fixer = _OWNER_SAY.get(f.get("code"), _OWNER_SAY_DEFAULT)
+    fact, fixer = (_OWNER_SAY_BOOTING if f.get("node_state") == "booting"
+                   else _OWNER_SAY.get(f.get("code"), _OWNER_SAY_DEFAULT))
     tail = ("%s is not running now, so this waits until it comes back" % who
             if f.get("liveness") == "dark"
             else "it clears on %s's next signed post" % who
@@ -896,11 +903,19 @@ def _waiter_cursor_sessions(live):
 
 
 ROOMLESS_CURSOR_S = 3600   # a cursor on a missing room, untouched this long
+# A cursor on a room `helm chat retire-rooms` took off the bus, untouched this
+# long (task/3848). The same grace as ROOMLESS_CURSOR_S, for the same race: a
+# pass that listed the room before it left mints its cursor after.
+RETIRED_CURSOR_S = 3600
 
 
-def _live_prefixes(live, waiters):
-    """The 8-char session prefixes that hold cursors. Raises when liveness
-    cannot be proven; `dead_cursors` turns that into its refusal."""
+def _live_sessions(live=None, waiters=None):
+    """Every session id that may still hold per-session chat state: the
+    sessions a pane holds open (sessions.live_sids) and the launch-time
+    sessions a live or uncertain waiter still runs. THE one answer to "is
+    this session dead" for every per-session file in the chat dir (cursors,
+    steer latches). Raises when liveness cannot be proven; a caller turns
+    that into its refusal, never into an empty answer."""
     if live is None:
         from . import sessions
         held = sessions.live_sids()
@@ -909,6 +924,13 @@ def _live_prefixes(live, waiters):
             held if isinstance(held, dict) else dict.fromkeys(live))
     live = set(live)
     live.update(waiters or ())
+    return live
+
+
+def _live_prefixes(live, waiters):
+    """The 8-char session prefixes that hold cursors. Raises when liveness
+    cannot be proven; `dead_cursors` turns that into its refusal."""
+    live = _live_sessions(live, waiters)
     # NORMALISE BOTH SIDES TO THE SAME 8 CHARS, then compare exactly. Filenames
     # do not agree on a sid length — measured on the live dir: 7,480 cursors
     # carry an 8-char sid, 3,613 carry 23, with a tail out to 34 — and
@@ -937,22 +959,36 @@ def _rostered_seat_keys():
     return {_seat_key(seat) for seat in rows}
 
 
-def _cursor_judge(live_pfx):
-    """One cursor's verdict -> True when it is dead. A judge asks the roster
-    and each room log at most once, so a whole-directory scan shares one and
-    a per-victim re-proof takes a fresh one."""
+def _retired_rooms():
+    """The room keys `helm chat retire-rooms` took off the bus. An index that
+    cannot be read names none (chatdebris.retired_through reads it as {}),
+    so an unreadable index retires no cursor: unknown keeps."""
+    from .chatdebris import retired_through
+    try:
+        return frozenset(retired_through())
+    except Exception:                   # noqa: BLE001 -- unknown keeps
+        return frozenset()
+
+
+def _cursor_judge(live_pfx, retired=None):
+    """One cursor's verdict -> True when it is dead. A judge asks the roster,
+    the retirement index and each room log at most once, so a whole-directory
+    scan shares one and a per-victim re-proof takes a fresh one. `retired` is
+    a retirement index the caller already read; None reads it on first
+    need."""
     seats, gone, now = [], {}, time.time()
+    index = [] if retired is None else [retired]
 
     def over(seat_key):
         if not seats:
             seats.append(_rostered_seat_keys())
         return seats[0] is not None and seat_key not in seats[0]
 
-    def roomless(room, path):
-        """The room's log is PROVABLY absent and the cursor has sat untouched
-        past the grace. Only FileNotFoundError is absence: an unstatable log
-        is unknown, and unknown keeps. The key is the cursor's own, already
-        slugged, so it is never slugged again (`room_key_path`)."""
+    def absent(room):
+        """The room's log is PROVABLY absent. Only FileNotFoundError is
+        absence: an unstatable log is unknown, and unknown keeps. The key is
+        the cursor's own, already slugged, so it is never slugged again
+        (`room_key_path`)."""
         if room not in gone:
             try:
                 os.stat(room_key_path(room))
@@ -961,18 +997,29 @@ def _cursor_judge(live_pfx):
                 gone[room] = True
             except OSError:
                 gone[room] = False
-        if not gone[room]:
-            return False
+        return gone[room]
+
+    def untouched(path, grace):
         try:
-            return now - os.stat(path).st_mtime >= ROOMLESS_CURSOR_S
+            return now - os.stat(path).st_mtime >= grace
         except OSError:
             return False
 
+    def retired_room(room):
+        if not index:
+            index.append(_retired_rooms())
+        return room in index[0]
+
     def judge(cur):
+        room = cur["room"]
+        if absent(room) and retired_room(room) \
+                and untouched(cur["path"], RETIRED_CURSOR_S):
+            return True
         sid = cur["session_key"]
         if sid is not None:
             return sid[:8] not in live_pfx
-        return roomless(cur["room"], cur["path"]) and over(cur["seat_key"])
+        return absent(room) and untouched(cur["path"], ROOMLESS_CURSOR_S) \
+            and over(cur["seat_key"])
     return judge
 
 
@@ -1017,11 +1064,33 @@ def dead_cursors(live=None, waiters=None):
     room or no room, and a seat-level cursor on a missing room goes only when
     the roster no longer holds its seat -- nothing runs it and nothing will
     inherit it. An unreadable roster, or a rename in flight, keeps every one.
-    The one age bound in this function is here and nowhere else:
-    `ROOMLESS_CURSOR_S`, because a join baselines its rooms before it writes
-    the roster row. Only a log that is provably ABSENT counts; an unstatable
-    one keeps. No `.lock` sibling is ever a victim here (task/2520):
-    gc's chat-cursor-locks row probes an unheld one before it takes it.
+    That rule's age bound is `ROOMLESS_CURSOR_S`, because a join baselines
+    its rooms before it writes the roster row. Only a log that is provably
+    ABSENT counts; an unstatable one keeps. No `.lock` sibling is ever a
+    victim here (task/2520): gc's chat-cursor-locks row probes an unheld one
+    before it takes it.
+
+    A CURSOR ON A RETIRED ROOM, WHOEVER HOLDS IT (task/3848). `helm chat
+    retire-rooms` removes a room's cursors under the room's locks, so one
+    found on a retired room later was minted by a pass that listed the room
+    before it left, or left by a retirement that stopped between the log and
+    its cursors, and the two rules above keep it for as long as its session
+    or its seat lasts. Nothing reads it: the restore never brings a retired
+    room back, and a room REBORN under the name has a log again, which keeps
+    every cursor on it (`absent` is asked first, and again by the re-proof).
+    A reborn room's first rows still reach its seats: a tracked seat reads a
+    cursor-less room from 0, and an untracked one does too for a log born
+    after its join (`_born_after_join`). So such a cursor goes, live session
+    or rostered seat, once its log is provably absent, its room is in the
+    retirement index, and it has sat untouched past `RETIRED_CURSOR_S`. An
+    index that cannot be read retires nothing.
+
+    NOT A ROOM THAT IS ONLY IDLE. A cursor whose room log is still on the bus
+    is an admission line however long the room has been quiet: the next pass
+    to reach a room without one mints it again -- from offset 0 for a tracked
+    seat, which replays the room's history as news. The lever for an idle
+    room is taking the ROOM off the bus (`retire-rooms`), which takes its
+    cursors with it.
 
     Dry-run by default, like every other helm gc.
     """
@@ -1085,7 +1154,10 @@ def still_dead_cursor(live=None, waiters=None):
     asks again, for the one path: its session still dead (liveness is read
     ONCE, at the first re-proof, which is after the scan), or, for a
     seat-level cursor, its room still absent, the grace still passed, and
-    its seat still not in the roster, read afresh for every path. A `.lock`
+    its seat still not in the roster, read afresh for every path. A cursor
+    on a retired room is asked whether its log is STILL absent, afresh for
+    every path, so a room reborn since the scan keeps it; the retirement
+    index is read once, beside liveness. A `.lock`
     path answers False for every cursor, the finder's own law (task/2520):
     only gc's chat-cursor-locks row, which probes a lock unheld before it
     takes it, unlinks one. Anything unprovable answers False, and False
@@ -1101,7 +1173,8 @@ def still_dead_cursor(live=None, waiters=None):
             return False
         if not snap:
             snap.append(_live_prefixes(live, waiters))
-        return _cursor_judge(snap[0])(cur)
+            snap.append(_retired_rooms())
+        return _cursor_judge(snap[0], snap[1])(cur)
     return still
 
 
@@ -1883,6 +1956,8 @@ def _cause_now(code, reason, probe, profile=None):
                 "the node probe itself failed at %s (%s), so whether %s "
                 "answers is unknown" % (at, probe["head_error"], u))
         head = probe.get("head")
+        if head is None and probe.get("boot"):
+            return CAUSE_PRESENT, _booting_cause(u, at, probe["boot"])
         if head is None:
             return CAUSE_PRESENT, ("the chat node still does not answer at %s "
                                    "(probed %s)" % (u, at))
@@ -1906,6 +1981,38 @@ def _cause_now(code, reason, probe, profile=None):
     return CAUSE_UNPROBED, (
         "not re-probeable — clears when %s next commits a signed turn, or on "
         "`helm chat transport ack --profile %s`" % (who, who))
+
+
+def _node_boot(url):
+    """chatnode's classifier asked of `url`: its diagnosis when the node is
+    BOOTING, else None. Never raises: a reader that cannot ask keeps the
+    plain node_unreachable words."""
+    try:
+        from . import chatnode
+        return chatnode.booting(url)
+    except Exception:                     # noqa: BLE001 — advisory reading
+        return None
+
+
+def _booting_cause(url, at, boot):
+    from . import chatnode
+    return ("the chat node at %s does not answer because it is BOOTING "
+            "(probed %s): pid %s alive for %s with %s, %s"
+            % (url, at, boot.get("pid"), chatnode._span(boot.get("running_s")),
+               chatnode.LISTENER_WORDS[boot["listener"]],
+               chatnode._cpu_words(boot)))
+
+
+def _booting_rows(rows, boot):
+    """`rows` with every node failure's remedy made BOOTING's: wait, do not
+    restart. The record's own remediation ("restore the chat node") was
+    right when it was written and is wrong while the node replays."""
+    if not boot:
+        return rows
+    from . import chatnode
+    fix = chatnode.BOOTING_REMEDY + "; " + _ACK_REMEDIATION
+    return [dict(f, remediation=fix, node_state="booting")
+            if f.get("code") in _NODE_CAUSES else f for f in rows]
 
 
 def _resolution_public(event):
@@ -2170,8 +2277,11 @@ def transport_status(fleet=False, reader=None):
         h = None
         probe_error = "%s: %s" % (exc.__class__.__name__, exc)
     out["head"] = h.get("chain_index") if isinstance(h, dict) and h else None
+    # ONE CLASSIFIER (task/3891): a node that does not answer because it is
+    # BOOTING says so on this line, as `helm chat node status` does.
+    boot = _node_boot(u) if u and h is None and not probe_error else None
     probe = {"epoch": probe_at, "url": u, "head": h,
-             "head_error": probe_error, "signer": signer}
+             "head_error": probe_error, "signer": signer, "boot": boot}
     if failures:
         resolved = _resolve_sign_failures(
             probe, _resolver_label(fleet, me, reader))
@@ -2194,7 +2304,9 @@ def transport_status(fleet=False, reader=None):
             reason += " (%s)" % probe_error
         degraded = [dict(_transient_failure(me, "node_unreachable", reason),
                          cause_state=CAUSE_PRESENT, liveness="live",
-                         cause="the chat node does not answer at %s now" % u)]
+                         cause=_booting_cause(u, _iso(probe_at), boot) if boot
+                         else "the chat node does not answer at %s now" % u)]
+    degraded = _booting_rows(degraded, boot)
     if degraded:
         out.update(degraded[0], mode="degraded", state="DEGRADED",
                    failed_profiles=degraded + unknown)
@@ -3839,6 +3951,11 @@ def post(text, room=None, who=None, profile=None, sign=None, origin=None,
     row carries {turn, receipt, chain}. Node down -> plain v1 row (rendered
     with the [unsigned] tag). O(1) append; rotation only past the cap.
 
+    `sign` None is the default: a person's or a seat's row is signed when a
+    signer is configured, and a subsystem label's row takes its class's arm
+    (machine_senders.SENDERS), so a status row is never signed. True forces
+    an attempt; False skips.
+
     `origin` marks the WRITE RAIL, not the author: the server-side owner
     surfaces stamp "web"/"tui" and ONLY those rows get the delivery lane's
     owner-rule (a CLI post claiming an owner name delivers as an ordinary
@@ -3857,9 +3974,10 @@ def post(text, room=None, who=None, profile=None, sign=None, origin=None,
     (the room, `helm chat read`, the web feed) but seats.deliverable() drops
     it before any wake rule — including the home-room rule, which otherwise
     hands EVERY plain row in a team channel to every seat homed there. It is
-    the class for machine status a teammate PULLS (the todo mirror), never
+    the class for machine status a teammate PULLS (the todo mirror, a gate
+    observer line, a source-clean hold auto-land will land by itself), never
     the class for a word addressed to anyone; a mention or DM must not use
-    it (and does not: only the mirror passes ambient=True).
+    it.
 
     `reply_to` is a parent REFERENCE (row id, id prefix, or ordinal) resolved
     against the room the row lands in: the row gains {reply_to, rts, rfrom}
@@ -4004,7 +4122,14 @@ def post(text, room=None, who=None, profile=None, sign=None, origin=None,
         row["vtip"] = str(verdict["tip"])
         row["vrid"] = str(verdict["rid"])
         row["vref"] = str(verdict.get("ref") or "")
-    _touch_poster_presence(row["from"])
+    poster = row["from"]
+    _touch_poster_presence(poster)
+    if sign is None:
+        # A SUBSYSTEM SIGNS BY ITS CLASS (machine_senders, task/3851): a status
+        # row posts unsigned and costs the node no proof. An explicit `sign`
+        # wins, and a person's or a seat's row keeps the default.
+        from . import machine_senders
+        sign = machine_senders.sign_for(poster)
     return _append(_signed_row(row, text, profile, sign,
                                admitted=_own_admission(who)), room,
                    event_id=event_id)
@@ -5294,6 +5419,12 @@ _ARGV_GRAMMARS = (
 
 def _shell_segments(command):
     """Top-level command segments split at shell control operators."""
+    for start, end in _shell_segment_spans(command):
+        yield command[start:end]
+
+
+def _shell_segment_spans(command):
+    """`_shell_segments` as ``(start, end)`` offsets into `command`."""
     start = 0
     quote = None
     esc = False
@@ -5310,12 +5441,12 @@ def _shell_segments(command):
         elif ch in "'\"":
             quote = ch
         elif ch in ";|&":
-            yield command[start:i]
+            yield start, i
             if command[i + 1:i + 2] == ch and ch in "|&":
                 i += 1
             start = i + 1
         i += 1
-    yield command[start:]
+    yield start, len(command)
 
 
 _COMMENT_OPENS_AFTER = " \t;|&()\n"      # …and at the start of the text
@@ -5446,34 +5577,45 @@ def _select_argv_grammar(command):
     return match, grammar
 
 
-def _heredoc_hazard(line):
-    """The first substitution operator active in an unquoted heredoc line."""
-    esc = False
+def _heredoc_hazards(line):
+    """Every substitution operator active in an unquoted heredoc line, as
+    ``(index, name)``."""
+    out, esc = [], False
     for i, ch in enumerate(line):
         if esc:
             esc = False
         elif ch == "\\":
             esc = True
         elif ch == "`":
-            return "a backtick"
+            out.append((i, "a backtick"))
         elif ch == "$" and line[i + 1:i + 2] == "(":
-            return "$("
-    return None
+            out.append((i, "$("))
+    return out
 
 
-def _guard_unquoted_heredocs(command):
-    """Guard substitution-active bodies attached to protected commands."""
-    pending = []
+def _heredoc_hazard(line):
+    """The first substitution operator active in an unquoted heredoc line."""
+    found = _heredoc_hazards(line)
+    return found[0][1] if found else None
+
+
+def _unquoted_heredoc_hazards(command, first=False):
+    """Every substitution active in an unquoted body attached to a protected
+    command, as ``(offset, cure, why)`` with `offset` into `command`."""
+    pending, out, at = [], [], 0
     for line in command.splitlines(True):
+        here, at = at, at + len(line)
         if pending:
             spec, cure, part = pending[0]
             if _heredoc_terminates(line, spec):
                 pending.pop(0)
                 continue
-            hazard = _heredoc_hazard(line)
-            if hazard:
-                return cure, ("%s inside an unquoted heredoc body EXECUTES "
-                              "before %s sees it" % (hazard, part[1]))
+            for i, hazard in _heredoc_hazards(line):
+                out.append((here + i, cure,
+                            "%s inside an unquoted heredoc body EXECUTES "
+                            "before %s sees it" % (hazard, part[1])))
+                if first:
+                    return out
             continue
         for segment in _shell_segments(line):
             match, grammar = _select_argv_grammar(segment)
@@ -5483,7 +5625,13 @@ def _guard_unquoted_heredocs(command):
             masked = _mask_quoted_line(segment)
             pending.extend((spec, cure, part)
                            for spec in _UHEREDOC_TAGS.findall(masked))
-    return None
+    return out
+
+
+def _guard_unquoted_heredocs(command):
+    """Guard substitution-active bodies attached to protected commands."""
+    found = _unquoted_heredoc_hazards(command, first=True)
+    return found[0][1:] if found else None
 
 
 # A HEREDOC DELIMITER IS ONE SHELL WORD, and _delimiter_word is the one
@@ -5679,14 +5827,20 @@ def _excise_quoted_heredocs(command, keep=frozenset()):
     shell reads as a script (task/2973), which are the command's own code
     whatever their tag."""
     lines = command.split("\n")
+    return "\n".join(lines[k] for k in _kept_lines(command, keep))
+
+
+def _kept_lines(command, keep=frozenset()):
+    """The indices of the lines of `command` that `_excise_quoted_heredocs`
+    keeps, in order."""
     out, ordinal = [], 0
     for i, openers in _heredoc_openers(command):
-        out.append(lines[i])
+        out.append(i)
         for _match, quoted, start, _end, resume in openers:
             if not quoted or ordinal in keep:       # substitutes, or a script
-                out.extend(lines[start:resume])
+                out.extend(range(start, resume))
             ordinal += 1
-    return "\n".join(out)
+    return out
 
 
 def _quoted_heredoc_bodies(command):
@@ -5765,11 +5919,25 @@ def _argv_guard_segment(command):
     shell segment, and verb discovery ignores quoted data, so one protected
     command cannot hide a later leg or turn a literal command example into code.
     """
+    found = _segment_hazards(command, first=True)
+    return found[0][1:3] if found else None
+
+
+def _segment_hazards(command, first=False):
+    """Every substitution `_argv_guard_segment` refuses in one segment, as
+    ``(offset, cure, why, verb)``: `offset` is the backtick or the `$` of
+    `$(` in `command`, and `verb` the protected verb's own text. The scan
+    is the guard's, so a hazard listed here is one the guard refuses."""
     m, grammar = _select_argv_grammar(command)
     if m is None:
-        return None
+        return []
     _needle, _pattern, body_position, body_arg, part, cure, bare = grammar
     region = command[m.end():]
+    out = []
+
+    def hazard(i, why):
+        out.append((m.end() + i, cure, why, m.group()))
+        return first
     # stop at an unquoted command separator — a later && segment's $() is
     # someone else's business (crude split; a separator inside a quoted body
     # truncates the scan early, which fails OPEN, never closed)
@@ -5787,12 +5955,14 @@ def _argv_guard_segment(command):
             if ch == quote:
                 quote = None
             elif quote == '"' and body:
-                if ch == "`":
-                    return cure, ("a backtick inside a double-quoted %s "
-                                  "EXECUTES before %s sees it" % part)
-                if ch == "$" and region[i + 1:i + 2] == "(":
-                    return cure, ("$( inside a double-quoted %s EXECUTES "
-                                  "before %s sees it" % part)
+                if ch == "`" and hazard(i, (
+                        "a backtick inside a double-quoted %s EXECUTES "
+                        "before %s sees it" % part)):
+                    return out
+                if ch == "$" and region[i + 1:i + 2] == "(" and hazard(i, (
+                        "$( inside a double-quoted %s EXECUTES before %s "
+                        "sees it" % part)):
+                    return out
             continue
         if ch in "'\"":
             quote = ch
@@ -5808,14 +5978,15 @@ def _argv_guard_segment(command):
             while region[j:j + 1] in ("-", " ", "\t"):
                 j += 1
             if region[j:j + 1] in ("'", '"'):
-                return None
+                return out
         elif ch == "`" and bare:
             # after a POSITIONAL-body verb a bare backtick has no legitimate
             # use; flag-body grammars still allow computed non-body arguments.
-            return cure, "a bare backtick after a messaging verb executes"
+            if hazard(i, "a bare backtick after a messaging verb executes"):
+                return out
         elif ch in ";|&" and quote is None:
             break
-    return None
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -5905,13 +6076,18 @@ _STEERS = (
      "`set -o pipefail` first."),
 
     ("typed-ledger-id",
-     re.compile(r"\bhelm\s+(?:dispatch|lr|work)\s+\S+\s+[0-9a-f]{12,40}\b"),
-     "A LEDGER ID TYPED RATHER THAN INTERPOLATED. Extending a short prefix "
-     "with invented hex produces a token of the right shape, right length and "
-     "right prefix that does not exist — measured six times, and once against "
-     "a real 12-hex id that was called nonexistent. Resolve it into a shell "
-     "variable and pass the VARIABLE, so the value you send is the value "
-     "something produced."),
+     # A FULL LEDGER ID IS 32 HEX (os.urandom(16)). That plain argument is the
+     # form an isolated worktree can verify: the worktree guard refuses a
+     # variable-valued helm invocation as unverifiable, so the steer must not
+     # demand one. Anything shorter or longer is the invented-suffix shape
+     # (a real prefix padded, or a token past the id length) and still fires.
+     re.compile(r"\bhelm\s+(?:dispatch|lr|work)\s+\S+\s+"
+                r"(?:[0-9a-f]{12,31}|[0-9a-f]{33,40})\b"),
+     "A LEDGER ID TYPED RATHER THAN INTERPOLATED. Padding a prefix with hex "
+     "produces a nonexistent id — measured six times. Where the shell permits "
+     "it, pass the ledger's id via a variable. An isolated worktree refuses "
+     "variable-valued helm commands: use the full 32-hex id the ledger just "
+     "printed as a plain argument; add no hex."),
 
     # ── ACT STEERS (task/2980 lane 5). Each replaces a store entry or reflex
     # that rode every prompt whose words looked like its topic; the rows it
@@ -6569,8 +6745,40 @@ def _tree_advise(d, text, first=()):
         wanting += tree_steers(text, d.get("cwd"), d.get("session_id"))
     except Exception:                          # noqa: BLE001 — fail open
         pass
+    said = []
     try:
-        advise(admit(d.get("session_id"), wanting, agent=d.get("agent_id")))
+        said = admit(d.get("session_id"), wanting, agent=d.get("agent_id"))
+        advise(said)
+    except Exception:                          # noqa: BLE001 — fail open
+        pass
+    return said
+
+
+def _door_wanting(d):
+    """([(steer-id, line)], pending) from the doors (helm/doors.py,
+    task/1135): the store and reflex rules bound to the act this payload
+    stands in, and (HELM_DOOR_SHADOW=1) the agent's own post matched in
+    shadow. A Bash command with no `helm` word followed by a blank (a verb
+    needs one) does not even import the module: this hook runs on every
+    tool call, and a path such as `helm-wt/...` is not a verb. Fail-open."""
+    try:
+        if d.get("tool_name") == "Bash":
+            cmd = str((d.get("tool_input") or {}).get("command") or "")
+            if not ("helm " in cmd or "helm\t" in cmd or "helm\n" in cmd):
+                return [], None
+        from . import doors
+        return doors.wanting(d)
+    except Exception:                          # noqa: BLE001 — fail open
+        return [], None
+
+
+def _door_settle(d, pending, said):
+    """Record the doors' moment rows once the envelope is admitted."""
+    if not pending:
+        return
+    try:
+        from . import doors
+        doors.settle(d, pending, said)
     except Exception:                          # noqa: BLE001 — fail open
         pass
 
@@ -8925,12 +9133,13 @@ class _ShellReader(object):
 
 class _Simple(object):
     """One simple command of the top level: its argv words, its redirection
-    targets, the heredoc operators it owns, and its place in a pipeline."""
+    targets and their operators (`ops[i]` is `targets[i]`'s), the heredoc
+    operators it owns, and its place in a pipeline."""
 
-    __slots__ = ("words", "targets", "docs", "pipeline", "stage")
+    __slots__ = ("words", "targets", "ops", "docs", "pipeline", "stage")
 
     def __init__(self, pipeline, stage):
-        self.words, self.targets, self.docs = [], [], []
+        self.words, self.targets, self.ops, self.docs = [], [], [], []
         self.pipeline, self.stage = pipeline, stage
 
 
@@ -8944,6 +9153,7 @@ def _simple_commands(tokens):
             cmd.words.append(token[1])
         elif kind == "r":
             cmd.targets.append(token[2])
+            cmd.ops.append(token[1])
         elif kind == "h":
             cmd.docs.append(token[1])
         elif kind == "p":
@@ -9000,6 +9210,12 @@ def _after_nice(words, k):
     return _options(words, k, valued=("-n", "--adjustment"))
 
 
+def _after_ionice(words, k):
+    # -p, -P and -u name processes, not a command: unnamed, so unsettled
+    return _options(words, k, valued=("-c", "-n", "--class", "--classdata"),
+                    flags=("-t", "--ignore"))
+
+
 # The programs that run the command after their own options, whose name bash
 # does not strip itself. `sudo -s`, `sudo -i`, `sudo -e`, `env -S` and
 # `command -v` are none of this (a shell, an editor, a split string, a
@@ -9015,6 +9231,7 @@ _WRAPPERS = {
     "env": _after_env,
     "timeout": _after_timeout,
     "nice": _after_nice,
+    "ionice": _after_ionice,
     "nohup": _options,
     "command": lambda words, k: _options(words, k, flags=("-p",)),
     "stdbuf": lambda words, k: _options(
@@ -9066,6 +9283,35 @@ def _program(words):
     return None, None
 
 
+#: a character that makes an unquoted word a glob, which bash may expand to
+#: several words
+_GLOB_CHARS = re.compile(r"[*?\[]")
+
+
+def _settled_program(words):
+    """`_program`, but `(None, index)` — the program the text does not
+    settle — where a word before the program is neither an assignment nor a
+    LITERAL (a word the text settles to one argument, with no glob).
+
+    A wrapper (`timeout`, `nice`, `ionice`, `env`, `sudo`, ...) execs the
+    argv after its own arguments and runs no shell string, so the program
+    after it decides what is data — but only where bash hands the wrapper
+    exactly the words `_program` stepped over. A runtime value there
+    (`timeout $T`, `nice -n $N`, `timeout -k $K 5`) is split into more
+    words, and they can name a shell that runs the text after them (`T="5
+    sh -c …"`, judged in real bash, task/4170); so can a glob. The data
+    predicates ask this; a rung that refuses BY NAME keeps `_program`, so a
+    `timeout $T helm …` it refuses is still named helm."""
+    name, k = _program(words)
+    if k is not None and not all(
+            _GRANT_ASSIGNMENT.match(w.raw) or (
+                w.value() is not None
+                and not (w.plain and _GLOB_CHARS.search(w.raw)))
+            for w in words[:k]):
+        return None, k
+    return name, k
+
+
 # THE SETS, each closed and each read by NAME.
 #: helm verbs that post, send or record the text they are given
 _HELM_PROSE = frozenset(("asks", "chat", "dispatch", "handoff", "lr", "note",
@@ -9113,7 +9359,8 @@ _PY_INERT_MODULES = frozenset((
     "collections", "itertools", "functools", "io", "datetime", "hashlib",
     "base64", "csv", "glob", "fnmatch", "string", "math", "statistics",
     "tokenize", "shlex", "time", "typing"))
-#: the os attributes that start nothing and write nothing
+#: the os attributes that start no process. They are not read-only:
+#: makedirs, remove, rename, replace, mkdir and rmdir write the filesystem
 _PY_OS_SAFE = frozenset((
     "path", "environ", "getcwd", "listdir", "walk", "makedirs", "remove",
     "rename", "replace", "mkdir", "rmdir", "getenv", "urandom", "sep",
@@ -9136,11 +9383,13 @@ def _parses_python(src):
         return False
 
 
-def python_text_inert(src):
+def python_text_inert(src, trusted=frozenset()):
     """Whether python source is INERT under the allowlist above: every import
     from _PY_INERT_MODULES (os only through its safe attributes), no dynamic
     primitive named or attributed anywhere. Unparseable is False — text that
-    may not be read as data is never data."""
+    may not be read as data is never data. `trusted` names more import roots
+    to read as inert; only the Actions refusal's wording asks for one (helm,
+    `_python_test_text`), and no cut does."""
     import ast                              # local: paid only by python calls
     try:
         tree = ast.parse(src)
@@ -9158,7 +9407,7 @@ def python_text_inert(src):
                             return False
                     else:
                         os_aliases.add(a.asname or "os")
-                elif root not in _PY_INERT_MODULES:
+                elif root not in _PY_INERT_MODULES and root not in trusted:
                     return False
         elif isinstance(node, ast.ImportFrom):
             module = node.module or ""
@@ -9169,7 +9418,7 @@ def python_text_inert(src):
                 for a in node.names:
                     if a.name.partition(".")[0] not in _PY_OS_SAFE:
                         return False
-            elif root not in _PY_INERT_MODULES:
+            elif root not in _PY_INERT_MODULES and root not in trusted:
                 return False
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and node.id in _PY_DYNAMIC:
@@ -9323,8 +9572,11 @@ def _command_data(words, interpreters=None, bodies=None, docs=()):
     rung reads as running their text: their arguments and their stdin are
     code, exactly like a shell's. The Actions rung passes none, because a
     python body naming a gh act runs no gh; the owner-posture rung passes
-    python, because a python body naming the mint runs the mint."""
-    name, k = _program(words)
+    python, because a python body naming the mint runs the mint.
+
+    A program behind a wrapper word bash may split (`_settled_program`,
+    task/4170) answers nothing: its words stay code."""
+    name, k = _settled_program(words)
     if name is None:
         return (), None
     base = name.rsplit("/", 1)[-1]
@@ -9412,7 +9664,7 @@ def _safe_stage(cmd):
     """Whether a pipe may lead into this stage and a data program's output
     stay data: a filter that runs nothing it reads, and runs no program of
     its own through a substitution."""
-    name, _k = _program(cmd.words)
+    name, _k = _settled_program(cmd.words)
     return name in _SAFE_FILTERS \
         and not any(w.subst for w in cmd.words + cmd.targets) \
         and not _runs_a_program(cmd.words, ("--pre", "--hostname-bin"))
@@ -9612,7 +9864,7 @@ def _message_value_words(words):
     whose directory belt CURE B lifts. Empty for any other command; and never
     a pathspec, a redirect target, or a flag value that is not a message, so
     the belt still holds on `git commit -m x -- <dir>/f` and its kin."""
-    name, k = _program(words)
+    name, k = _settled_program(words)
     if name is None:
         return []
     base = name.rsplit("/", 1)[-1]
@@ -9649,6 +9901,675 @@ def _message_value_words(words):
                 i += 1
         return [w for w in out if w.prose and not w.subst]
     return []
+
+
+# ---------------------------------------------------------------------------
+# A WRITTEN FILE THAT IS RUN IS CODE (task/3430). The cut reads a printer's
+# prose, a quoted body cat or tee writes and inert python's text as data,
+# because the program holding them runs none of it. Where that program's
+# OUTPUT reaches a file the SAME command then runs — `echo '<act>' > x.sh;
+# bash x.sh`, `cat > a.sh <<'EOF'` then `bash a.sh`, `bash -c "$(< x)"` —
+# the data is the script, and trunk admitted it (measured on 1dcf4989). So
+# that program, and only that one, keeps its words and bodies: a commit
+# message, a post or a grep pattern whose output reaches no run file stays
+# data. Reading the WHOLE command uncut instead was the abandoned lane's
+# answer, and it newly refused commands whose data never reached the file
+# (its F-C: a message beside a script, a written file handed to a script as
+# an argument).
+#
+# A FILE IS WRITTEN by an output redirect (not into /dev) or a tee operand,
+# and a copy of a written file (cp, mv, ln, install, rsync) is written too.
+# A program whose output reaches a file and that reads a written file, as
+# an operand or on its stdin, passes it on the same way (`cat a > b.sh`):
+# running the one runs the other.
+# IT IS RUN, compared by base name (which errs toward run), when it is:
+#   * the program word (`./x.sh`), or every written file behind a program
+#     word that is a VALUE;
+#   * a shell's SCRIPT operand, run by its -c text read as the commands it
+#     is (`sh -c '. /tmp/x.sh'`; a -c text the reader cannot settle, like
+#     `bash -c "$(< x)"`, counts every name it holds), or named in a body
+#     it reads; an interpreter's script operand (python only where its text
+#     is not inert, the allowlist python is read by everywhere, task/3071);
+#   * named in an interpreter's -c or -e text, and for python a module that
+#     text imports or `-m` names (`python3 -c 'import x'` runs a written
+#     `x.py`; `perl -e 'system("sh x.sh")'`);
+#   * the operand of `.` or `source`, or named in an `eval`;
+#   * the target of an input redirect into a shell, an interpreter or exec
+#     (`bash < x`, `exec 3< x`), or into a group, a subshell, a loop or a
+#     conditional that holds a command running text (`{ bash; } < x`, a
+#     `done < x` whose body evals or runs `$l`; one that only reads, `while
+#     read -r l; do echo "$l"; done < x`, runs nothing) — into any other
+#     program (`helm dispatch send < brief`) the file is data, exactly as
+#     its heredoc would be;
+#   * named by a program that runs what it is handed or finds: xargs or
+#     parallel feeding a shell, find -exec, awk whose program spawns,
+#     busybox, script, at, watch, ssh, su, make with a makefile, and a git
+#     that runs a command (an alias or other non-identity -c, bisect,
+#     rebase, submodule, filter-branch).
+# A run operand that is a GLOB counts every written file it matches (`bash
+# *.sh`, `{a,b}.sh`), and one that is a VALUE every written file whose name
+# it could be (`bash "$f"` in a loop; `"$HOME/bin/x.sh"` can only be x.sh).
+# The words AFTER a script operand are that script's data (`bash report.sh
+# hits` runs report.sh); `bash -n` runs no file, and `python3 -m` only the
+# module it names (`-m py_compile x.py` runs py_compile).
+#
+# A PROGRAM'S OUTPUT REACHES the files its own redirects and every later
+# stage of its pipeline write; a group, loop, subshell or exec whose OUTPUT
+# is redirected sends every program's output to every written file (CURE
+# A's fail-closed reading, narrowed to a redirected group). Python can write
+# with no redirect (`open(...)`), so python holding data text reaches every
+# run file a string in its text names as a path.
+#
+# A BODY RUN BY A SHELL IS CODE, where every row counts (task/2973); one
+# run only by an interpreter is read as trunk reads a non-inert
+# `python3 - <<'EOF'` body: kept whole, its anchorless rows not evidence.
+#
+# WHAT IT GIVES UP: a file written by an EARLIER call, or by the Write tool,
+# and run in this one (the rung reads one command); a program this list
+# does not name that finds a written file by itself (a git hook, `sed e`),
+# or writes one through its own option or text (`sort -o`, `sed w`, awk's
+# `print > f`); a module a runner loads from its ARGUMENTS (`python3 -m
+# unittest tests.test_x`); and a file written through a name the text does
+# not settle (`> "$f"`) and run by its literal name.
+_SCRIPT_SHELLS = frozenset(("bash", "sh", "zsh", "dash", "ksh", "mksh", "ash",
+                            "fish"))
+_SCRIPT_INTERPRETERS = frozenset(("node", "perl", "ruby", "php", "lua",
+                                  "tclsh"))
+_FILE_RUNNERS = frozenset(("busybox", "script", "at", "batch", "watch", "ssh",
+                           "su"))
+_AWKS = frozenset(("awk", "gawk", "mawk", "nawk"))
+_FIND_RUNS = frozenset(("-exec", "-execdir", "-ok", "-okdir"))
+_GIT_RUN_SUBCOMMANDS = frozenset(("bisect", "rebase", "submodule",
+                                  "filter-branch"))
+_MAKES = frozenset(("make", "gmake"))
+_MAKEFILES = frozenset(("Makefile", "makefile", "GNUmakefile"))
+_COPIERS = frozenset(("cp", "mv", "ln", "install", "rsync"))
+#: the words that close a group, loop or conditional: a redirect on one of
+#: them is the whole compound's
+_COMPOUND_CLOSERS = frozenset(("}", "done", "fi", "esac"))
+#: the words that open one, each with the word that closes it
+_COMPOUND_OPENS = {"{": "}", "while": "done", "until": "done", "for": "done",
+                   "select": "done", "if": "fi", "case": "esac"}
+
+
+#: a parameter expansion a word holds, `$name`, `$1`, or `${...}` with no
+#: expansion or quote nested in it; a brace list, which bash expands to each
+#: name; and the quoting a word's text is read past
+_PARAMETER = re.compile(r"\$\{[^{}$`'\"]*\}"
+                        r"|\$(?:[A-Za-z_]\w*|[0-9@*#?$!-])")
+_BRACES = re.compile(r"\{[^{}]*\}")
+_QUOTING = re.compile(r"['\"\\]")
+
+
+def _operand_glob(raw):
+    """The pattern of base names a run operand could be where it is not one
+    literal name (review F5), or None: "*" (every written file) for a word
+    holding a substitution or an expansion the text cannot bound (`"$f"`,
+    `<(cat x)`), else its base name read as a glob with each `$name`,
+    `${...}` and brace list standing for `*`, where that holds one (`*.sh`,
+    `x*.sh`, `"$d"/x-*.sh`, `{a,b}.sh`). A literal name, and a value whose
+    base name is literal (`"$HOME/bin/check.sh"`), is None: `_Names` finds
+    it by that name."""
+    if "$(" in raw or "`" in raw or "<(" in raw or ">(" in raw:
+        return "*"
+    text = _PARAMETER.sub("*", raw)
+    if "$" in text:
+        return "*"
+    base = posixpath.basename(_BRACES.sub("*", _QUOTING.sub("", text)))
+    return base if any(c in base for c in "*?[") else None
+
+
+def _base_names(raws):
+    return {posixpath.basename(r.strip("'\"")) for r in raws} - {""}
+
+
+#: a whole path segment: a name is found only where it stands alone between
+#: characters outside this class (`x.sh` is not in `ax.sh` or `x.sh.bak`)
+_SEGMENT = re.compile(r"[\w.-]+")
+
+
+class _Names(object):
+    """Which of a set of base names a text holds, each as a whole path
+    segment, in time LINEAR in the text (review F2). One regex per name per
+    text cost 19.9 s at 800 written files — past the re module's 512-pattern
+    cache every search compiled again — and the hook's 2 s timeout ADMITS.
+
+    A name made only of segment characters stands in the text exactly where
+    it is one whole segment, so a set intersection finds it with no pattern
+    at all. A rare name holding another character (a blank, a `$`) is found
+    by ONE alternation over all of them, compiled once, which marks each
+    place one could start; every such name is then checked there by its
+    length. So a call compiles at most one pattern, whatever the names."""
+
+    __slots__ = ("all", "plain", "odd", "lengths", "find", "stems",
+                 "globbed")
+
+    def __init__(self, bases):
+        self.all = frozenset(bases)
+        self.plain = frozenset(b for b in self.all if _SEGMENT.fullmatch(b))
+        self.odd = self.all - self.plain
+        self.lengths = sorted({len(b) for b in self.odd})
+        self.find = re.compile(r"(?<![\w.-])(?=(?:%s)(?![\w.-]))" % "|".join(
+            re.escape(b) for b in sorted(self.odd, key=len, reverse=True))
+        ) if self.odd else None
+        #: python's module name for each written `x.py` (`import x`, `-m x`)
+        self.stems = {b[:-3]: b for b in self.plain
+                      if b.endswith(".py") and len(b) > 3}
+        self.globbed = {}
+
+    def modules(self, text):
+        """The written python files whose module name `text` holds as one
+        dotted part of a segment (`import x`, `from pkg.x import y`)."""
+        if not self.stems:
+            return set()
+        return {self.stems[p] for seg in _SEGMENT.findall(text)
+                for p in seg.split(".") if p in self.stems}
+
+    def matching(self, pattern):
+        """The names a glob matches, each pattern matched once per call."""
+        got = self.globbed.get(pattern)
+        if got is None:
+            import fnmatch                  # local: paid only by a glob
+            got = self.globbed[pattern] = {
+                b for b in self.all if fnmatch.fnmatchcase(b, pattern)}
+        return got
+
+    def __call__(self, text):
+        out = set(_SEGMENT.findall(text)) & self.plain if self.plain \
+            else set()
+        if self.find is not None:
+            for m in self.find.finditer(text):
+                at = m.start()
+                out.update(text[at:at + n] for n in self.lengths
+                           if text[at:at + n] in self.odd
+                           and not _SEGMENT.match(text, at + n))
+        return out
+
+
+def _operands(words):
+    return [w for w in words if not (w.value() or "-").startswith("-")]
+
+
+def _program_parts(base, words):
+    """(program texts, script operand, module) a shell or interpreter runs
+    from its words after the program, or None where it runs nothing: a -c
+    or -e text, else the first operand (a VALUE counts as one), and nothing
+    after it; python's `-m` names the module it runs, and the words after it
+    are that module's. `bash -n` only checks, and `-` is the program's
+    stdin."""
+    shell, py = base in _SCRIPT_SHELLS, bool(_PYTHON.fullmatch(base))
+    j = 0
+    while j < len(words):
+        v = words[j].value()
+        if v == "-":
+            return [], None, None
+        if v is None or v[:1] not in ("-", "+") or v == "+":
+            return [], words[j], None
+        if v == "--":
+            return [], words[j + 1] if j + 1 < len(words) else None, None
+        text = words[j + 1:j + 2]
+        if v.startswith("--"):
+            if v in ("--eval", "--execute", "--command"):
+                return text, None, None
+            j += 2 if v in ("--rcfile", "--init-file") else 1
+            continue
+        letters = v[1:]
+        if py:
+            if letters.endswith("c"):
+                return text, None, None
+            if "m" in letters:
+                module = letters[letters.index("m") + 1:] or (
+                    (text[0].value() or text[0].raw) if text else None)
+                return [], None, module
+            j += 2 if v in ("-W", "-X") else 1
+        elif shell:
+            if "c" in letters and v[0] == "-":
+                return text, None, None
+            if "n" in letters and v[0] == "-":
+                return None
+            j += 2 if letters[-1:] in ("o", "O") else 1
+        else:
+            if letters[-1:] in ("e", "E") or letters in ("p", "r"):
+                return text, None, None
+            j += 1
+    return [], None, None
+
+
+def _runs_named(base, words):
+    """Whether a program that is not a shell or an interpreter RUNS files
+    named in its words (see above), and so every name there counts."""
+    if base in _FILE_RUNNERS:
+        return True
+    if base in ("xargs", "parallel"):
+        fed = _fed_command_word(words)
+        return fed is None or fed in _SCRIPT_SHELLS \
+            or fed in _SCRIPT_INTERPRETERS or fed in _EVALUATORS \
+            or bool(_PYTHON.fullmatch(fed))
+    if base == "find":
+        return any(w.value() in _FIND_RUNS for w in words)
+    if base in _AWKS:
+        return any("system" in w.raw or "|" in w.raw for w in words)
+    if base == "git":
+        vals = [w.value() for w in words]
+        return any(v in _GIT_RUN_SUBCOMMANDS for v in vals) or any(
+            v == "-c" and (n or "").split("=", 1)[0].lower()
+            not in _GIT_SAFE_CONFIG for v, n in zip(vals, vals[1:] + [None]))
+    return False
+
+
+def _runs_text(cmd, name, k):
+    """Whether a simple command RUNS text it reads or is handed: a shell, an
+    interpreter, an evaluator, a runner, a program word that is a value, or
+    a word holding a substitution (which runs a program of its own)."""
+    if any(w.subst for w in cmd.words + cmd.targets):
+        return True
+    if k is None:
+        return False
+    if name is None:
+        return True
+    base = name.rsplit("/", 1)[-1]
+    return base in _SCRIPT_SHELLS or base in _SCRIPT_INTERPRETERS \
+        or base in _EVALUATORS or base in _MAKES \
+        or bool(_PYTHON.fullmatch(base)) or _runs_named(base, cmd.words[k + 1:])
+
+
+def _compound_stdin(tokens, commands, programs):
+    """{index: whether its stdin is run} for each simple command that closes
+    a group, loop, conditional or subshell — the one a redirect after the
+    compound belongs to (`done < x`; the empty command after `)`). A file
+    redirected into a compound is run only where a command INSIDE it runs
+    text (`_runs_text`); a loop that only reads it (`while read -r l; do
+    echo "$l"; done < x`) runs nothing (review F3). Where the openers and
+    closers do not pair, the whole line is read as inside, which errs toward
+    run."""
+    runners = [0]
+    for cmd, (name, k) in zip(commands, programs):
+        runners.append(runners[-1] + _runs_text(cmd, name, k))
+    out, stack, i, start = {}, [], 0, True
+
+    def close(closer, word):
+        first = stack.pop()[1] if stack and stack[-1][0] == word else None
+        lo, hi = (0, len(commands) - 1) if first is None else (first, closer)
+        out[closer] = runners[hi + 1] > runners[lo]
+    for token in tokens:
+        kind = token[0]
+        if kind in ("s", "p"):
+            if token[1] == "(":
+                stack.append((")", i + 1))
+            elif token[1] == ")":
+                close(i + 1, ")")
+            i, start = i + 1, True
+        elif kind == "w":
+            w = token[1]
+            if start and w.plain and w.raw in _COMPOUND_OPENS:
+                stack.append((_COMPOUND_OPENS[w.raw], i))
+            elif start and w.plain and w.raw in _COMPOUND_CLOSERS:
+                close(i, w.raw)
+            start = start and w.plain and w.raw in _COMMAND_PREFIX
+    return out
+
+
+def _python_writes(texts, paths, mentioned):
+    """The run operands (base names) python `texts` may have written: a
+    string constant in the text that IS an operand's path or base name, or
+    ends in `/<base>` (an f-string's pieces count). `paths` maps each run
+    operand's path and base name to that base name, built once per command,
+    so each constant is one lookup (review F2). Text that does not parse
+    counts every base name it mentions (`mentioned`), which errs toward
+    run."""
+    import ast                              # local: paid only by python text
+    out = set()
+    for src in texts:
+        try:
+            consts = {n.value for n in ast.walk(ast.parse(src))
+                      if isinstance(n, ast.Constant)
+                      and isinstance(n.value, str)}
+        except (SyntaxError, ValueError, RecursionError):
+            out |= mentioned(src)
+            continue
+        for c in consts:
+            base = posixpath.basename(c) if "/" in c else None
+            if c in paths:
+                out.add(paths[c])
+            elif base and paths.get(base) == base:
+                out.add(base)
+    return out
+
+
+def _files_run(commands, programs, bodies, names, python_code, tokens,
+               depth=0):
+    """({base name: "shell" | "interpreter"}, run operand raws, every): which
+    of the written files `names` finds these simple commands run, and how
+    (see above), and the hows that run EVERY written file (a program word
+    that is a value), which the caller applies once. A shell's -c text the
+    reader can settle is read as the commands it is; one it cannot settle
+    counts every name it holds."""
+    runs, operands, every = {}, set(), set()
+    compound = _compound_stdin(tokens, commands, programs)
+
+    def mark(found, how):
+        for b in found:
+            if runs.get(b) != "shell":
+                runs[b] = how
+
+    def run(texts, how):
+        for text in texts:
+            mark(names(text), how)
+
+    def run_file(w, how):
+        # a file run through its word: what the word names, and every
+        # written file its glob or value could be (review F5)
+        operands.add(w.raw)
+        mark(names(w.raw), how)
+        glob = _operand_glob(w.raw)
+        if glob == "*":
+            every.add(how)
+        elif glob is not None:
+            mark(names.matching(glob), how)
+    for i, (cmd, (name, k)) in enumerate(zip(commands, programs)):
+        base = (name or "").rsplit("/", 1)[-1]
+        py = bool(_PYTHON.fullmatch(base))
+        interprets = base in _SCRIPT_SHELLS or base in _SCRIPT_INTERPRETERS \
+            or (py and python_code)
+        how = "shell" if (base in _SCRIPT_SHELLS or name is None
+                          or base in _COMPOUND_CLOSERS or base in _EVALUATORS
+                          or base in _FILE_RUNNERS) else \
+            "interpreter" if interprets else None
+        if i in compound:                   # a compound's stdin (review F3)
+            how = "shell" if compound[i] else None
+        for op, t in zip(cmd.ops, cmd.targets):
+            if "<" in op and op not in ("<<<", "<&") and how:
+                run_file(t, how)
+        if k is None:
+            continue
+        words = cmd.words[k + 1:]
+        if name is None:                    # a program word that is a value
+            every.add("shell")
+            continue
+        if "/" in name or names(cmd.words[k].raw):
+            run_file(cmd.words[k], "shell")
+        if base in _EVALUATORS:             # `. x`, `source x`, `eval ...`
+            if base in (".", "source") and words:
+                run_file(words[0], "shell")
+            run([w.raw for w in words]
+                + [bodies.get(at, "") for at in cmd.docs], "shell")
+            operands.update(w.raw for w in words[:1])
+        elif interprets:
+            parts = _program_parts(base, words)
+            if parts is None:
+                continue
+            texts, script, module = parts
+            if script is not None:
+                run_file(script, how)
+            if module is not None:
+                mark(names.modules(module), how)
+            if how != "shell":
+                # AN INTERPRETER'S -c OR -e TEXT (review F5) runs the written
+                # files it names and, python's, the modules it imports: by a
+                # shell, unless it is python text naming no way to start one
+                for w in texts:
+                    text = w.raw if w.value() is None else w.value()
+                    via = "interpreter" if py and not _SPAWNS.search(text) \
+                        else "shell"
+                    mark(names(text) | (names.modules(text) if py else set()),
+                         via)
+                continue
+            for w in texts:
+                # a single-quoted -c text is literal whatever it spells
+                # (`value()` withholds any word holding a `$`)
+                text = w.value() if w.value() is not None else (
+                    w.raw[1:-1] if re.fullmatch(r"'[^']*'", w.raw) else None)
+                inner = None if text is None or depth >= 3 else \
+                    _files_run_in(text, names, python_code, depth + 1)
+                if inner is None:
+                    run([w.raw], "shell")
+                    continue
+                for b, h in inner[0].items():
+                    if runs.get(b) != "shell":
+                        runs[b] = h
+                operands |= inner[1]
+                every |= inner[2]
+            run([bodies.get(at, "") for at in cmd.docs], "shell")
+        elif base in _MAKES:
+            runs.update((b, "shell") for b in names.all & _MAKEFILES)
+            run([w.raw for w in words], "shell")
+        elif _runs_named(base, words):
+            run([w.raw for w in words]
+                + [bodies.get(at, "") for at in cmd.docs], "shell")
+    return runs, operands, every
+
+
+def _files_run_in(text, names, python_code, depth):
+    """`_files_run` over a shell's -c text, or None where it cannot be
+    read."""
+    try:
+        reader = _ShellReader(text)
+        tokens = reader.read()
+    except Exception:          # _Unsettled, or the reader's defect
+        return None
+    commands = _simple_commands(tokens)
+    return _files_run(commands, [_program(c.words) for c in commands],
+                      {at: "\n".join(reader.lines[start:end])
+                       for at, _q, start, end in reader.bodies},
+                      names, python_code, tokens, depth)
+
+
+def _stdout_inert_read(base, args):
+    """Only ordinary reads whose redirected stdout cannot replay their input.
+
+    `git add -p/-i` prints the file's diff, and an unquiet commit prints its
+    subject; neither is inert when stdout is itself a script. Unknown options
+    fail closed. The git globals are walked before the subcommand, not treated
+    as operands, and a Python -B before -m does not change py_compile's stdout.
+    """
+    if base == "git":
+        i = 0
+        while i < len(args):
+            if args[i] == "-C" or args[i] == "-c":
+                if i + 1 >= len(args) or args[i + 1] is None:
+                    return False
+                if args[i] == "-c" and args[i + 1].split("=", 1)[0].lower() \
+                        not in _GIT_SAFE_CONFIG:
+                    return False
+                i += 2
+            elif args[i] in ("--no-pager", "-P") or (args[i] or "").startswith("-C") \
+                    and args[i] != "-C":
+                i += 1
+            else:
+                break
+        if i >= len(args):
+            return False
+        sub, rest = args[i], args[i + 1:]
+        if sub == "add":
+            short = frozenset("AunfNqv")
+            long = frozenset(("--all", "--update", "--no-all", "--no-ignore-removal",
+                              "--intent-to-add", "--force", "--dry-run", "--quiet",
+                              "--verbose", "--ignore-errors", "--ignore-missing",
+                              "--sparse", "--renormalize"))
+            for v in rest:
+                if v is None:
+                    return False
+                if v == "--":
+                    break
+                if v.startswith("--"):
+                    if v not in long:
+                        return False
+                elif v.startswith("-") and v != "-" and not set(v[1:]) <= short:
+                    return False
+            return True
+        if sub == "commit":
+            quiet, i = False, 0
+            while i < len(rest):
+                v = rest[i]
+                if v is None:
+                    return False
+                if v == "--":
+                    break
+                if v == "--quiet":
+                    quiet = True
+                elif v in ("--file", "--message"):
+                    i += 1
+                    if i >= len(rest) or rest[i] is None:
+                        return False
+                elif v.startswith(("--file=", "--message=")):
+                    pass
+                elif v.startswith("--"):
+                    return False
+                elif v.startswith("-") and v != "-":
+                    for j, ch in enumerate(v[1:], 1):
+                        if ch == "q":
+                            quiet = True
+                        elif ch in "Fm":
+                            if j == len(v) - 1:
+                                i += 1
+                                if i >= len(rest) or rest[i] is None:
+                                    return False
+                            break
+                        else:
+                            return False
+                i += 1
+            return quiet
+        return False
+    if _PYTHON.fullmatch(base):
+        i = 0
+        while i < len(args) and args[i] == "-B":
+            i += 1
+        return args[i:i + 2] == ["-m", "py_compile"]
+    return False
+
+
+def _writers_of_what_runs(command, tokens, commands, programs, bodies):
+    """{index: "shell" | "interpreter"} for the simple commands whose output
+    reaches a file this command runs (see above): their words and bodies
+    stay uncut, and the bodies of those a shell runs are code."""
+    def writes(cmd, name, k):
+        out = {t.raw for op, t in zip(cmd.ops, cmd.targets)
+               if ">" in op and not t.raw.isdigit() and t.raw != "-"
+               and not t.raw.strip("'\"").startswith("/dev/")}
+        if k is not None and (name or "").rsplit("/", 1)[-1] == "tee":
+            out.update(w.raw for w in _operands(cmd.words[k + 1:]))
+        return out
+    wrote = [_base_names(writes(c, n, k))
+             for c, (n, k) in zip(commands, programs)]
+    written = set().union(*wrote)
+    holds_python = {}
+    for i, (cmd, (name, k)) in enumerate(zip(commands, programs)):
+        if k is not None and _PYTHON.fullmatch((name or "").rsplit("/", 1)[-1]):
+            texts = [w.raw if w.value() is None else w.value()
+                     for w in _python_text(cmd.words[k + 1:])] \
+                + [bodies[at] for at in cmd.docs if at in bodies]
+            if texts:
+                holds_python[i] = texts
+    if not written and not holds_python:
+        return {}
+    # CLASSES OF FILES WHOSE TEXT FLOWS ONE INTO ANOTHER: a copy joins its
+    # operands, a copy of a copy joins them all, and a class holding a
+    # written file is written. Running any member runs every member. One
+    # union-find, so the cost is linear in the copies (review F2), and a
+    # chain of any length is followed.
+    parent = {}
+
+    def find(b):
+        while parent.get(b, b) != b:
+            parent[b] = parent.get(parent[b], parent[b])
+            b = parent[b]
+        return b
+
+    def join(bs):
+        root = None
+        for b in bs:
+            parent.setdefault(b, b)
+            r = find(b)
+            if root is None:
+                root = r
+            elif r != root:
+                parent[r] = root
+    for cmd, (name, k) in zip(commands, programs):
+        if k is not None and (name or "").rsplit("/", 1)[-1] in _COPIERS:
+            join(_base_names(w.raw for w in _operands(cmd.words[k + 1:])))
+    roots = {find(b) for b in written}
+    written |= {b for b in parent if find(b) in roots}
+    # A REWRITE PASSES IT ON TOO (review F4): any program whose output
+    # reaches a file and that READS a written file, an operand or its stdin
+    # (`cat a > b.sh`, `sed ... a > b.sh`, `cat < a > b.sh`, `cat a | tee
+    # b.sh`), joins them. Read from the last command back, the files the
+    # later stages of a pipeline write wait in `pending` until a stage that
+    # reads joins them; one then stands for them all, so each is joined once.
+    pending, pipeline = [], None
+    for i in range(len(commands) - 1, -1, -1):
+        cmd, (_name, k) = commands[i], programs[i]
+        if cmd.pipeline != pipeline:
+            pipeline, pending = cmd.pipeline, []
+        pending.extend(wrote[i])
+        if not pending:
+            continue
+        base = (_name or "").rsplit("/", 1)[-1]
+        # These reads do not copy their input into redirected stdout.
+        args = [w.value() for w in cmd.words[k + 1:]] if k is not None else []
+        inert = _stdout_inert_read(base, args)
+        reads = set() if inert else _base_names(
+            [w.raw for w in (_operands(cmd.words[k + 1:])
+                             if k is not None else ())]
+            + [t.raw for op, t in zip(cmd.ops, cmd.targets)
+               if "<" in op and op not in ("<<<", "<&")]) & written
+        if reads:
+            join(list(reads) + pending)
+            pending = pending[:1]
+    python_code = bool(_SPAWNS.search(command)) or any(
+        not python_text_inert(b) for b in bodies.values())
+    runs, operands, every = _files_run(commands, programs, bodies,
+                                       _Names(written), python_code, tokens)
+    if every:
+        how = "shell" if "shell" in every else "interpreter"
+        runs.update((b, how) for b in written if runs.get(b) != "shell")
+    best = {}
+    for b, h in runs.items():
+        if b in parent and best.get(find(b)) != "shell":
+            best[find(b)] = h
+    for b in parent:
+        h = best.get(find(b))
+        if h and runs.get(b) != "shell":
+            runs[b] = h
+    paths, fallback = {}, []
+    for raw in operands:
+        path = raw.strip("'\"")
+        base = posixpath.basename(path)
+        if base:
+            paths[path] = paths[base] = base
+
+    def mentioned(src):                     # built once, and only if asked
+        if not fallback:
+            fallback.append(_Names(set(paths.values())))
+        return fallback[0](src)
+    python_wrote = {i: _python_writes(texts, paths, mentioned)
+                    for i, texts in holds_python.items()}
+    if not runs and not any(python_wrote.values()):
+        return {}
+    everywhere = any(
+        any(">" in op for op in cmd.ops) and (
+            (name or "").rsplit("/", 1)[-1] in _COMPOUND_CLOSERS
+            or (not cmd.words and not cmd.stage and i)
+            or (cmd.words[:1] and cmd.words[0].plain
+                and cmd.words[0].raw == "exec" and name is None))
+        for i, (cmd, (name, _k)) in enumerate(zip(commands, programs)))
+    # WHAT EACH COMMAND'S OUTPUT REACHES, read from the last command back:
+    # its own writes and those of every later stage of its pipeline (the
+    # stages of one pipeline stand together, in order), so the hows its
+    # reach is run by are a running union per pipeline and the whole map is
+    # linear (review F2: the pairwise walk was quadratic)
+    def hows_of(bs):
+        return {runs[b] for b in bs if b in runs}
+    around = hows_of(written) if everywhere else set()
+    keep, tail, pipeline = {}, set(), None
+    for i in range(len(commands) - 1, -1, -1):
+        if commands[i].pipeline != pipeline:
+            pipeline, tail = commands[i].pipeline, set()
+        tail = tail | hows_of(wrote[i])
+        hows = tail | around | {runs.get(b, "shell")
+                                for b in python_wrote.get(i, ())}
+        if hows:
+            keep[i] = "shell" if "shell" in hows else "interpreter"
+    return keep
 
 
 def _invocation_text(command, interpreters=None, actions=False):
@@ -9693,7 +10614,7 @@ def _cut_data(command, interpreters=None, actions=False):
            for k, (kind, word) in enumerate(t[:2] for t in tokens)):
         return command, frozenset()
     commands = _simple_commands(tokens)
-    programs = [_program(cmd.words) for cmd in commands]
+    programs = [_settled_program(cmd.words) for cmd in commands]
     if any(name in _REBINDS for name, _k in programs):
         return command, frozenset()
     # UNSEEN TEXT RUNS: a current-shell evaluator, or a program word that is a
@@ -9714,8 +10635,19 @@ def _cut_data(command, interpreters=None, actions=False):
     # or `{ sh; }`, or a loop whose body runs each line it reads (`while read
     # l; do bash -c "$l"; done <<'EOF'`, whose heredoc the `done` owns)
     shell = any(stdin == "shell" for _data, stdin in stdins)
+    # A WRITTEN FILE THAT IS RUN (task/3430): the program whose output
+    # reaches it keeps its words and its bodies as code
+    keep = _writers_of_what_runs(command, tokens, commands, programs,
+                                 body_text)
     cuts, kinds, sinks = [], {}, set()
-    for cmd, (data, stdin), (name, _k) in zip(commands, stdins, programs):
+    for i, (cmd, (data, stdin), (name, _k)) in enumerate(
+            zip(commands, stdins, programs)):
+        if i in keep:
+            # a shell runs it: code; an interpreter runs it: kept whole,
+            # read as a non-inert python body is (neither data nor code)
+            kinds.update((at, "code" if keep[i] == "shell" else "run")
+                         for at in cmd.docs if at not in reader.nested)
+            continue
         if safe:
             cuts.extend((w.start, w.end, "_") for w in data)
         # a shell later in the body's OWN pipeline reads it, whatever the pipe
@@ -9752,8 +10684,9 @@ def _cut_data(command, interpreters=None, actions=False):
         # stage anywhere on the line.
         line_redirected = any(cmd.targets for cmd in commands)
         flat = _at_top_level(tokens)
-        for cmd, (name, ki) in zip(commands, programs):
-            if name is None or name.rsplit("/", 1)[-1] != "jq":
+        for i, (cmd, (name, ki)) in enumerate(zip(commands, programs)):
+            if i in keep or name is None \
+                    or name.rsplit("/", 1)[-1] != "jq":
                 continue
             if line_redirected or not flat:          # output may reach a file
                 continue
@@ -9769,7 +10702,7 @@ def _cut_data(command, interpreters=None, actions=False):
         # so nothing records the message and replays it. An allowlist fails
         # closed where the abandoned lane's runner list failed open.
         if commands and all(_on_message_allowlist(c.words) for c in commands):
-            for cmd in commands:
+            for cmd in (c for i, c in enumerate(commands) if i not in keep):
                 cuts.extend((w.start, w.end, "_")
                             for w in _message_value_words(cmd.words)
                             if _names_the_directory(w))
@@ -9784,8 +10717,8 @@ def _cut_data(command, interpreters=None, actions=False):
         # anchor. A span that itself runs an act keeps the argument code,
         # exactly as its unquoted spelling does, and the directory belt is
         # mirrored from the base cut.
-        for cmd, (name, ki) in zip(commands, programs):
-            if name is None or name.rsplit("/", 1)[-1] not in (
+        for i, (cmd, (name, ki)) in enumerate(zip(commands, programs)):
+            if i in keep or name is None or name.rsplit("/", 1)[-1] not in (
                     "echo", "printf"):
                 continue
             for w in cmd.words[ki + 1:]:
@@ -9980,6 +10913,18 @@ def github_actions_refusal(command=None, path=None):
     rows, anchor = _actions_evidence(readings)
     if not rows and anchor is None:
         return None             # every windowed row carries its anchor
+    # PROSE THAT NAMES NO GH IS NOT A GH INVOCATION (task/3945,
+    # `_gh_less_prose`): asked only once a row or an anchor stands, so the
+    # ordinary command still pays for nothing.
+    try:
+        prose = _gh_less_prose(command, readings)
+    except Exception:           # the cure's defect must not open the rung
+        prose = command
+    if prose != command:
+        command, readings = prose, _readings(prose)
+        rows, anchor = _actions_evidence(readings)
+        if not rows and anchor is None:
+            return None
     text, code = _invocation_text(command, actions=True)
     if text != command:
         readings = _readings(text)
@@ -9990,14 +10935,411 @@ def github_actions_refusal(command=None, path=None):
     if found is not None:
         if _only_the_directory_is_read(text, readings, found):
             return None
-        return _row_refusal(text, found)
-    if anchor is None or not holds_expansion(text):
-        return None
-    anchor = _anchor_in_a_region_with_an_expansion(text, readings, anchor)
-    if anchor is None:
-        return None
-    return ("%s at character %d of the folded command, beside an "
-            "unresolved expansion" % anchor)
+        act = _row_refusal(text, found)
+    else:
+        if anchor is None or not holds_expansion(text):
+            return None
+        anchor = _anchor_in_a_region_with_an_expansion(text, readings, anchor)
+        if anchor is None:
+            return None
+        act = ("%s at character %d of the folded command, beside an "
+               "unresolved expansion" % anchor)
+    # The hint only words the refusal. Its reader runs after the act is
+    # found, and this hook ADMITS on an exception, so a defect there costs
+    # the hint and never the refusal (review F1).
+    try:
+        hint = _python_test_text(command)
+    except Exception:           # the hint's defect must not open the rung
+        hint = False
+    return act + _IN_PYTHON_TEXT if hint else act
+
+
+# THE WORDS OF GH'S OWN VERB GRAMMAR (task/3945): every piece of the rows
+# that spell a gh subcommand (`workflow <verb>`, `run <verb>`, `gh run
+# rerun`) holds one of these, and so do both of the anchors those rows
+# carry. The edges are a word's, wider than a piece's, so a blank covers
+# every place a piece could stand.
+_GH_VERB_WORDS = re.compile(r"(?<!\w)(?:workflow|rerun|run)(?!\w)",
+                            re.IGNORECASE)
+#: the GitHub CLI's head as the rows read it: the piece of the re-execute
+#: row, with its Windows name and its expansion-mark reading
+_GH_HEAD = next(matcher for _s, pieces, _says in _ACTIONS_ROWS
+                for text, matcher, _a in pieces if text == "gh")
+
+
+#: programs that take no text to run and are handed none worth reading:
+#: a directory change, a status, and the words that close a compound
+#: and `read`, which assigns what it reads and runs none of it (task/4170)
+_PROSE_HARMLESS = frozenset(("cd", "true", "false", ":", "pwd", "fi", "done",
+                             "}", "read"))
+#: sed's options that take no value, and the ones that take the next word
+_SED_FLAGS = frozenset("nErsuzb")
+_SED_LONG_FLAGS = frozenset((
+    "--quiet", "--silent", "--regexp-extended", "--separate", "--unbuffered",
+    "--null-data", "--posix", "--debug", "--follow-symlinks", "--binary",
+    "--in-place"))
+
+
+def _sed_regex_end(script, i, delim):
+    """The index past the `delim` that closes the regex or replacement
+    starting at `script[i]`, or None where this reader cannot be sure: a
+    newline, a bracket expression (a delimiter inside one is a letter to
+    GNU sed and a close to this reader), or no close at all."""
+    while i < len(script):
+        c = script[i]
+        if c == "\\":
+            i += 2
+        elif c == "\n" or c == "[":
+            return None
+        elif c == delim:
+            return i + 1
+        else:
+            i += 1
+    return None
+
+
+def _sed_script_runs(script):
+    """Whether a sed script may RUN text: GNU sed's `e` command and the `e`
+    flag of `s` each hand the shell a command line. Anything this reader
+    cannot follow answers True."""
+    n, i = len(script), 0
+
+    def to(stop, i):
+        while i < n and script[i] not in stop:
+            i += 2 if script[i] == "\\" else 1
+        return i
+    while i < n:
+        c = script[i]
+        if c in " \t\n;{}":
+            i += 1
+            continue
+        if c == "#":
+            i = to("\n", i)
+            continue
+        while i < n:                       # the addresses, and their `!`
+            c = script[i]
+            if c in "0123456789$~+,! \t":
+                i += 1
+            elif c in "/\\":
+                delim = "/" if c == "/" else script[i + 1:i + 2]
+                i = _sed_regex_end(script, i + (1 if c == "/" else 2), delim) \
+                    if delim and delim not in "\n\\" else None
+                if i is None:
+                    return True
+                while i < n and script[i] in "IM":
+                    i += 1
+            else:
+                break
+        if i >= n:
+            return True
+        c = script[i]
+        if c in "sy":
+            delim = script[i + 1:i + 2]
+            if not delim or delim in "\n\\ ":
+                return True
+            j = _sed_regex_end(script, i + 2, delim)
+            j = j and _sed_regex_end(script, j, delim)
+            if j is None:
+                return True
+            while j < n and script[j] not in ";\n}":
+                f = script[j]
+                if c == "s" and f == "w":
+                    j = to("\n", j)
+                elif c == "s" and f in "gpiImM0123456789 \t":
+                    j += 1
+                elif f in " \t":
+                    j += 1
+                else:
+                    return True             # `e`, and any flag not read
+            i = j
+        elif c in "aicrRwW":                # text or a file to the line end
+            i = to("\n", i + 1)
+        elif c in "btTv:":                  # a label
+            i = to(";\n", i + 1)
+        elif c in "lLqQ":
+            i += 1
+            while i < n and script[i] in "0123456789 \t":
+                i += 1
+        elif c in "dDgGhHnNpPxz=F{}":
+            i += 1
+        else:
+            return True                     # `e`, and any command not read
+    return False
+
+
+def _sed_runs(args):
+    """Whether a sed invocation whose words after the program are `args`
+    may RUN text: a script that executes, a script file this reader cannot
+    see, or a script it cannot settle. `--sandbox` refuses `e` in sed
+    itself."""
+    scripts, operands, j = [], [], 0
+    while j < len(args):
+        v = args[j].value()
+        if v is None:
+            return True
+        if v == "-" or not v.startswith("-"):
+            operands.append(v)              # GNU sed reads options anywhere
+        elif v == "--":
+            operands.extend(a.value() for a in args[j + 1:])
+            break
+        elif v == "--sandbox":
+            return False
+        elif v.startswith("--expression="):
+            scripts.append(v.split("=", 1)[1])
+        elif v == "--expression":
+            if j + 1 >= len(args):
+                return True
+            j += 1
+            scripts.append(args[j].value())
+        elif v.startswith(("--in-place=", "--line-length=")) \
+                or v in _SED_LONG_FLAGS:
+            pass
+        elif v == "--line-length":
+            j += 1
+        elif v.startswith("--"):
+            return True                     # `--file`, and any option not read
+        else:
+            for x, ch in enumerate(v[1:], 1):
+                if ch in _SED_FLAGS:
+                    continue
+                if ch == "i":
+                    break                   # the rest is the backup suffix
+                if ch == "l":
+                    j += 0 if v[x + 1:] else 1
+                    break
+                if ch == "e":
+                    if v[x + 1:]:
+                        scripts.append(v[x + 1:])
+                    elif j + 1 < len(args):
+                        j += 1
+                        scripts.append(args[j].value())
+                    else:
+                        return True
+                    break
+                return True                 # `-f`, and any option not read
+        j += 1
+    if not scripts:
+        if not operands:
+            return True
+        scripts = operands[:1]
+    return any(s is None or _sed_script_runs(s) for s in scripts)
+
+
+def _receives_prose_only(cmd):
+    """Whether the program of one simple command receives text and runs
+    none of it: a program the data predicate cuts (`_command_data`: echo,
+    printf, the greps, cat, tee, helm's prose verbs, git's and gh's prose
+    commands), a filter that runs nothing it reads (`_safe_stage`: tail,
+    head, wc, ...), sed with a script that executes nothing (`_sed_runs`),
+    or a harmless word (`_PROSE_HARMLESS`). Python is none of these, whatever
+    the predicate makes of its text.
+
+    A PROGRAM WORD THE READER COULD NOT SETTLE runs text (task/3945): a
+    RUNTIME value (`$SH`, `$(echo sh)`, `${A[0]}`, whose `.value()` is None)
+    may be a shell, and a wrapper option no row names (a plain word) runs
+    what follows. A quoted LITERAL settles to a name — `'sh'` is still sh —
+    so a literal that spells a shell or python runs text too; any other
+    literal is only prose standing where a program would (a bogus command
+    made of words, `helm store add x | 'the workflow run finished green'`).
+    An empty pipe stage (a subshell or a group) runs unknown code.
+
+    A WRAPPER IS TRANSPARENT ONLY OVER LITERAL WORDS (task/4170): `timeout
+    30`, `nice -n 5` and `ionice -c3` exec the prose program after them, so
+    the program decides; a runtime value or a glob among the words before
+    the program (`_settled_program`) runs text, since bash may split it
+    into a shell."""
+    name, k = _settled_program(cmd.words)
+    if name is None:
+        if k is None:
+            return not (cmd.stage and not cmd.words)
+        word = cmd.words[k]
+        if word.plain:
+            return False                   # a wrapper option no row names,
+            #                                or a word before it bash splits
+        val = word.value()
+        if val is None:
+            return False                   # a runtime value may be a shell
+        base = val.rsplit("/", 1)[-1]
+        return not (base in _STDIN_SHELLS or bool(_PYTHON.fullmatch(base)))
+    if name in _PROSE_HARMLESS or _safe_stage(cmd):
+        return True
+    if name == "sed":
+        return not _sed_runs(cmd.words[k + 1:])
+    if _PYTHON.fullmatch(name.rsplit("/", 1)[-1]):
+        return False
+    return _command_data(cmd.words)[1] == "data"
+
+
+def _subst_runs_text(cmd):
+    """Whether one simple command INSIDE a substitution may run text the
+    fold would blank (task/3945). A substitution inherits the enclosing
+    pipe's or redirect's stdin, so a program whose stdin is a SCRIPT (a
+    shell, ssh, xargs, eval, source, python) RUNS it — `printf X | echo
+    $(sh)`, `printf X > >(sh)`, ``printf X | `sh` `` — and so does a program
+    word that is a runtime value. A program that only produces OUTPUT (date,
+    git log) runs nothing it reads, so a `$(date)` in an argument of its own
+    leaves the prose beside it blankable (one inside the prose's own quoted
+    argument keeps that argument read, `_blank_quoted_prose`). A
+    substitution in COMMAND position is a value program word, answered
+    False already by `_receives_prose_only`. A word before the program
+    that bash may split (`_settled_program`) may name a shell too."""
+    name, k = _settled_program(cmd.words)
+    if name is None:
+        return k is not None and (cmd.words[k].value() is None
+                                  or _program(cmd.words)[0] is not None)
+    base = name.rsplit("/", 1)[-1]
+    return base in _STDIN_SHELLS or bool(_PYTHON.fullmatch(base))
+
+
+def _a_program_runs_text(command):
+    """Whether a program of `command` may run text it is handed: one that is
+    not `_receives_prose_only` at the top level, a shell or runner inside any
+    substitution or process substitution (`_subst_runs_text`, quote or not —
+    a substitution with no quote still runs its stdin), or the reader cannot
+    settle the command at all. An ALLOW-LIST: a program it does not name runs
+    text. A substitution that holds a quote keeps the stricter top-level
+    predicate over every program in it, never loosened here."""
+    try:
+        reader = _ShellReader(command)
+        if not all(_receives_prose_only(cmd)
+                   for cmd in _simple_commands(reader.read())):
+            return True
+        for start, end in reader.substs + reader.outs:
+            inner = command[start:end]
+            cmds = _simple_commands(_ShellReader(inner).read())
+            if "'" in inner or '"' in inner:
+                if not all(_receives_prose_only(cmd) for cmd in cmds):
+                    return True
+            elif any(_subst_runs_text(cmd) for cmd in cmds):
+                return True
+    except _Unsettled:
+        return True
+    return False
+
+
+def _blank_word(m):
+    return "_" * len(m.group())
+
+
+def _blank_quoted_prose(text):
+    """`text` with gh's verb words blanked inside every quoted string that
+    holds a blank: one argument of prose to the program that receives it.
+    A double-quoted string that holds a LIVE substitution (an unescaped `$(`,
+    which `$((` and a `$(` inside `${…}` begin with too, or a backtick) is
+    not prose and keeps its words: bash runs that text before the program
+    sees the argument, and main's data cut reads such a word too. Single-
+    quoted and `$'…'` text has none. Same length as `text`, so every
+    position a refusal names still holds."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\":
+            out.append(text[i:i + 2])
+            i += 2
+            continue
+        ansi = ch == "$" and text[i + 1:i + 2] == "'"
+        if ch in "'\"" or ansi:
+            quote = "'" if ansi else ch
+            j = i + (2 if ansi else 1)
+            while j < n and text[j] != quote:
+                j += 2 if text[j] == "\\" and (quote == '"' or ansi) else 1
+            span = text[i:j + 1]
+            # a double-quoted span that holds a live `$(` or backtick is
+            # read as main reads it, never blanked (round 4 of task/3945)
+            if any(c in " \t\n" for c in span) and not (
+                    quote == '"' and not ansi and _heredoc_hazards(span)):
+                span = _GH_VERB_WORDS.sub(_blank_word, span)
+            out.append(span)
+            i = j + 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _gh_less_prose(command, readings):
+    """`command` with gh's verb words blanked in its PROSE, when no reading
+    of the command holds the GitHub CLI's head at all; else `command`.
+
+    THE MEASURED FALSE REFUSAL (task/3945): a sed state line, a task note
+    and a store statement each said in words that an orchestration ran
+    (`workflow` beside `run`), inside a quoted text argument, and the rung
+    refused them as `gh workflow run`. Of 255 distinct refusals by this
+    rung over one day of the fleet's transcripts, 219 named no `gh` at all;
+    the fleet's own vocabulary (a Workflow agent, a rerun, a dry run) is
+    exactly the words of gh's verb grammar.
+
+    PROSE IS a quoted string that holds a blank, which reaches its program
+    as one argument (`_argv_text` reads it the same way), and the body of a
+    QUOTED heredoc, which no shell expands. Inside either, gh's verb words
+    (`_GH_VERB_WORDS`) are blanked, same length, so no row of gh's
+    subcommand grammar and neither of its anchors can stand there. Every
+    other row is untouched: the REST paths, the workflow directory, the
+    composite-action directory and `/dispatches` read exactly as before.
+
+    ONLY WHERE NO GH STANDS ANYWHERE. A command that holds the head in any
+    reading (`gh`, `gh.exe`, an escaped or quoted spelling of it, a letter
+    beside an expansion) is read whole, as before: `bash -c "gh workflow
+    run x"`, `ssh host 'gh run cancel 1'` and a gh in one segment beside
+    prose in another all keep their refusal. Unquoted words are never
+    blanked, so a head supplied by a runtime value on the command line
+    (`$B workflow run ci.yml`, `$B run rerun 1`) is refused as before.
+
+    ONLY WHERE EVERY PROGRAM RECEIVES PROSE (`_a_program_runs_text`, an
+    ALLOW-LIST). A shell, an evaluator, an interpreter or a runner anywhere
+    among the command's programs can build the head from pieces the fold
+    cannot rejoin (`printf '%sh run cancel 1' g | sh`) or take it from a
+    runtime value inside its text (`bash -c "$G workflow run x"`), and so
+    can a program no deny-set thought to name: a wrapper option no row
+    reads (`env -S`, `sudo -s`), a multiplexer (`tmux new-window`, `screen`),
+    a lock (`flock -c`), a git alias (`git -c 'alias.z=!…' z`) or the fabric
+    itself (`fab test -- sh -c`), each refused by main and measured passing
+    a deny-set (the cross-model read of task/3945). A program word that is a
+    runtime VALUE (`$SH`, `$(echo sh)`, `${A[0]}`) may be a shell, so it runs
+    text too, and so does a shell or runner inside ANY substitution, quote or
+    not: `printf X | echo $(sh)`, `printf X > >(sh)` and ``printf X | `sh` ``
+    inherit the pipe's or redirect's stdin (round 3 of task/3945). So only
+    programs that record or print what they are handed qualify: a chat or task
+    text, a commit message, an echo, a sed script that runs nothing; any other
+    command is read whole, as before.
+
+    A LIVE SUBSTITUTION IS NEVER PROSE (round 4 of task/3945). A double-quoted
+    argument that holds a `$(` or a backtick is not blanked
+    (`_blank_quoted_prose`): it is read exactly as main reads it, for every
+    verb, with no list of verbs to keep. Blanking it let `helm task note 1
+    "the … run broke: $(rm -rf ~)"` past this rung, where main refused it,
+    for every helm verb the body guard does not cover (note, lr, handoff,
+    asks). Single-quoted text and a quoted heredoc body hold none and stay
+    blankable.
+
+    WHAT THIS GIVES UP: `$E helm task note '...'`, whose program word is a
+    value and so is no longer read as prose, and prose in the same quoted
+    argument as any live substitution, even one that only prints (`"ran at
+    $(date): the … run is green"`) — each refused now, as main refuses it
+    too. A program that only produces OUTPUT inside a substitution in an
+    argument of its own runs nothing it reads, so that still passes."""
+    if _GH_HEAD.search(readings) or _a_program_runs_text(command):
+        return command
+    lines = command.split("\n")
+    out, run, last = list(lines), [], None
+
+    def strings(idx):
+        if idx:
+            new = _blank_quoted_prose("\n".join(lines[k] for k in idx))
+            for k, part in zip(idx, new.split("\n")):
+                out[k] = part
+    for i, openers in _heredoc_openers(command):
+        if last is not None and i != last + 1:
+            strings(run)
+            run = []
+        run.append(i)
+        last = i
+        for _match, quoted, start, end, _resume in openers:
+            if quoted:
+                for k in range(start, end):
+                    out[k] = _GH_VERB_WORDS.sub(_blank_word, lines[k])
+    strings(run)
+    return "\n".join(out)
 
 
 def _row_the_shell_runs(command, rows, code=frozenset()):
@@ -10072,6 +11414,63 @@ def _row_the_shell_runs(command, rows, code=frozenset()):
 # number is what that pin exists to refuse. This clause says the one thing
 # the reader cannot derive and would otherwise get WRONG.
 _IN_A_DOCUMENT = " (in a heredoc body)"
+# A TEST STRING IN PYTHON THAT IMPORTS HELM (task/3430 (5), task/3382 item
+# 6): a local seat was refused 160 times in 233 minutes on Actions words in
+# `python3 -c` test strings. Python that imports helm can reach a denied
+# primitive through it (the integrator's ruling on codex F2), so that text
+# stays code and the string stays refused; what the seat lacked was the
+# move that works. The clause marks the one refusal whose evidence stands
+# ONLY in such text, and the message names the move there.
+_IN_PYTHON_TEXT = " (in python importing helm)"
+
+
+def _python_test_text(command):
+    """Whether every Actions spelling in `command` stands inside python text
+    that is code only because it imports helm: text that would be inert with
+    helm on the allowlist, and that names no way to start a process
+    (`_SPAWNS`) — a test string, not a spawn. False wherever the reader
+    cannot settle the command, or a spelling stands outside such text."""
+    try:
+        reader = _ShellReader(command)
+        tokens = reader.read()
+    except Exception:          # _Unsettled, or the reader's defect
+        return False
+    # a body opened on the LAST line starts past the end of the text, as
+    # `_cut_data` bounds it (review F1: indexing it raised IndexError)
+    spans = {at: tuple(reader.starts[line] if line < len(reader.starts)
+                       else reader.n for line in (start, end))
+             for at, _q, start, end in reader.bodies}
+    found = []
+    for cmd in _simple_commands(tokens):
+        name, k = _program(cmd.words)
+        if k is None or not _PYTHON.fullmatch((name or "").rsplit("/", 1)[-1]):
+            continue
+        texts = [(spans[at], None) for at in cmd.docs if at in spans]
+        args, j = cmd.words[k + 1:], 0
+        while j < len(args):                # the -c text, as _python_text
+            v = args[j].value()
+            if v is None or v == "-m" or not v.startswith("-") or v == "-":
+                break
+            if re.fullmatch(r"-[A-Za-z]*c", v):
+                if j + 1 < len(args) and args[j + 1].value() is not None:
+                    w = args[j + 1]
+                    texts.append(((w.start, w.end), w.value()))
+                break
+            j += 2 if v in ("-W", "-X") else 1
+        for (start, end), value in texts:
+            src = command[start:end] if value is None else value
+            if _SPAWNS.search(src) or python_text_inert(src) \
+                    or not python_text_inert(src, frozenset(("helm",))):
+                return False
+            found.append((start, end))
+    if not found:
+        return False
+    out, at = [], 0
+    for start, end in sorted(found):
+        out.append(command[at:start] + " ")
+        at = end
+    rows, anchor = _actions_evidence(_readings("".join(out) + command[at:]))
+    return not rows and anchor is None
 
 
 def _row_refusal(command, found):
@@ -11026,7 +12425,11 @@ def github_actions_message(act, tool="Bash"):
     belongs here is the part a reader cannot reconstruct — which spelling
     offended, where it stands, and the exact word that sends the act through.
     This function writes words and decides nothing."""
-    if tool == "Bash":
+    if tool == "Bash" and act.endswith(_IN_PYTHON_TEXT):
+        # the move that works for a test string (task/3430 (5))
+        cure = ("Test string? Spell it in pieces ('work'+'flow'). "
+                "Deliberate? Put %s first." % GITHUB_ACTIONS_OVERRIDE)
+    elif tool == "Bash":
         cure = ("Deliberate? Put %s first in the command; nowhere else "
                 "counts, nor does the environment."
                 % GITHUB_ACTIONS_OVERRIDE)
@@ -13281,6 +14684,21 @@ def shared_checkout_write_message(hit):
             % (spelled, top, _WRITE_CLAIM, INTEGRATOR_DECLARATION))
 
 
+def _narrow_goal(d):
+    """The narrow-goal refusal for this call, printed, or False (the rung,
+    its moment and its latch: helm/narrow_goal.py). Asked on the PASS path
+    only, after every other refusal: a call refused for another reason never
+    runs, so it is not the turn's first build act."""
+    try:
+        from . import narrow_goal
+        line = narrow_goal.refusal(d)
+    except Exception:                       # noqa: BLE001 — fail open
+        return False
+    if line:
+        print(line, file=sys.stderr)
+    return bool(line)
+
+
 def cmd_argv_guard(args):
     """chat argv-guard --hook-json — the PreToolUse gate over Bash, Monitor,
     Write, Edit and Agent.
@@ -13329,11 +14747,27 @@ def cmd_argv_guard(args):
     unreadable payload, helm's own bugs — exits 0: a guard on EVERY Bash
     call must fail open or it wedges the fleet (the stop-guard's law).
 
+    THE NARROW-GOAL RUNG (helm/narrow_goal.py) stands last on the pass path
+    of Bash, Write, Edit, NotebookEdit, Agent and Workflow: the turn's first
+    build act exits 2 with one line asking "am I optimizing on too narrow a
+    goal?" unless the turn's visible text already holds a `Wider goal:` line
+    or the seat is in an open meld for the task it builds. Once per turn;
+    the retry passes; HELM_NARROW_GOAL=0 turns it off.
+
     ON THE PASS PATH of Bash, Monitor, Write and Edit the TREE RUNG may add
     one advisory line (tree_steers): the call names a path in another
     registered project's checkout whose own native lead is live. It exits 0
     like every pass, and the line rides the JSON envelope on stdout, the one
     channel an agent reads from a hook that exits 0.
+
+    THE DOORS (helm/doors.py, task/1135) ride the same envelope, last: on
+    the pass path of Bash and Agent, each store entry with a `route:` cell,
+    and each `signal: act` reflex with a `route:`, that the call's act
+    stands in (a helm verb read off its argv, or act.spawn) is said once per
+    context in one line of at most doors.LINE_CAP bytes. With
+    HELM_DOOR_SHADOW=1 (off by default), a `helm chat post|reply|dm` body
+    is matched against the store's phrase probes in SHADOW: logged to the
+    moment ledger, never said. Advice only: a door never refuses.
     """
     try:
         d = json.load(sys.stdin)
@@ -13341,8 +14775,11 @@ def cmd_argv_guard(args):
         # THE AGENT RUNGS, first and alone: an Agent call is judged on its
         # `model` key, then on who calls, then (a steer) on its prompt's
         # shape. Its prompt is prose for a subagent, not a shell command, so
-        # no Bash rung reads it, and a read-only main-thread call imports
-        # nothing and reads no file.
+        # no Bash rung reads it. A read-only main-thread call imports one
+        # module, helm/doors.py, and reads one small file, its door table
+        # (plus one stat of the registry), to ask whether any rule binds
+        # act.spawn; only then is its index read (the store only to rebuild
+        # a stale one).
         if tool == "Agent":
             model = agent_model_refusal(d.get("tool_input") or {})
             if model is not None:
@@ -13357,10 +14794,19 @@ def cmd_argv_guard(args):
                     print("[helm argv-guard] BLOCKED: "
                           + actors.sidechain_spawn_refusal(), file=sys.stderr)
                     return 2
-            # THE FABLE-BUILD STEER (task/2574), the pass path's one line.
+            # THE NARROW-GOAL RUNG (helm/narrow_goal.py): a spawn is a build
+            # act, and the turn's first one waits for a `Wider goal:` line.
+            if _narrow_goal(d):
+                return 2
+            # THE FABLE-BUILD STEER (task/2574), then the act.spawn door's
+            # bound rules (task/1135), on one envelope.
             steers = fable_build_steers(d)
-            if steers:
-                advise(admit(d.get("session_id"), steers))
+            door, pending = _door_wanting(d)
+            said = []
+            if steers or door:
+                said = admit(d.get("session_id"), steers + door)
+                advise(said)
+            _door_settle(d, pending, said)
             return 0
         if tool in ("Write", "Edit", "NotebookEdit"):
             forged = owner_posture_forge_refusal(
@@ -13382,9 +14828,15 @@ def cmd_argv_guard(args):
             if wrote is not None:
                 print(shared_checkout_write_message(wrote), file=sys.stderr)
                 return 2
+            if _narrow_goal(d):
+                return 2
             _tree_advise(d, (d.get("tool_input") or {}).get("file_path"),
                          first=_act_write_steers(d))
             return 0
+        if tool == "Workflow":
+            # A Workflow spawns its agents from a script, with no Agent call
+            # for the rung to see, so the Workflow call is the build act.
+            return 2 if _narrow_goal(d) else 0
         if tool not in ("Bash", "Monitor"):
             return 0
         cmd = (d.get("tool_input") or {}).get("command") or ""
@@ -13482,6 +14934,10 @@ def cmd_argv_guard(args):
                 if deny:
                     print(deny, file=sys.stderr)
                     return 2
+            # THE NARROW-GOAL RUNG: a command that writes a file or orders
+            # work is a build act (helm/narrow_goal.py build_act).
+            if _narrow_goal(d):
+                return 2
             # STEERS RIDE THE PASS PATH ONLY. A blocked command never runs,
             # so its cure is the only thing worth saying; stacking advice on
             # top of a refusal buries the refusal. Advisory always: printed,
@@ -13492,12 +14948,30 @@ def cmd_argv_guard(args):
             # reaches the debug log and nobody else, so a steer printed there
             # spends its once-per-session latch on telling no one. The lines
             # ride the pass path's one envelope (see `advise`).
-            _tree_advise(d, cmd, first=granted + [
+            #
+            # THE DOORS RIDE LAST (task/1135): a rule bound to the helm verb
+            # this command runs, said once per context, and the agent's own
+            # post matched in shadow when HELM_DOOR_SHADOW=1 (logged,
+            # never said).
+            door, pending = _door_wanting(d)
+            said = _tree_advise(d, cmd, first=granted + [
                 (sid, "[helm steer] " + text)
                 for sid, text in argv_steers(cmd, d.get("cwd"),
-                                             d.get("tool_input"))])
+                                             d.get("tool_input"))] + door)
+            _door_settle(d, pending, said)
             return 0
         cure, why = blocked
+        # THE EXACT COPY (task/3945): the refused command with every refused
+        # substitution made literal, checked against this guard, so the
+        # seat runs it instead of rebuilding its own command by hand. Its
+        # module loads on the refusal path only, inside its OWN try: this
+        # outer one fails open, so a failed import there would admit the
+        # refused command. A defect here costs the copy, never the refusal.
+        try:
+            from .argv_cure import corrected_tail
+            fixed = corrected_tail(cmd)
+        except Exception:
+            fixed = ""
         # three cures, one law: the block must name the safe route for ITS
         # surface — an undiscoverable safe path is no safe path.
         #
@@ -13521,7 +14995,7 @@ def cmd_argv_guard(args):
                   "--patch-tip or --no-patch-because); RELATION is "
                   "new|uncured|regression-of-cure|UNKNOWN. Or single-quote "
                   "evidence that needs no apostrophes."
-                  % why, file=sys.stderr)
+                  % why + fixed, file=sys.stderr)
             return 2
         if cure == "commit":
             print("[helm argv-guard] BLOCKED: %s. The landed message would be "
@@ -13530,17 +15004,25 @@ def cmd_argv_guard(args):
                   "quoted heredoc, then:\n"
                   "  git commit -F <file>\n"
                   "or single-quote a message that needs no apostrophes."
-                  % why, file=sys.stderr)
+                  % why + fixed, file=sys.stderr)
             return 2
         print("[helm argv-guard] BLOCKED: %s. The message body would be "
               "mangled and the substitution runs on your box. Pipe stdin, or "
               "quote the heredoc delimiter:\n"
               "  helm chat post --room R <<'EOF'\n  ...body...\n  EOF\n"
               "or single-quote a body that needs literal backticks."
-              % why, file=sys.stderr)
+              % why + fixed, file=sys.stderr)
         return 2
     except Exception:
         return 0                       # fail-open, always
+
+
+def _meld_named(room):
+    """Is `room` a meld's by its name: a `meld-` room, or a task's pair meld,
+    whose `<scope>-<N>` name carries no prefix (`review_door.is_pair_room`)?
+    Local import, like meld's: review_door reads chat."""
+    from . import review_door
+    return room.startswith("meld-") or review_door.is_pair_room(room)
 
 
 def log_flush(rooms=None, report=None):
@@ -13607,7 +15089,7 @@ def log_flush(rooms=None, report=None):
         # down globally, that applies to EVERY meld room, because none of them
         # were mirrored.
         why = quarantined.get(room)
-        if why is None and lifecycle_down and room.startswith("meld-"):
+        if why is None and lifecycle_down and _meld_named(room):
             why = lifecycle_down
         if why is not None:
             quarantined[room] = why
@@ -14551,8 +16033,18 @@ HELP = {
             "expiry — its stdout must "
             "be a pipe; a background shell writes wake-lines to a file that "
             "wakes nobody, and the beacon refuses that shape) "
-            "[--replace] [--ambient] [--per-row] [--on-behalf] "
+            "[--replace] [--ambient] [--per-row] [--once] [--on-behalf] "
             "[--timeout SECONDS]\n"
+            "  --once (with --follow): the ONE-SHOT beacon. Mention-only like "
+            "--follow, it exits after its\n"
+            "  first ring, so its exit is the wake: arm it as a background "
+            "task (its output file is\n"
+            "  read when it exits) or a Monitor, and re-arm it in the turn it "
+            "starts. While it runs\n"
+            "  the census counts it; for the re-arm grace after it rings the "
+            "seat reads WAKING, not DEAF.\n"
+            "  It never rings for a row a ring already showed or the hook "
+            "already showed.\n"
             "  --on-behalf: this process declares no identity and is naming "
             "ANOTHER seat — a supervisor arming a beacon for a seat it is "
             "standing up. It drains that seat's inbox, so it must be said.\n"
@@ -15526,14 +17018,22 @@ def cmd_chat(args):
         rows, total = read(room)
         idx = index_rows(rows)            # the WHOLE room indexes the thread:
         tag = read_prefix(rows)           # [n] beside a row IS its `react n`,
+        # A --since past the room's end prints nothing, with or without
+        # --limit: falling back to row 0 replayed the whole room into a reader
+        # holding a stale cursor. The note goes to stderr only.
+        if since > total:
+            print("helm chat: --since %d is past room %s's last row (%d); "
+                  "nothing printed. The newest rows: --limit N"
+                  % (since, room, total), file=sys.stderr)
         if limit is not None:
             # --limit = the NEWEST N (what every caller means), counting from
             # the END of the room; [n] tags stay whole-room so a react still
             # resolves. --since composes as the window's floor.
             start = max(since, total - limit)
         else:
-            start = since if 0 <= since <= total else 0   # counted over the WHOLE
-        msgs = rows[start:]               # room so --since never shifts [n]
+            # counted over the WHOLE room so --since never shifts [n]
+            start = min(max(since, 0), total)
+        msgs = rows[start:]
         # A PULL THE SEAT CHOSE IS A DELIVERY of the rows that reached stdout
         # whole (helm.pull_delivery): each line is flushed before it counts,
         # and the rows printed before a failed write still count. Whether a

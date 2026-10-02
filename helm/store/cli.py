@@ -285,7 +285,7 @@ _GRAMMAR = {
                           "--edit": "rest", "--rescope": "switch"},
                 "pos": 1, "tail": False},
     "reject": {"flags": {"--type": "one"}, "pos": 1, "tail": "literal"},
-    "resolve": {"flags": {}, "pos": 0, "tail": "literal"},
+    "resolve": {"flags": {"--act": "switch"}, "pos": 0, "tail": "literal"},
     "pinned": {"flags": {"--stats": "switch"}, "pos": 0, "tail": False},
     "evidence": {"flags": {}, "pos": 3, "tail": "literal"},
     "supersede": {"flags": {}, "pos": 3, "tail": "literal"},
@@ -1226,9 +1226,19 @@ def cmd_store(args):
         if not text and not sys.stdin.isatty():
             text = sys.stdin.read()
         if not text.strip():
-            print("usage: helm store resolve <text>   (or pipe prompt text on stdin)",
-                  file=sys.stderr)
+            print("usage: helm store resolve <text>   (or pipe prompt text on stdin)\n"
+                  "       helm store resolve --act '<command>'   (what a tool "
+                  "call's door says)", file=sys.stderr)
             return 2
+        if ns.has("--act"):
+            # THE RESOLVE-TEST FOR A ROUTE CELL (task/1135): the route ids the
+            # command stands in and the rule each door would say, read fresh
+            # from the store, so /learn's "resolve-test both ways" has a verb
+            # for a lesson bound to an act rather than to words.
+            from .. import doors
+            for line in doors.explain(text, project=project):
+                print(line)
+            return 0
         hits = resolve_prompt(text, project=project)
         for e in hits:
             print(_fmt(e))

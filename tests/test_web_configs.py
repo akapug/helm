@@ -415,6 +415,34 @@ class TestWebConfigs(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertIn(os.path.realpath(self.proj), self._paths(still))
 
+    def test_the_catalog_prewarm_builds_the_catalog_off_the_serve_path(self):
+        from helm import web_server, transcripts
+        with mock.patch.object(transcripts, "get_catalog",
+                               return_value={"rows": []}) as cat:
+            t = web_server._prewarm_catalog()
+            self.assertIsNotNone(t)
+            t.join(30)
+        self.assertFalse(t.is_alive())
+        self.assertEqual(cat.call_count, 1)
+        # a failing build is swallowed: the thread finishes, nothing escapes
+        escaped = []
+        prior_hook = threading.excepthook
+        threading.excepthook = escaped.append
+        self.addCleanup(setattr, threading, "excepthook", prior_hook)
+        with mock.patch.object(transcripts, "get_catalog",
+                               side_effect=OSError("cv is gone")) as broke:
+            t = web_server._prewarm_catalog()
+            t.join(30)
+        self.assertEqual(broke.call_count, 1)
+        self.assertEqual(escaped, [])
+
+    def test_the_serve_path_starts_the_catalog_prewarm(self):
+        import inspect
+        from helm import web_server
+        src = inspect.getsource(web_server.cmd_web)
+        self.assertIn("_prewarm_catalog()", src)
+        self.assertIn("_prewarm_configs()", src)   # control: the same block
+
     # -- GET /api/configs/homes --------------------------------------------
     def test_homes_lists_home_scope_files(self):
         status, d = self.req("/api/configs/homes")

@@ -235,6 +235,71 @@ SEAT_RUNGS = {
         "source": _CARDS},
 }
 
+# The apprenticeship rungs CAN live in a data file instead of this code, so
+# the board shows fresh evidence without a helm change: <helm global dir>/
+# seat-rungs.json (the mentor edits that, the code only reads it). RUNGS and
+# SEAT_RUNGS here are the FALLBACK, kept unchanged, for when the file is absent,
+# unreadable, or does not put every seat's step on its track's ladder.
+SEAT_RUNGS_FILE = "seat-rungs.json"
+
+def load_rungs():
+    """(ladders, seats, source_line): the apprenticeship rungs and how they were
+    found.
+
+    The data file is used when it parses AND every seat's `step` sits on its
+    own track's ladder; a single malformed seat entry is skipped and counted,
+    the other seats still load. Otherwise the built-in RUNGS/SEAT_RUNGS are
+    returned as the "reader" ladder. source_line says which was shown.
+
+    The ladder a seat's next rung is read from is its OWN track's ladder (the
+    board places each seat on the ladder of the track it is on).
+    """
+    from . import home
+    try:
+        _path, obj, why = home.global_json(SEAT_RUNGS_FILE)
+    except Exception:
+        obj, why = None, "global_json raised"
+    if obj is not None and isinstance(obj, dict):
+        ladders = obj.get("ladders")
+        seats = obj.get("seats")
+        if isinstance(ladders, dict) and isinstance(seats, list):
+            clean = []
+            for seat in seats:
+                track = str(seat.get("track", "")) if isinstance(seat, dict) else ""
+                ladder = ladders.get(track)
+                if (isinstance(seat, dict) and isinstance(ladder, list)
+                        and str(seat.get("step", "")) in ladder):
+                    clean.append(seat)
+            skipped = len(seats) - len(clean)
+            if not clean:
+                return {"reader": list(RUNGS)}, _seats_from_dict(), (
+                    "rungs: built-in (seat-rungs.json has no seat on its ladders: %d skipped)" % skipped)
+            if clean:
+                # ONE BAD ENTRY IS NOT A REASON TO DISCARD THE FILE, but a ladder
+                # with no step present is: it would place every seat off-rung.
+                last = clean[-1]
+                date = last.get("date") if isinstance(last, dict) else ""
+                return ladders, clean, (
+                    "rungs from %s%s%s"
+                    % (os.path.join(home.global_dir(), SEAT_RUNGS_FILE),
+                       (" (updated %s)" % date if date else ""),
+                       ("; %d seat entr%s off its ladder skipped" % (skipped, "y" if skipped == 1 else "ies")
+                        if skipped else "")))
+    if why:
+        return {"reader": list(RUNGS)}, _seats_from_dict(), "rungs: built-in (seat-rungs.json unreadable: %s)" % why
+    return {"reader": list(RUNGS)}, _seats_from_dict(), "rungs: built-in (seat-rungs.json missing)"
+
+
+def _seats_from_dict():
+    """The built-in fallback rungs, one rung row per seat, each carrying its
+    own words plus the fields the data-file seats carry (track, model)."""
+    return [
+        dict(r, seat=seat, rung=r["rung"], step=r["step"],
+             track="reader",
+             model=None)
+        for seat, r in SEAT_RUNGS.items()
+    ]
+
 # ── WHAT THIS BOARD DOES NOT MEASURE YET, and why ───────────────────────────
 UNMEASURED = {
     "request_speed": "not joined yet: the per-seat proxy logs name no lane and "
@@ -772,12 +837,19 @@ def board(rows, trunk, now=None, window_s=WINDOWS[DEFAULT_WINDOW], trunk_why=Non
                  "rung": SEAT_RUNGS.get(seat, {}).get("rung")}
         seats.append(entry)
     seat_of = {x["seat"]: x for x in seats}
+    ladders, data_seats, source_line = load_rungs()
     rung_rows = []
-    for seat, r in SEAT_RUNGS.items():
-        at = RUNGS.index(r["step"])
-        rung_rows.append(dict(r, seat=seat, next_rung=RUNGS[at + 1],
-                              model=(seat_of.get(seat) or {}).get("model"),
-                              reader=((seat_of.get(seat) or {}).get("measured") or {}).get("reader")))
+    for seat in data_seats:
+        ladder = ladders.get(str(seat.get("track", "")))
+        if not isinstance(ladder, list):
+            ladder = RUNGS
+        at = ladder.index(str(seat.get("step")))
+        seat_id = seat.get("seat")
+        # the top rung ("admitted") has no next one: None, never an IndexError that takes the board down
+        rung_rows.append(dict(seat, next_rung=ladder[at + 1] if at + 1 < len(ladder) else None,
+                              model=(seat.get("model")
+                                     or (seat_of.get(seat_id) or {}).get("model")),
+                              reader=((seat_of.get(seat_id) or {}).get("measured") or {}).get("reader")))
     label = next((k for k, v in WINDOWS.items() if v == window_s), "%dd" % (window_s // 86400))
     return {
         "window": label, "since": _stamp(since), "generated_at": _stamp(now),
@@ -788,7 +860,10 @@ def board(rows, trunk, now=None, window_s=WINDOWS[DEFAULT_WINDOW], trunk_why=Non
         "prior_note": PRIOR_NOTE,
         "models": models, "seats": seats,
         "unnamed": dict(unnamed, seats=sorted(unnamed["seats"])),
-        "rungs": {"ladder": list(RUNGS), "who_admits": WHO_ADMITS, "seats": rung_rows},
+        # "ladder" STAYS the reader ladder as a list: the console's Models page joins it (23-models.js.part:135)
+        "rungs": {"ladder": list(ladders.get("reader") or RUNGS), "ladders": ladders,
+                  "who_admits": WHO_ADMITS, "seats": rung_rows,
+                  "source_line": source_line},
         "unknown": dict(UNMEASURED)}
 
 
@@ -897,9 +972,14 @@ def board_lines(b):
                    for m in gaps)
     out.append("")
     out.append("apprenticeship rungs (%s):" % b["rungs"]["who_admits"])
+    if b["rungs"].get("source_line"):
+        out.append("  " + b["rungs"]["source_line"])
     for r in b["rungs"]["seats"]:
         rd = r.get("reader")
-        out.append("  %s — %s (%s %s); next: %s" % (r["seat"], r["rung"], r["by"], r["date"], r["next_rung"]))
+        model = r.get("model")
+        out.append("  %s [%s] — %s (%s %s)%s; next: %s" % (r["seat"], r.get("track") or "reader", r["rung"],
+                                                            r["by"], r["date"], ("; " + model) if model else "",
+                                                            r["next_rung"] or "none (the top rung)"))
         out.append("      needs: " + r["next"])
         out.append("      so far: " + r["evidence"] + ("; on the ledger: %d of %d tips agreed with the tier, %d missed"
                                                         % (rd["agree"], rd["pairs"], rd["misses"]) if rd

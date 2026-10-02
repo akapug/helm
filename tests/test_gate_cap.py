@@ -41,7 +41,7 @@ class WorldNarrativeGuardTest(unittest.TestCase):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         paths = (
             "helm/gate.py", "tests/test_gate_cap.py", "helm/notify.py",
-            "helm/telegram.py", "docs/VERBS.md", "helm/cli_help.py",
+            "helm/telegram.py", "docs/VERBS.md", "helm/help/telegram.txt",
         )
         texts = {}
         for path in paths:
@@ -123,13 +123,14 @@ class WorldNarrativeGuardTest(unittest.TestCase):
             "helm/telegram.py": texts["helm/telegram.py"].split('"""', 2)[1],
             "docs/VERBS.md": between(
                 "docs/VERBS.md", "### `helm telegram", "\n### "),
-            # The verb help text WORLD translated lives in cli_help.py, where
-            # each marker occurs once. cli.py's dispatch table spells the same
-            # two keys, so the region is read from the help module by name and
-            # `between` still refuses a marker that appears twice.
-            "helm/cli_help.py": between(
-                "helm/cli_help.py", '    "telegram":', '\n    "dispatch":'),
+            # The verb help text WORLD translated lives in
+            # helm/help/telegram.txt — one file per verb (3918) — so the
+            # whole file is the region: the file boundary is what bounds the
+            # entry. The loaded dict must still hold the key.
+            "helm/help/telegram.txt": texts["helm/help/telegram.txt"],
         }
+        from helm import cli_help
+        self.assertIn("telegram", cli_help._VERB_HELP)
         # CONTROL: every bounded site must keep its translated topology or
         # uncertainty. This proves the scan saw the intended narrative.
         anchors = {
@@ -164,8 +165,8 @@ class WorldNarrativeGuardTest(unittest.TestCase):
                                  "one daemon common to every pane"),
             "docs/VERBS.md": ("may span daemon generations",
                               "no single daemon is assumed"),
-            "helm/cli_help.py": ("may span daemon generations",
-                                 "not one daemon common to every pane"),
+            "helm/help/telegram.txt": ("may span daemon generations",
+                                       "not one daemon common to every pane"),
         }
         # NARRATIVE MATCHING IS WHITESPACE-INSENSITIVE, and both directions of
         # this check needed it. Prose in a docstring is WRAPPED, so a phrase
@@ -893,6 +894,53 @@ class PerHostCapTest(CapBase):
             with mock.patch("builtins.open", denied):
                 self.assertFalse(gate._print_mode_agent(90211, self.proc))
                 self.assertEqual(gate.suite_cap(self.proc), gate.SUITE_CAP)
+
+    def _host_ns(self, kind):
+        d = os.path.join(self.proc, "1", "ns")
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, kind)
+        if not os.path.exists(path):
+            with open(path, "w") as fh:
+                fh.write(kind)
+        return path
+
+    def _link_ns(self, pid, kind, same):
+        host = self._host_ns(kind)
+        d = os.path.join(self.proc, str(pid), "ns")
+        os.makedirs(d, exist_ok=True)
+        dest = os.path.join(d, kind)
+        if same:
+            os.link(host, dest)
+        else:
+            with open(dest, "w") as fh:
+                fh.write("other-" + kind)
+
+    def test_a_container_agent_is_not_a_pane(self):
+        """task/3094: a claude whose pid or cgroup namespace is not the
+        host's is a container job, not a seat. An unreadable namespace
+        stays a pane."""
+        self.paneless()
+        with mock.patch.object(gate, "_online_cpu_count", return_value=32):
+            self.assertEqual(gate.suite_cap(self.proc), 16)
+            self.pane(90301)
+            self._link_ns(90301, "pid", same=False)
+            self._link_ns(90301, "cgroup", same=True)
+            self.assertTrue(gate._container_agent(90301, self.proc))
+            self.assertEqual(gate._agent_pane_pids(self.proc), [])
+            self.pane(90302)
+            self._link_ns(90302, "pid", same=True)
+            self._link_ns(90302, "cgroup", same=False)
+            self.assertEqual(gate._agent_pane_pids(self.proc), [])
+            self.pane(90303)
+            self._link_ns(90303, "pid", same=True)
+            self._link_ns(90303, "cgroup", same=True)
+            self.assertFalse(gate._container_agent(90303, self.proc))
+            self.assertEqual(gate._agent_pane_pids(self.proc), [90303])
+            self.assertEqual(gate.suite_cap(self.proc), gate.SUITE_CAP)
+            self.pane(90304)
+            self.assertFalse(gate._container_agent(90304, self.proc))
+            self.assertEqual(gate._agent_pane_pids(self.proc),
+                             [90303, 90304])
 
     def test_a_build_host_full_of_protected_STRANGERS_still_raises(self):
         """THE REGRESSION THAT LANDED, as a test rather than a story.

@@ -1210,6 +1210,49 @@ class SeatAttributionGateTest(ReleaseFixture):
         with open(os.path.join(work, "reports", "arm_attr.txt"), encoding="utf-8") as f:
             self.assertIn("STALE KEEP entry", f.read())
 
+    def test_a_planted_attribution_in_a_help_fragment_is_refused(self):
+        """A seat-attribution line in a help fragment (one file per verb,
+        task/3918) ships only with a KEEP entry: the scanner reads the
+        fragments, so a line moved out of a source file stays under the same
+        scan. The stand-in is the fixture's own seat, so no private name
+        enters the tree."""
+        _write(os.path.join(self.src, "helm", "help", "widget.txt"),
+               "usage: helm widget [args]\n" + SEAT_LINE + "\n")
+        self.commit_trunk("trunk: a help fragment with an attribution line")
+        rc, out, work = self.release()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("REFUSED", out)
+        self.assertIn("seat attribution", out)
+        self.assertIn("helm/help/widget.txt:2", out)
+        self.assertNotIn("fixture-seat-7", out)
+        self.assertNothingWritten(out)
+        with open(os.path.join(work, "reports", "arm_attr.txt"), encoding="utf-8") as f:
+            report = f.read()
+        self.assertIn("OFFENDING helm/help/widget.txt:2: " + SEAT_LINE, report)
+
+    def test_a_kept_line_that_moved_into_a_help_fragment_is_live(self):  # noqa: VACUOUS_ASSERTION — the pass case pins rc 0, KEEP-listed 1 and no STALE entry unconditionally; the mode loop's nothing-written absence is pinned by each mode's rc 1 and refusal
+        """The approval follows the text, not the file it stood in. The line
+        stood in helm/widget.py as a quoted source line and the KEEP entry
+        names it there; it moved into helm/help/widget.txt, one file per verb
+        (task/3918), where it stands unquoted. The entry still matches the
+        moved line, in either direction of the move, so the line is kept and
+        the entry is not stale — and the release passes."""
+        _write(os.path.join(self.src, "helm", "widget.py"),
+               '"""The widget counts."""\nCOUNT = 0\n')
+        _write(os.path.join(self.src, "helm", "help", "widget.txt"),
+               "usage: helm widget [args]\n" + SEAT_LINE + "\n")
+        self.commit_trunk("trunk: a kept line moved into a help fragment")
+        self.keep([{"file": "helm/widget.py",
+                    "text": '"%s"' % SEAT_LINE.strip("# "),
+                    "reason": "names the fixture's own seat"}])
+        rc, out, work = self.release()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("seat attribution: 1 line in helm/, on the KEEP list", out)
+        with open(os.path.join(work, "reports", "arm_attr.txt"), encoding="utf-8") as f:
+            report = f.read()
+        self.assertIn("definition-B lines=1  (KEEP-listed 1, offending 0)", report)
+        self.assertNotIn("STALE KEEP entry", report)
+
     def test_an_absent_keep_list_fails_the_gate_in_every_mode(self):  # noqa: VACUOUS_ASSERTION — the mode table is a non-empty literal and each case pins rc 1 and the refusal before the absences
         os.unlink(self.keep_file)
         for mode in ((), ("--publish",)):
@@ -1220,6 +1263,35 @@ class SeatAttributionGateTest(ReleaseFixture):
                 self.assertIn("the seat-attribution gate did not run", out)
                 self.assertIn("%s is absent" % self.keep_file, out)
                 self.assertNothingWritten(out)
+
+    def test_a_second_unkept_name_in_a_help_fragment_is_refused(self):
+        """The approval is span-aware, per occurrence. The kept name moves into
+        helm/help/widget.txt (one file per verb, task/3918) and the KEEP entry
+        names it in helm/widget.py, but a second, unkept private name stands on
+        the same fragment line: it is refused, and the entry stays live (its
+        value is still present), so the release fails on the second name alone
+        and never on staleness. The stand-ins are the fixture's own seats."""
+        second = "fixture-seat-9 reviewed the queue reset."
+        _write(os.path.join(self.src, "helm", "widget.py"),
+               '"""The widget counts."""\nCOUNT = 0\n')
+        _write(os.path.join(self.src, "helm", "help", "widget.txt"),
+               "usage: helm widget [args]\n" + SEAT_LINE + " " + second + "\n")
+        self.commit_trunk("trunk: a kept name and a second name in a fragment")
+        self.keep([{"file": "helm/widget.py",
+                    "text": '"%s"' % SEAT_LINE.strip("# "),
+                    "reason": "names the fixture's own seat"}])
+        rc, out, work = self.release()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("REFUSED", out)
+        self.assertIn("seat attribution", out)
+        self.assertIn("helm/help/widget.txt:2", out)
+        self.assertNotIn("fixture-seat-9", out)
+        # the second name is redacted
+        self.assertNothingWritten(out)
+        with open(os.path.join(work, "reports", "arm_attr.txt"), encoding="utf-8") as f:
+            report = f.read()
+        self.assertIn("OFFENDING helm/help/widget.txt:2:", report)
+        self.assertNotIn("STALE KEEP entry", report)  # the kept entry is still live
 
     def test_a_keep_list_anyone_else_can_reach_is_refused_unread(self):  # noqa: VACUOUS_ASSERTION — the mode table is a non-empty literal and each case pins rc 1 and the named mode before the absences
         secret = "fixture-private-token-9"
@@ -1537,6 +1609,242 @@ class NightlyTest(ReleaseFixture):
                                    env=self.command()[1])
                 self.assertEqual(p.returncode, 2, p.stdout + p.stderr)
                 self.assertIn(said, p.stderr)
+
+
+NEXT = "9.9.2"
+README_NOTE = "# Change notes\n\nA lane writes its change note here.\n"
+UNRELEASED_BULLETS = "- the widget sleeps\n- the counter\n  wraps at nine"
+NOTE_A = "- a note from lane a\n  on two lines\n"
+NOTE_B = "- a note from lane b\n"
+
+
+class ChangeNotesTest(ReleaseFixture):
+    """A lane writes its change note as changes/<lane>.md and never edits
+    CHANGELOG.md. `--fold` is the cut's notes commit: the notes under
+    '## Unreleased', then each changes/*.md note in path order (README.md
+    excepted), become the new version's section, and the folded files go in
+    the same commit. The nightly's notes are the ones the next fold takes."""
+
+    def setUp(self):
+        super().setUp()
+        self.tool = _tool()
+
+    def plant(self, bullets="", notes=None, readme=True):
+        """Trunk with `bullets` under '## Unreleased' (after its pointer line)
+        and `notes` ({name: text}) under changes/; -> the new trunk sha."""
+        unreleased = "## Unreleased\n%s\n\n%s" % (
+            self.tool.POINTER, bullets + "\n\n" if bullets else "")
+        _write(os.path.join(self.src, "CHANGELOG.md"), CHANGELOG.replace(
+            "## %s" % VERSION, unreleased + "## %s" % VERSION, 1))
+        if readme:
+            _write(os.path.join(self.src, "changes", "README.md"), README_NOTE)
+        for name, text in (notes or {}).items():
+            _write(os.path.join(self.src, "changes", name), text)
+        return self.commit_trunk("trunk: change notes to fold")
+
+    def fold(self, version=NEXT):
+        """Run `--fold`; -> (rc, output, the '## <version>' section at HEAD
+        or None, the date the fold stamps)."""
+        date = _git(self.src, "log", "-1", "--format=%cd", "--date=short")
+        rc, out, _work = self.release("--fold", version=version, work=None)
+        with open(os.path.join(self.src, "CHANGELOG.md"), encoding="utf-8") as f:
+            text = f.read()
+        self.assertEqual(_git(self.src, "show", "HEAD:CHANGELOG.md"),
+                         text.strip(), "the fold left CHANGELOG.md uncommitted")
+        return rc, out, self.tool.changelog_section(text, version), date
+
+    def notes_left(self):
+        return sorted(os.listdir(os.path.join(self.src, "changes")))
+
+    def assertOneFoldCommit(self, before, removed):
+        """HEAD is one commit on `before` that changes CHANGELOG.md and
+        removes exactly `removed`, and the tree is clean."""
+        self.assertEqual(_git(self.src, "rev-parse", "HEAD~1"), before)
+        self.assertEqual(sorted(_git(self.src, "diff", "--name-status", before,
+                                     "HEAD").splitlines()),
+                         sorted(["M\tCHANGELOG.md"]
+                                + ["D\tchanges/" + n for n in removed]))
+        self.assertEqual(_git(self.src, "status", "--porcelain"), "")
+
+    def test_the_fold_takes_the_change_notes_alone(self):  # noqa: VACUOUS_ASSERTION — the emptied '## Unreleased' notes and the clean status are the fold's contract; the section equality, the pointer assertIn and the dry run's notes file pin the same text and commit positively
+        """Fragments only: '## Unreleased' holds just its pointer. The notes
+        become the section in path order, the files go, and the dry run of
+        that version then publishes that section as its notes."""
+        before = self.plant(notes={"b-lane.md": NOTE_B, "a-lane.md": NOTE_A})
+        rc, out, section, date = self.fold()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("FOLDED", out)
+        self.assertEqual(section, "Changes since %s.\n\n%s\n%s" % (
+            VERSION, NOTE_A.strip(), NOTE_B.strip()))
+        with open(os.path.join(self.src, "CHANGELOG.md"), encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("## %s — %s\n" % (NEXT, date), text)
+        self.assertEqual(self.tool.unreleased(text), "")
+        self.assertIn("## Unreleased\n%s\n" % self.tool.POINTER, text)
+        self.assertEqual(self.notes_left(), ["README.md"])
+        self.assertOneFoldCommit(before, ["a-lane.md", "b-lane.md"])
+        self.assertIn("changes/a-lane.md", _git(self.src, "log", "-1", "--format=%B"))
+        # the owner bumps the version; the dry run reads the folded section
+        _write(os.path.join(self.src, "helm", "__init__.py"),
+               '__version__ = "%s"\n' % NEXT)
+        self.commit_trunk("trunk: %s" % NEXT)
+        rc, out, work = self.release(version=NEXT)
+        self.assertEqual(rc, 0, out)
+        with open(os.path.join(work, "notes-v%s.md" % NEXT), encoding="utf-8") as f:
+            self.assertEqual(f.read().strip(), section)
+
+    def test_the_fold_takes_the_unreleased_notes_alone(self):  # noqa: VACUOUS_ASSERTION — the emptied '## Unreleased' notes and the clean status are the fold's contract; the section equality and the fold commit's name-status list pin them positively
+        """CHANGELOG only: no change note. The '## Unreleased' notes become
+        the section, and only the pointer stays under '## Unreleased'."""
+        before = self.plant(bullets=UNRELEASED_BULLETS)
+        rc, out, section, _date = self.fold()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(section, "Changes since %s.\n\n%s" % (
+            VERSION, UNRELEASED_BULLETS))
+        with open(os.path.join(self.src, "CHANGELOG.md"), encoding="utf-8") as f:
+            self.assertEqual(self.tool.unreleased(f.read()), "")
+        self.assertEqual(self.notes_left(), ["README.md"])
+        self.assertOneFoldCommit(before, [])
+
+    def test_the_fold_takes_both_the_unreleased_notes_first(self):  # noqa: VACUOUS_ASSERTION — the clean status is the fold's contract; the section equality and the fold commit's name-status list pin the same commit positively
+        before = self.plant(bullets=UNRELEASED_BULLETS,
+                            notes={"z-lane.md": NOTE_B, "a-lane.md": NOTE_A})
+        rc, out, section, _date = self.fold()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(section, "Changes since %s.\n\n%s\n%s\n%s" % (
+            VERSION, UNRELEASED_BULLETS, NOTE_A.strip(), NOTE_B.strip()))
+        self.assertOneFoldCommit(before, ["a-lane.md", "z-lane.md"])
+
+    def test_the_readme_is_never_folded(self):  # noqa: VACUOUS_ASSERTION — a refused fold writes nothing by contract; rc 1, the named refusal and the second fold's section equality are unconditional positive controls
+        """changes/README.md is not a note: with it alone there is nothing
+        to fold, and beside a note it is neither folded nor removed. A file
+        the fold does not take (another suffix, a subdirectory) stays too."""
+        before = self.plant()
+        rc, out, section, _date = self.fold()
+        self.assertEqual(rc, 1, out)
+        self.assertIn("nothing to fold", out)
+        self.assertIsNone(section)
+        self.assertEqual(_git(self.src, "rev-parse", "HEAD"), before)
+        self.assertEqual(self.notes_left(), ["README.md"])
+        before = self.plant(notes={"a-lane.md": NOTE_A, "b-lane.txt": NOTE_B,
+                                   "sub/c-lane.md": NOTE_B})
+        rc, out, section, _date = self.fold()
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(section, "Changes since %s.\n\n%s" % (
+            VERSION, NOTE_A.strip()))
+        self.assertNotIn("A lane writes its change note here", section)
+        self.assertEqual(self.notes_left(), ["README.md", "b-lane.txt", "sub"])
+        self.assertOneFoldCommit(before, ["a-lane.md"])
+
+    def test_the_fold_refuses_a_version_with_a_section_and_a_busy_checkout(self):  # noqa: VACUOUS_ASSERTION — a refused fold moves nothing by contract; rc 1 and each named refusal are unconditional positive controls
+        """A version CHANGELOG.md already has a heading for is refused, and so
+        is a checkout whose CHANGELOG.md, changes/ or index holds uncommitted
+        work: the commit must hold the fold and nothing else. Each refusal
+        leaves HEAD and the notes where they were."""
+        before = self.plant(notes={"a-lane.md": NOTE_A})
+        rc, out, _section, _date = self.fold(version=VERSION)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("already has a section for %s" % VERSION, out)
+        for rel, why in (("changes/a-lane.md", "uncommitted changes"),
+                         ("README.md", "staged changes")):
+            with self.subTest(rel=rel):
+                _write(os.path.join(self.src, rel), "- edited\n")
+                if rel == "README.md":
+                    _git(self.src, "add", "--", rel)
+                rc, out, _work = self.release("--fold", version=NEXT, work=None)
+                self.assertEqual(rc, 1, out)
+                self.assertIn(why, out)
+                self.assertEqual(_git(self.src, "rev-parse", "HEAD"), before)
+                _git(self.src, "reset", "-q", "--hard", before)
+        self.assertEqual(self.notes_left(), ["README.md", "a-lane.md"])
+
+    def test_no_section_and_an_empty_section_are_still_refused(self):
+        """The dry run's refusals are unchanged: no '## <version>' heading,
+        and a heading with nothing under it, are each no section, pending
+        notes or not. With notes pending and no heading, the refusal names
+        the fold that makes one; an empty heading would refuse the fold, so
+        there it does not."""
+        self.plant(notes={"a-lane.md": NOTE_A})
+        _write(os.path.join(self.src, "helm", "__init__.py"),
+               '__version__ = "%s"\n' % NEXT)
+        self.commit_trunk("trunk: %s with its notes unfolded" % NEXT)
+        rc, out, _work = self.release(version=NEXT)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("no section for %s" % NEXT, out)
+        self.assertIn("`--fold` makes it", out)
+        with open(os.path.join(self.src, "CHANGELOG.md"), encoding="utf-8") as f:
+            text = f.read()
+        _write(os.path.join(self.src, "CHANGELOG.md"), text.replace(
+            "## %s" % VERSION, "## %s — 2026-10-01\n\n## %s" % (NEXT, VERSION), 1))
+        self.commit_trunk("trunk: an empty section")
+        rc, out, _work = self.release(version=NEXT)
+        self.assertEqual(rc, 1, out)
+        self.assertIn("no section for %s" % NEXT, out)
+        self.assertNotIn("--fold", out)
+        self.assertNothingWritten(out)
+
+    def test_the_candidate_leaves_out_each_note_and_ships_the_readme(self):
+        """A change note's public form is its CHANGELOG section, so a note
+        still on trunk at a cut never ships raw. changes/README.md is not a
+        note: AGENTS.md links it and tests/test_change_notes.py reads it, so
+        it ships."""
+        self.plant(notes={"a-lane.md": NOTE_A})
+        rc, out, work = self.release()
+        self.assertEqual(rc, 0, out)
+        paths = _git(os.path.join(work, "release.git"), "ls-tree", "-r",
+                     "--name-only", "v%s^{commit}" % VERSION).split()
+        self.assertIn("changes/README.md", paths)
+        self.assertNotIn("changes/a-lane.md", paths)
+        self.assertIn("README.md", paths)
+
+    def test_the_nightly_notes_are_the_notes_the_next_fold_takes(self):
+        """The nightly publishes nothing, but its notes are what a cut made
+        now would publish: the '## Unreleased' notes, then the change notes,
+        README excepted. With nothing pending, the pointer line is not a
+        note: the newest version section is."""
+        self.plant(bullets=UNRELEASED_BULLETS,
+                   notes={"b-lane.md": NOTE_B, "a-lane.md": NOTE_A})
+        rc, out, work = self.release("--nightly", version=None)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("2 change notes in changes/", out)
+        with open(os.path.join(work, "notes-v%s-nightly.md" % VERSION),
+                  encoding="utf-8") as f:
+            self.assertEqual(f.read().strip(), "%s\n%s\n%s" % (
+                UNRELEASED_BULLETS, NOTE_A.strip(), NOTE_B.strip()))
+        _git(self.src, "rm", "-q", "--", "changes/a-lane.md", "changes/b-lane.md")
+        self.plant()
+        rc, out, work = self.release("--nightly", version=None)
+        self.assertEqual(rc, 0, out)
+        self.assertIn("the newest CHANGELOG section, '## %s" % VERSION, out)
+        with open(os.path.join(work, "notes-v%s-nightly.md" % VERSION),
+                  encoding="utf-8") as f:
+            self.assertEqual(f.read().strip(), SECTION)
+
+
+class KeptSpanTest(unittest.TestCase):
+    """The span-aware KEEP match on a help fragment line, called directly.
+    Synthetic names only."""
+
+    SEAT = re.compile(r"(?<![A-Za-z0-9_/.-])(zz-seat-\d+)(?![A-Za-z0-9_])")
+
+    def test_the_reason_is_the_entry_whose_span_holds_the_hit(self):
+        """Two kept values overlap on one fragment line and only the second
+        holds the hit: the owner's report gives the second entry's reason,
+        never the first value's that merely stands earlier on the line."""
+        tool = _tool()
+        keep = {("helm/a.py", '"aa zz-se"'): "first, holds no hit",
+                ("helm/b.py", '"zz-seat-1 found it"'): "second, holds the hit"}
+        got = tool.kept_reason("helm/help/x.txt", "aa zz-seat-1 found it",
+                               keep, self.SEAT)
+        self.assertEqual(got, "second, holds the hit")
+
+    def test_a_hit_straddling_a_kept_span_is_not_covered(self):
+        """A hit that starts inside a kept value and ends past it is not held
+        by that value's span: the part outside was never approved."""
+        tool = _tool()
+        keep = {("helm/a.py", '"see zz-seat-1"'): "kept"}
+        self.assertIsNone(tool.kept_reason(
+            "helm/help/x.txt", "see zz-seat-12 found it", keep, self.SEAT))
 
 
 class RedactOrderTest(unittest.TestCase):

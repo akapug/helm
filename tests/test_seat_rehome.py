@@ -1141,6 +1141,21 @@ class ApplyTest(RehomeBase):
         self.assertTrue(row["verified"]["register"])
         self.assertTrue(row["verified"]["beacon"])
 
+    def test_a_rehome_whose_launch_never_started_writes_no_launch_row(self):  # noqa: VACUOUS_ASSERTION — no row is the contract: the row is the relaunched process's own SessionStart hook's, and the rc 1 is the positive control that the launch line produced nothing
+        """The launch record holds only launches that really started: the
+        relaunched claude's own SessionStart hook writes the row, so a
+        launch line typed into the pane that produced nothing leaves none,
+        and the capture of the process the rehome stopped still describes
+        the session's last launch. MUTATION: write the row before typing
+        the line — a relaunch that never started unbinds that capture."""
+        from helm import eventledger, home
+        rc, _refusal = self._apply(launch=False)
+        self.assertEqual(rc, 1)
+        rows, unread = eventledger.checked_events(
+            os.path.join(home.global_dir(), "seat-launches.jsonl"))
+        self.assertIsNone(unread)
+        self.assertEqual(rows, [])
+
     def test_a_refused_ledger_row_exits_non_zero_with_the_partial_effect(self):
         """A MISSING DURABLE ROW IS NOT A SUCCESS. The rehome itself goes
         perfectly — every surface comes back — and the ledger append is refused

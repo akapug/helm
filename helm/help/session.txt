@@ -1,0 +1,1 @@
+session ls|doctor|doctor-panes|checkpoint|port|rescue|resume|experts|ask — the session substrate: inventory, persistence-health, checkpoint, port, compose (wraps cv; single-open law + print-don't-launch)

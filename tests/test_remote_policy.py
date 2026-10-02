@@ -378,8 +378,14 @@ class CreditTest(unittest.TestCase):
         with open(os.path.join(home, ".credentials.json"), "w") as f:
             json.dump({"claudeAiOauth": {"accessToken": "tok-SECRET-VALUE",
                                          "expiresAt": 1000}}, f)
-        r = remote_credit.read_credit(home, get_json)
-        self.assertIn("no live access token", r["error"])
+        # every copy helm can see is dead, and Orca's store is this test's own
+        # empty dir, never the machine's
+        with mock.patch.dict(os.environ, {
+                "ORCA_USER_DATA_PATH": os.path.join(self.tmp, "orca")}):
+            r = remote_credit.read_credit(home, get_json)
+        self.assertIn("no copy of one@example.com is live", r["error"])
+        self.assertIn("helm home home expired", r["error"])
+        self.assertNotIn("tok-SECRET-VALUE", json.dumps(r))
         self.assertEqual(len(seen), 1)
 
 

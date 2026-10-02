@@ -38,6 +38,7 @@ function $(sel) {
 let ROSTER_SORT = {key: "presence", dir: 1};
 let ROSTER_SHOW = {absent: false, sas: false};
 let LAST_ROSTER = null;
+let ROSTER_MOOD = {};
 // dashFleet stamps the strip's render time here (00-core.js.part)
 let DASH_FLEET_TS = 0;
 // rrank + RCOLS are module-local consts of 80-roster.js.part; only the sort
@@ -67,6 +68,7 @@ function rdotGlyph(p) { return p; }
 function lago(s) { return "1m ago"; }
 function upstreamBadge(s) { return ""; }
 function memBadge(s) { return ""; }
+function moodDot(m) { return ""; }
 
 /*__INJECT__*/
 

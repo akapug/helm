@@ -659,7 +659,8 @@ class TheDispatchAppendTest(tdc.ChainBase):
                                side_effect=door):
             return dispatches.add("codex-3", lane, repo=self.repo,
                                   kind="review", notify=False, new_work=True,
-                                  _reason=True, ref=self.a, force=force)
+                                  _reason=True, ref=self.a, force=force,
+                                  task=self.review_task["id"])
 
     def test_f3_a_rest_recorded_after_the_door_refuses_the_append(self):
         row, why = self.add("lane-open", rest_meanwhile=False)

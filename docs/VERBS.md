@@ -28,6 +28,16 @@ Run the auto-map across every harness (Claude Code, Codex, OpenCode), refresh
 the registry, scaffold project homes. Additive — never deletes a known
 project. This is the first command on any machine.
 
+`helm sync` takes no arguments and has no dry run (`helm sync --apply` is
+refused with exit 2). A plain `helm sync` WRITES three things: the registry
+(`registry.sync`); the keyword cells an act rung now owns, removed from their
+store entries (`actsteer.retire_moved`); and the doors' route cells
+(`doors.apply_routes`, task/1135), which `store.retag` each entry in
+`doors.ROUTED` (friction-tax, fleet-autoswitch-at-the-wall,
+claude-cred-1yr-auth): the route cells are added, and the common cells they
+replace are removed while the entry still has all of them. Each retag
+rewrites the entry file and writes one `store.retag` event.
+
 ```console
 $ helm sync
 helm sync: 14 projects known (2 new, 12 refreshed)
@@ -300,6 +310,13 @@ helm store get <id>                        one entry, full record; <id> may be
                                            (`premise:`, `move:`, `term:`, `ref:`)
 helm store resolve <text>                  JIT lookup — what fires for this prompt
                                            (or pipe the prompt on stdin)
+helm store resolve --act '<command>'       the DOOR lookup (task/1135): the act
+                                           route ids a tool call's command
+                                           stands in (`act.helm.<verb>`,
+                                           `.<sub>`, `.<flag>`, `.<value>` of
+                                           --kind) and the line each bound
+                                           rule would say, read fresh — the
+                                           resolve-test for a `route:` cell
 helm store xrev-clear <id> --by <who> [--type T] [--force-new]
                                            candidate -> PROVISIONAL: a cross-family
                                            /x review cleared it (the reviewer
@@ -993,11 +1010,24 @@ $ helm drift
 helm drift: no drift (48 priors steady).
 ```
 
-### `helm reflex [list [--all] | add <id> | <steer> [--signal S] [--pattern RE] [--marker PATH] [--counter NAME --threshold N [--latch] [--escalate N] [--window S]] [--project P] | retire <id> | smoke [--session S] [--project P]]`
+### `helm reflex [list [--all] | add <id> | <steer> [--signal S] [--pattern RE] [--marker PATH] [--counter NAME --threshold N [--latch] [--escalate N] [--window S]] [--signal act --verb "<helm verb> [--flag]" | --route ID] [--project P] | retire <id> | smoke [--session S] [--project P]]`
 The (signal → steer) entries a harness delivers every matching turn. Signals:
 `prompt` (regex on the turn text — the default; the pattern defaults to the
 id as a word), `every-turn`, `marker-file --marker <path>` (fires while the
 file exists). Retire is a one-line status flip; the file stays.
+
+**`act` is said at the act, never on a turn (task/1135).** `--signal act
+--verb "task --priority"` records the route the door reads off that helm
+verb's argv (`act.helm.task.priority`: the flag's route, else the
+subcommand's, else the verb's); `--route ID` names one directly
+(`act.helm.<verb>[.<sub>|.<flag>]`, or `act.spawn` for an Agent call).
+argv-guard says the steer once per context when a tool call stands in that
+route (helm/doors.py), in one line of at most 250 bytes, and the call
+proceeds: a door never refuses. `add --signal act` with no route is REFUSED,
+because nothing could ever say it; the act reflexes that predate routes
+(`publication-boundary`, `sweep-before-you-build`) stay the record of a
+hand-written rung that says them. `helm store resolve --act '<command>'`
+shows what a command's door would say.
 
 **Counter/latch signals (v2)** turn `helm record`'s per-session counters into
 dynamic reflexes — every threshold and steer is an editable store entry, not
@@ -1042,7 +1072,7 @@ $ helm reflex add "spin-guard | stop retrying; read the error" --signal stuck --
 $ helm reflex smoke
 ```
 
-### `helm friction [--days N] [--seat] [--json] | record <guard> [--reason TOKEN] [--session ID] | dial [N] [--json]`
+### `helm friction [--days N] [--seat] [--json] | record <guard> [--reason TOKEN] [--session ID] | dial [N] [--json] | autopilot [--dry-run] [--json]`
 Refusals per guard over a window (default 7 days), most-refusing guard first;
 `--seat` adds each guard's per-seat split. It reads the **friction ledger**,
 `_global/.state/friction.jsonl` in the helm home: one JSON line per guard
@@ -1098,11 +1128,200 @@ dial with a minus and a plus button. A press posts to `/api/friction/dial`
 with the number the card was showing; if the dial has moved since, the press
 is answered `stale`, writes nothing, and the card shows the number in force.
 
+`helm friction autopilot` is one pass of the **friction autopilot**
+(helm/frictionpilot.py), the part that acts on the count with no seat in the
+loop. The idle-dispatch tick (`helm seat idle-dispatch`, every 5 minutes)
+runs a pass at most every 15 minutes. Each refusal gets a **cause key**: its
+guard and its reason, lower-cased, with the seat, session, dates, times,
+paths, shas and numbers normalized away, so one cause keeps one key. A cause
+that reaches 10 refusals, or 3 seats, in 24 hours gets **one task row**: in
+the helm project, unowned so an idle seat is offered it, with the ref
+`friction-cause:<key>`. It is P1, or P0 when it reaches 3 seats or blocks
+lands (its reason is `pre-push` or `pre-merge-commit`, or the stopped
+auto-land train's reason names its guard). The ledger cannot tell a refusal a
+seat routed around from one that stopped a mistake, so every refusal is
+counted and the row says so; the bar keeps a mistake stopped once under it.
+Later refusals add one counted comment a day to the same row, never a second
+row. Raising a row to P0 is a rank change and records who ranked it: a pass
+an admitted seat runs raises it as that seat, and a pass on the timer raises
+it as helm itself (`ranked_by` reads `system:frictionpilot`). helm's own rank
+is a closed-set capability (`actors.SYSTEM_RANK_SUBSYSTEMS`) that the task
+door admits for one change only: a row the autopilot filed and still maps,
+from P1 to P0, the priority alone; it keeps the row's `last_updated`, so the
+task sweep never reads it as a seat working the row. Either raise writes one
+comment and one `#seats` post. A row helm may not raise (one a seat filed
+that the pass adopted, or one a seat ranked away from P1) gets one comment
+that owes the raise and names the command. When the row closes, the pass
+records the hit rate over the 48 hours before; 48 hours later, if the rate
+has not fallen, the cause gets a new row that cites the closed one and
+carries both rates (the ledger never reopens a closed row). A close whose reason starts `guard-correct:`
+retires the cause. Each new row, raise and refile is posted once to `#seats`,
+mentioning local-names `friction-steward-seat`; nothing pages the owner. At
+most 5 task writes happen in one pass. `--dry-run` prints what the pass would
+do and writes nothing; `--json` prints the pass's report. The pass's comments
+start `[helm/friction-autopilot:` and are never motion to the task sweep.
+
 ```console
 $ helm friction --seat
 $ helm friction --days 1 --json
 $ helm friction dial
 $ helm friction dial 8
+$ helm friction autopilot --dry-run
+```
+
+### `helm seat mood [SEAT] [--json] | set <word> [--why "..."] [--rating 1-5] [--blocker "..."] [--win "..."] | rank [--days N] [--json]`
+
+Each seat's **mood**, measured from the trace helm already keeps and set beside
+the seat's own word for it (task/3899, the first slice of the office floor).
+Bare, it lists every live roster seat, the ones that need the owner first;
+with a seat name, that seat in full; `--json` prints the readings.
+
+A reading is one of `flowing`, `grinding`, `stuck`, `blocked-on-owner`,
+`walled` or `idle`, a 0-100 frustration score, and the top reason as one line
+("3 refusals by author-gate in 20 min"). Its inputs:
+
+- **Refusals** in the last hour, from the friction ledger. Each refusal
+  counts, and each repeat of the same guard counts more: one guard refusing a
+  seat again and again is a wall it keeps meeting.
+- **Loops**: the same refusal (guard and reason token) four times in a row,
+  the same command re-run three times, or three failing calls in a row, from
+  the seat's own hook record. A loop reads `stuck`.
+- **Minutes busy with no progress.** Progress is a comment or a close on a
+  task, a verdict or hold on a dispatch row sent to the seat or a row it
+  sent, a commit off trunk on a lane it holds the lease on, or a trunk merge
+  that names it as author. The clock starts at the later of the last progress
+  event and the start of the seat's current turn. 45 minutes reads
+  `grinding`, two hours `stuck`. A source that cannot be read is named in the
+  reason and is never read as "no progress".
+- **Stalled turns** and a proxy seat's **context fill** add a little.
+- **A wall**: the seat's family RED on money or reach in `helm burn`, its own
+  last turn ending on a billing or credential refusal, or its proxy pool
+  refusing. A walled seat reads `walled` with a score of 0: a wall is not
+  frustration.
+- **An open decision card** the seat filed (`helm decide`) reads
+  `blocked-on-owner`.
+
+`helm seat mood set <word> [--why "..."]` records the calling seat's own word
+(one word, a-z and hyphens, at most 24 letters; the why one line of at most
+200 characters), keyed by the seat's roster identity through the identity
+law: a process no roster seat names, or whose identity is disputed, records
+nothing and exits 1. The reading shows the word and when it was said, and
+flags a seat that says flowing or fine (within two hours) while it measures
+`stuck` or `grinding`: that gap is the honesty signal. Once an hour at most,
+a seat that has not said a word in the last hour is asked for one at the
+start of its turn, on the reflex lane of `helm inject`. A Stop hook reaches
+the model only by blocking the stop, so the ask never rides the Stop hook.
+
+**The check-in.** Beside the word, `set` takes the 15five pulse fields: a
+`--rating` of how the work is going (1 worst, 5 best), one `--blocker` line
+and one `--win` line (each one printable line of at most 200 characters). A
+blocker is posted ONCE to the #seats room with the seat's steward
+@mentioned, so the steward's seat wakes and answers it: the lead of the
+project the seat serves, else the build-lanes steward (the integrator) when
+the seat serves no project, its team names no single lead, or the seat is
+that lead. The same blocker words said again post nothing; a post that fails
+is owed and goes out on the next seat event. A win is recorded only. A
+rating of 4 or 5 while helm measures `stuck` or `grinding` is divergent
+(without a rating, the word decides).
+
+**The steer.** When a seat's own measured state turns `grinding` or `stuck`,
+its next turn carries one line on the reflex lane of `helm inject`: the
+measured reason and the cheapest next move ("MOOD: helm measures you stuck:
+the same refusal by author-gate 4 times in a row. Cheapest next move: stop
+retrying; do what the refusal asks, or hand the row back."), with the
+`--blocker` check-in named as the way to reach its steward. It fires once per
+state change per seat, never for a walled, idle or blocked-on-owner seat, and
+the turn that carries it counts as that hour's ask. At a turn's start the
+seat is measured at most every five minutes, from its refusals, loops, wall,
+decision cards and context; the quiet clock reads zero at a turn's start, so
+the progress sources are not read there.
+
+**On the roster.** Every measure is kept as the seat's latest reading, and
+`helm chat seats` shows it on each row: `mood stuck (4m ago), says fine:
+DIVERGES`. A reading older than a day is not shown. The console's seats panel
+draws one dot per seat in the measured state's colour, dim when the seat's
+last sign of work is over an hour old, with the reason, the seat's word and
+any blocker on hover.
+
+`helm seat mood rank` ranks helm's own friction across every seat over N days
+(default 7): refusals per guard from the friction ledger, merged with the
+causes in `_global/.state/friction-notes.json`, where the ranking of the
+burn-down friction notes plugs in (`{"source": "...", "causes": [{"cause",
+"count", "example"}]}`; a cause spelled `guard:<name>` adds to that guard's
+count). An unreadable friction ledger prints `UNREADABLE` and exits 1.
+
+```console
+$ helm seat mood
+$ helm seat mood seat-a --json
+$ helm seat mood set grinding --why "fab queue is slow"
+$ helm seat mood set stuck --rating 2 --blocker "the brief names no lane path"
+$ helm seat mood rank --days 1
+```
+
+### `helm office weather [--json] [--push]` (also `helm weather`)
+
+The **office weather**: the whole floor in one word (task/3902, the fourth
+slice of the office floor). It reads every live seat's mood (`helm seat
+mood`) and the fleet's own alarms, and answers the one question the owner
+asks of the floor: does he have to come over?
+
+- **sunny**: every live seat is `flowing` or `idle`, and no fleet alarm is up.
+- **cloudy**: something is off and someone other than the owner has it: a
+  seat `grinding` or `walled`, a `stuck` seat (including one with no available
+  steward), auto-land paused, the chat node booting, or a source helm could not read.
+  An unread source is never sunny.
+- **stormy**: the owner has to act: a seat `blocked-on-owner` (waiting on his
+  decision card), every measured
+  model family RED in `helm burn`, the fleet stalled (`helm pressure-watch`
+  has an open episode), the chat node not answering, or the land train
+  STOPPED or its timer trapped, failed or never firing.
+
+A seat's steward comes from the #seats steward table (task/3876): its
+project's lead, else the integrator; for a walled seat, the credential or
+local-serving steward. The steward handles the seat only when it is another
+seat on the floor that is not itself stuck, blocked or walled.
+
+The line is `<glyph> <word>: <the first two reasons>[; +N more]`, one
+printable line of at most 200 characters. The same line heads `helm brief`
+and the owner console (it rides `/api/ready` into the strip under the nav).
+
+Bare, the verb reads the floor now and prints the word, its line and every
+reason; nothing is written. `--json` prints the same as one document.
+`--push` is the timer's pass. The idle-dispatch tick (`helm seat
+idle-dispatch`, every five minutes) runs that pass on every bare run, so the
+weather is live wherever that timer runs. The pass records the reading in
+`_global/.state/office-weather.json`. The owner's paging rule decides what
+reaches his phone: "A P0 cause turns the office weather stormy, and nothing
+else pages him." So the pass pushes through the one phone path
+(`notify.owner_push`) only a storm and its all-clear:
+
+- the first reading in a helm home is a baseline and pushes nothing;
+- a new word must hold on passes 240 s apart before it settles
+  (`HELM_OFFICE_WEATHER_HOLD_S`), so a flap never reaches the phone;
+- a settled edge into stormy pushes at once;
+- the matching all-clear (the floor settled out of a storm the phone heard)
+  pushes once, as `all clear: <line>`, after 30 minutes have passed since
+  the storm's push (`HELM_OFFICE_WEATHER_GAP_S`). It is dropped if the storm
+  returns first, and waits while the floor is turning stormy again;
+- every other change of the word is shown here, in `helm brief` and on the
+  console, and never pushed;
+- a push that fails stays owed and the next pass retries it.
+
+`HELM_OFFICE_WEATHER=off` is the weather's kill switch: the tick's pass
+reads and records nothing, and no pass pushes. The test suite plants it, so
+no test can ring the owner's phone.
+
+Each of the tick's legs (the pass itself, the dark-seat mover, the friction
+autopilot and the office weather) records every pass with the tick alarm
+(task/4189): 3 failures in a row post one #seats row, and `helm doctor`
+FAILs the leg until a pass works. See `helm doctor`.
+
+`helm office` with no subverb is `helm office weather`.
+
+```console
+$ helm office weather
+$ helm office weather --json
+$ helm office weather --push
 ```
 
 ### `helm classify --labels L --source KIND [--consumer NAME] [--task TEXT] [--each-line] [--budget-ms N] [--json] | where [--json] | metrics [--consumer NAME] [--json] | label --consumer NAME --label ID | eval private-name [--json]`
@@ -1579,8 +1798,8 @@ PID-keyed Claude Code records are used only when their canonical UUID and
 `doctor` classifies a session (normal / forked / compacted / live /
 MEMORY-ONLY / UNKNOWN) + the live-pane state. A proven live memory-only SID is
 diagnosed directly even though its missing transcript gives `cv` and the catalog
-nothing to open. `checkpoint` mints a NEW resumable id (`cv prune --thinking`,
-original untouched) so a maxed/forked session becomes branchable. `rescue` tells
+nothing to open. `checkpoint` mints a NEW resumable id (`cv prune
+--drop-thinking`, `--thinking` on cv 0.10; original untouched) so a maxed/forked session becomes branchable. `rescue` tells
 stamped and unstamped transcriptless panes to harvest side-channels and write a
 self-recap while still live; it never invents a resume line for a missing
 transcript.
@@ -1710,7 +1929,7 @@ $ cp scripts/helm-corpus.{service,timer} ~/.config/systemd/user/ \
 
 ## accounts — credentials and quota
 
-### `helm burn [--json] | burn why <family> [--json] | burn burst [--json] | burn runway [--json] [--window <hours>] | burn calibrate [--json] | burn declare <family> <colour> --until <iso> [reason...] | burn certify-local <family> --until <iso|duration> [note...] | burn certify-local <family> --revoke [note...]`
+### `helm burn [--json] | burn why <family> [--json] | burn burst [--json] | burn runway [--json] [--window <hours>] | burn calibrate [--json] | burn declare <family> <colour> --until <iso> [reason...] | burn certify-local <family> --until <iso|duration> [note...] | burn certify-local <family> --revoke [note...] | burn horizon [anthropic <utc-iso> [reason...] | anthropic --clear] | burn spend [--json] [--session <id>...]`
 The fire-danger rating for the fleet's usage: one flag per model family, plus
 the overall reading and what it means for how much may run at once.
 
@@ -1977,20 +2196,40 @@ under each Claude account. The quota page's account rows carry it as
 `pace_5h`.
 
 What the state does is small. A Claude seat running on a WATCH or TIGHT
-account hears one steer through `helm inject`. A seat on the BASELOAD home
-hears it only while no other Claude account reads OK: the watcher moves its
-credential when its window caps, so while any other account has room it hears
-nothing. An account with no reading (UNKNOWN) is not known to have room, so it
-never silences the steer. A seat HOMED to one credential (a named credhome) is
-not moved, so it always hears the state and is asked to rank its work and pace
-it to the reset. It is said at most once per state per window in its context:
-a WATCH that clears and comes back before the reset is not said again, and a
-step back down from TIGHT to WATCH is not said at all. For example `this
-account's 5h window is WATCH at 81%, 24%/h, resets 19:50Z: no other Claude
-account is known to have room, so route NEW builds and reviews to codex, local
-and other seats; keep your own work going` on the baseload home, and `this
-seat is homed to this account, so the watcher will not move it: rank your work
-and pace it to the reset, and route new builds to other seats` on a homed one.
+account hears one steer through `helm inject`. On the BASELOAD home, what it
+hears depends on the SWITCH POOL: the Max accounts the default-home watcher
+switches between (each usage history row names its plan). While the pool has
+an account the watcher would switch to (under 90% of its week, and either
+IDLE or OK under 70% of its 5h window), the seat hears that the watcher will
+switch it, with the pool's pace and its project's light, and is never told
+to route away. IDLE is read, not assumed: an account nobody has used since
+its last window reads 0% with no reset instant. Such a reading counts for a
+day, the watcher's own bound, and after eight hours only under 80% of the
+week. Any newer row for that account that did not read it idle (a 429, a
+lapsed copy's refresh-due row) ends it, because the account may be in use.
+The blind spot: a probe cycle that writes no row at all leaves the last idle
+reading standing, so an account put to use unseen reads idle until its next
+row, within those bounds. An account in use that nothing can pace (an open
+window with too few readings, a probe that did not read) is not known to
+have room. Only when no account is switchable does the seat hear the routing
+line. A row that names no plan (rows written before rows carried one) takes
+it from the providers' account census, a read of metadata files with no
+vendor call. A seat HOMED to one credential (a named credhome) is not moved, so it
+always hears the state and is asked to rank its work and pace it to the
+reset. It is said at most once per state per window in its context: a WATCH
+that clears and comes back before the reset is not said again, and a step back
+down from TIGHT to WATCH is not said at all. For example `5h TIGHT at 93%,
+resets 23:20Z; the watcher will switch this home to one with room. helm is
+YELLOW: normal work, no extra lanes. Claude pool ORANGE: ease off about 55%,
+out ~Thu 23:22Z, before horizon Sat 07:00Z. helm's light: release blockers,
+major bugs, P0s and the owner's asks.` while the pool has room (the
+project's light in its own sentence, then the pool, then the light's
+authored reason last, so a cap cuts only the reason), `this account's 5h window is WATCH at
+81%, 24%/h, resets 19:50Z: no other Claude account is known to have room, so
+route NEW builds and reviews to codex, local and other seats; keep your own
+work going` when it has none, and `this seat is homed to this account, so the
+watcher will not move it: rank your work and pace it to the reset, and route
+new builds to other seats` on a homed one.
 No seat is told to stop, finish or wait for a reset. Where helm ranks Claude
 accounts (`providers.allocate`), an account in WATCH or TIGHT ranks after an
 equal one that is not. A second home on the same account (`email#dir`) reads
@@ -1998,6 +2237,63 @@ that account's state. The tie-break rarely decides anything: a Claude
 account's headroom is its 5h headroom, so exact ties are uncommon. Nothing
 stops, pauses or reroutes a turn in flight, no dispatch is refused, and no
 colour moves.
+
+#### `helm burn horizon [anthropic <utc-iso> [reason...] | anthropic --clear]` — what the Claude pool must last until
+
+The same pass reads the SWITCH POOL as one weekly budget. Its BURN is what
+each pool account spent of its week over the last six hours, summed and per
+hour (percent of one account's week per hour; a Max 20x week and a Max 5x
+week are added as equals, a stated bound). Its LEFT is the weekly headroom
+summed. The HORIZON is what it must last until: the value `helm burn horizon
+anthropic <utc-iso> [reason...]` records (`--clear` removes it, bare prints
+it; an instant in the past or more than 7 days out is refused, exit 2, and
+a hand-written one further out is read at 7 days, so no account resets
+twice before it), or, unset, the soonest weekly reset that returns at least
+half a week. An account whose week resets before the horizon adds a whole
+week, beside the headroom it has until then. The PACE is the burn
+over the burn that lasts exactly to the horizon:
+
+- **EASE** (1.10 and over, held down to 1.00): `ease off about N%`, ORANGE,
+  or RED when the pool runs out inside one 5h window.
+- **EVEN**: `on pace`, YELLOW.
+- **FASTER** (0.70 and under, held up to 0.80): `can go faster`, GREEN.
+- **UNKNOWN**: under an hour of readings, no pool account read, or no
+  horizon.
+
+The bare `helm burn` prints the pool's line (its colour, the adjustment, the
+burn, what is left, the run-out against the horizon, how many pool accounts
+were read) and one line per project with an AUTHORED light, in that light's
+own sentence (the one `helm projects` and the work doors print, so a light
+has one meaning) and its authored reason, which is where a project says
+what kind of work it wants. The pace is advice: it moves no burn flag.
+
+**The handoff.** When the default home's account changes (the watcher's
+switch, or a switch by hand in Orca), every native Claude seat that takes a
+turn in the next two hours hears ONE line for that switch through `helm
+inject`: `the Claude home switched accounts at 21:07Z. helm is YELLOW:
+normal work, no extra lanes. Claude pool ORANGE: ease off about 55%; 4.0%/h
+of a week over 6h, 105% left, out ~Thu 23:22Z, before horizon Sat 07:00Z.
+helm's light: ...`. A seat homed to an account the pool does not read as its
+own does not hear it. The pass writes the horizon to
+`<helm_home>/_global/.state/pace-horizon.json`.
+
+#### `helm burn spend [--json] [--session <id>...]` — what this seat spent of its account's week
+
+It reads the seat's OWN sessions: the running session (and its subagents'
+transcripts) by default, or each `--session <id>`, from the Claude Code logs
+under the seat's own config home. It never sums the project dir, because every
+helm home links its `projects/` into one shared store that also holds other
+seats', the owner's and other accounts' sessions. Messages are deduped by
+message.id and split into fresh input, cache read, cache write by window (5m,
+1h, and a write the log does not split, whose price is UNKNOWN), output and
+thinking. The window is the weekly window of the account the seat's home holds,
+read from helm's own claudepace snapshot; with no measured reset it is the last
+7 days, and the output says so. A message with no readable timestamp is counted
+apart, never folded in. Prices are per model, from the model ids helm catalogs:
+cache read is 0.05x for Opus 5.5, 0.025x for Fable 5.1 and 0.1x for the other
+catalogued models; cache write is 1.25x (5m) and 2x (1h). A model outside the
+catalog is named and left unpriced. The verb prints no Max savings %; it states
+that the weekly figure is the whole account's, shared by every seat on it.
 
 #### `helm burn burst [--json]` — the per-credential question the colour was hiding
 
@@ -2449,6 +2745,32 @@ from the 5h one. That inversion is the bug the owner hit: a 7d window at 100%
 under a 5h window at 52% reported 48% headroom while every pooled account was
 weekly-capped. Rows for other families are unchanged, byte for byte.
 
+**A Claude account is read through a LIVE copy of it, and Orca's copy is one**
+(task/2283; the reader is `helm/livecred.py`). Orca keeps one managed copy of
+every Claude account it holds and is that chain's one refresher, so every
+account works in Orca; a helm home's copy is refreshed only while a seat runs
+in it or keepalive grants on its own chain. An account is read through the
+freshest live copy among the helm homes that hold it (a live home reads first,
+as before) and, when none is live, Orca's managed copy of the SAME account
+(the email, and the organization and account uuids wherever the homes and
+Orca's copy both carry them), read-only: its access token goes to one GET of
+the usage endpoint, and helm never refreshes it, writes it, or launches a seat
+on it. When no copy is live anywhere, Orca's own
+last measurement of the account stands in (the `accounts.list` snapshot its
+accounts pane renders, asked for without a refresh, at most 24h old; a window
+that has ended since reads unread), and the verdict cell says `(Orca's own
+reading)`. With neither, the row reads `unknown` / `no-live-copy` and its note
+names every dead copy; it names no keepalive pass and no login, because Orca
+refreshes its own copy when it next measures the account. An account only Orca
+holds is listed too (`source` orca), measured the same way, and never a launch
+target or a `swap` target. A helm home whose own copy is dead beside an account
+read through Orca keeps its home state in `home_state` (the verdict cell reads
+`home due-refresh; account ...`, and a footnote names the home's cure);
+allocation still refuses it — including a dead home whose token merely
+expired later than Orca's dead copy. Every Claude row carries `source`: `credhome`,
+`default`, `orca` or `orca-reading` — the capacity roster reads the same rows
+through `providers.default_provider().cred_state()`.
+
 **A Claude row carries its 5h pace** as one more continuation line, for example
 `5h WATCH: 72% at 26.0%/h, hits 100% ~19:36Z, resets 19:50Z`, read from the
 watchdog pass's snapshot (see `helm burn`, the Claude five-hour pace). With no
@@ -2543,7 +2865,7 @@ is `UNKNOWN`, never a match.
 | FRESHNESS | meaning |
 | --- | --- |
 | `FRESH` | the home's access token expires no earlier than Orca's copy (or is byte-identical). |
-| `STALE-vs-ORCA` | Orca's copy is strictly fresher AND the home's own chain is provably spent: no `.credentials.json` or refresh token, Orca's family, or a refresh lifetime already passed. |
+| `STALE-vs-ORCA` | Orca's copy is strictly fresher AND the home's own chain is provably spent: no `.credentials.json` or refresh token, Orca's family, a refresh lifetime already passed, or `home-refresh-refused`: the token endpoint answered HTTP 400 to the refresh token the home holds now (keepalive's log, bound to that token by its family digest, or, for a row written before digests were logged, written after the credentials file last changed). The reason counts the refusals and names the last. |
 | `OWN-CHAIN` | Orca's copy expires later, but the home is on an independent login chain: its refresh lifetime is still live and more than 5 minutes from Orca's, so the two are different grants. Access expiries across two chains prove nothing, so it is never synced, and keepalive rolls it as before. |
 | `CHAIN-UNPROVEN` | Orca's copy expires later, and nothing tells the home's chain apart from a copy Orca rotated away: the refresh lifetimes are within 5 minutes, or one is missing. One grant Orca refreshed away and a login minted minutes apart look the same, and so does a home whose token Orca once held (Orca's dir may have logged in again). A sync would overwrite what may be a live login, and a launch would present what may be a spent token (the reuse that revokes Orca's live family), so a launch or `sessions resume` is REFUSED with that reason, the sync writes nothing, and keepalive skips it. The reason names both cures: a fresh login in the home, or `sync-orca --home H --apply --replace-own-chain` when the operator knows the home's chain is Orca's to replace — including the common case of a synced home whose Orca account refreshed while its seat was down. |
 | `NO-ORCA-COPY` | Orca's store was read and no dir holds this account. |
@@ -2836,7 +3158,7 @@ mirrors it as the `cred token families` row (byte-copies = FAIL).
 names a benefit, its source, how it is provisioned, how its absence is
 measured, and the command that closes the gap: the shared session store, the
 skills hub, the skill deck, the default home's MCP server set, the project
-MCP approvals, the global instructions link, the Opus settings defaults, the
+MCP approvals, the global instructions link, the effort defaults, the
 hook contract and the auto-memory base. `prepare` runs one pass over that
 list; `provision [<name>]` PLANS the same pass over an existing claude home
 (every named one when no name is given) and writes nothing — each gap is a
@@ -2846,6 +3168,22 @@ rewritten `.claude.json` keeps its key order, indent, trailing newline and
 mode (a new one is `0600`), a symlinked one is left untouched, and a
 user-scope server rewrite leaves a `.claude.json.bak-mcp-<stamp>` backup
 beside it. A second `--apply` changes nothing.
+
+**Effort defaults.** Every agent starts at high effort, and ultracode is not
+special. The pass writes `effortLevel` high in `settings.json` at the top
+level and under `modelSettings` for `claude-opus-5-5`, `claude-sonnet-5` and
+`claude-fable-5-1` (Claude Code reads a current model's effort from a home's
+settings only under `modelSettings`). It adds a key the home lacks and keeps
+another level the home sets, such as `low` or `medium`. Two values are the
+old default and count as drift: an Opus `effortLevel` of `xhigh` and an
+`ultracode` of `true`. `helm doctor` names them, and the next `helm homes
+provision --apply` or `helm launch` changes xhigh to high and removes
+ultracode, keeps a `settings.json.bak-effort-<stamp>` backup beside the file,
+and prints what it changed. Helm cannot tell these values from ones the owner
+set, so it corrects those too: an owner's own `/effort xhigh` on Opus (Claude
+Code saves it under `modelSettings`) and an `ultracode: true` put in by hand
+both go at the next launch. A proxy seat's config dir gets none of these
+keys.
 
 **Project MCP approvals** (task/2698). Claude Code runs a server a project's
 `.mcp.json` declares only once the config dir's `.claude.json` approves it
@@ -3202,6 +3540,12 @@ for the same reason; an `OWN-CHAIN` home is rolled as before. `--home H --apply`
 `~/.cache/helm/keepalive-log.jsonl`; token and exception values appear nowhere.
 Every logged row records `by` — the seat identity that ran the pass, or `hand`
 for a human-typed run — so the log can answer whether the loop is turning.
+A grant the token endpoint refuses (4xx) logs `needs_reauth` with the HTTP code
+and the refused refresh token's family digest (never a byte of the token), which
+is how `helm cred sync-orca` proves that home's chain spent; a 429 or 5xx logs
+`error` (the endpoint failed, not the chain; nothing is written and the next
+pass asks again). The newest decision a status sentence reads for a claude home
+never comes from the codex home of the same name.
 
 `--ensure-timer` installs or verifies the HOURLY systemd user timer
 (`helm-keepalive.timer`, identity `HELM_CHAT_NAME=keepalive-cron`, session vars
@@ -3221,8 +3565,11 @@ age passes the ~8h access-token lifetime the loop exists to stay ahead of.
 situations and the provider now names both. A home whose refresh chain helm can
 still grant on reads `due-refresh`, whose status names `helm keepalive --apply`,
 the chain, and when the cadence last ran — it never says reauth, because the
-owner owes nothing. A home whose chain is spent or absent keeps `expired-token`
-and its re-login. `due-refresh` is still BLOCKED for allocation: a dead access
+owner owes nothing. A credhome whose own chain is proven spent (`helm cred`
+FRESHNESS `STALE-vs-ORCA`) while Orca holds a fresher copy of the account reads
+`due-refresh` too, and its status names `helm cred sync-orca --home H --apply`,
+no login. A home whose chain is spent or absent with no such copy keeps
+`expired-token` and its re-login. `due-refresh` is still BLOCKED for allocation: a dead access
 token 401s whoever presents it. A refresh token carrying no
 `refreshTokenExpiresAt` counts as refreshable, because keepalive never consults
 that field and the token endpoint is the authority.
@@ -3660,6 +4007,54 @@ fail-closed, unlike the hooks it installs: a guard that cannot run, a config it
 cannot refresh or a contract it cannot verify is a refusal (exit 1, reason on
 stderr). Without `--config-dir DIR` it prints its usage and exits 2.
 
+### `helm hooks resident [--status]`
+Serves the per-tool-call argv-guard from a warm process instead of a cold
+interpreter per call (task/1825, helm/hookres.py). You do not normally run it:
+the console `helm web` (port 7433) keeps one alive beside it, with the
+interpreter the hooks run, and restarts it when it exits.
+
+When one is serving, `bin/helm-hook` hands an argv-guard call to it through
+`bin/helm-hookres`, a bash client that starts no python. The resident forks a
+child that runs helm's own `chat argv-guard` as the calling hook process: with
+the caller's environment, cwd and umask, on the caller's own stdin, stdout and
+stderr. So the answer (exit code, stdout, stderr) is the one a cold run gives.
+Measured on the agents box, CPU per call fell from about 160-270 ms cold to
+about 20-30 ms (the numbers and the conditions are in docs/HOOKS.md).
+
+The resident refuses a call it cannot stand in for, and the client then runs
+the cold command and prints one line on stderr that names why:
+`[helm argv-guard] hook resident <why>; this call runs cold`. The reasons are
+a resident that is down, stopped, not beating (its heartbeat file is missing
+or more than 3 s old), slow (no answer within `HELM_HOOK_RESIDENT_WAIT_S`),
+on code older than the tree, started with a different interpreter or
+checkout, or started with an environment value that a module read while it
+imported (every `PYTHON*` variable, `TZ` and the locale's character set are
+always compared). With no endpoint file (no resident serves this checkout for
+this helm home) the cold command runs and nothing is printed. An answer that
+does not carry the resident's proof from the endpoint file (a listener on a
+port a dead resident left, a resident refusing a wrong token, or a busy
+resident, which refuses before it reads the token) is never trusted: the cold
+command runs, and none of that answer's text is printed.
+
+After a land the resident stops serving, checks that the new tree imports, and
+re-execs itself onto it (the `helm web` follower's mechanism). Between the land
+and that check, each call compares the checkout's HEAD with the one the
+resident loaded, so no call is served from the older code.
+
+`--status` prints one line: serving (pid, port, interpreter, and the
+environment keys it holds callers to), down, or not running, and, on a host
+where it does not start, why. It exits 0 only when a resident is serving this
+checkout. A second `helm hooks resident` for a checkout that is already served
+exits 0 at once and says so.
+
+It does not start where the kernel refuses `pidfd_getfd` on another process
+(`kernel.yama.ptrace_scope` 1 or more): Claude Code gives a hook socket stdio,
+and nothing else can take a socket, so a resident there would only slow every
+call. It exits 4 with one line naming the reason, `helm web` does not restart
+it, and every call runs cold in silence.
+`HELM_HOOK_RESIDENT=off` stops `helm web` from starting one and stops
+`bin/helm-hook` from asking one.
+
 ### `helm mcp sync [--apply]`
 Same shape for MCP servers, and every SEAT is planned like a home. The
 canonical set is a JSON object `{name: config|null}` read from the first of:
@@ -3722,10 +4117,12 @@ keeps. The enact re-reads the room's HEAD and HEAD reflog just before
 **LANDED IS ASKED BY CONTENT, NOT BY SHA.** A stub retires when its commits are
 on the trunk by ancestry **or** by patch identity (`git cherry`, stable across
 rebase). That is the difference between a reaper that works and one that does
-not: helm lands work REBASED, so the commit on trunk carries a different sha,
-ancestry answers "not merged" *truthfully*, and every well-behaved lane
-accumulates forever — measured 2026-08-03 at 107 `lane/*` branches against 24
-branch-holding worktrees.
+not: historically, work also landed rebased, so those commits on trunk
+carried different shas; ancestry answered "not merged" *truthfully*, and
+well-behaved lanes accumulated — measured 2026-08-03 at 107 `lane/*` branches
+against 24 branch-holding worktrees. Today's exact-sha train merges keep the
+reviewed tip reachable by ancestry; patch identity also recognises older
+rebased or cherry-picked work.
 
 **THE TWO PROOFS ARE NOT THE SAME GRADE OF FACT, AND THE CODE PAYS FOR THE
 DIFFERENCE.** Ancestry is reachability: after `git branch -d` the tip is still
@@ -3738,6 +4135,23 @@ permanently reachable (immune to `git gc`), the sidebar clears because Orca
 renders `refs/heads/*`, `git for-each-ref refs/helm-retired/` is the audit
 trail, and restore is one command. A failed or unverifiable preservation KEEPS
 the branch.
+
+**A BRANCH THAT LANDED UNDER OTHER SHAS IS JUDGED COMMIT BY COMMIT.** When both
+whole-branch proofs say no, the sweep question (`work._sweep_state`, the one
+`helm work gc` asks) reads each commit past the trunk (task/1026): its own
+patch-id on a trunk copy with its author line, a train car merge of the lane or
+its `-rN` rebuild that carried it, or a merge that adds nothing of its own. All
+proven is LANDED-EQUIVALENT and retires the patch-identity way (tip preserved
+first); anything unproven keeps, and the row names the commit and why. It
+catches the two shapes the whole-branch proofs miss: a branch that merged the
+trunk back in, and a lane whose rebuild landed.
+
+**SCHEDULED AND FETCHED (task/4061).** `helm-gc.service` runs this after
+`helm work gc --apply` every hour, so a branch whose room was retired or
+parked is judged again as an orphan stub. `--apply` refreshes the trunk ref
+first and refuses when the fetch fails, as `helm work gc --apply` does. The
+lane rooms the second pass reads again cost little: it shares the sweep's
+memo of NOT-landed verdicts. Stray rooms are never parked.
 
 Every retirement names which proof authorized it. Everything else KEEPS: a
 partly-landed stack, an unreadable object, a range past the cap, any commit
@@ -3938,6 +4352,73 @@ $ helm seat rest seat-a --because "drain to pause for the time being" --until 8h
 helm seat rest: seat-a is RESTING (owner pause since 2026-09-28T09:00:00Z: "drain to pause for the time being"; recorded by seat-a; until 2026-09-28T17:00:00Z). Nothing wakes it and no work is offered to it; end it with `helm seat rest seat-a --end`.
 ```
 
+### `helm seat shout --need "<one line>" [--speak-up [--about COMPONENT]] | --status [--json] | --answered | --dial N`
+A seat's voice has three volumes (task/3901):
+
+- **Talk.** The seat's own room, as today: `helm chat post "..."`. This verb
+  adds nothing there.
+- **Speak up** (`--speak-up`). One row in `#seats`, posted as the seat, that
+  @mentions its steward through `seatevents.address`, so the steward's beacon
+  rings. The steward is the lead of the project the seat serves, else the
+  integrator. When the project names no lead, the row wakes the integrator and
+  says which project has none. `--about credentials|local-serving|build-lanes|
+  project-seats` names a `seatevents.STEWARDS` component instead. A speak-up
+  costs no budget and never reaches the owner's phone. One that wakes nobody
+  is still posted, exits 1 and says where the steward should be declared.
+- **Shout** (the default). One `notify.owner_push` to the owner's phone,
+  titled `shout: <seat>`, carrying the seat's name, its one `--need` line and
+  its pane, with the seat as the `reply_key`, so a Telegram reply comes back
+  to the seat as a DM.
+
+Every shout needs exactly one `--need` line: one line, at most 200
+characters, no control characters. Without one it is refused with exit 2 and
+nothing is sent.
+
+**The budget.** N shouts per seat in any 24 hours, default 2. Over budget, the
+shout is refused with exit 1 and names the time the next one refills. Only a
+delivered shout spends: with no phone configured (`HELM_NTFY_TOPIC` or the
+Telegram bridge), or a push that fails, the shout is refused and nothing is
+spent. N is the owner's dial, stored like `helm friction dial`: under
+`shout_dial` in the `host` block of the authored registry layer, with who set
+it and when. `--dial N` sets it (0 to 10; 0 means no seat may shout). A
+process that carries a seat name other than the owner's is refused, because
+the budget bounds seats. A stored value that cannot be used is never guessed
+at: the default is in force and `--status` says so.
+
+**Where the seat is.** The push cannot focus a pane. ntfy has no inbound leg,
+the console binds 127.0.0.1 (on a phone that is the phone), and Orca has no
+URL scheme; `orca terminal switch` could focus a tab from this box, but doing
+it at shout time would move the owner's keyboard focus while he types in
+another tab. So the push names the pane: the tab titled with the seat's name
+(the title is the seat name, byte-exact, `helm seat retitle`) and the worktree
+from the process's own `ORCA_WORKTREE_ID`.
+
+**The open question.** Orca cannot pin text at the bottom of a pane, and its
+worktree comment is one line shared by every seat in that worktree. So a
+delivered shout is the seat's open question on the floor view until the seat
+closes it with `--answered` (which does not refund the shout).
+`--status` prints every seat that shouted in the last 24 hours or has a
+question open: spent of budget, when the next shout refills, and the open
+question with its age. Shouts spent early are the signal that a seat needs a
+better brief. `--json` carries the same floor, which `seatshout.floor()`
+returns for a later floor or mood view.
+
+The ledger is `_global/.state/shouts.jsonl` in the helm home, one JSON line
+per shout or answer, read and appended through `eventledger` with one rotated
+generation. The budget check, the push and the append share the ledger's
+lock, so two shouts from one seat cannot both pass a budget of one. An
+unreadable ledger refuses the shout and prints `UNREADABLE` on `--status`; it
+is never read as zero shouts. A shout is an act, so it admits through
+`actors.resolve_actor`: a derived or disputed name cannot shout.
+
+```console
+$ helm seat shout --need "approve the 3876 land: the gate is green and waits on you"
+$ helm seat shout --need "a second read on the seatevents dedup" --speak-up
+$ helm seat shout --status
+$ helm seat shout --answered
+$ helm seat shout --dial 3
+```
+
 ### `helm beacons [--seat S] [--json]`
 
 The inbox-beacon **registry census**. A seat's beacon is HELM'S ONLY wake path
@@ -4006,11 +4487,22 @@ count reached 48 while every check said fine:
   it presses nothing and names the door and the reason. A record that carries
   no repair key (the compaction resume, and a `--nudge` recorded before this
   door existed) keeps the payload-only check: same handle, same text, same
-  generation. The census (`helm seat composers`) and the
-  recovery task a refused recovery writes say the same thing first: a strand
-  whose attempt was retired or passed its horizon is not called eligible, and
-  the owner is told that `--submit` will refuse it and that the held text must
-  be resolved by hand. A pause or a drain gets the same note while it holds.
+  generation. The census (`helm seat composers`) says the same thing first: a
+  strand whose attempt was retired or passed its horizon is not called
+  eligible, and the owner is told that `--submit` will refuse it and that the
+  held text must be resolved by hand. A pause or a drain gets the same note
+  while it holds.
+
+  **A nudge is submitted or taken back, never left.** A deliverer that typed
+  its line and will not submit it (the Enter did not take, its recovery door
+  refused, or the directive the line points at is gone) takes the line back
+  out with one Ctrl+U, sent only while the composer holds exactly that line;
+  a human's edit or a pane it cannot read gets no key. No
+  `task/resume-turn-*` recovery row is filed. `helm beacons --post` also
+  clears any line whose deliverer died before it finished (a killed process,
+  an OOM, a reboot) and forgets the record of a pane that is gone, and it waits
+  for the deliverers it forks before it exits, because systemd kills what a
+  oneshot unit leaves running.
 
 **Turn age does not decide this one.** A seat can complete turns and never
 consume a row, so "no turn since the delivery" is false exactly when the defect
@@ -4217,6 +4709,65 @@ helm ready: NOT READY — 3 green, 1 red, 1 unknown
 found two seats whose beacons were dark and a stale pane handle the fleet
 had not noticed. Honest reds are the product; a gauge that always reads
 READY is decoration.)
+
+### `helm pile [--json]`
+
+**The Lego reflex** (owner-asked, task/3868): one read-only screen of the
+whole inventory a seat can build with — the unused pieces. It lists, in one
+pass, the seats that are usable and hold nothing, credentials with at least
+half their window left that reset within six hours, credentials whose window
+resets within the hour, tasks whose lane merged to trunk today with the row
+still open, reviewer FIX verdicts from the last week that carry a committed
+patch and that no later row in their chain superseded, and the owner's rulings cast today. It only READS:
+every section reads one existing source — `seat_usability.join`,
+`creds._rows`, the git log, `tasks.open_rows`, `dispatches.snapshot`,
+`ownerasks.decisions_snapshot`.
+
+A source that is unreadable or cut by its deadline degrades to
+`unknown: <why>` with the time it was cut, and its count reads `?`, never a
+number or a traceback. `--json` is the machine surface; the table is the
+human one.
+
+**FLOW** (owner P0, task/4184; `helm/pileflow.py`) is the last section: the
+fleet's throughput, measured, so a bottleneck is flagged by a number and not
+found by hand. Each line compares one measured number with its own 7-day
+median and reads `FLAG` only when the number is 2x worse (a count's median
+is floored at one). A line whose question is a state that is never normal
+flags on that state. Each line names the seat that acts, read from the
+roster and local-names (`seatevents.steward`), never spelled:
+
+| line | source | flags when |
+|---|---|---|
+| land gate | the gate receipts the week's trains name (`gate:<id>` in a train's history) | the newest land gate took 2x the median; the line also says sliced or serial, how many of the last 6h ran serial, and the gate canary's standing |
+| lands per hour | the project's land log | lands in the last 6h are half the median 6h rate |
+| owner P0s | the task ledger, replayed hour by hour | the open count is 2x its median; median age and the oldest row ride along |
+| leads | open P0/P1 rows, open dispatch rows, live lane leases | a seat's unrouted P0/P1 count is 2x its median. In flight counts lanes and dispatch rows only: harness subagents are not counted until idle-capacity-signal-3821 lands, and the line says so |
+| land train | auto-land's store | a train is STOPPED (it needs a person), auto-land is paused, or the train in flight is 2x the median DONE train |
+| fab jobs | `fab status --live` (the one external call) | a node reads a job STALE (no log output for 30+ min); the launcher acts. A fab without `--live` reads UNKNOWN |
+| helm units | `systemctl --user --failed 'helm*'` | any helm user unit failed |
+| dark seats | the burn snapshot's dark families and the dark-seat mover's state file | a seat of a dark family holds a claimed task (the mover moves only unstarted work), or the mover has not finished a pass in 30 min |
+| mirrors | each checkout under `~/dev/references` and the proxy fork (`HELM_PILE_MIRRORS`, `:`-separated, overrides) — local git data only, no fetch | HEAD lacks an upstream commit older than 7 days, or the last fetch is older than 7 days |
+
+The readers run in parallel under one 15 s deadline. A reader that raises or
+is cut prints one `UNKNOWN` line with why; every other line is still
+measured. The FLOW header counts flagged and unknown lines, not lines.
+
+```console
+$ helm pile
+== SEATS (usable and idle) (1) ==
+  gemini — usable
+== CREDENTIALS (room that strands) (1) ==
+  claude acct-a — headroom 80%, resets 2.1h
+== RESETS WITHIN THE HOUR (0) ==
+  none
+...
+== FLOW (throughput against its own 7-day median) (2 flagged, 1 unknown) ==
+  FLAG    land gate — newest land gate 1a2b3c4d5e6f7a8b took 26 min (serial, OK, 8 min ago): 5.7x its 7-day median of 5 min; last 6h: 4 of 7 gates serial; canary: ... (integrator-seat acts)
+  ok      lands per hour — 0.5/h over the last 6h: 75% of its 7-day median of 0.7/h; the last land was 6 min ago
+  UNKNOWN fab jobs — this fab has no `status --live` (it read --live as a host); ...
+  FLAG    dark seats — the dark-seat mover has not finished a pass in 3.3d; ... (steward-seat acts)
+  ...
+```
 
 ## substrate — the attested-truth leg
 
@@ -4521,15 +5072,29 @@ status` and `helm doctor` read `GET /api/node/identity`'s `unlocked`: a locked
 node is **LOCKED** (status exits 1, doctor FAILs) with the cure `helm chat node
 up`, and an identity that cannot be read is `lock state UNKNOWN` (a WARN),
 never unlocked.
-**The node yields the CPU to interactive work.** Proofs attach asynchronously
-after a turn commits, so proving is background work, and a lower priority
-delays proofs, never delivery. Every `up` writes
+**The node yields the CPU to interactive work and bounds its prover.** Proofs
+attach asynchronously after a turn commits, so proving is background work,
+and a lower priority delays proofs, never delivery. Every `up` writes
 `helm-chat-node.service.d/20-helm-priority.conf` (0600) with `CPUWeight=20`
-(systemd weighs each sibling 100) and `Nice=10`, before the daemon-reload it
+(systemd weighs each sibling 100), `Nice=10`, `Slice=background.slice` (the
+stock user slice, weighted 30, next to the fleet's `agents.slice` at 25; the
+node used to run in `app.slice` at 100 and outrank every seat 4:1),
+`Environment=RAYON_NUM_THREADS=N` and `Environment=DREGG_PROVE_WORKERS=1`.
+N is one prover thread per six online CPUs, at least 2 (4 on a 24-CPU box);
+the kernel's online count is used, not `nproc`, which a CPU quota shrinks.
+Measured before this bound: a signed send cost the node about 25 CPU-seconds,
+in bursts of 7-12 cores. `up` writes the file before the daemon-reload it
 already runs, and restarts nothing: the reload re-applies the weight to a
-running node, and the nice reaches the process at its next start. `helm chat
-node status` prints both values and the main process's nice, and names the
-cure when they differ. There is no `IOWeight`: the data dir is tmpfs.
+running node, and the nice, the slice and the prover's bound reach the
+process at its next start. A second `up` writes the same bytes, and a hand
+edit of this file is put back. `up` never writes a drop-in it did not write:
+it names each other file in that directory that sets one of these
+directives, and says whether it sorts after helm's (systemd then applies its
+values) or before. `helm chat node status` prints the values systemd holds,
+the main process's nice and, when it still runs in its old slice, that
+slice; it names the cure when they differ: `up`, or the later drop-in that
+is not helm's. There is no `IOWeight`: a user unit's io weight is inert,
+because the user manager is not delegated the io controller.
 
 **`helm chat node prepare [--data-dir D] [--bin B]` is the unit's
 ExecStartPre.** It restores the node's chain descriptor (every data-dir file
@@ -4541,6 +5106,47 @@ must not be a mount point**: the data dir is assembled in a sibling directory
 and renamed into place, which rename(2) cannot do onto a mount point. The
 shipped unit's data dir (`/dev/shm/helm-chat-node`) is a plain subdirectory
 and is unaffected.
+
+**`helm chat node move --to ram|disk|PATH` moves the data dir (task/4064).**
+The unit runs the recorded placement: `/dev/shm/helm-chat-node` (tmpfs) by
+default, or the dir a move recorded in the state file (`disk` is
+`<helm-home>/_global/.state/chat-node-data`). A tmpfs store is RAM the kernel
+can swap but never drop, and it does not survive a reboot; a disk store is
+served from the page cache, which the kernel reclaims under pressure, and it
+does. Measured 2026-10-01 on the owner's laptop: the store was 4.8 GB of
+shmem and grows with the chain; on its NVMe a redb commit costs p50 0.2-0.4
+ms and p99 0.7 ms on ext4 against 0.02 ms on tmpfs, and the node's 230 MB
+checkpoint (every 100 blocks) costs 0.2-0.7 s against 0.06 s. `move` runs only
+with the unit stopped for good (inactive or failed, no restart queued, no stop
+in flight) and refuses a store another process holds open (redb's own flock):
+a copy of a live store is torn, because redb rewrites pages in place between
+commits (four of five copies of the live store spanned a commit, and redb
+refused the one opened). It refuses a PATH holding whitespace, `%` or a
+control character (the unit writes the path unquoted into its Exec lines), and
+an installed unit whose ExecStart it cannot read (it could not repoint it).
+With a unit installed it refuses when `systemctl --user` cannot report it (it
+could not tell a stopped node from a restarting one, and the daemon-reload
+would fail after the copy); with none installed it proceeds and says that the
+store's redb lock is the guard against a running node.
+Under the prepare lock it copies into a stage beside the target (holes stay
+holes), verifies every file by sha256, renames the stage into place, records
+the placement, rewrites an installed unit to run it and reloads systemd, and
+only then sets the source aside as `<source>.moved-<ts>`. The unit follows the
+record before the source leaves: the unit is enabled, so a start (a reboot, an
+auto-restart) on the old path would restore the identity into an empty ledger
+there; a start during the move finds the prepare lock held. A unit that cannot
+be rewritten or reloaded rolls the move back (the record names the source
+again and the copy is removed). The record and the unit are fsynced, file
+then directory, before the source moves, and the source's parent after it, so
+power lost mid-move never keeps the rename and drops the record (which would
+start the node on the tmpfs default, empty). A move that fails with an OS
+error says what it left: where the source is, whether a verified copy is in
+place, which dir the record names and whether the unit was rewritten.
+Nothing is deleted: the message and `helm chat
+node status` name the aside dir and the `rm -rf` that frees it, and `status`
+also names a stage a killed move left behind. The reverse is the same verb
+(`--to ram`). `status` prints the data dir, its filesystem and the store's
+size on every run.
 
 **The faucet is a cell, and it can run dry.** `POST /api/faucet` never mints —
 value enters a cave only by genesis issuer-moves — so on a genesis-less cave
@@ -4887,9 +5493,9 @@ so an open meld waits for the N-day bound, and a pair room whose next round
 has opened is open again. The day of quiet leaves the closer's countersign
 read and a last look on the bus; the finished state is re-proven under the
 room lock with the idleness. The dry run marks those rooms `meld finished`.
-The chat directory is FLAT and the delivery hook lists every entry in it on
-every tool call, so a room nobody uses still costs every seat: its file, and
-a delivery+wake cursor pair per consumer. Retirement copies the raw room and
+The chat directory is FLAT and every listing of it reads every entry, so a
+room nobody uses still costs every seat: its file, and a delivery+wake cursor
+pair per consumer. Retirement copies the raw room and
 its meld actor snapshots to `~/.helm/helm/journal/retired-rooms/<room>/` and
 fsyncs them FIRST, records the newest row time in
 `journal/retired-rooms.json`, and only then removes the room and every cursor
@@ -4981,7 +5587,7 @@ frames; this lane is called *delivery*.)
   finished subagent does not inherit the long-lived parent process. The
   owner-unread marker is untouched (only a real
   read consumes it).
-- **`helm chat wait [--seat S] [--any] [--follow] [--ambient] [--per-row] [--timeout N]`**
+- **`helm chat wait [--seat S] [--any] [--follow] [--ambient] [--per-row] [--once] [--timeout N]`**
   — the
   beacon: block until the next word addressed to the seat (a delivery — it
   advances the cursor, so the hook never re-nudges), or any new row with
@@ -5050,7 +5656,20 @@ frames; this lane is called *delivery*.)
   **`--per-row`** keeps the pre-doorbell stream byte for byte (EACH matching
   row as one line); it is part of the waiter's behavior, so a live doorbell
   and a `--per-row` arm of the same seat and session conflict until
-  `--replace`. The beacon's default scope is **MENTION-ONLY**: `@seat`
+  `--replace`. **`--once`** (with `--follow`, never with `--any` or
+  `--per-row`) is the ONE-SHOT beacon: the same mention-only doorbell, but
+  the waiter exits after its first ring, so its exit is the wake. Armed as a
+  background task, its regular-file stdout is admissible (the harness reads
+  the output file when the task exits); armed as a Monitor it is a pipe as
+  usual. The census counts it as a live beacon while it runs; its exit
+  stamps the registry row (`ended`), so for the re-arm grace after the ring
+  the seat reads WAKING, not DEAF, and the re-arm typer types nothing. It is
+  part of the waiter's behavior, so it conflicts with a live plain doorbell
+  of the same seat and session until `--replace`. A ring carries its lead
+  row whole, so that row is shown: no later ring (a backstop, or a re-armed
+  waiter's first pass) leads with it again, and a row the tool-boundary hook
+  showed inside the debounce window is never rung. The beacon's default
+  scope is **MENTION-ONLY**: `@seat`
   mentions, replies to the seat's rows, DMs and `@all` wake it — ambient
   home-room rows do NOT (each ambient wake burns a full idle turn; premise
   `mute-busy-home-room-trust-mentions`, owner directive 2026-07-29). A row
@@ -5258,9 +5877,9 @@ frames; this lane is called *delivery*.)
   composition; an unwritable latch degrades to the WARN.
   A LANDED BRANCH IS NOT A HALF. Neither room's work may already be on the
   trunk, asked through `_merged` — the same authority `helm work release`
-  prints LANDED-by-ancestry and LANDED-by-patch-identity from, because our
-  protocol lands work REBASED so almost nothing arrives under the sha its
-  author wrote and ancestry alone answers a truthful NO. Measured false
+  prints LANDED-by-ancestry and LANDED-by-patch-identity from. Exact-sha
+  train merges preserve ancestry; patch identity also recognises historical
+  rebase and cherry-pick lands under other shas. Measured false
   positive that added this: the rung fired on its own lane against a seat
   branch carrying one two-week-old commit that `git cherry` marked with a
   MINUS. Asked of the BRANCH, not each commit, following that instrument's own
@@ -5751,7 +6370,16 @@ aligned with every other chat verb).
   replies take longer than 90 s (the Claude-side 90th percentile measured
   533 s); `[ABORT]` → exit 4, fail-loud. After your own `[DONE]`, recv is
   the COUNTERSIGN WATCH: it returns the peer's closing DONE (→ done-mutual,
-  counted) instead of refusing — the closer is never blind.
+  counted) instead of refusing — the closer is never blind. In a task's pair
+  meld (docs/MELD_REVIEW_DOOR.md) the timeout also prints the HOLD that keeps
+  the round open, and while a member's newest turn is a `[HOLD]` whose text
+  says `HOLDING: <what it is doing>` the timeout prints `MELD-HELD` instead:
+  it names each holder and what it is doing, says the round stays open, and
+  offers no close (still exit 3). A `[HOLD]` with no `HOLDING:` reason gets
+  the ordinary timeout lines. When recv returns an addressed pair-meld YIELD,
+  that physical row is retired from the reading session's delivery inbox; its
+  next tool boundary and stop guard do not replay it. Earlier unread rows and
+  later YIELDs remain owed; this does not extend the exchange cap.
 - **`meld say <room> --marker YIELD|HOLD|DONE|ABORT [<text...>]`** — one
   bounded chunk, content + floor marker in the one text field. WITH NO TEXT
   THE CHUNK COMES FROM STDIN, the same door `post` and `dm` use, and that is
@@ -5772,9 +6400,16 @@ aligned with every other chat verb).
   DONE/ABORT @mention the peer (act-moments — the closing must land);
   YIELD/HOLD stay mention-free, so a meld never floods the peer's delivery
   cursor with stale nudges (both parties sit inside recv, polling the room
-  at 0.5 s). Once the peer's `[DONE]` is in the room, read or not, a YIELD
+  at 0.5 s). A task's pair meld is the exception: its turns outlast any recv
+  bound, so a YIELD there @mentions every peer in the round and is an owed
+  row like any @mention (the beacon's doorbell counts it, the tool boundary
+  delivers it, the stop guard blocks an idle stop on it). A peer that never
+  joined the round is not addressed: the dispatch ring woke it. Once the
+  peer's `[DONE]` is in the room, read or not, a YIELD
   or HOLD is REFUSED before it posts (`MELD-PEER-CLOSED`): it would reach
-  nobody, so close your side with DONE.
+  nobody, so close your side with DONE. In a pair meld, work that outlasts
+  the bound is a `[HOLD]` saying `HOLDING: <what you are doing>`, which
+  keeps the round open for the peer's next YIELD; `[DONE]` leaves it.
 - **`meld status`** — this seat's live melds (role, status, exchanges/cap)
   plus lifecycle provenance: `live-not-yet-durable`, `durable-live`,
   `replayed`, or `UNKNOWN`. Missing, unreadable, malformed, sequence-gapped,
@@ -5847,7 +6482,8 @@ whose checkpoint cannot be read or written is not rotated.
 - **Dispatch.** When a row's sender and reader both hold the pair's
   standing room, `dispatch send` (and `add`, rebind, retract) records the
   round as one `[STANDING-ROUND]` row there and mints NO per-chain pair meld
-  (`meld-0-pair-*`); the DM names the standing room. A FIX verdict's
+  (`<project>-<n>` for a task, `meld-0-pair-*` otherwise); the DM names the
+  standing room. A FIX verdict's
   hand-back names it too. A pair with no standing room opens the per-chain
   pair meld exactly as before. `meld status` lists the standing rooms this
   seat is in. An idle standing room is never retired.
@@ -5889,7 +6525,7 @@ $ helm multiplayer leave --cave helm --actor alice --connection phone
 The default adapter stores both channels in tmpfs, but the interfaces are
 metaharness- and CRDT-agnostic. See [MULTIPLAYER.md](MULTIPLAYER.md).
 
-### `helm launch [--seat S] [--home H] [--room R] [--model M] [--no-install] [--] [claude args…]`
+### `helm launch [--seat S] [--home H] [--room R] [--model M] [--role R] [--no-install] [--] [claude args…]`
 The metaharness seam (meld-launch's capability): wires the full hook estate
 into the target home (idempotent), pre-writes the seat's roster row so
 teammates can address it before the first tool call, exports
@@ -5905,6 +6541,22 @@ that room plus
 `main`, and project-less launches remain un-homed. The fleet needs no wrapper
 (`helm hooks install` covers every home); launch adds the stable name and the
 per-home pin (`CLAUDE_CONFIG_DIR`).
+
+**`--role lead|worker` (with `--seat`) declares a native seat's role.** A seat
+`helm seat spawn` made takes its role from its spawn register. A native seat
+helm never spawned (a lead started by hand, or one adopted from an Orca pane)
+has no register, so `--role` writes a declaration, `role.json`, in that seat's
+native instance directory. `seat_role.recorded_role` reads it only when no
+register resolves the seat, and later launches keep it. A lead launch gets the
+lead context window, the lead-lean settings and `HELM_SEAT_ROLE=lead`. `--role`
+on a spawned seat whose register says otherwise is refused (exit 2, no
+session); `helm seat spawn <seat> --replace --role R` changes that role.
+`helm seat resume <seat> --role R` writes the same declaration for an
+Orca-adopted seat before it relaunches it, and that relaunch reads it back: an
+adopted claude session whose recorded role is lead resumes with the lead
+context window, `HELM_SEAT_ROLE=lead` and the lead-lean `--settings` before
+`--resume`, on the exact recipe and on `--defaults` alike. A worker, an
+undeclared seat and a declaration that does not read resume as before.
 
 **Before the exec, a launch onto a named credhome passes the Orca sync** — the
 same function as `helm cred sync-orca --apply`, whether the home came from
@@ -5948,6 +6600,14 @@ derives its room.
 carry `--model`. With no model at all, the launch names the model the home's
 `settings.json` will select (read, never written), so a seat that lands on a
 settings default is visible at launch.
+
+**The launch it starts is recorded by claude's own SessionStart hook**, not
+by the launch line: once the process has really started, helm's hook writes
+the launch record's row for its session, whatever the args named
+(`--resume <sid>`, `--continue`, a fork). A seat moved onto another home by
+hand (`/exit`, then `helm launch --seat S --home B -- --continue`) is then a
+later launch every resume sees (see `helm seat resume`); an exec that fails
+records nothing.
 
 ### `helm ownership census`
 
@@ -6058,7 +6718,7 @@ for a reason that legitimately begins with a dash. Because that escape exists,
 it — a better sentence than a generic unknown-flag refusal, which cannot know
 which flag was starved — so that one shape is left to it.
 
-- **`helm work claim <lane> [--ttl N] [--lease ID] [--task task/N]`** — check-in: lease
+- **`helm work claim <lane> [--ttl N] [--lease ID] [--task task/N [--whole|--part]]`** — check-in: lease
   first (ADMITTED ACTOR required — a lane lease durably assigns responsibility
   and can strand another worker, so a name minted from session+cwd is refused;
   export `HELM_CHAT_NAME` or `helm chat join`. `--seat` ASSERTS that identity,
@@ -6076,7 +6736,7 @@ which flag was starved — so that one shape is left to it.
   `helm chat claim` and `helm multiplayer presence` read `--ttl` through the
   same reader (`seats_common.ttl_flag`), each with its own default.
   A renewal (`--lease`) takes the same forms.
-- **`helm work claim <lane> --task task/N`** — records the task the lane
+- **`helm work claim <lane> --task task/N --part`** — records the task the lane
   serves (task/3643). The record is the lane branch's own git config key,
   `branch.lane/<lane>.helmTask`, in the repository's common config: git
   moves it with a branch rename and drops it with the branch, so it lives
@@ -6096,6 +6756,85 @@ which flag was starved — so that one shape is left to it.
   records) beats a literal `task/N` or `task-N` in the lane's name, and a
   trailing number alone (`canary-seeded-red-0926`) is never a task. Two
   different stored keys are UNKNOWN, with both named.
+- **`helm work claim <lane> --task task/N --part [--because "<one line>"]`** — the
+  biggest lever first (task/3821). Before anything is claimed, the task is
+  weighed against the open tasks nobody is on (no lane record, no open
+  dispatch chain, and not `in_progress`, for the task or a task below it):
+  a sub-task of the same story that the story's order (`helm task update
+  <story> --order`) puts first, or, where no order decides the two, one
+  ranked strictly higher (its priority, or a fast tax cut at the same
+  priority; an older sub-task of the same rank is not a lever, since age is
+  not a judgment), and an owner-asked P0 or P1 task in the same project ranked CLEARLY
+  higher, two ranks or more (`tasks.LEVER_STEP`), than the best rank on the
+  claimed task's own story chain (a P2 sub-task of a P0 story weighs as
+  P0): a P2 or P3 pick under an owner-asked P0, a P3 under a P1. A closer
+  rank, an unranked pick and a task with no project say nothing about
+  owner-asked work; a story lever speaks at any rank. A task that
+  continues the claimed one builds on it and is never counted. THE CHECK
+  STEERS AND NEVER REFUSES: when one is skipped the claim prints one line
+  naming ONE lever, the best-ranked (then the story's order, or the
+  oldest), and goes ahead with rc 0: `LEVER INVERSION: task/C goes ahead
+  of task/A (story task/S, no lane). Take it first if you can; this goes
+  ahead, recorded as "went ahead without a reason" (next time, say why
+  with --because "<one line>").` The lane's branch records the skipped ids and the reason
+  (`branch.lane/<lane>.helmLeverSkipped` and `.helmLeverBecause`, dropped
+  with the branch), and, when `--because` gives a reason, one comment on
+  the task keeps it after the branch is gone: `lane <lane> took task/C
+  ahead of task/A, task/B (--because): "<reason>"`. With no `--because` the
+  lane records `went ahead without a reason` and the task gets no comment;
+  the morning report's ORDER lines show the skip. The line is said once per session, task and lever: keyed by
+  the harness session id (the acting seat when none is set), the check,
+  the task and the id the line names, in
+  `<helm home>/_global/.state/lever-steer.json`, so a new bigger lever on
+  a second pick of the same task speaks. An entry older than seven days
+  (`taskkey.STEER_KEEP_S`) is dropped before the lookup. A lane that already
+  records the task is a renewal and is not weighed again, and claiming an
+  existing lane whose work is not on trunk adopts started work, which is
+  not a new pick: neither check weighs it. The pick reads the dispatch
+  ledger once and the task ledger once. When the ledgers cannot be read the claim prints
+  `LEVER CHECK UNKNOWN: <why>` and goes ahead. `--because` without `--task`
+  is refused (rc 2).
+- **`helm work claim <lane> --task task/N --part [--start-anyway "<one line>"]`** —
+  finish first (task/3821). Before a new pick, the claiming seat's started
+  work that sits unlanded is counted: a lane whose lease it holds, whose tip
+  is not on trunk, and on which nothing moved (no commit, no write in its
+  room, no dispatch row, no lease grant or extension, so a lane adopted a
+  minute ago is not idle from its old commits) for 4h (`taskkey.FINISH_FIRST_IDLE_S`, one default
+  lane lease). The integrator (the lander seat) answers for the fleet: every
+  held lane, and every row held SOURCE-CLEAN for 1h
+  (`taskkey.FINISH_FIRST_HELD_S`) that is waiting to land and whose work
+  has not reached trunk (landreq's landing proof; when that cannot tell,
+  one `git cherry <pinned trunk> <tip>`; a hold on a landed lane is
+  finished, and a hold neither can read is counted; the census spends one
+  20s deadline, `taskkey.CENSUS_BUDGET_S`, on every hold's proof, and a hold
+  reached after it is spent is counted unread). A lane with an open or held dispatch row is waiting on it,
+  not stalled, and a hold stands in for its lane. This check steers too:
+  when anything is found the claim prints one line naming the
+  highest-leverage item (the rank of the task it serves), oldest first,
+  once per session and item (not again for the next pick while that item
+  stays stalled), and goes ahead: `FINISH FIRST: your started
+  work sits unlanded — lane/<lane> (task/N, P1) unlanded, with no commit,
+  write or dispatch for 5h. Finish it first if you can; this goes ahead,
+  recorded as "went ahead without a reason" (next time, say why with
+  --start-anyway "<one line>").` The lane's branch records the items and the reason
+  (`branch.lane/<lane>.helmStartAnywayOver` and `.helmStartAnyway`; `went
+  ahead without a reason` when none is given), and a `--start-anyway`
+  reason goes in the same one comment on the task as a `--because`. When
+  the census cannot be read the claim prints `FINISH FIRST CHECK UNKNOWN:
+  <why>` and goes ahead. `--start-anyway` without `--task` is refused (rc 2).
+- **`helm work claim <lane> --task task/N --whole`** — records, beside the
+  task, that the lane carries the task's WHOLE ask (task/3746): the branch's
+  `branch.lane/<lane>.helmWhole` key names the task, and lives and dies with
+  the branch as `helmTask` does. `--whole` without `--task` is REFUSED (rc 1)
+  before anything is claimed. At the land the task is LANDED, not closed: it
+  owes a seen-working check by one named seat ("landed whole in LAND N
+  <sha12> (lane L at <tip12>): owes a seen-working check by @X"), and
+  `helm task observed <id> --evidence TEXT` closes it (helm/observed.py).
+  A task with open sub-tasks at any depth stays open and a comment names
+  them. A lane without `--whole` lands
+  with the one question commented on the task and asked in its room: "is
+  the whole ask done? close it, narrow its title, or file the remainder with
+  --continues task/N" (helm/landtask.py).
 - **`helm work release [<lane>] --lease ID [--park] [--superseded REASON] |
   --stale`** — checkout at
   the desk. `--lease` needs the same admitted actor `claim` does; `--stale`
@@ -6115,9 +6854,9 @@ which flag was starved — so that one shape is left to it.
   surrenders the lease and unlocks the room, but retires room + branch only
   when Git proves the lane's work reached the trunk — by ANCESTRY (the tip
   itself is on trunk) or by PATCH IDENTITY (every commit is on trunk under a
-  rebased sha). The second half is what lets a seat clean up after itself:
-  helm lands work rebased, so an ancestry-only check said "not landed"
-  truthfully and stranded the branch of every agent that followed the rule. A
+  rebased sha). The second half also recognises historical rebases and
+  cherry-picks whose original tips are not ancestors of trunk; today's
+  exact-sha train merges do preserve ancestry. A
   patch-identity retirement preserves the tip at `refs/helm-retired/<branch>`
   before removing the branch, so it is reversible by construction; the release
   line names which proof retired the lane and how to restore it.
@@ -6185,7 +6924,19 @@ which flag was starved — so that one shape is left to it.
   out-of-band → keep; detached/mid-operation → manual keep; clean + LANDED
   (ancestry OR patch identity) → remove room and retire branch, saying which
   proof and — on patch identity — preserving the tip at
-  `refs/helm-retired/<branch>` first; clean + UNSTARTED (the tip is on the
+  `refs/helm-retired/<branch>` first; clean + LANDED-EQUIVALENT (task/1026:
+  ancestry and whole-branch patch identity say no, but every commit past the
+  trunk is proven one by one — its own `--verbatim` patch-id is a trunk
+  commit's with its author line, or a train car merge naming this lane or a
+  later `-rN` rebuild of it carried a commit with its author line and the
+  commit was not rewritten after that merge, or it is a merge that adds
+  nothing of its own by `git show --remerge-diff`) → remove room and retire
+  branch the patch-identity way, the row printing each proof with its shas
+  and the train; a subject match or a share of lines on the trunk proves
+  nothing, and a lane with any commit it cannot prove stays TRIAGE with the
+  first unproven commits named and why (no copy on the trunk, a copy with a
+  different patch, rewritten after the train, a merge with a change of its
+  own); a predecessor's train never speaks for its rebuild; clean + UNSTARTED (the tip is on the
   trunk only because the branch never carried a commit of its own, by its
   reflog) → keep both while the room last moved inside 24h or its age cannot
   be read, and retire as an abandoned claim after that — ancestry alone reads
@@ -6200,7 +6951,21 @@ which flag was starved — so that one shape is left to it.
   one a reflog still names after its creation line expired), so work only a
   reflog holds keeps both, and a reflog whose file git could not read whole
   keeps both; clean + unlanded → TRIAGE and keep both;
-  landedness UNKNOWN → TRIAGE and keep both; DIRTY → rescue-commit then keep
+  landedness UNKNOWN → TRIAGE and keep both; clean + not landed + idle →
+  PARK (task/4061): the checkout is removed and the branch is kept at the same
+  tip, so `helm work claim <lane>` re-opens the room (a harness room prints its
+  `git worktree add` line). A room parks only when its landedness reads a
+  clean NOT landed (never UNKNOWN); its HEAD reflog, its lease lock and the
+  admin-dir files checkout, commit, reset, merge and fetch write have not
+  moved for 3 days (a HEAD reflog `git gc` expired to nothing is dated by
+  those files and the branch tip's committer time; an unreadable one keeps);
+  no commit only its HEAD reflog or its branch's reflog records is off the
+  trunk; it holds no ignored file except `__pycache__` and `.pytest_cache`;
+  and no disposable shell or pane is in it; otherwise it stays
+  TRIAGE and the row says why it was not parked. Apply asks all of it again,
+  under the claims lock, and closes no pane and stops no shell for a park.
+  The summary prints `parked=N`; parked lanes stay in `triage=N`, because
+  their work still waits. DIRTY → rescue-commit then keep
   both (the rescue is itself unlanded). Apply re-checks occupancy, METAHARNESS
   PANES, branch identity, dirtiness and landedness immediately before removal,
   then re-reads the room's HEAD and HEAD reflog against a reading taken before
@@ -6226,14 +6991,19 @@ which flag was starved — so that one shape is left to it.
   be hung up (SIGHUP — bash ignores SIGTERM in that state) before an otherwise-
   proven reap; every uncertain process state keeps the room, and no pane-bound
   room reaches that leg. Each APPLY pass prints and posts one `removed=N kept=N
-  triage=N` summary. A stale `lease:` lock with no live lease falls through to
+  triage=N` summary. The scan runs in one projection scope and remembers each
+  NOT-landed verdict in `~/.cache/helm/gc-landed-<repo>.json`: while the
+  lane's tip is the same commit and the trunk is the same, or only gained
+  commits with none of the lane's author lines and no train merge naming it,
+  the verdict is reused for up to 24h. A remembered verdict can only keep; a
+  retiring one is always computed fresh, and apply re-asks without the memo. A stale `lease:` lock with no live lease falls through to
   the sweep. `helm gc` carries the report row; this verb is the actuator.
 - **`helm work list`** — the room board: lane, holder + remaining, dirty,
   ahead/behind the base, lock, path (registry ⋈ claims, computed). A HELD
   room whose committed work is already on the trunk prints a `LANDED — <proof>;
   the lease is still held` line under its row with the exact release command
   (the token for your own lease; for another seat's, where its holder reads
-  it), because a land releases no lease and `+0/-N` left the reader to infer
+  it), because a hand land releases no lease (auto-land releases the lanes it lands, and names any it could not) and `+0/-N` left the reader to infer
   it. The verdict is `work.lanes_landed` — the same one the web board's
   kanban reads: `_merge_state` (the proof `helm work release` retires on:
   ancestry, or patch identity) bound to the resolved tip and trunk shas, plus
@@ -6635,7 +7405,7 @@ an unsafe/unreadable ledger is **UNAVAILABLE / owner debt UNKNOWN** on both
 `list` (nonzero) and stop-whisper, never silently rendered as zero. Mutations
 still never traceback, and a failed `add` says NOT RECORDED loudly.
 
-### `helm task add <title...> [--owner SEAT | --mine] [--note N] [--ref R]... [--id NNN] [--owner-asked] [--posture-na REASON] [--priority P0|P1|P2|P3] [--project NAME] [--tax N] [--tax-cost N] | list [--all] [--all-projects] [--project NAME] [--mine | --owner SEAT] [--by-tax] [--json] | triage [--apply] [--limit N] [--legacy] [--project NAME] | show <id> [--json] | resolve <token> [--json] | claim <id> [--owner SEAT] | release <id> [--note TEXT] | takeover <id> --from-lane L --transfer-id ID [--superseding] | update <id> [--title T] [--note N] [--owner S] [--status S] [--origin owner|agent] [--ref R]... [--priority V] [--tax N] [--tax-cost N] | close <id> <reason...> | close-candidates [--json] | confirm-close <id> | comment <id> <text...>`
+### `helm task add <title...> [--owner SEAT | --mine] [--note N] [--ref R]... [--id NNN] [--owner-asked] [--posture-na REASON] [--priority P0|P1|P2|P3] [--project NAME] [--tax N] [--tax-cost N] | list [--all] [--all-projects] [--project NAME] [--mine | --owner SEAT] [--by-tax] [--json] | triage [--apply] [--limit N] [--legacy] [--project NAME] | show <id> [--json] | resolve <token> [--json] | claim <id> [--owner SEAT] | release <id> [--note TEXT] | takeover <id> --from-lane L --transfer-id ID [--superseding] | update <id> [--title T] [--note N] [--owner S] [--status S] [--origin owner|agent] [--ref R]... [--priority V] [--order IDS] [--tax N] [--tax-cost N] | close <id> [--open-children-stay] <reason...> | close-candidates [--json] | confirm-close <id> [--open-children-stay] | comment <id> <text...> | observed <id> --evidence TEXT | rehome --plan FILE [--apply] | health [--project NAME | --all-projects] [--json]`
 The FLEET TASK LEDGER — shared work items with real ids every seat can
 resolve. One append-only jsonl at `~/.helm/_global/tasks.jsonl`, same
 event-sourced shape as the owner ledgers: every mutation appends a full
@@ -6644,6 +7414,49 @@ origin, closed_reason, comments, takeover?, released?, tax?, tax_cost?}` and
 the last line per id wins. `takeover` is present only on an evidence-bound
 BUILD continuation and lands in the same snapshot as its owner change;
 `released` is the last time the holder handed the row back to the pool.
+
+**DONE IS LIVE AND SEEN WORKING: `helm task observed <id> --evidence TEXT`
+(helm/observed.py).** A land that carries its task's WHOLE ask (`--whole`)
+does not close the task. The land step stamps a `landed` record on it
+`{land, sha, lane, tip, ts, owner, role, passed, restart, moved}` and the
+task stays open, reading "landed — owes a seen-working check by @X". The
+check owner is ONE seat: the seat that filed the task (its `source`); when
+that seat is dark (`seat_usability.availability` reads its family's measured
+wall), a longtail seat (a team role that is not lead) or unknown (no filer,
+or not on the roster), its project's lead; when the lead is too, the
+integrator. `passed` says why each earlier seat was passed over. The owner
+is told once: auto-land's LAND announcement carries the land step's line,
+which @mentions it with the exact command, and a hand land posts the same
+line once to the task's `<project>-<N>` room. `observed` records what was
+seen working and where (free text, required; nothing closes without it),
+the recording seat (any seat may record it, named by the acting identity),
+and closes the task "seen working: <evidence> (recorded by @S; landed LAND
+N <sha12>)". `show` prints the check owed, or the evidence and its recorder.
+A row that owes no check (no whole land stamped it, or it is closed) is
+refused, naming `helm task close`. `confirm-close` refuses a row that owes
+a check, naming this verb, and the stale sweep does not ask its holder to
+confirm one. A land that owes the leads a relaunch (helm/autoland.py
+RESTART_RULES) records it, and the check line says "not LIVE until: ...".
+THE PILE: a check older than 24 h moves ONCE to the next fit seat of the
+chain (requester, then lead, then integrator), with one @mention naming the
+command, and stays there; the auto-land tick runs that sweep at most every
+15 minutes, after its own work, and a sweep that fails is said and changes
+nothing about the tick. A check the integrator holds has nowhere to move.
+`helm doctor` counts the landed tasks that owe a check and the oldest one's
+age (WARN once any is past 24 h); the same rung names the seat processes
+that run a replaced binary, since installed is not live outside a land
+either: a process whose exe the kernel reads as `<path> (deleted)` and
+whose parent declares a seat (its one `HELM_CHAT_NAME` entry, read alone)
+is one line, "N seat processes run a replaced binary: <binary> in <seats>,
+live on their next relaunch" (task/3717). The morning report's ORDER lines carry
+one line per owing seat: "ORDER @S owes N seen-working checks: <ids>"
+(helm/brief.py). The owing seat itself hears it at its stop: a stop-whisper
+rung just above the work offer says "owes N seen-working checks: <up to 3
+ids> — see each working, then `helm task observed <id> --evidence "..."`",
+once per owed set and again when the set changes, and nothing to a seat
+that owes none; an unchanged task ledger is not read again (the owed map
+is memoised beside its identity). No check holds a land, the train or any
+other task.
 
 **EVERY COMMENT NAMES ITS AUTHOR (goal-ledger D1).** A comment is `{ts, text,
 by, door}`. `helm task comment` records the acting seat; the owner's note from
@@ -6676,6 +7489,85 @@ helm's own checkout to report something about helm. `update`, `close` and
 `show` resolve a FLEET-WIDE id and read no scope at all — they REFUSE the flag
 with that sentence rather than accept it as a no-op. Moving an already-filed
 row between projects is not any of these doors.
+
+**A TASK MUST NAME ITS PROJECT (task/3745).** Every row lives in exactly one
+project, so a project's lead finds all of its work in `helm task list`.
+`helm task add` takes the project from the cwd (the lens `list` scopes with)
+or from `--project NAME`, and when it has neither it REFUSES with exit 2,
+files nothing, and names both ways in and the registered names. `--project
+none` (or `null`, or `unscoped`, in any case) is refused the same way: it is
+not a way out. `helm goal add` makes the same check (`tasks.require_project`)
+for a new goal; `--from`, which promotes a row that already exists, does not.
+The other doors that file rows name a project too: `helm task mirror` files
+each row under the registered project its session's recorded cwd resolves to
+(the first `cwd` in the session's transcript, through the lens `list` scopes
+with), and under `helm`, the mirror's own project, when nothing resolves;
+`helm todos promote` takes the cwd's project and refuses without one; a
+resume-turn recovery row takes the project of the cwd its hook runs in, and
+`helm` when that cwd is in none. The library door (`tasks.add`) still accepts
+a row with no project from a caller that passes none; `helm doctor` counts the
+open homeless rows and `helm task rehome` gives them a home. A scoped `helm task list` counts the
+homeless rows it does not show on its disclosure line ("N homeless row(s)
+with no project", naming `helm task rehome`, beside the other projects'
+count; with `--all` it says how many of them are open, since rehome refuses a
+closed row), and `helm doctor` has a `task homes:` row.
+
+**A new row with no parent may still belong to a story.** `helm task add`
+without `--continues` prints ONE extra line, `story home? task/N (words),
+...`, naming up to three open stories in the row's project that share a RARE
+title word with it (the words the duplicate check compares; a word is rare
+when at most max(2, 2% of the project's open rows) carry it). A matching
+sub-task names its story's root. The line never refuses and sets nothing;
+`helm task update <id> --continues task/N` makes the row a sub-task.
+
+**`helm task rehome --plan FILE [--apply]` gives homeless rows their
+project.** The plan is a JSON file in one of two shapes. A bare mapping is
+`{"56": "helm", "471": {"project": "helm", "force": true, "from":
+"other", "reason": "..."}}`. nesting.json's shape is `{"homes": {ID: ROW, ...}, "home_notes":
+{PROJECT: REASON, ...}}`; its other top-level keys (`stories`, `reparent`,
+`notes`) are not read, and the output names them. ID is any spelling of a
+task id; ROW is a project name or an object with `project`, and optionally
+`force` (true or false), `from` and `reason`. A forced row must name `from`,
+the project its author saw the row in: `--apply` judges a fresh snapshot, and
+a forced row whose task is anywhere else by then is refused, never moved from
+a project nobody read. A row's own reason wins over its
+project's `home_notes` entry. Without `--apply` it is a DRY RUN that writes
+nothing and prints one line per plan row: the id, `None -> PROJECT`, the
+title and the plan's reason; a row that already has exactly that project
+reads `already in PROJECT — nothing to do`; and every refusal is named with
+its reason: not a task id, not in the ledger, closed, an unregistered
+project, already in another project without `"force": true`, forced with
+no `from` or from a project the row is no longer in, or named twice.
+The count line follows, and the exit code is 1 when any row was refused.
+`--apply` resolves the caller as an admitted actor first (no actor, nothing
+written) and writes each row as ONE project update through the task writer:
+the row gains `homed_by`, `homed_at` and `homed_from`, and keeps its
+`last_updated`, because a home is not work on the row. A row that moved
+after the plan was judged is skipped, not overwritten. Re-running an applied
+plan writes nothing: every row reads `already in PROJECT`. The rehome verb
+takes no scope; it runs from any directory.
+
+**`helm task health [--project NAME | --all-projects] [--json]` is each
+project's health line.** One line per project: its open stories (counted
+the way `helm task list` counts them), its open rows, the rows opened today,
+the rows closed today, and the 7-day net (opened minus closed), for example
+`helm   12 open stories, 40 open rows; today 3 opened, 5 closed; 7-day net
+-2`. Opened is a row's filing stamp; closed is the stamp of the event that
+closed it, read from the ledger's own event history. A row born closed (a
+tombstone) counts as neither, and a row counts under the project it has now.
+TODAY IS THE HOST'S LOCAL DAY, from local midnight, the same day `helm goal
+cycle` counts from; the 7 days are today and the six local days before it.
+The first line says both starts with the zone. The scope is `list`'s:
+`--project NAME` wins, else the cwd's project, else every project;
+`--all-projects` lists every registered project (a project with no rows
+reads all zeros), then any unregistered name a live row carries, then a `(no
+project)` line when homeless rows are open or moved in the window.
+`--project` with `--all-projects` is refused. `--json` prints
+`{"today_since", "week_since", "tz", "projects": [...]}`, each project an
+object with the line's keys: `project` (null for the homeless rows),
+`open_stories`, `open_rows`, `opened_today`, `closed_today`, `net_7d`. The
+project registry has no repository field, so the line does not name a
+project's repository.
 
 **THE POSTURE GUARD (`helm/posture.py`, task/1346) stands at this door and
 at `helm dispatch send`.** A title-plus-note or a dispatch body that applies
@@ -6767,6 +7659,60 @@ value must be a number above zero. An empty value (`--tax=`) clears it, and a
 cost with no tax is refused. The keys are stored only when set, so a row
 without them reads as before; `--json` adds `payback_days` when both are set.
 
+**STORIES: A TASK'S SUB-TASKS AND "N OF M DONE" (task/3742).** A row that
+`--continues` another row is its sub-task. The row at the head of the chain is
+the story, and a row with no parent is a story of one. The ledger keeps one
+number per row and no second parent field; `continues` is the link.
+
+- `show <id>` lists the row's direct sub-tasks (id, status, title), then
+  `sub-tasks  N of M done` over every row below it at every depth. Done means
+  closed. A sub-task prints its `parent` and its `story root`.
+- `list` prints `N open stories, M open rows` as its first line. A story is a
+  top-level group in the listing with an open row in it. A parent line shows
+  `[N of M done]` before its title, counted over the whole ledger, so closed
+  sub-tasks that the open listing hides still count.
+- `close <id> <reason...>` refuses a row that has an open row below it and
+  names each one. `close <id> --open-children-stay <reason...>` closes it
+  anyway; the reason says why the sub-tasks stay open, and the row records
+  their ids as `open_children_at_close`. `list` then shows each open sub-task
+  under a dim `(closed) task/N title` line, never as a story of its own.
+- `add --continues task/N` refuses an open row under a closed parent, and so
+  does `update <id> --continues task/N` when it moves an open row (or one it
+  reopens in the same write) under a closed parent (task/3862). An update
+  that keeps the row's parent is not refused, so a sub-task that
+  `--open-children-stay` left open keeps every other update. A closed row
+  may continue a closed parent: it records history.
+- A broken chain (a parent the ledger does not hold, or a ring that older
+  helms wrote) is shown flat: the row is its own story and is never dropped.
+  A parent outside the shown set (another project, or filtered out by
+  `--owner`) leaves its sub-task at the top level of that listing.
+
+`show --json` and `list --json` add six keys to every row. The fold is
+ledger-wide, across every project and status:
+
+| key | value |
+|---|---|
+| `parent` | the id that `continues` records, or `null` |
+| `story_root` | the id at the head of the story; the row itself for a story of one or a broken chain |
+| `story_broken` | `null`, or `{"kind": "ring" \| "dangling", "at": "<id>"}` |
+| `children` | `[{"id", "status", "title"}]`, the direct sub-tasks in board order |
+| `done` | the closed rows below it, at every depth |
+| `total` | all rows below it, at every depth |
+
+**A STORY'S ORDER: WHICH SUB-TASK GOES FIRST (task/3821).** `helm task update
+<story> --order 3746,3745,3742` records the order of the story's sub-tasks, as
+task ids separated by commas or spaces. Every id must be a sub-task of the
+story (a row that `--continues` it), once; anything else is refused by name
+and nothing is written. Sub-tasks the order leaves out come after the listed
+ones in board order (rank, a fast tax cut, then age). `--order=` clears it.
+The order is what the leverage check at `helm work claim --task` and a
+chain's first `helm dispatch send` reads (sub-tasks the order does not
+decide are levers over each other only by a strictly higher rank or a fast
+tax cut, never by age), what puts a story's lead first in
+the idle-seat offer, and what `helm brief --report` reads for its `ORDER`
+lines. A row filed from now on carries `order` (`null` when unset); an
+older row has no key, which reads the same.
+
 **`add` RESOLVES THE TITLE AGAINST THE OPEN BACKLOG BEFORE IT FILES.** The
 owner's other question on the same morning: "how do we prevent me continually
 asking for things that have been placed on the list and ignored." 477 open rows
@@ -6804,6 +7750,17 @@ command-line spelling of that same bit — the flag `helm drain` already uses �
 and forcing is never silent: the override says it fired. CLOSED rows are never
 matched (a thing finished in June is history), and the scope is this project's
 rows plus the UNSCOPED legacy bucket, the same population the board renders.
+
+**A RANK ON AN OWNER-ASKED ROW PRINTS ITS RULE (task/1135).** `add
+--owner-asked --priority V`, and `update <id> --priority V` on a row whose
+origin is owner, print three lines after the write: the friction-tax rule (an
+owner ask is ranked by its tax and payback, never by habit), how many times
+the owner has asked for it (this row plus every other owner-asked row whose
+title shares at least half its words) with the row's tax and payback, and the
+payback question with the `--tax N --tax-cost N` command that records the
+answer. The rank is written as typed and the verb exits as before: the door
+advises and never refuses. At the tool call, argv-guard's door says the
+store's friction-tax entry too (route `act.helm.task.priority`).
 
 **AN UNRANKED ROW IS NOT A P3 AND NOTHING DEFAULTS IT.** Unset means NOBODY
 HAS JUDGED THIS, which is a different answer from judged-lowest — the same
@@ -6930,6 +7887,50 @@ and every door that puts an owner on an unowned row (`claim`, `update
 on a clear its refusal now names `helm task release`.
 One id per call; `--all-mine` is deliberately absent, because a steward's
 "mine" includes the rows it is actively building.
+
+**`handoff` IS THE HOLDER'S GIFT TO A NAMED SEAT (task/2309).** The incumbent
+guard could not tell a GIFT from a SEIZURE: `update <id> --owner SEAT` by the
+holder and `claim <id>` by the recipient were both refused, so a live holder
+that agreed the work belonged elsewhere had no door (measured five times,
+including a retiring seat whose 18 rows only an operator's `seat reassign
+--force` could move). `helm task handoff <id> --to SEAT [--note TEXT]`:
+
+- **The caller must be the holder, admitted by task/1918's act-door rule.**
+  `actors.resolve_actor` admits a declared name only when
+  `seats_roster.seat_for_session` resolves the presented session to the same
+  seat, so a name with no session, an invented session, or a session rostered
+  to another seat hands off nothing (exit 2, `NOTHING WAS HANDED OFF`). This
+  is stricter than `release`, which admits a declared name with no session.
+  The holder test is `tasks.held_by` on the admitted actor's canonical name,
+  the `--mine` predicate. No session a row records is ever consulted.
+- **Refused by name, exit 2, nothing written:** a non-holder (a seizure stays
+  refused, and neither filing the row nor having filed it from your session
+  makes you its holder), a CLOSED row, an UNOWNED row (use `claim`), and a
+  SEAT that is not on the roster (`helm seat reassign`'s target door,
+  `seat_reassign.resolve_target`: an exact roster row, or a family with one
+  member). Naming the current holder is a loud no-op at exit 1.
+- **One capability at the one guard.** The verb mints
+  `takeover.HolderHandoffAuthorization` (holder-only, bound to the row's
+  snapshot, the named seat and an owner-only field set) and goes through
+  `tasks.update`, where the incumbent guard admits it beside the BUILD
+  takeover and seat-reassign proofs. `claim` and `update --owner` still
+  refuse an incumbent; their refusal now names this door as the holder's own
+  and puts the doors somebody else opens under "say it on the row".
+- **The owner moves; the status stays.** A gift says who holds the row, not
+  that the recipient started it. Like every custody move it keeps
+  `last_updated` and stamps `custody_updated`.
+- **One custody event.** The snapshot carries `takeover: {kind:
+  "holder-handoff", from, to, by, session, pid, ppid, owner_was, status_was,
+  note, ts, resolved}`; `session` is the session the roster resolved to `by`,
+  kept in the store and dropped from every wire by `public_row`, as the
+  release event's is. `show` prints `handed off by … : FROM -> TO (was
+  STATUS): note`, and the row's event history keeps every earlier hand-off
+  (task/305's trail). The note has the release note's 2,000-character cap.
+
+Identity here is still a cost barrier, not a proof: a process that presents
+the holder's declared name and the session the roster binds to it is admitted
+as the holder. That was already true of the two-step path this replaces
+(`release`, then `claim --owner SEAT`), whose legs are weaker than this door.
 
 **TAKEOVER TRANSFERS BUILD CONTINUATION ONLY.** `task takeover` requires a stable
 caller-owned `transfer_id`, the source lane, and a distinct current successor
@@ -7476,15 +8477,15 @@ anyone can compute rather than a role someone holds.
 | clause | what it proves |
 |---|---|
 | (i) landlock held | this seat, not another, holds `landlock:helm` |
-| (ii) gate binds the **post-rebase tree** | the receipt describes what BECOMES TRUNK, not what was reviewed |
+| (ii) gate binds the **composed merge tree** | the receipt describes what BECOMES TRUNK, not what was reviewed |
 | (iii) cross-family APPROVE at the **reviewed tip** | a human reviewed this exact tip |
 | (iv) changed-file set **disjoint** from other approved-unlanded lanes | a cheap pre-filter against cross-lane collision |
 | (v) freeze admits | the land window is open |
 
 **(ii) and (iii) bind different trees on purpose.** The verdict is about what a
 human reviewed; the gate is about what becomes trunk. Every dispatch already
-says the integrator "rebases the chain and runs the final exact-tree gate
-once" — that gate exists today only because it is one agent's last keystroke,
+says the integrator "merges the chain at those exact shas and runs the final
+exact-tree gate once" — that gate exists today only because it is one agent's last keystroke,
 and decentralising without naming it would delete the strongest check there is.
 Collapsing them to one tip is the mistake this verb makes impossible.
 
@@ -8756,6 +9757,14 @@ whether a conflict was resolved on the way lived in one session's memory.
   independent looked, or an unanswered FIX stands on this tip). No land verb
   enforces them, so this verb does. This verb never re-judges a verdict. The
   order is the order the rows became READY, oldest first.
+* **An unread row lands first and is read after** (task/4223). An open review
+  row that nobody has read for `LAND_FIRST_WAIT_S` (30 min) (no verdict, no
+  hold, no released hold, no advisory read) rides at its dispatched tip when
+  that tip is its branch's tip, is off trunk, and `review_door.lane_doors`
+  finds no door; its line reads `unread tip` and `UNREAD`, its merge body and
+  LAND line say `landed before review`, it passes the same whole-suite gate,
+  and its row stays OPEN as the post-land read of the landed merge (a FIX files
+  a follow-on task, never a revert).
 * **A held source-clean row is a car too** (task/3053 F3). A reviewer who read
   the delta and found nothing cannot mint an approve, since an approve binds a
   whole-suite token only this gate produces, so it holds the row
@@ -8883,10 +9892,12 @@ the train again by hand and gated it again. This verb does that
   with no readable verdict or one that names no failing test is refused by
   name.
 * **Blame by diff when it names exactly one car (R2).** A car is named when
-  its lane diff (`git diff P0...tip`) touches a failing test's file or a path
-  that failure's traceback names (a frame, or a dotted `helm.module` in the
+  what its merge added to the room (`git diff P(k-1) Pk`, never a
+  merge-base diff of its lane, so a lane that merged trunk back in is charged
+  only with its own changes) touches a failing test's file or a path that
+  failure's traceback names (a frame, or a dotted `helm.module` in the
   message; the slice runner's own leak frame names nobody). Exactly one named
-  car, with every diff readable, is the culprit, and nothing runs.
+  car, with every diff readable, is the culprit, and no prefix is bisected.
 * **Otherwise it bisects the prefixes across hosts.** Only the failing
   modules run, through the gate's own runner: the slice runner's `--modules`
   scope with the land gate's fail-mode leak audit for a sliced gate (the
@@ -8909,6 +9920,14 @@ the train again by hand and gated it again. This verb does that
   CLASH naming the earlier cars whose diffs overlap its files, the failing
   test files or the traceback's paths. UNKNOWN: a prefix the verdict turns on
   could not be read; nothing is ejected.
+* **Trunk on the red's own host licenses every ejection.** Before any car is
+  ejected, by diff or by bisect, the failing modules run on P0 pinned to the
+  host the red ran on (the window job log's node, else the receipt's; the
+  audits' placement line for a red audit). Trunk red there is TRUNK-RED, naming
+  the host (a host fault or a trunk fault); no host recorded, the host excluded
+  or busy, a run Fab placed or moved elsewhere or one that cannot be read is
+  UNKNOWN. Either ejects nothing. The bisect places its own P0 run on that host
+  first, so it is the same run.
 * **Ejection (`--apply`) is told first (R2).** The car's author (its land
   request's author, the dispatch row's sender) gets a DM with the failing
   tests, the window log, the receipt, blame's own run log
@@ -8982,7 +10001,10 @@ nothing.
 * **COMPOSING.** The room is minted under `<repo>-wt/compose/` and each car
   merged at its exact tip (`landwindow.mint_and_merge`, the compose half of
   `helm train --apply`), with the merge subject carrying the car's task,
-  priority, door, author and reader. A car that conflicts is dropped and posted
+  its title, priority and door, and never a seat or a model (task/4033: commit
+  metadata is akapug's alone; who built and read the car, and on which model,
+  stay in the ledger: the row, its verdict or hold, and the AUTHORS line its
+  landed close prints). A car that conflicts is dropped and posted
   as owed, never resolved. The tree-wide audits (`helm gate audits --wide`
   on the composed room against trunk: every audit, `test_no_private_names`,
   `test_delivery_truth`, `test_stop_seam`, `test_hostpath_guard` and the lane
@@ -9170,16 +10192,47 @@ nothing.
 * **Closes.** Each approved car closes with `helm lr close <id> --reason
   landed`, with `--live`, or `--needs-restart WHAT` when the paths it touches
   owe the running fleet a restart: the hooks, a `seat_catalog` sidecar pin, a
-  systemd unit or timer installer, or a long-running daemon (the web board,
-  the chat node, proxywatch). `helm rearm` reports stale processes but
-  classifies no path, so the table lives in the module. Each close runs as
+  systemd unit or timer installer, or a long-running daemon that does not
+  follow its code (the chat node, proxywatch). A lead reads its posture when
+  its session starts, so a car that touches the hooks, the skills
+  (`agents/claudecode/skills/`), the inject and its whoami profile reader
+  (`helm/inject/`, `helm/whoami.py`) or the lead settings (the lead-lean
+  code in `seat_catalog`, `seat_launch_assets`, `homes`, `launch` and
+  `seat_recipe`) owes "relaunch the leads; the land is not LIVE until they
+  do", and the LAND line says so. `helm rearm` reports stale
+  processes but classifies no path, so the table lives in the module. The
+  web board owes no restart: every `helm web` re-execs itself onto a changed
+  tree, so a car that touches `helm/web*` closes `--live`, and its land is
+  READ instead, 60 s after the fast-forward (`WEB_FOLLOW_S`; the train waits
+  for the first tick past it): the console web's served code digest (the
+  `policy` its stop-facts snapshot carries) against trunk's
+  (`stopfacts.code_policy` of the landed package). A web that still serves
+  the code from before the land, and has not started since, is ONE line to
+  the integrator naming both digests; nothing is restarted. No snapshot, a
+  resident that is not running, a resident that serves another tree and one
+  that re-exec'd after the land and is still refolding are noted in the
+  train's history, never posted. Each close runs as
   a CHILD process of the installed helm (up to 1,800 s), as the foldcheck
   does and for its reason (task/3562). A refusal the close answers is
   posted as one line and the car is done; a child that crashes, cannot
   start, runs past it or exits with no refusal of its own is posted once
   with all it said, the car stays open, and the next tick retries it,
   as it retried an in-process close that raised. A needs-restart car's
-  ops item is posted to the integrator, never performed. No task is
+  ops item is posted to the integrator, never performed. **Then each car's
+  lane lease is released, whoever holds it** (task/3674): the land is the
+  lease's natural end. The lease is read off the claims ledger and released
+  through `helm work release <lane> --lease L --seat H` in a child of the
+  installed helm, only when the lane's tip is on the trunk (the stop guard's
+  own landedness read: ancestry or patch identity, of the lane branch and of
+  its room's HEAD). A lane whose tip is not keeps its lease. Work release's
+  own rules hold: a room that is dirty or occupied refuses, and the branch
+  is deleted only on its own proof and KEPT when it holds commits no ref
+  carries. The LAND line names the lanes released (`leases released: one,
+  two`) and each release that refused (`lease release refused: lane one:
+  <its first helm work line>`); a refusal never stops the land. What
+  became of each lease is recorded on its car before and after the
+  release, so a tick killed under a release releases nothing twice and
+  never a lease granted since. No task is
   closed (task/3643): a land is not a re-read of the whole ask, so the
   car's task is reported landed, whole ask not yet re-read
   (`taskkey.lands_by_task`), and its owner closes it. Then the announcement (`LAND <n>: <task>: <title>; ... PUSHED
@@ -9189,7 +10242,7 @@ nothing.
   console walk is owed (`helm web walk`), one `console walk owed since
   <land>, <age>` line to the integrator, never to @all, once per owed
   state, and every room the train minted is removed. A car's merge subject carries its task's
-  title first too (`<task>: <title>; P1, not a door; author ...`), because
+  title first too (`<task>: <title>; P1, not a door`), because
   trunk's subject is where the morning report reads a land's words.
 * **One train in flight.** Auto-land composes nothing while a detached train
   room stands off trunk (a train composed by hand; a room whose head is more
@@ -9204,8 +10257,9 @@ nothing.
   its rooms. An abandon REFUSES a train whose head is on the declared trunk,
   or whose trunk cannot be read, because its fold, LAND number and closes
   would never run: the refusal names the owed
-  `helm lr foldcheck <head> --gate gate:<id> --apply` (no task close is
-  owed: a land closes no task). `--abandon --force --reason R` ends it
+  `helm lr foldcheck <head> --gate gate:<id> --apply` (the fold runs the
+  land step for each row it closes, helm/landtask.py). `--abandon --force
+  --reason R` ends it
   anyway, records those owed
   lines in the archived train and posts them to the integrator. A train
   landing past its push decision is refused while a tick runs, forced or
@@ -9232,7 +10286,7 @@ The lanes sitting **cured-but-unreviewed** — oldest first.
 
 A FIX verdict says a cure is owed by the lane — by the lane owner, or by the
 reviewer who already wrote it and named the tip under `--patch-tip`, in which
-case what the lane owes is the rebase. **Nothing tells the lane that curing
+case the lane owes composition preserving that tip's ancestry. **Nothing tells the lane that curing
 creates a NEW obligation** — a review dispatch on the cured tip — and no
 surface showed a lane in that state, so lanes cured and then re-gated, because
 re-gating is the action the tooling makes obvious. Lanes sat for weeks. This is
@@ -9436,23 +10490,25 @@ pane.
   `HELM_REMOTE_*` knob set where the timer is installed, and the absolute
   paths of `claude` and `gh`.
 
-### `helm dispatch send <recipient> <lane> <message...|stdin> --ref TIP --kind build|review --new-work|--supersedes ID [--key K] [--force] [--reason R] [--posture-na REASON] [--read-only-because REASON] [--decline-patch PATCH[,PATCH...]=REASON] [--task task/N] | add <recipient> <lane> --ref TIP --kind build|review --new-work|--supersedes ID [--force] [--reason R] [--posture-na REASON] [--read-only-because REASON] [--decline-patch PATCH[,PATCH...]=REASON] [--task task/N] | verdict <id-or-unique-prefix> <reviewed-tip> --approve|--fix|--supersede|--concur [--patch-tip SHA|--no-patch-because REASON [--diff-handoff ROOM/MSGID]] [--imperfect] <evidence> | cancel <id-or-unique-prefix> [--chain] [--dry-run] <reason...> | retract <id-or-unique-prefix> --reason R --reads source-clean|fix|supersede|unknown --measured|--inferred [--reissue|--successor ID] [--json] | rebind <id-or-unique-prefix> --to <seat> [--force] [--reason R] [--repo PATH] [--json] | retip <id-or-unique-prefix> --ref NEW_TIP --reason R [--repo PATH] [--json] | list [--open|--overdue|--held] [--source-clean] [--no-holder] [--mine] [--issued] [--to SEAT] [--all-projects] [--json] | triage [ID...] [--all-projects] | show|read|get|status|brief <id-or-unique-prefix> | mix [--hours N] [--sender SEAT] [--json] | briefs [--cut] | collisions [--json]`
+### `helm dispatch send <recipient> <lane> <message...|stdin> --ref TIP --kind build|review --new-work|--supersedes ID [--key K] [--force] [--reason R] [--posture-na REASON] [--read-only-because REASON] [--decline-patch PATCH[,PATCH...]=REASON] [--task task/N [--whole|--part]] [--because "<one line>"] [--start-anyway "<one line>"] | add <recipient> <lane> --ref TIP --kind build|review --new-work|--supersedes ID [--force] [--reason R] [--posture-na REASON] [--read-only-because REASON] [--decline-patch PATCH[,PATCH...]=REASON] [--task task/N [--whole|--part]] [--because "<one line>"] [--start-anyway "<one line>"] | verdict <id-or-unique-prefix> <reviewed-tip> --approve|--fix|--supersede|--concur [--patch-tip SHA|--no-patch-because REASON [--diff-handoff ROOM/MSGID]] [--imperfect] <evidence> | cancel <id-or-unique-prefix> [--chain] [--dry-run] <reason...> | retract <id-or-unique-prefix> --reason R --reads source-clean|fix|supersede|unknown --measured|--inferred [--reissue|--successor ID] [--json] | rebind <id-or-unique-prefix> --to <seat> [--force] [--reason R] [--repo PATH] [--json] | retip <id-or-unique-prefix> --ref NEW_TIP --reason R [--repo PATH] [--json] | list [--open|--overdue|--held] [--source-clean] [--no-holder] [--mine] [--issued] [--to SEAT] [--all-projects] [--json] | triage [ID...] [--all-projects] | show|read|get|status|brief <id-or-unique-prefix> | mix [--hours N] [--sender SEAT] [--json] | briefs [--cut] | collisions [--json]`
 
 **A typed id resolves; it is never guessed (task/3382).** Every row id takes the full id or any unique prefix of at least 8 hex, and the reviewed tip and `--patch-tip` of `verdict` take the full commit id or any unique prefix of at least 7 hex, resolved in the row's repository and bound as the FULL id, so the ledger never stores a prefix and every check on what is bound runs on the full id. An ambiguous prefix refuses and lists its candidates; a token that names nothing refuses and names the row or commit its longest matching prefix resolves to, which is how a 12-hex prefix padded with zeros to 40 is told what its first 12 name. `show`, `read`, `get`, `status` and `brief` each answer exactly as `triage <id>`. An unknown subverb, or a known one given bad arguments, prints one usage line and the closest subverb's; the whole grammar stays on `helm dispatch --help`.
 
 **A reviewed tip is pinned against `git gc` (task/2383).** A verdict pins the tip it names at `refs/helm-reviewed/<row id>` in the row's repository, and its `--patch-tip` at `refs/helm-reviewed/<row id>-patch`; `hold --source-clean <tip>` pins that tip at `refs/helm-reviewed/<row id>-source-clean`. So a branch deleted after review no longer lets a prune take the commit the verdict names. There is at most one pin per row and role. Pinning the same tip again is a no-op, and a pin that already holds another commit is copied to the retired namespace before it moves. The pin is written before the verdict or hold event is appended to the dispatch ledger, and before the ledger's write lock is taken on every try but the last (which reads under the lock), so no process exit or prune after the append can leave a recorded verdict whose tip is unpinned. If the append then fails, the pin stays: it keeps one commit alive and records nothing. A pin that fails never blocks the verdict or the hold: the row records, the verb prints one `warning: reviewed tip NOT pinned against git gc (...)` line on stderr, and the journal gets a `dispatch-pin-failed` receipt before the append. The failure is not written to the dispatch ledger. `lr close` (every reason), `close-landed` and `lr retire` MOVE the row's pins to `refs/helm-retired/reviewed/<same name>`: the retired copy is written and read back, and only then is the live pin removed, compare-and-delete on that sha. A pin is never deleted. Nothing in helm sweeps `refs/helm-retired/` (`helm work gc` writes lanes there and never removes them), so a retired pin stays until a person removes it. A pin is review evidence and not a place work lives, so the off-frontier reachability rung of `lr retire` skips both namespaces when it asks whether a ref still holds a tip.
 
-**The review door runs at `send` and `add` (docs/MELD_REVIEW_DOOR.md).** It reads the chain's round count from the stop rung's own fold. T0: a first build row whose brief names an irreversible target is refused until it cites an AGREED design meld with `--meld ROOM` or records `--async-because REASON`. T1: a round-2 send whose continued read carries a design finding (`--design-finding` or `--no-patch-because` without validated MELD-DIFF `--diff-handoff ROOM/MSGID`), or a finding the author `--disputes`, prints the meld for those findings only. A reason alone remains a no-cure nudge, including on historical MELD-DIFF rows; `--meld` outcome does not prove a diff. T2: from round 3 the door opens the bar meld itself when the reader has a live beacon and no open row in flight, and otherwise puts the BAR in the brief; a chain whose recorded counts read FINISH gets no meld and a one-line note; the row is always written, and `--async-because` skips the meld and is recorded. Only the first advancing direct child of a MELD-DIFF FIX with a validated typed diff receipt and send/add proof that it applies that diff, the reviewer's adopted PATCH tip, a tip already on the chain and a dispatch nobody answered add no round; a FIX on either cure tip makes it a real round. The row records `meld_door`. `verdict --fix` carries `--design-finding TEXT` for a design finding beside a cure, and `verdict`/`hold --source-clean` take `--meld ROOM` (the newest round) or `--meld ROOM@EPOCH` (a named round) to record a meld's MELD OUTCOME on the row, with `meld_epoch`; a pair round's outcome closes only the row whose dispatch opened it (exact-round authority). `helm dispatch melds [--hours N] [--json]` measures the door's two falsifiers, the pair meld's (a) and (g), and the PATCH/MELD-DIFF trial per chain root: recorded mode, enrollment round, mode-reader active rounds and cure cycles, and first enrolled send to the first accepted source-clean hold. The fold reads state and accepted events from one coherent ledger snapshot. Reviewer and author tokens are `UNKNOWN` until a token record binds to a dispatch or chain; the report never substitutes brief or meld bytes, and never infers an uncited meld outcome. Every `send`, `add` and `rebind` also opens the next round of the chain's PAIR MELD (`meld-0-pair-<project>-task-<n>` when the chain's first row records its task or names exactly one, `taskkey.join` without the lane's record, else `-chain-<id12>`): the first round is the plan, the DM carries the room as the only wake, and `send` prints "your pair meld for this task: ROOM" with the `recv` command.
+**The review door runs at `send` and `add` (docs/MELD_REVIEW_DOOR.md).** It reads the chain's round count from the stop rung's own fold. T0: a first build row whose brief names an irreversible target is refused until it cites an AGREED design meld with `--meld ROOM` or records `--async-because REASON`. T1: a round-2 send whose continued read carries a design finding (`--design-finding` or `--no-patch-because` without validated MELD-DIFF `--diff-handoff ROOM/MSGID`), or a finding the author `--disputes`, prints the meld for those findings only. A reason alone remains a no-cure nudge, including on historical MELD-DIFF rows; `--meld` outcome does not prove a diff. T2: from round 3 the door opens the bar meld itself when the reader has a live beacon and no open row in flight, and otherwise puts the BAR in the brief; a chain whose recorded counts read FINISH gets no meld and a one-line note; the row is always written, and `--async-because` skips the meld and is recorded. Only the first advancing direct child of a MELD-DIFF FIX with a validated typed diff receipt and send/add proof that it applies that diff, the reviewer's adopted PATCH tip, a tip already on the chain and a dispatch nobody answered add no round; a FIX on either cure tip makes it a real round. The row records `meld_door`. `verdict --fix` carries `--design-finding TEXT` for a design finding beside a cure, and `verdict`/`hold --source-clean` take `--meld ROOM` (the newest round) or `--meld ROOM@EPOCH` (a named round) to record a meld's MELD OUTCOME on the row, with `meld_epoch`; a pair round's outcome closes only the row whose dispatch opened it (exact-round authority). `helm dispatch melds [--hours N] [--json]` measures the door's two falsifiers, the pair meld's (a) and (g), and the PATCH/MELD-DIFF trial per chain root: recorded mode, enrollment round, mode-reader active rounds and cure cycles, and first enrolled send to the first accepted source-clean hold. The fold reads state and accepted events from one coherent ledger snapshot. Reviewer and author tokens are `UNKNOWN` until a token record binds to a dispatch or chain; the report never substitutes brief or meld bytes, and never infers an uncited meld outcome. Every `send`, `add` and `rebind` also opens the next round of the chain's PAIR MELD (`<project>-<n>`, such as `helm-3742`, when the chain's first row records its task or names exactly one, `taskkey.join` without the lane's record, else `meld-0-pair-<project>-chain-<id12>`; a task whose room opened under the older `meld-0-pair-<project>-task-<n>` name keeps that room): the first round is the plan, the DM carries the room as the only wake, and `send` prints "your pair meld for this task: ROOM" with the `recv` command.
 
 Review `send`, `add`, `rebind`, and `retract --reissue` choose recorded review mode and guidance from the ledger under the append lock. An inherited full brief retains its authored text while replacing the parent's generated guidance. Only a new eligible round at round 3 or later receives the convergence whisper; fan-out and adopted-cure closing sends do not. The sender's original `message_hash` remains the send-operation identity, and the stored `brief_ref` binds the final full brief.
 
-**A seat helm knows is broken takes no new work (task/3546).** The owner's ruling: "if something is broken we should canonically not keep using it until it's fixed". `send` and `add` (and every `rebind`, `retract --reissue` and `seat reassign` target, which reach the same recipient door) refuse a recipient under an operator HOLD (`helm seat hold`), one in a silent-drop STORM (at least two drops in a row that the seat answered nothing between, each within 15 minutes of the one before, from the watchdog's latch; a drop the seat answered with text before its next one is the known self-recovering reasoning-only class and never counts), one whose own last turn ended on a provider billing or credential refusal (TURN-WALL, task/3587: a 402, a 429 whose wording says a quota or balance is exhausted, or a 403 asking for account verification, read off the seat's newest transcript turn; an ordinary 429 rate limit, which names a per-minute window, an RPM/TPM budget or a retry-after, is not one, and the seat reads live again on its next successful turn or once the refusal is older than `HELM_TURNWALL_MAX_AGE_S`), or one whose family is walled on money (the budget rung below). The refusal names the fact, since when (the hold's time and setter, the storm's first and last drop, the burn reading's measurement), and a seat to use instead: one the usability join measures USABLE now, not held, not storming, not walled on its own last turn and whose family `helm burn` reads RED on neither money nor reach, the recipient's own family first; with none, it says so and names `helm route`. An operator hold lifts only on its own terms: `helm seat hold <seat> --clear --reason R`, or the `--until` it was set with (`task/N` lifts when that task's row closes as landed, a close reason starting `landed`, which the task sweep's confirm-close writes; auto-land closes no task since task/3643; a time lifts when it passes). It NEVER lifts on the seat's activity or a healthy reading: a held seat still working its old rows is not evidence its defect is fixed. A storm, a measured refusal, ends after 3 clean text turns follow its last drop, ages out once no drop has been seen for `HELM_DROP_STORM_AGE_S` (6 h), and `helm seat hold <seat> --clear --reason R` clears it (the drops at or before the clear are acknowledged; new ones form a new storm). `helm route` drops a held or storming seat at N4, so the router never recommends a seat this door refuses. `--force --reason R` admits the repair work itself: `--force` past any of the four facts without `--reason` is refused, and the admission is recorded in the seat's hold log and listed by `helm seat hold`; `--reason` without `--force` is refused. **A CHANGE for scripts and skills: `--force` alone past a family walled on money used to file the row; since task/3546 it exits 2 (`--force past WALLED on <seat> needs --reason R`), so a caller that forces past a wall must now pass `--reason R` naming the work.** A hold log, latch or task ledger that cannot be read is UNKNOWN: an unreadable hold log or latch admits the row with a note saying so, and a readable hold whose task cannot be read stands and says the lift is unverified. A storm counts only drops the seat's newest transcript tail can show unanswered: with no transcript to read, or a tail that begins after the drops (a relaunched seat answered them in its old session), the storm reading is UNKNOWN and the row is admitted with a note saying so, unless the tail already shows 3 clean turns after the newest drop; drops the tail does show unanswered still refuse. A DEAF seat is not broken here: it is queued as before (task/3055).
+**A seat helm knows is broken takes no new work (task/3546).** The owner's ruling: "if something is broken we should canonically not keep using it until it's fixed". `send` and `add` (and every `rebind`, `retract --reissue` and `seat reassign` target, which reach the same recipient door) refuse a recipient under an operator HOLD (`helm seat hold`), one in a silent-drop STORM (at least two drops in a row that the seat answered nothing between, each within 15 minutes of the one before, from the watchdog's latch; a drop the seat answered with text before its next one is the known self-recovering reasoning-only class and never counts), one whose own last turn ended on a provider billing or credential refusal (TURN-WALL, task/3587: a 402, a 429 whose wording says a quota or balance is exhausted, or a 403 asking for account verification, read off the seat's newest transcript turn; an ordinary 429 rate limit, which names a per-minute window, an RPM/TPM budget or a retry-after, is not one, and the seat reads live again on its next successful turn or once the refusal is older than `HELM_TURNWALL_MAX_AGE_S`), or one whose family is walled on money (the budget rung below). The refusal names the fact, since when (the hold's time and setter, the storm's first and last drop, the burn reading's measurement), and a seat to use instead: one the usability join measures USABLE now, not held, not storming, not walled on its own last turn and whose family `helm burn` reads RED on neither money nor reach, the recipient's own family first; with none, it says so and names `helm route`. An operator hold lifts only on its own terms: `helm seat hold <seat> --clear --reason R`, or the `--until` it was set with (`task/N` lifts when that task's row closes as landed, a close reason starting `landed`, which the task sweep's confirm-close writes, and which the land step writes when a lane that carried the whole ask lands, task/3746; a time lifts when it passes). It NEVER lifts on the seat's activity or a healthy reading: a held seat still working its old rows is not evidence its defect is fixed. A storm, a measured refusal, ends after 3 clean text turns follow its last drop, ages out once no drop has been seen for `HELM_DROP_STORM_AGE_S` (6 h), and `helm seat hold <seat> --clear --reason R` clears it (the drops at or before the clear are acknowledged; new ones form a new storm). `helm route` drops a held or storming seat at N4, so the router never recommends a seat this door refuses. `--force --reason R` admits the repair work itself: `--force` past any of the four facts without `--reason` is refused, and the admission is recorded in the seat's hold log and listed by `helm seat hold`; `--reason` without `--force` is refused. **A CHANGE for scripts and skills: `--force` alone past a family walled on money used to file the row; since task/3546 it exits 2 (`--force past WALLED on <seat> needs --reason R`), so a caller that forces past a wall must now pass `--reason R` naming the work.** A hold log, latch or task ledger that cannot be read is UNKNOWN: an unreadable hold log or latch admits the row with a note saying so, and a readable hold whose task cannot be read stands and says the lift is unverified. A storm counts only drops the seat's newest transcript tail can show unanswered: with no transcript to read, or a tail that begins after the drops (a relaunched seat answered them in its old session), the storm reading is UNKNOWN and the row is admitted with a note saying so, unless the tail already shows 3 clean turns after the newest drop; drops the tail does show unanswered still refuse. A DEAF seat is not broken here: it is queued as before (task/3055).
 
 **The project's light is checked at this door.** A NEW build row whose repository belongs to a project with an authored `red` light is refused as described under `helm projects state`; a `yellow` one is admitted with its reason printed as an admission note. `--force` does not change this, because it is a statement about the recipient.
 
 **EXACTLY ONE of `--new-work` or `--supersedes <dispatch-id>` is REQUIRED on `send` and `add`.** The lane is a free-text LABEL and always was; work IDENTITY is the CHAIN. `--supersedes` names the row this one continues, and the row inherits that row's chain root; `--new-work` roots a fresh chain at this row's own id.
 
-**A chain's first row records the task it serves (task/3643).** On a `--new-work` row the writer stores `task`: `--task task/N` when given (an OPEN task the ledger holds, which must agree with the lane's record from `helm work claim --task`; anything else is REFUSED by name and no row is written), else the lane's record (which must name an OPEN task: a record whose task has closed is REFUSED by name, because new work in that lane is other work and needs a lane of its own), else the one open task the lane names literally (`task/N` or `task-N`), else the one open task the brief or `--note` names literally. Two tasks named, a task that is not open, or a ledger that cannot be read records nothing and refuses nothing. `--task` on a `--supersedes` row is REFUSED: a later round keeps its chain's first row's task. `taskkey.join` reads the key for the pair meld's room, auto-land's car task (its merge line and announcement name it, or say `task UNKNOWN: <why>` when two records disagree or a record cannot be read), train blame's task comment (the same UNKNOWN reason when there is none to comment on), the land board's card (the land projection joins each loop once and the board draws that answer), and the task sweep's lease motion. The task sweep reads the task a merge served off its line, never off today's records.
+**A chain's first row records the task it serves (task/3643).** On a `--new-work` row the writer stores `task`: `--task task/N` when given (an OPEN task the ledger holds, which must agree with the lane's record from `helm work claim --task`; anything else is REFUSED by name and no row is written), else the lane's record (which must name an OPEN task: a record whose task has closed is REFUSED by name, because new work in that lane is other work and needs a lane of its own), else the one open task the lane names literally (`task/N` or `task-N`), else the one open task the brief or `--note` names literally. Two tasks named, a task that is not open, or a ledger that cannot be read records nothing; for a NEW review chain that resolves no task, the writer refuses before append and names `--task task/N`, `helm work claim <lane> --task task/N`, and `helm task add <title> --project P`. An internal remote-relay undelivered notice alone is exempt; `--force` and a lane spelled like a task do not bypass the gate. `--task` on a `--supersedes` row is REFUSED: a later round keeps its chain's first row's task. `--whole` beside the task (task/3746) records `task_whole` on the first row: the lane carries the task's WHOLE ask, so its land leaves the task LANDED, owing one named seat's seen-working check (`helm task observed`, helm/observed.py), where any other land asks the task's room whether the whole ask is done (helm/landtask.py). `--whole` on a row that records no task, or on a `--supersedes` row, is REFUSED; on `send` it is read only in the trailing option block, as `--force` is. `taskkey.join` reads the key for the pair meld's room, auto-land's car task (its merge line and announcement name it, or say `task UNKNOWN: <why>` when two records disagree or a record cannot be read), train blame's task comment (the same UNKNOWN reason when there is none to comment on), the land board's card (the land projection joins each loop once and the board draws that answer), and the task sweep's lease motion. The task sweep reads the task a merge served off its line, never off today's records.
+
+**A chain's first `send` weighs its task (task/3821).** When a `--new-work` row records a task, build or review, the task is weighed exactly as `helm work claim --task` weighs it: a sub-task of the same story that the story's order puts first or that ranks strictly higher (never by age alone), or an owner-asked P0/P1 task in the same project ranked two or more ranks higher, with no lane. The check STEERS and never refuses: the CLI prints the one `LEVER INVERSION` line naming one lever (once per session, task and lever, and before any later refusal of the send, so a refusal never swallows it), the send goes ahead with rc 0, and the row records `lever_skipped` (the ids) and `lever_because` (the `--because` reason, or `went ahead without a reason`). A `--supersedes` row carries no task and is never weighed. When the ledgers cannot be read the row records `lever_unknown` with the reason, the CLI prints `LEVER CHECK UNKNOWN`, and the send goes ahead. Only the CLI's `send` and `add --new-work` are weighed: helm's own senders (a relay notice, a cured successor, a rebind or reissue) never are, and a retry whose operation is already on the ledger gets its row back without being weighed. A first row on a lane that already records its task is not weighed either, because `helm work claim --task` weighed that pick: whatever the claim recorded (`lever_skipped` and `lever_because`, `start_anyway_over` and `start_anyway`) is copied onto the row, which names the lane in `reasons_from`, so a review of built work is never refused for it and one choice is asked once. **Finish first** runs at the same first row of a build (a review moves started work toward landing and is not held to it), for the sending seat (the fleet, for the integrator), exactly as at `helm work claim --task`, and steers the same way: the row records `start_anyway_over` and `start_anyway` (the `--start-anyway` reason, or `went ahead without a reason`); an unreadable census records `finish_unknown`. A reason given also lands as one comment on the task, `dispatch <id12> took task/C ahead of ... (--because): "<reason>"`, once per row; a row with no reason comments nothing. The retry lookup and both checks read the dispatch ledger once and the task ledger once.
 
 One missing relation cost three separate things in a single night, pointing in opposite directions, which is why patching any one of them alone kept failing:
 
@@ -9678,8 +10734,10 @@ exact-ID matching and never prefix-matches history:
   `--kind review` is asked:
   a build brief saying "report only" is describing its own deliverable. Every
   `send --kind review` also prints the procedure in one line, whatever else it
-  prints: the reader commits its cure on a branch off the exact tip it read
-  and returns FIX with `--patch-tip`; the author reviews that patch; agreement
+  prints: the reader commits its cure off the exact tip it read — a subagent
+  reviewer has no room of its own, so it uses a scratch clone and fetches the
+  exact commit back — and returns FIX with `--patch-tip`; the author reviews
+  that patch; agreement
   on the patch is what lands the chain.
 * **`verdict`** closes a REVIEWED obligation. It takes the full exact reviewed
   commit id and refuses unless it equals the row's dispatched tip — a stale
@@ -9701,21 +10759,30 @@ exact-ID matching and never prefix-matches history:
   instances and never guesses old intent.
 * **`--patch-tip <full-sha>` — the PATCH reviewer's committed cure, recorded
   as co-author work.** A reviewer of EITHER family in PATCH mode who finds a
-  bounded MECHANICAL defect commits it off the exact reviewed tip, in their own room or in a
+  bounded MECHANICAL defect commits it off the exact reviewed tip — in a room
+  it holds, or, for a subagent with no room of its own (the default), a
   `git clone --shared` clone whose commit you then fetch into the repo
   (`git -C <repo> fetch --no-write-fetch-head <clone> <sha>`, no refspec,
   so no ref moves; a
-  commit left in the clone does not resolve here and is refused), do not
-  push, and name that tip here. The row then records
+  commit left in the clone does not resolve here and is refused). For an
+  explicit BUILD, a parent may instead assign its sole delegate a REGISTERED
+  lane room (`helm work claim`); the parent owns the lease through completion
+  or accepted handoff and then returns the room (`helm work release`), never
+  unfinished work. This narrower build allocation is never general
+  reviewer authority; never an unregistered shared worktree, an unleased
+  shared branch, raw `git worktree add`, a protected or shared ref write, a
+  permission bypass, a config/canon edit, a test-home leak or a publication.
+  Do not push, and name that tip here. The row then records
   `patch_tip` and `patch_author` — the reviewer this row was dispatched to,
   taken from the row rather than from the caller, because a name the writer
   accepts is a name the writer cannot check — and `helm dispatch triage <id>`
-  and `helm lr show <id>` print it. The lane owner or the integrator rebases
-  the lane onto that tip or cherry-picks it; `helm lr close --reason landed`
-  credits every author the chain records. The tip must resolve to a commit in
-  the row's repository whose ancestry CONTAINS the reviewed tip, else the
-  verdict refuses naming it: a cure written against a different tree would make
-  the rebase carry work nobody reviewed, which is the lane-discipline class
+  and `helm lr show <id>` print it. The lane owner or the integrator merges
+  that exact tip as a parent of a NEW composition commit, never rewrites or
+  cherry-picks the submitted tip; `helm lr close --reason landed` credits
+  every author the chain records. The tip must resolve to a commit in the
+  row's repository whose ancestry CONTAINS the reviewed tip, else the
+  verdict refuses naming it: a cure written against a different tree would
+  carry work nobody reviewed, which is the lane-discipline class
   arriving through a co-author. It rides `--fix` alone — APPROVE ends the loop,
   SUPERSEDE says the work is replaced, CONCUR blocks nothing — and a DESIGN
   finding is never patched under review: that takes a meld, because a design
@@ -9773,6 +10840,50 @@ exact-ID matching and never prefix-matches history:
   tip. `--imperfect` with `--worse-than-main` is refused as two answers to one
   question, and a stored `imperfect` answer with no well-formed patch tip
   reads UNMARKED, the same fail-closed shape a forged blocking answer gets.
+* **`--finding TEXT`, `--finding-carried task/N`, `--note TEXT` — findings are
+  sub-tasks, observations are comments (task/3742).** A FIX names each finding
+  that is WORK with `--finding "<one line>"` (repeatable, at most 256
+  characters and 20 per verdict). The texts ride the verdict event, so the
+  verdict and its findings are one write, and each is filed at once as a task
+  that continues the task the chain serves (the join `review_door.pair_key`
+  names the chain's meld with), owned by the lane's author (the row's
+  custodian), in that task's project, `origin agent`, with `found_in` (the
+  review row) and `found_chain` (its chain). `helm task show <task>` lists them
+  as its sub-tasks with "N of M done", and `helm lr show <row>` lists what the
+  row filed. With `--finding` the verdict's `--finding-count` is derived, and
+  a typed count that disagrees, or `UNKNOWN`, refuses. `--note "<one line>"`
+  (any polarity) is an observation: a comment on the task, never a row.
+  `--finding` belongs to FIX, and a model run's advisory read takes none of
+  these flags. Every check the task ledger makes (the parent, the posture
+  guard) is asked before the append, so a finding it would refuse refuses the
+  verdict and records nothing. A filing the task ledger could not take is said
+  as NOT FILED, and the identical verdict run again files it, never twice.
+  A later round that names the same issue passes `--finding-carried task/N`
+  instead of filing it twice: the task must be an open finding of this chain
+  under the same task, or the verdict refuses. The carried row takes a comment
+  naming the round, `helm lr show` lists it, and it counts in the derived
+  `--finding-count`.
+  An old review chain whose first row names no task refuses named findings
+  before verdict append and on filing replay: findings cannot become top-level
+  stories. A reviewed task without a project also refuses filing. A FIX with
+  a positive `--finding-count` but no named `--finding` or
+  `--finding-carried` refuses unless a `--patch-tip` or validated
+  `--diff-handoff` carries the cure. Meld `FINDINGS` may say
+  `<id>=task/N` only if task/N is open in the reviewed task's story.
+  A finding closes only when its chain answers it: a row of the chain held
+  `--source-clean` at a tip that strictly descends from the reviewed tip of
+  every FIX that filed or carried it ("cured, held source-clean at <tip12>
+  (row <id12>)"), the land of the chain, by the auto-land LAND step ("cured
+  in LAND N") or by a land recorded by hand (`helm lr close --reason landed`,
+  `helm lr foldcheck --apply`, `helm lr land`: "cured in a hand land at
+  <sha12>", helm/landtask.py), or the retraction of the last FIX that filed or carried it,
+  when that retraction reads `--reads source-clean` ("retracted (row
+  <id12>)"). A retraction that reads fix, supersede or unknown closes none of
+  them and says "kept open: the retraction reads fix; carry them with
+  --finding-carried (task/N, ...)". A FIX closed without a retraction still
+  names its findings. A finding a FIX named at the landed tip or past it, and a
+  finding any live lane records as its task, stays open at every closer.
+  Nothing else closes it.
 * **Optional finding observations:** `--finding-count N` records the total
   findings in this exact review (integer 0..999999999, not a confidence or
   line number); `--prior-relation regression-of-cure|uncured|new` records the
@@ -9917,7 +11028,7 @@ exact-ID matching and never prefix-matches history:
   cannot be recovered, rather than claiming a whole brief travelled.
 * **`retip`** re-points one OPEN obligation at a NEW TIP in place — same row,
   same recipient, same chain — the mirror of `rebind` for the case where the
-  BASE moved rather than the reviewer (a land rebased the lane under an
+  BASE moved rather than the reviewer (a land moved the chain's base under an
   unstarted review). One strict seq-ordered `retip` event moves the row's
   `tip`/`ref` and appends the hop (old tip, old ref, when, why, identity) to
   the row's `retips` history; the seq-0 event keeps the original tip forever,
@@ -9991,6 +11102,22 @@ exact-ID matching and never prefix-matches history:
   achieved row without a second event, even after the row has since gone
   terminal (reconciliation runs before the OPEN-only gate) — a lost response
   is never punished.
+* **`attach-task <id-or-unique-prefix> --task task/N`** records, as ONE
+  append-only `chain-task` event on the chain's FIRST row, that a chain minted
+  naming no task now serves task/N: a LATER round of the chain (or its
+  successors) files and carries the chain's findings under that task instead
+  of top-level, and the pair meld names the chain's room with it. History is
+  never rewritten — the opener's own `task` key stays the immutable fact of
+  what the mint recorded, findings the chain already filed keep their rows and
+  their `found_chain`, and a pair room the chain already opened keeps its
+  name. REFUSED when the first row already names a task, when the attach
+  already stands (the refusal names it), when task/N is closed or absent from
+  the task ledger, when the caller is neither the chain's author (the first
+  row's sender) nor the integrator, and when either ledger cannot be read —
+  a chain whose first row is UNKNOWN may name a task the attach would
+  contradict. REPLAY ENFORCES THE SAME LAWS: a hand-appended `chain-task`
+  event with a malformed task, no admitted hand, a second task answer on the
+  row, or a non-root row as its target folds inert.
 * Four proof-specific post-verdict annotations preserve the immutable verdict:
   **`discharge`** records a later land-authorizing, Git-proven resolution of a
   contrary FIX/SUPERSEDE. It applies the same approval-tier and gate requirement
@@ -10261,9 +11388,11 @@ does not:
   not parse). A changed line is a guard door when a guard reaches the
   function, class, name or import it sits in, so rebinding what a guard calls
   on an import line is a door; a lane that changes only a module the guard
-  imports is not followed into it yet (task/3204). No door class refuses the
-  read. A lane whose changed files cannot be told (no base, or a diff it
-  cannot read) refuses it, because (b) reads them. On a door lane the
+  imports is not followed into it yet (task/3204). A merge commit in the
+  lane is read against its first parent, so a main-into-lane merge's files,
+  the main side included, are the lane's changed files too (task/4041). No
+  door class refuses the read. A lane whose changed files cannot be told (no
+  base, or a diff it cannot read) refuses it, because (b) reads them. On a door lane the
   read is the ONE re-read by a fresh-context reader that wrote none of the
   lane that the door owes, and its CONCUR holds the row source-clean as on a
   reversible one (below); `helm train auto` still rides a door car only when
@@ -10395,7 +11524,7 @@ brief never authorized.
   the successor. An identical retry prints the standing retraction and writes
   nothing.
 
-### `helm review done <row-id-prefix> clean|concur|fix "<evidence>" [--patch-tip SHA] [--no-patch-because R] [--diff-handoff ROOM/MSGID] [--worse-than-main PATH] [--imperfect] [--finding-count N] [--prior-relation new|uncured|regression-of-cure] [--tip SHA]`
+### `helm review done <row-id-prefix> clean|concur|fix "<evidence>" [--patch-tip SHA] [--no-patch-because R] [--diff-handoff ROOM/MSGID] [--worse-than-main PATH] [--imperfect] [--finding-count N] [--prior-relation new|uncured|regression-of-cure] [--finding TEXT]... [--finding-carried task/N]... [--note TEXT]... [--tip SHA]`
 
 Record your read of a dispatch row addressed to you, with everything else read
 from the row (task/3382). Measured over 40.5 hours of the three local seats,
@@ -10501,6 +11630,30 @@ that, so the line is `helm dispatch list --mine --open` and the line above it
 says whose move it is. A read of a closed row names `helm dispatch triage`. A send whose row was
 already written prints no corrected line: it was answered, not refused, and a
 resend is the one thing its own line says not to do.
+
+`helm dispatch send` and `add` REFUSE a review row to a seat whose catalog
+family carries a `bench_role` (`seat_catalog.BENCH_ROLES`: opus46 is
+proof-of-life), naming the role, its store premise and the reviewer ladder;
+`--force` does not open it, and any other kind is admitted (task/3855).
+
+They also REFUSE any row to a long-lived LEAD seat whose home project is not
+the lane's project (task/4039, store premise
+`a-leads-context-holds-only-its-own-projects-work`): the front-door seat
+(homed in #main) for every lane, and another project's lead. A lead is a
+native seat, a seat of a family project seats are made of (claude, codex), or
+a seat whose spawn register binds a project; its home project is the one
+`helm team` places it in (home room, then register, then working directory).
+Bench seats (every other catalog family) and the lane project's own leads are
+admitted. A seat whose role or home cannot be read, an unreadable roster and
+an unreadable registry all refuse. `--force` does not open it. The refusal
+ends in one `corrected:` line: do the work in your own subagent or one-agent
+orchestration run and record its read with `--reviewer-run`. A hand-back is
+admitted: a row whose `--supersedes` chain holds a row FROM this recipient TO
+this sender on the same repository, read off the ledger (a bench seat's
+review back to the lead that sent it the build, and that chain's later
+rounds, cured successors and `retract --reissue` successors). The walk stops
+at 64 rows, and a cycle, a missing ancestor or an unreadable ledger admits
+nothing.
 
 `helm dispatch send` also REFUSES a recipient that is the sending seat — a DM
 to yourself is never delivered, and 7 hand-backs were addressed that way — and
@@ -10629,10 +11782,9 @@ their record: for a local seat, 5 door reads with no miss is the evidence put
 to him, never an automatic admission. When none
 of them can take it, the door read PARKS until a tier reader can take it,
 with gemini reading meanwhile as input only. Fable is for max QC
-only, never a default and never automatic (owner ruling, task/3202): the most
-important work (an owner P0, a release, a public push, or a money or creds
-door with no other reader), at about 3 Opus tokens per Fable token, and not
-while `helm burn` reads anthropic ORANGE or worse. Sonnet and Haiku never
+only, never a default and never automatic (owner rulings, task/3202 and
+task/3855): it reads only when the owner asks for it, at about 3 Opus tokens
+per Fable token, and not while `helm burn` reads anthropic ORANGE or worse. Sonnet and Haiku never
 review anything.
 
 **A grant is for deliberate same-family delegation.** The seat's main thread
@@ -10652,6 +11804,29 @@ installed, admits a delegate's write. The corrective is `helm dispatch
 retract`.
 
 ### `helm lr list [--all] [--json] | show <id> [--json] | stalls [--json] | foldcheck <tip> [--gate gate:TOKEN] [--repo PATH] [--remote R] [--branch B] [--no-fetch] [--apply] | legacy-completion-hints [--json] | land <id> [--json] | compose <id> [<id>...] [--trunk REF] [--repo PATH] [--bounded-concur] [--dry-run] [--json] | close <id> --reason landed|superseded|withdrawn|out-of-scope|stranded|subsumed|delivered-report|discharged|resolved|carried|chain-proof|expired|endorsement-moot|source-clean-landed [--evidence LINE] [--artifact-ref REF] [--report-ref CHAT_REF] [--tip FULL_SHA] [--repo PATH] [--trunk REF] [--gate gate:TOKEN] [--live | --needs-restart WHAT] [--compose-manifest PATH --compose-gate gate:ID] [--dry-run] [--json] | annotate-delivered-report <id> --artifact-ref REF --report-ref CHAT_REF --evidence LINE [--json] | discharge <id> <full-superseding-tip> <evidence...> [--json] | withdraw <id> <evidence...> [--json] | abandon <id> --reason TEXT [--repo PATH] [--json] | close-landed <id> --trunk REF [--repo PATH] [--json] | postland [--hours N] [--json] | postland --record <head> [--by NAME] [--repo PATH]`
+
+**Every land runs the land step on its task (task/3746, helm/landtask.py).**
+`helm lr close <id> --reason landed` (for the row it closed), `helm lr foldcheck
+<tip> --apply` (for each held source-clean row the fold closed) and `helm lr land
+<id>` (once trunk carries the reviewed tip; before that it prints that the
+step waits) run the step the auto-land LAND step runs, with "by hand at
+<sha12>" where auto-land says "LAND N <sha12>". The step finds the task the
+row served (the chain's and the lane's record, which must agree, else the
+open task a trailing `-<N>` of the lane names), closes the findings its
+chain filed, and then stamps the task LANDED, owing one named seat's
+seen-working check, when the lane recorded `--whole` (helm/observed.py; the
+owner is told once in its `<project>-<N>` room; its open sub-tasks keep it
+open, and a comment names them) or comments the one
+question on it and asks it in its `<project>-<N>` room, addressed to the
+lane's author. Last, every other live row of the landed chain is offered to
+the close door whose proof fits it, in order (`landed` for an approve or a
+build row when the land declared its delivery, `discharged` for a row that
+never got a verdict, then `carried`); each door re-proves the row, and a row
+every door refuses stays open and is named. A live row of the same lane with
+no chain link is never closed: it is FLAGGED on the land line and on its
+task. It prints `the land step: ...` lines (`--json` carries `land_step`),
+writes nothing twice when run again, and is left to the LAND step on the
+children auto-land runs (`HELM_LAND_STEP_BY=auto-land`).
 
 **A close moves the row's review pins, never deletes them (task/2383).** Every
 `close` reason, `close-landed` and `retire` moves `refs/helm-reviewed/<row
@@ -10822,8 +11997,8 @@ suite ever ran. Every verdict carries the value that decided it (both trees
 spelled out, the count and the first dirty path, the ref that was compared)
 rather than a restatement of the rule.
 **After the five PASS it names the leases the trunk now carries**, because a
-land releases none of them and every board kept drawing those lanes as
-building. `LEASES ON LANDED WORK` lists each held, live, clean lane room whose
+hand land releases none of them and every board kept drawing those lanes as
+building (`helm train auto` releases its own cars' leases after its fold). `LEASES ON LANDED WORK` lists each held, live, clean lane room whose
 committed work is on the trunk (`work.landed_leases`, over the same verdict
 `helm work list` prints) with the exact `helm work release` line its holder
 runs; `KEPT` lists the rooms it must not release yet — a landed tip under a
@@ -10932,11 +12107,23 @@ task, and today's lane records never supply a task for an old merge, since
 a lane name can be reused; they can only veto an inference: a lane that now
 records a different task, or records that cannot be read, link nothing and
 write no receipt (`no link: ...` in the report). A link writes a receipt
-comment naming the land sha, and the row becomes a **close candidate**
-marked **"landed, whole ask not yet re-read"**. **No land closes a task**
-(task/3643, task/3653): its owner re-reads the whole ask and closes it with
-`helm task confirm-close <id>` (the holder's one word; `helm task
-close-candidates` lists them). A land that a trunk commit reverts (`This
+comment naming the land sha, and the row is a **close candidate** marked
+**"landed, whole ask not yet re-read"**. It is one from the land itself, not
+from the receipt (task/3746): `helm task close-candidates` lists a row a
+full land names before any `--apply` wrote its receipt (the scheduled sweep
+runs dry, and a candidate list that waited for the receipt listed none of
+seven landed rows), and a row carrying the land step's question or
+whole-land note (helm/landtask.py). Each candidate names its LAND (the land
+step's, else the land log's number for its train) and whether its lane
+carried the whole ask (`whole`, `part: asked whether the whole ask is
+done`, or unrecorded). The land step's comments, like the receipts, are
+never motion. **No land closes a task** its lane did not say it carries
+whole (task/3643, task/3653, task/3746): its owner re-reads the whole ask
+and closes it with `helm task confirm-close <id>` (the holder's one word;
+`helm task close-candidates` lists them). Like `helm task close`,
+confirm-close refuses a row with open sub-tasks at any depth, naming them,
+unless `--open-children-stay` says they stay (their ids are recorded); the
+sweep's candidates are held by the same open sub-tasks. A land that a trunk commit reverts (`This
 reverts commit <sha>` in its body, whatever its subject) is never linked,
 and an already-linked one is held. A **P0 or owner-asked** (`origin owner`)
 candidate's holder is DMed once to re-read and confirm, after
@@ -11011,10 +12198,11 @@ change-demanding FIX/SUPERSEDE verdicts and 100 cancelled rows derived `LANDED`
 off the ancestry of tips that were somebody else's landing. What stays
 untrusted is the fold's reading of *absent* verbs, never the recorded events.
 
-**Landing is not ancestry.** The integrator rebases, so the commit on trunk is
-patch-identical and object-different and `merge-base --is-ancestor` truthfully
-answers "no". Content identity by `git patch-id` is what sees it, and a single
-commit in a stack that trunk does not carry is decisive *against* landing. A
+**Landing is ancestry or patch identity.** An exact-sha train merge preserves
+the reviewed tip as an ancestor. Historical rebases and cherry-picks instead
+left patch-identical work under different shas, so ancestry truthfully answered
+"no" and `git patch-id` recognised it. A single commit in a stack whose
+content trunk does not carry is decisive *against* landing. A
 merge commit has no patch-id, so its silence is refused rather than skipped.
 
 **A lane NAME is not a binding.** `fold: <lane> at <sha>` subjects match every
@@ -12316,7 +13504,10 @@ git-compatible alternative on the radar), and the keepalive cadence — whether
 (reported as superseded, never edited), and the age of the last recorded grant,
 which WARNs once it passes the ~8h access-token lifetime the loop exists to
 stay ahead of, because an unrefreshed helm copy of a healthy account is what
-makes the quota page ask for re-logins. The `helm web` servers on this host
+makes the quota page ask for re-logins. A `task homes:` row counts the open
+task rows that name no project (task/3745): OK at zero, a WARN with the
+count and `helm task rehome --plan FILE` otherwise, and UNKNOWN (never zero)
+when the task ledger cannot be read. The `helm web` servers on this host
 are counted from their records and the process table (two or more at once is
 a FAIL naming each), and an `ad hoc web servers:` line lists every one that is
 not the owner's helm-web unit with its port, pid, RSS (with swap, which RSS
@@ -12354,6 +13545,29 @@ checked out or rebuilt, and helm does not move the shared primary checkout
 to the installed commit. Without `--ensure`,
 no credential repair is attempted and the ordinary report is unchanged.
 Exit 1 on FAILs.
+
+**Tick legs: results, not switches (task/4189).** The `dark mover` row says
+whether the dark-seat mover is switched on; it said "automatic" for the three
+days the mover raised AttributeError on every idle-dispatch pass. The `tick
+leg` rows read what each leg did. Every tick leg records each pass
+(`helm/tickalarm.py`, `_global/.state/tick-legs.json`): the idle-dispatch
+pass and the three legs that ride it (darkmove, frictionpilot,
+officeweather), `helm proxywatch --post` and `--dark-only --post`, `helm gc
+--apply`, `helm train auto --apply` and `helm beacons --post`. A raise is a
+failure; so is exit 2 of proxywatch and beacons (the watchdog itself
+failed), and a dispatch ledger the idle-dispatch pass cannot read. A leg
+that failed 3 passes in a row is a FAIL naming the leg, the count, since
+when and the error; one that failed its last pass is a WARN; the rest are
+one OK row. The same 3 failures post ONE #seats row naming the leg, the
+error and the count, @mentioning the leg's steward (`seatevents.STEWARDS`:
+local-names `tick-steward-seat` for most legs, the credential steward for
+proxywatch, the integrator for auto-land, the friction steward for the
+friction autopilot). If the leg still fails an hour after that row, the
+owner's phone gets ONE push (`notify.owner_push`). A pass that works re-arms
+both, so each failing episode is heard once. The alarm never raises into
+the leg it reports: a row or push that fails stays owed for the next failing
+pass. `HELM_TICK_ALARM=off` turns it off, and doctor then WARNs that it is
+off; the test suite plants it.
 
 `--ensure` backs up discovered authenticated named/default Claude homes through
 `cred.backup_all` and credential-bearing Helm-minted seat configurations from
@@ -12563,6 +13777,25 @@ death verdict. Proxywatch never calls a CLIProxy management API, reuses a seat
 bearer as management authority, kills/signals/resets/restarts/resumes/reseeds,
 auto-heals, or clears the latch. Only a later measured HEALTHY pass clears it.
 
+A local cooldown is often the mirror of a vendor refusal: the proxy cools a
+credential because the vendor refused it on quota. When the canary meets only
+the proxy's own 429, the seat's `proxy.log` still records the vendor's refusal,
+and `poolwall.seat_wall` reads it as the cooldown's cause. A `PROXY-COOLDOWN`
+pass whose pool wall has a vendor cause (an empty balance or a spent usage
+window) holds `quota_wall: QUOTA-WALL` with `refusal_provenance`
+`proxy-log:<vendor>:<window|balance>`, the same way it holds a `QUOTA-WALL` a
+canary measured. The family holds it when every seat's cooldown holds it.
+`helm burn` then reads the family's vendor quota wall
+(`money:vendor-quota-wall`, or reach for an on-demand-off family). The repair
+follows the refusal's kind (`refusal_kind`, from `poolwall.quota_kind`, which
+also types a wall the canary measured): for a spent window it is a wait for the
+vendor's reset, which stays unknown until the owner enters one; for an empty
+balance it is a top-up or a plan change, with no reset to wait for. A wall with
+no recorded kind keeps the reset wording. Remediation is
+`restart=NOT_HELPFUL`, because a restart sends the next request to the same
+spent window or empty account. A cooldown with no vendor cause, or a log
+that cannot be read, stays ours (`reach:our-cooldown`).
+
 `PROXY-LOCAL-403` is the same origin rule on a 403: when the producer marks a
 403 `local` and no selected trace denies it, the refusal is ours whatever its
 body says, so quota wording in it is never `QUOTA-WALL`. `helm burn` reads it
@@ -12685,9 +13918,12 @@ catalog may declare a `billing_window`: the vendor, `tz` (always `UTC`),
 `guard_lead_s`, `guard_lag_s`, `clock_max_skew_s`, and two date tables.
 `DEEPSEEK_BILLING_WINDOW` is the one in
 use: peak 01:00-04:00 and 06:00-10:00 UTC, Monday to Friday, when DeepSeek
-bills twice the off-peak price. The `ds4pro` family carries it on its only
-route, the DeepSeek direct key (one token source per seat: the flat OpenCode
-Go subscription is the `ds4flash` family's route, and is never gated).
+bills twice the off-peak price. The `ds4pro` family carries it on its
+default route, the DeepSeek direct key. Its other pool row, the flat OpenCode
+Go subscription on the same model, is never gated, and neither is the
+`ds4flash` family's Go route. One token source per seat: a mint writes one
+row, and a seat whose config cannot be read is treated as its family's
+default row.
 
 One pure function decides whether an instant is peak. The guard closes
 `guard_lead_s` (300) seconds before each window and opens `guard_lag_s` (300)
@@ -12872,6 +14108,41 @@ block its reader, so the detail has its own budget of 10 s, inside the unit's
 50 s. The row carries the detail when it arrived, or `Process detail UNKNOWN:
 <why>` when it did not, and the detail goes to the alarm log as a second entry.
 
+**Whether helm itself is the load (task/3841).** The measured stalls were
+mostly short-lived processes (hook pythons at about 15 births a second), which
+a sample of living pids never sees. So the same one-second window also reads
+`agents.slice`'s `cpu.stat` `usage_usec` and the host's `processes` count in
+`/proc/stat`. The `Processes by cpu:` line ends with `short-lived N% cpu of
+agents.slice's M% over 1s (its cpu.stat usage less every process sampled at
+both ends), R births/s host-wide`. The listed processes, and up to 16 births
+still alive after the window, are HELM-OWN when the command line runs this
+checkout's `bin/helm`, `bin/helm-hook` or a `helm/*.py` (the checkout comes
+from the module's own location; its lane rooms count, a link such as
+`~/.local/bin/helm` is followed, and a relative path is read against the
+process's cwd), `python -m helm`, the chat node (`dregg-node`,
+`dregg-node-rebased`, `dregg-cave-node`), or a fab client whose cwd is a helm
+checkout. Helm's short-lived cpu is the short-lived cpu times helm's share of
+the ticks the caught births spent. When cpu is a stalled kind of the pass that
+opened the alarm and helm's own cpu is at least half the slice's, the row gains
+ONE line (a stall on memory alone gets none: the share is of cpu):
+
+`HELM IS THE LOAD (P-1: fixed ahead of everything): helm's own processes used
+X% of agents.slice's M% cpu over 1s: <each helm-own process with its cpu>;
+short-lived N% cpu (k of n births caught alive were helm's); R births/s
+host-wide. P-1 row task/NNN filed to <integrator>.`
+
+The pass then files ONE open task row titled `P-1: helm is dragging the fleet
+(pressure-watch)`: owner-asked, P0, project helm, owned by the integrator, with
+a note naming the owner's rule and the numbers. While that row is open, a
+later alarm adds a comment to it instead of a second row; a row this watcher
+filed stays the one row after it is retitled. The watcher writes on those rows
+at most once per 30 minutes; inside that the line says `was filed or refreshed
+Nm ago`, and names the row's status when it has since closed. The filing runs in the process detail's thread and
+10 s budget, and a ledger it cannot read or write, an `agents.slice`
+`cpu.stat` that will not read (`Helm's own cpu share UNKNOWN: <why>`) or a
+filing that did not finish is said in the row, never raised. A read-only pass
+files nothing and says so.
+
 **A process is named by its PROGRAM only**: the basename of the first word of
 its `argv[0]`, or, for an interpreter (`python3`, `node`, `bash` and the like),
 the basename of the script it runs (`python3 x.py` is `x.py`). No other word
@@ -12906,6 +14177,145 @@ taken. Both the shell wrapper (`bin/helm-hook`, builtins only) and the
 in-process handler timeout (`helm/hookrun.py`, which also puts it in the
 outcome's `why`) print it. With `HELM_SEAT_PRESSURE=off` and no
 `HELM_FLEET_CGROUP`, nothing is read and the clause is absent.
+
+### `helm slice-limits [--seats [--role-for SEAT=ROLE,...]] [--apply [--lower]] [--json] | --seat-props SEAT`
+Derive the limits of `agents.slice`, the slice every seat runs in, from the
+box (task/3847). Before this verb, the limits were numbers typed into
+drop-ins by hand. On 2026-09-30 three drop-ins disagreed (1800%, 800% "until
+task/1574 lands" with task/1574 already closed, and a `set-property` 1600%).
+systemd merges a unit's drop-ins in file-name order across all its unit
+directories, and the last assignment wins. So the 800% file won at every
+`daemon-reload` and undid each value set by hand.
+
+| limit | derivation |
+|---|---|
+| `CPUQuota` | (online CPUs − owner reserve) × 100% |
+| `MemoryHigh` | MemTotal − owner reserve at the throttle line, down to whole GiB |
+| `MemoryMax` | MemTotal − owner reserve at the kill line, down to whole GiB |
+| `CPUWeight` | 25, against the 100 of `app.slice` and `session.slice`, so the owner wins every contention 4:1 |
+| `MemorySwapMax` | 0: a runaway fleet process is killed, never swapped |
+
+Online CPUs come from `/sys/devices/system/cpu/online`, never from `nproc`
+(`nproc` honours the cgroup quota and the caller's affinity). MemTotal comes
+from `/proc/meminfo`. Each owner reserve is declared once, in
+`slicelimits.RESERVES`, as the larger of a fraction of the box and a floor:
+CPU 1/3 with a floor of 4 CPUs (rounded up); memory 45% with a floor of 12 GiB
+at `MemoryHigh` and 36% with a floor of 8 GiB at `MemoryMax`. On a box with
+24 CPUs and 87.7 GiB, that gives `CPUQuota=1600%`, `MemoryHigh=48G` and
+`MemoryMax=56G`.
+
+**Bare** prints each limit with its derivation, its value now (the live
+cgroup, else the unit files, else systemd's default: no quota, `infinity`,
+weight 100) and the file it loads from, every other drop-in
+that sets one of these limits, and every drop-in comment that says `until
+task/N` with the status of task N. It writes nothing. Exit 0: everything
+comes from helm's drop-in and matches the derivation; 1: something does not;
+2: the box will not read.
+
+**`--apply`** writes ONE drop-in, `agents.slice.d/zzz-helm-slice-limits.conf`
+in the user unit directory. Its name sorts after every other drop-in in use,
+and it is written FIRST, so a stop at any later step leaves the files
+loading helm's values, never the base unit's or none. Then it moves every other `agents.slice` drop-in that sets one of these limits
+aside, in `~/.config/systemd/user`, `~/.config/systemd/user.control` (where
+`set-property` writes) and `$XDG_RUNTIME_DIR/systemd/user.control`: the file
+is renamed with a `.helm-slice-limits-<time>` suffix, systemd reads only
+`*.conf`, and the renamed file is the backup. A drop-in that also carries
+other settings keeps them and is never absent: the backup is a hard link, and
+a copy with the limit lines turned into comments replaces the file in one
+rename. Then it runs `systemctl --user daemon-reload`, reads the
+live slice again, and prints the rollback (`mv` each backup back, remove
+helm's drop-in, `daemon-reload`). **No limit goes lower than its value now**
+unless `--lower` is given; a kept value is named in the drop-in's header.
+`--json` prints the reading.
+
+`helm doctor` runs the same reading (`check_slice_limits`). It names each
+limit that differs from the derivation, a live value that the unit files
+would change at the next `daemon-reload`, each limit that loads from a file
+the derivation did not write, each other drop-in that sets one, and each
+drop-in whose comment waits `until task/N` when task N is closed: a stopgap
+whose exit condition was met while its number stayed. A box with no
+`agents.slice` unit gets one OK line. The rung never fails the report.
+`HELM_SEAT_PRESSURE=off` turns off the reading of this box's `/sys`, `/proc`
+and cgroup tree: the verb then says it cannot derive.
+
+**`--seats`** does the same for every seat slice, `agents-<seat>.slice`
+(task/4062). On 2026-10-01 a probe's python3 in seat qwenlocal grew past 9 GB
+twice. It stayed under its seat's kill line and under the fleet's 48G
+throttle line while the host swapped 28 GB and froze. Every seat carried the
+same literal 12G/16G from three writers (the claude entry shim's
+`set-property` defaults, the hand-written prefix drop-in
+`agents-.slice.d/per-seat-memory.conf`, and `set-property` stopgaps), and 27
+seats at 16G is nine times the fleet's line.
+
+| limit | derivation |
+|---|---|
+| `MemoryMax` | max(floor, share × `agents.slice`'s derived `MemoryHigh`), never above that line, down to whole GiB. Lead share 1/3 (floor 4 GiB), worker 1/6 (floor 2 GiB): `seatlimits.SEAT_SHARES` |
+| `MemoryHigh` | 3/4 of the seat's `MemoryMax`, down to whole GiB, never under 4G (`seatlimits.HIGH_FLOOR`, 1G above the 3G at which seats were measured throttle-frozen): the throttle band below the kill. A `MemoryMax` under 5G (`HIGH_CAP_MIN`) holds no 4G High below it, so that seat gets `MemoryHigh=infinity`: no per-seat throttle, and `agents.slice`'s own High throttles |
+| `MemorySwapMax` | 0, as the fleet's |
+
+On the 87.7 GiB box a lead gets 12G/16G and a worker 6G/8G. On a 32G box a
+worker's cap is 2G and gets no per-seat High, and a lead's is 5G with the 4G
+floor; on a 16G box neither gets one. The plan, the apply and `helm doctor`
+print one line per class with no per-seat High: `throttle left to the fleet
+line: a per-seat High under 4G freezes seats`. The `infinity` is written,
+not left out, so that no other file's High (the lead default in the prefix
+directory, or a launch's `set-property` file) loads in its place. A seat is a
+**lead** when a process in it carries `HELM_SEAT_ROLE=lead`, when its name
+ends in `-claude` or `-integrator` (the names `teams.role_for` proposes as
+leads), or when it has no name: the shim names a seat with no
+`HELM_CHAT_NAME` `pid<N>`, and an owner-opened pane is one of those. A
+seat those rules read as a worker takes the role it records: its spawn
+register, else, for a native seat helm never spawned, its `role.json`
+declaration (`helm launch --seat S --role R`). A record that will not read,
+or two declarations that fold to one slice name with different roles, gives
+no role. Every other seat is a **worker**. The role is read from a RUNNING
+seat's process: a seat that is not running gets no role file and keeps the lead default,
+because its name alone would make a lead named outside those suffixes a
+worker, and its next launch would load the worker's kill line.
+`--role-for SEAT=ROLE[,SEAT=ROLE...]` (ROLE `lead` or `worker`) names a
+seat's role explicitly, for a stopped seat or over a running one's.
+A role file already on a stopped seat (an earlier apply wrote it while the
+seat ran, or an older name-only apply wrote it for a lead) still loads at
+its next reload, so a stopped seat whose default is lead (its name, or the
+lead posture its spawn register or declaration records) has that file named
+as stale by the plan and moved aside by `--apply`, one line naming the seat,
+the file and why. A worker's file agrees with its default and stays. A file
+`--role-for` wrote carries a `# --role-for SEAT=ROLE` line and is never
+stale. When the spawn registers will not read and the name does not decide,
+the file is refused as UNKNOWN.
+
+Bare `--seats` prints both classes with their derivations and a table of
+every running seat slice: its live high, max and swap ceiling, `memory.current`
+and `memory.peak` (both count page cache), anon and shmem (neither reclaims in
+a swapless slice), its `high` and `oom_kill` event counts, and its target.
+`--lower` without `--apply` previews what `--apply --lower` does.
+
+**`--seats --apply`** writes `agents-.slice.d/zzz-helm-seat-limits.conf` with
+the lead class (every seat slice's default, including the pid-named ones
+nobody can name ahead), and `agents-<seat>.slice.d/zzz-helm-seat-role.conf`
+with the worker class for each running worker seat. systemd applies drop-ins
+with different names in lexicographic order across every directory, so these
+two load after the shim's `50-Memory*.conf` files. A file that sorts after
+helm's in a seat's own directory, or a same-named file in a higher-priority
+unit directory that hides helm's, would still win: before it writes, the
+apply computes what each seat it decides will load from every drop-in that
+applies (in each unit directory by priority, the seat's own directory,
+then each dash-prefix one such as `agents-ops-.slice.d` for
+`agents-ops-a.slice`, then `agents-.slice.d`: systemd's search order, where
+the first file of a name hides the rest), and refuses, naming the file, when a limit would
+load from any file but helm's, or when a drop-in there will not read (not
+UTF-8), since what it sets is then UNKNOWN. It moves every other prefix
+drop-in that sets a seat memory limit aside (renamed with a
+`.helm-slice-limits-<time>` suffix), runs `systemctl --user daemon-reload`,
+reads every running seat slice again, and prints the rollback. It refuses,
+and writes nothing, when a running seat would be lowered without `--lower`, or
+when a running seat's anon + shmem × 1.5 does not fit under its new
+`MemoryHigh` (its new `MemoryMax` when it gets no per-seat High). `helm doctor` names each running seat slice that differs from
+the derivation, and each other prefix drop-in that sets one.
+
+**`--seat-props SEAT`** prints the `set-property` arguments a launch stamps
+on SEAT's slice (`MemoryHigh=6G MemoryMax=8G MemorySwapMax=0`), with
+`HELM_SEAT_ROLE=lead` in the environment marking a lead.
 
 ### `helm eval arms [--seat S] [--json] | register [--seat S] [--out PATH]`
 The cc-codex vs pi-codex eval's guard rails, which exist **before** its runner
@@ -13266,12 +14676,18 @@ report what WOULD be reaped, reap nothing; `--apply` enforces. Laws:
   session is provably dead, or it is the seat-level cursor of a seat the
   roster no longer holds, on a room whose log is gone, untouched for an hour;
   a live session's or a rostered seat's cursor is never reaped for a missing
-  room, and no cursor's `.lock` sibling is ever a victim of this stream
+  room unless `helm chat retire-rooms` retired it, and then only once it has
+  sat untouched for an hour (task/3848: the restore never brings a retired
+  room back, and one reborn under the name has a log, which keeps every
+  cursor on it), and no cursor's `.lock` sibling is ever a victim of this stream
   (task/2520: unlinking a lock a writer holds hands the next writer a fresh
   inode), so each is left to `chat-cursor-locks`.
   Owner-bound: the reap holds the cursor topology lock and re-proves each
   victim before it unlinks), `chat-unpaired-cursors` (a live session its seat
-  no longer runs, the seat's own baseline kept), `chat-cursor-locks` (a
+  no longer runs, the seat's own baseline kept), `chat-steer-latches` (a
+  once-per-context steer latch whose session is dead by the same liveness
+  answer `chat-cursors` reads; an unprovable liveness is an error row that
+  reaps nothing), `chat-cursor-locks` (a
   per-cursor sibling lock, which nothing has opened since the cursor stack
   took one lock per room; held ones are skipped) and `work-worktrees` (the
   lane has no lease). **`size: N` nominates the WHOLE
@@ -13298,7 +14714,7 @@ helm gc — declared retention over the derived exhaust (dry-run; `helm gc --app
 helm gc: 3 items would be reaped; 0 report-only over budget — nothing touched
 ```
 
-### `helm scratch [small|big|durable [--name N]] | gc [--apply] | unattributable [--json] | status [--json]`
+### `helm scratch [small|big|durable [--name N]] | gc [--apply] | evicted [--session S] [--json] | restore <path> [--force] | unattributable [--json] | status [--json]`
 
 The **mount plane**. Two facts made this a verb rather than a rule: (1) a tmpfs
 `nr_inodes=` cap is invisible to every bytes-based check, so the fleet hit
@@ -13472,6 +14888,53 @@ to reap what dies.
   liveness gate has already proved the session dead, and the sample is marked
   on the CLI line and in the audit line rather than passed off as a full
   reading.
+* **eviction, never deletion.** A unit the reaper picks (a dead session's
+  tree, or an aged unheld child of a live session's scratchpad) leaves RAM for
+  a disk archive; it is never only deleted. The archive is
+  `HELM_SCRATCH_ARCHIVE`, else `~/.helm/_global/scratch-evicted`, laid out as
+  `<session>/<UTC stamp>-<name>`. The unit is copied, and the copy must match
+  the RAM copy on file count, directory count and total bytes, read before and
+  after the copy. Copied files are fsync'd. Then one row goes into the
+  archive's `index.jsonl` (`event`, `path`, `session`, `tier`, `reason`,
+  `bytes`, `files`, `ts`, `archive_path`), and only then is the RAM copy
+  removed. A unit already on the archive's filesystem is renamed into it
+  instead of copied. A unit that cannot be archived **stays in RAM**, and the
+  pass says why on its line and in its audit event:
+  * the archive filesystem would drop under its free floor
+    (`HELM_SCRATCH_ARCHIVE_FREE_PCT`, default 5% of that filesystem);
+  * the archive root is on tmpfs or ramfs (the longest mount-point prefix in
+    `/proc/mounts`): an archive in RAM frees nothing and survives no reboot,
+    and a unit on that same mount would be "evicted" by a rename that leaves
+    it in RAM;
+  * the copy failed, or did not verify (the partial copy is discarded);
+  * the pass's copy allowance is spent (`HELM_SCRATCH_EVICT_PASS_BYTES`,
+    default 4 GiB). Copying out of tmpfs costs I/O exactly when memory is
+    short, so one pass copies at most this many bytes, biggest-by-inodes first
+    (a pressured seat's units lead). The allowance stops the pass at the first
+    unit after it is spent, so one unit bigger than the allowance still goes.
+    Only a copy spends it: a unit on the archive's own filesystem is one
+    rename and still goes after the allowance is spent;
+  * the unit is itself a FIFO, a socket or a device. A special file holds no
+    data, and opening one to copy it blocks or reads without end, so it is
+    refused before anything opens it and stays where it is;
+  * a gate re-taken after the copy (an agent opened or entered the unit while
+    it was copied).
+
+  There is no delete fallback, and the pass **never prunes the archive**: an
+  archive under its free floor or on a RAM mount is BLOCKED, every unit stays
+  in RAM, and the pass's summary leads its eviction note with `ARCHIVE
+  BLOCKED` and the reason (the dry run prints `ARCHIVE UNAVAILABLE` for a RAM
+  root). Space in the archive is the operator's to free. `helm scratch evicted
+  [--session S] [--json]` lists the index, newest first, with each unit's
+  state (archived, restored, archived with its RAM copy not removed, not
+  archived because its rename into the archive failed, or its archived copy
+  missing). `helm scratch restore
+  <path-or-archive-path>` copies the newest archived copy back to its original
+  path and verifies it. It refuses when that path exists; `--force` moves the
+  existing copy aside to `<path>.pre-restore-<stamp>` first and deletes
+  nothing. A restore whose copy fails or does not verify removes its partial
+  copy and renames the copy it moved aside back to `<path>`, and its message
+  says so.
 * **the dry run states its own proposal.** `helm scratch gc` ends with a
   per-tier total — units and, since the dry run prices them, bytes — before
   the `UNATTRIBUTABLE` block, which is the list of what the pass will *not*
@@ -13697,8 +15160,10 @@ helm-release-nightly --repo <room> -- python3 scripts/release/release.py
 remote, no GitHub release. It differs from a plain dry run in three ways,
 each so that the answer is about the tree. It takes no version: between
 releases trunk declares the version already released, so it rehearses the
-next cut as `<__version__>-nightly`, with the CHANGELOG's newest section as
-the notes. It requires gitleaks, as a publish does. Its default work
+next cut as `<__version__>-nightly`. Its notes are the ones the next
+`release.py --fold` would make a section of: the notes under the CHANGELOG's
+`## Unreleased`, then each change note in `changes/`; with none of those,
+the CHANGELOG's newest section. It requires gitleaks, as a publish does. Its default work
 directory is `~/.helm/releases/nightly`, which keeps the newest seven runs.
 The hub hands over the public URL in its https form (the dry run only reads
 the public repository, and the build hosts hold no GitHub key) and the
@@ -13786,7 +15251,7 @@ re-reads the span a compaction discarded by wrapping the ONE recall index
 (`cv show <sid> --pre-compaction`, architecture law 4 — helm records how to
 query it, never a second index); a missing `cv` prints that exact command.
 
-### `helm now [capture [--hook-json] [--session S] | show]`
+### `helm now [capture [--hook-json] [--session S] | show [--working-set [--session S] | --hook-json]]`
 
 Leg 2 — the AUTOMATIC safety net (the write side of the compaction-
 continuity reflex; the ancestor's now.md was advisory-without-actuator and
@@ -13798,19 +15263,43 @@ the snapshot ONLY while under 48h fresh — a stale now.md actively misleads,
 so staleness is silence (the gate is load-bearing, not polish) — shaped for
 SessionStart additionalContext; the legacy `~/.remember/now.md` is honored
 as a read fallback until retired. now.md is DERIVED telemetry: rebuildable,
-never ships, no mutation receipt.
+never ships, no mutation receipt. No hook runs plain `now show`: a reader
+asks for it.
 
-Hook recipes (the HOOKS.md fail-open law — `timeout` + `|| true`, absolute
-helm path):
+`show --hook-json` is the WORKING SET (task/4054), the one `now` form a hook
+runs: `helm hooks install` wires it on SessionStart with matcher `compact`
+(the `working-set` row in HOOKS.md). After a compaction a seat slipped for
+about 50 calls, wrong verbs and paths about 4x, and about half of those
+slips named a value from its own last few hundred calls. `helm record`
+keeps a per-session ring of one row per main-thread call
+(`working-set.jsonl`: tool, ok, paths, the verb spelling of helm, git, gh,
+fab, orca or cv with flag NAMES only, task and dispatch-row ids, background
+task id); this hands it back as additionalContext of at most 7,000
+characters, newest first: paths that still exist, spellings that worked,
+spellings that failed with a usage error marked DON'T (with the spelling
+that worked instead, when one did), ids with how many calls ago, background
+tasks and whether each has an output file (a Monitor has none), scratch
+dirs, and the PreCompact handoff nag. Never command text, flag values, file
+contents or output, and no env or credential-shaped path (`*.env`, `.env*`,
+`credentials*`, `*secret*`, `*.pem`, `*.key`, `~/.aws`). A subagent's compaction gets nothing. Fail-open: any
+fault prints nothing but the nag, rc 0. `HELM_WORKING_SET=0` turns the set
+off and still hands over the nag.
+`show --working-set` prints the same set for a session on demand (exit 1
+when none is recorded).
 
-```json
-"PreCompact":   [{"hooks": [{"type": "command",
-  "command": "timeout 10 <helm>/bin/helm handoff check --hook-json || true"}]}],
-"SessionEnd":   [{"hooks": [{"type": "command",
-  "command": "timeout 10 <helm>/bin/helm handoff check --hook-json || true"}]}],
-"SessionStart": [{"hooks": [{"type": "command",
-  "command": "timeout 10 <helm>/bin/helm now show || true"}]}]
-```
+THE PRECOMPACT NAG IS NOT ON STDOUT. Claude Code gives PreCompact stdout to
+the summarizer as custom instructions, so the handoff nag became a "next
+step" in 27 of 43 measured summaries. `handoff check --hook-json` at
+PreCompact writes the nag to the session's nag file, not stdout; the
+working-set hook gives it to the seat once, after the compaction.
+SessionEnd keeps stdout. A seat whose settings predate the working-set hook
+(no `helm hooks install` and restart yet) never runs it, so `inject
+--hook-json`, the per-turn hook every seat already has, hands a nag younger
+than an hour to the seat on its next prompt instead (task/4070). Each reader
+removes the file as it reads it, so the nag arrives once.
+
+`helm hooks install` writes these entries; the hook rows in HOOKS.md are
+the source for their exact commands.
 
 ---
 
@@ -13858,7 +15347,12 @@ addressing plugs in later without four ledgers changing.
 *It refuses only on a measured contradiction.* A source that is measurably
 LIVE needs `--force --reason` (moving work out from under a running agent is
 how two builders end up on one lane); a target nothing answers to is refused.
-UNKNOWN liveness **proceeds with the unknown named**, because this verb exists
+A source whose process runs but whose own liveness reading (the one `helm
+seat cubicles` reads) is WALLED or BLOCKED_ON_QUOTA, with its wall's reset
+(its proxy pool's refusal, else its family's burn flag) unknown or more than
+`HELM_DARK_MOVE_RESET_WAIT_S` (an hour) away, cannot take a turn: it is
+WALLED, not LIVE, and proceeds without `--force`, the classification and
+reset named (task/3881). UNKNOWN liveness **proceeds with the unknown named**, because this verb exists
 for the morning after a reboot, when absence is the normal state of the
 evidence — refusing on absence would make it useless exactly then.
 
@@ -14105,8 +15599,9 @@ cross-seat surface-ownership proof (an instance dir symlinked at a sibling is
 refused before any mutation, so a register write can never land on another
 seat's `spawn.json`), the default-home PROVISION on first spawn, the onboarding
 submit with its DELIVERED / NOT_DELIVERED / UNKNOWN tri-state, and the role
-posture (`--role lead` reaches the launched command as `HELM_SEAT_ROLE=lead` and
-the ultracode `--settings`, never only the register) are all shared. What native
+posture (`--role lead` reaches the launched command as `HELM_SEAT_ROLE=lead`,
+never only the register, and adds no settings flag: a lead starts at its
+home's high effort like every agent) are all shared. What native
 actually differs in is what it does not have: no proxy, no port, no cred
 translation, no `launch.sh`. `--model M` applies to native too: it rides the
 pane command as `helm launch --model M`, is recorded in `spawn.json` `model`,
@@ -14495,7 +15990,59 @@ proxy via its openai-compatibility block; the key comes from `KIMI_API_KEY`
 or `--key-from <env-file>` at add time and is baked into the seat's 0600
 config, never printed). `ds4pro` and `ds4flash` are proxy-key families whose
 endpoint and upstream id come from a per-provider pool table rather than from
-the family row.
+the family row. `helm seat add ds4pro` mints the DeepSeek direct key;
+`helm seat add ds4pro --provider opencode-go` mints the same model on the
+OpenCode Go subscription instead, and `helm seat add ds4flash` mints
+deepseek-v4.1-flash there. Go refuses a request without `x-opencode-session`
+(HTTP 400 MissingSessionID), so every Go block carries
+`session-header: "x-opencode-session"` and the proxy sets a value per
+conversation: the same across one Claude Code session's turns (a compaction
+included), a new one after `/clear`, and one of its own for each subagent.
+`helm seat up` refuses such a config when the installed `cli-proxy-api`
+predates the field, since every Go request would then be refused.
+
+**Devin/Windsurf — staged, NOT a seat.** `tests/fixtures/devin_proxy_contract.py`
+contains an offline, non-launching contract outside the Helm runtime tree for a
+proposed Claude Code → CLIProxyAPI → independently vetted loopback bridge →
+Devin Connect route. Its tests are synthetic controls, not a bridge or account
+probe. There is no `devin` family to `seat add` or dispatch to. The public MIT
+third-party adapter at [`dwgx/WindsurfAPI` commit `90f5ef2368b35bd1b4b057bd3c8a02296177f98c`](https://github.com/dwgx/WindsurfAPI/tree/90f5ef2368b35bd1b4b057bd3c8a02296177f98c)
+reports native ToolDef #10 (inner name/description/schema #1/#2/#3), response
+ChatToolCall #6 (reported inner id/name/arguments #1/#2/#3, with a name
+fallback inferred from request tool definitions that is not identity proof),
+tool result source #4
+with correlation #7; its response decoder identifies content #3 and
+reasoning #9 (an older source header calls #9 text; the parser wins). These are *third-party reported
+captures*, not independently verified on this account; its source has raw wire
+and error-body logging paths unsuitable for a privacy-safe probe without a
+reviewed patch. Its claims are not
+proof that the owner's existing CLI login authorizes its Basic-header route, or
+that this box can serve a full tool/result/continuation turn. A public ACP
+negative establishes only that ACP is not this bridge; it does not rule out
+proxy-first. Do not substitute prompt-text tool-call emulation or the frozen
+experimental native-harness fallback. The proposed aliases are exact vendor
+selectors (DeepSeek V4 Pro High, GLM-5.3 High, Gemini 3.8 Flash Medium, Kimi
+K3 High, SWE-2 High, GLM-5.3 Flash High, DeepSeek V4.1 Flash High); Adaptive is synthetic-trial
+only. One Windsurf account would fund all variants, not one account per alias.
+The requested selector, proxy route and actual served model are different facts:
+without independently observed upstream served UID, Adaptive remains UNKNOWN.
+Sonnet, Opus and Fable have a separate **cross-family reviewer-purpose-only
+proposal** (`devin-sonnet`, `devin-opus`, `devin-fable`), not a build/routine
+Anthropic route; all OpenAI/o-series routes remain excluded. No vendor UID for
+these three is hard-coded or inferred from a plausible alias. Selecting one in
+the *offline contract* requires an explicit reviewer purpose and a caller-supplied,
+independently vetted, unique matching model UID, family UID and catalog lineage;
+request text cannot grant that purpose. That candidate match is not proof of
+upstream identity, reviewer independence, actual served UID, wire support,
+login/entitlement, dispatch admission or approval. The separate synthetic
+native-call ledger validates immutable call IDs, names and JSON arguments, and
+rejects text-emulated tool calls including inside content-part lists; it cannot
+prove the bridge actually decoded those upstream. The vendor's advertised
+contexts and price summaries are neither observed serving windows nor actual
+metered spend/quota. No account credential or model catalog export belongs in
+the repo. Enabling a live family awaits native-wire proof, bridge
+provenance/vetting and a privacy-safe auth and health path; the money reader's
+native Devin quota schema is separately UNKNOWN (task/4078).
 
 **`qwen27` — the first LOCAL family.** Qwen3.8-27B (UD-Q4_K_XL, unsloth)
 served by llama-server on a LAN box, OpenAI-compatible, under the
@@ -14854,6 +16401,169 @@ refresh cannot turn a project default into an explicit room and undo a later
 operator rehome/clear. Resume also preserves the seat's `--multi` shape and
 refreshes `spawn.json` with the new pane handle.
 
+**`helm seat resume <seat>` brings the seat back EXACTLY AS IT RAN**
+(task/3695). It used to re-mint a proxy seat's launch from today's catalog and
+resume an orca-adopted lead with no `--model` and no permission flag, so every
+parked seat came back on whatever the defaults were that day: measured
+2026-09-29, helm-codex (running gpt-6-sol after a `/model`, window 320000)
+would have come back at the catalog's 220000, and meta-claude (running
+claude-opus-5-5[1m] in bypassPermissions after a `/model` over its
+`--model fable` argv) on its home's `opus[1m]` and `auto` mode. The resume now
+carries the seat's LAUNCH RECIPE (`helm/seat_recipe.py`): model, credential
+home, cwd, permission mode, effort (the level; a recorded ultracode is shown
+and no resume restores it, and the plan says so), denied tools, appended
+system prompt and identity environment, and for a proxy seat its family,
+window and subagent pin. Each field is read from the first source that states
+it: the session's own transcript for what moves while it runs (Claude Code's
+`model` attachment carries the exact id, and a later `/model` is honoured; the
+last permission mode; the effort level), then the seat's live process
+(`/proc` argv cut to the recipe's own words and an ALLOW-LISTED environ — no
+bearer, and no --settings env block or --mcp-config header an adopted lead's
+argv carries, is ever kept. EVERY FIELD PASSES AN ALLOW-LIST: a flag's
+value must be a model the seat catalog knows, a mode or effort level claude's
+flag takes, a tool name Claude Code ships or a deny rule helm's catalog mints,
+a catalog system line, or the ultracode boolean; an environment value must be
+a seat name by helm's seat-name rule, a home under ~/.claude, ~/.claude-homes
+or helm's own home, a catalogued family, a window or a catalogued model; the
+binary is kept only as the version its versions layout names. A value outside
+its list, such as the text of an adopted lead's --append-system-prompt or a
+token passed as --model, is never stored, carried, printed or logged: its
+field reads unknown by name. A config dir is kept only when it IS a home helm
+knows (exactly ~/.claude or helm's home, a seat home helm minted, or a named
+credhome that exists under ~/.claude-homes), never for lying under one; a
+version only as plain N.N.N. The ASSEMBLED recipe is checked the same way
+whatever the source, the transcript's facts included, and a model is named
+only when the catalog or an alias knows it or it is in Claude's own id
+grammar, so a retired Claude id is still named and anything else is "a model
+the catalog does not know"), then the capture every `seat resume --all --apply` pass keeps of each LIVE seat in the
+resume live set's `recipes` map (carried forward pass to pass and boot to
+boot, and read only for a session its process held), then a proxy seat's
+launch.sh. A proxy seat's launch.sh is re-minted to carry the recipe, and its
+effort rides the pane command as `--effort`; an adopted lead's resume script
+carries the flags and exports (unsetting what it ran without).
+
+**EXACTLY means one launch.** The transcript is the session's own record, and
+a live process or a capture is a process that held the session, so their
+fields are one launch's recipe. launch.sh is bound to no launch: `seat
+remint`, `seat launch` and `seat add` rewrite it with no launch after it. So a
+recipe that reads launch.sh beside a field the transcript states (the model it
+ran beside a re-minted window) is not one launch's: those launch.sh fields are
+unknown, each named with its source (`window [last launch (launch.sh)]`), and
+the resume refuses as it does for any unknown field. A seat the reboot sweep
+captured while it ran resumes exactly after a re-mint; one it never captured
+resumes on `--defaults`. A cv-pruned copy is the same conversation under a
+new session id: its own lineage stamp names the session it was pruned from,
+and the capture of the process that held that session binds the copy, so a
+captured seat's context-wall recovery resumes the copy exactly.
+
+**A capture binds a resume only as this session's LAST launch.** Same
+session (its process held it), same process birth (pid and start stamp, and
+the process the spawn register pins to the session, where it pins one), and
+no launch of the seat of any kind recorded after it was taken; for a pruned
+copy, a lineage stamp naming exactly the source the resume asked for.
+**THE LAUNCH RECORD** (`seat-launches.jsonl` in helm's global dir) is written
+by helm's SessionStart hook (`seat resume-turn --hook-json`, which every helm
+home runs in every project) once for each process start of a session:
+`startup`, `resume` (`--resume`, `--continue`, an in-session `/resume`, Orca's
+own relaunch, a hand `claude --resume`) and `fork`, and `clear` when it
+carries the same process's capture; `compact` keeps the session in the same
+process and writes none, and neither does a `claude -p` helper, which is not
+the seat. Each row is `{session, seat, home, model,
+source, ts, capture}`, and `capture` is the capture of the process that
+started (the `CLAUDE_PID` Claude Code gives its hooks), so a row exists only
+for a launch that really started and IS its freshest capture: the newest row
+for a session is what its resume binds, unless the sweep captured a process
+after it (a later start whose hook wrote nothing), which then binds instead;
+a row whose process could not be read binds nothing unless such a capture
+follows it. A `seat rehome` ledger row or an adopted resume's script newer
+than the newest row is a later launch that can only unbind (a rehome row
+naming the process that row captured is that launch). The reboot sweep's
+capture is the fallback for a session no row names (one started before the
+record existed), bound against the spawn register's stamp and those older
+records. The hook never
+fails a session: it waits on the record's lock at most a second, and a row it
+cannot write leaves a marker (`seat-launches.unrecorded/<sid>`) that reads as
+an unread record, so nothing binds that session's next resume; a record that
+does not read binds nothing, and the note names it. A live process speaks only
+for the session it holds, so `--session OLD` never borrows the recipe of the
+process running NEW. Anything short of that reads as uncaptured, and the
+recipe's notes say which rule it failed. A launch on a home without helm's
+hooks leaves no row and cannot be seen.
+
+**No resume changes the account a seat is paid by, or the model it ran,
+unseen.** A known account mismatch refuses on every path, `--defaults` and an
+unattended caller included, except for a seat whose captured launch ran on
+the default home (`~/.claude`) and resumes there: its payer is whichever
+account Orca holds, and Orca switching it is the fleet's designed wall
+handling, so there the resume prints `account: <now> now; it ran on <then>`
+and goes on. An adopted lead's last recorded launch names the home
+it ran on, over the session-creds index (which keeps the first home it saw);
+an unattended caller whose fallback would move it off that home leaves it down
+naming the home, and `--defaults` prints the move. An unattended caller that
+would change the model the recipe knows the seat ran leaves it down instead,
+in one line naming why; the operator's `--defaults` prints that change and
+takes it. A reply names a model without its 1M suffix: after `/model
+<id>[1m]` (or `opus[1m]`) the argument restores it, a launch's `--model
+opus[1m]` restores it for a reply alone, and a `/model` menu pick or a typed
+alias without the suffix (`/model default`, `/model opus`) answered by a
+Claude id leaves the model unknown (`seat recipe` says why), so the resume
+refuses it by name. The window
+an exact resume stamps reaches the process: a lite seat's settings.json pin,
+which outranks the launch stamp, is seeded from the recipe's window, and a
+pin the re-seed would keep at another value refuses the resume, naming the
+knob. An orca-adopted seat whose session lives in a proxy seat's tree is
+planned by the same rules, and resumes through that seat's own launch.sh
+with the model and effort it ran.
+
+**An unattended resume never leaves a seat down.** The reboot sweep and the
+context-wall recovery have no operator to choose `--defaults`. When every
+field a recipe lacks is one a defaults resume never takes from the seat's
+past run (every field but the session's cwd and an adopted lead's
+credential home), they resume on today's defaults and print one line,
+`WARNING: <the reboot sweep|the context-wall recovery> resumes it on TODAY'S
+defaults, not the recipe it ran with: <fields> unknown, …`, before the
+fields that move, except where that would change the account or the model
+it ran (above). The operator's `helm seat resume` refuses the same recipe.
+
+**A resume never silently swaps a model, an account or a permission mode.** A
+recipe with a field no source knows REFUSES before anything is stopped or
+written, and names the fields (`saved only: disallowed_tools, … unknown`),
+a field a source set outside its allow-list included (a permission mode or
+effort level claude's own flag does not take among them), never its value; so
+does one the launch line cannot carry (a model the family no longer
+catalogues, a proxy seat that ran outside bypassPermissions), and an adopted
+lead whose home now holds a different account than the one it held when the
+lead's process was captured. The account check compares one kind of id on
+both sides, the measured key of the account email a home holds (never the
+address, and never the transcript's bridge-session id, which is another kind
+of id); a side it cannot read prints `account: UNKNOWN (<why>)` and refuses
+nothing. `--defaults` is the explicit choice of today's defaults, the old
+behaviour: it prints each field that moves (`model gpt-5.6-sol -> gpt-6-sol`,
+`window 320000 -> 220000`, `UNKNOWN -> …` for a field the recipe lacked) and
+then resumes. A proxy seat whose recorded window is larger than the one the
+catalog teaches for its model resumes with the window it ran, and says so.
+
+**Identity follows the roster.** One field of a proxy seat's recipe comes from
+the roster, not from the launch it ran: its identity. HELM_CHAT_NAME,
+HELM_CELL_PROFILE and DREGG_PROFILE are derived from the roster at every
+launch, and a durable `helm chat seat rename` is the operator changing them
+on purpose. So a renamed proxy seat resumes under the roster's new name, prints
+`identity follows the roster: <recorded> -> <roster>`, and is never refused
+for it; every other field resumes as it ran.
+
+### `helm seat recipe <seat> [--json]`
+
+READ-ONLY. The launch recipe a seat runs (or ran) with, one line per field
+with its value and source, the recorded-only fields (harness version, paying
+account), and the answer the Asleep / Saved-only states read:
+`resume: resumes exactly`, or `resume: saved only: <fields> unknown`. The last
+line is what `seat resume <seat> --defaults` would change, field by field.
+`--json` prints the same as one object. An adopted seat whose recorded role
+is lead gets one more line (`lead_posture` in `--json`) naming the lead
+posture its resume adds; the readout writes nothing to say so. Exit 1 when the
+recipe is incomplete (a seat whose resume would refuse), 0 otherwise, 2 for an
+unknown seat.
+
 **`helm seat resume <seat>` resumes the session the seat's LIVE process holds,
 not the newest transcript** (task/3208). Measured twice on a fleet host: a
 `/clear`, then a resume at once, came back on the pre-clear session at 85%.
@@ -14955,8 +16665,8 @@ once. A seat the remote relay drives is never judged here: its liveness is
 its relay session, read by the same predicate the sweep above uses, and a
 row the relay cannot account for moves nothing. A seat or family read dark
 on every pass for `HELM_DARK_MOVE_GRACE_S` (default ten minutes, latched in
-`<helm home>/_global/.state/dark_move.json`) is confirmed, and its unstarted
-work moves to live seats. Unstarted means an OPEN
+`<helm home>/_global/.state/dark_move.json`) is confirmed, and its work
+moves to live seats. Unstarted work is an OPEN
 dispatch row whose recipient holds neither a claim on the row nor the
 dispatched lane's lease (`progress_state` IDLE), holds no room of the lane's
 family (the room fence `dispatch rebind` warns of), and, for any row but a
@@ -14966,7 +16676,25 @@ sets `in_progress`, so the owner never claimed it) whose owner holds no live
 lease on a lane whose name carries the task's number anywhere (`task-N`,
 `<slug>-N`, `<slug>-Nr`) or that the task records as a `lane:<name>` ref, and
 whose such lane branches in this helm's repository carry no commits off
-trunk. Each kept row prints why it stays. A
+trunk. Started work moves too (task/3881), unless the wall's known reset is
+within `HELM_DARK_MOVE_RESET_WAIT_S` (an hour): a task `in_progress`, or
+`open` with such a lease or lane commits. The pass reads every room git has
+checked out on one of the task's lanes. When no room holds an uncommitted
+change (`git status --porcelain`: tracked changes and untracked files count,
+ignored files do not, and a merge or rebase in progress counts), the task's
+own leases move to the target (rolled back if the owner move is refused),
+then its owner through the seat-reassign capability (its status stays), then
+the dark seat's working dispatch rows on the same lanes through `dispatch
+rebind`. No force is used: a running owner still refuses the move, unless
+its liveness reads WALLED or BLOCKED_ON_QUOTA with its reset more than an
+hour away (`helm seat reassign`'s WALLED disposition), and the task's
+reassign record names that classification and its reset. The receiving seat gets one DM naming the task, each lane, its room
+and tip: continue from this tip, since the commits on the lane are the dark
+seat's finished work; review and land them, then finish the task. When a
+room is dirty nothing moves, and one #seats row @mentions the integrator
+with the seat, the task, the room and the dirty paths, once until that
+changes. Started tasks move first, P0, then P1, then the rest. Each kept row
+prints why it stays. A
 review goes to a measured-eligible reader `helm reviewers` names, which
 already refuses every seat that wrote a round of the chain (a cure's patch
 author included) and a seat outside the approval tier; the review needs one
@@ -15051,7 +16779,8 @@ An already-full seat takes a separate, fail-closed rung. Recovery requires
 either repeated line-leading context-overflow 400s or a newly caused post-send
 400 whose exact fingerprint remains above its pre-send count on the next cadence;
 proxywatch `HUNG`, silence, historical errors, and generic HTTP 400s cannot act.
-Helm asks `cv prune --window … --thinking --json` to mint a bounded copy with
+Helm asks `cv prune --window … --drop-thinking --json` (`--thinking` on cv
+0.10) to mint a bounded copy with
 revive enabled, independently verifies that copy's recorded context fits the
 budget, and resumes that exact id in the prior registered worktree. Success is
 published only after the replacement pane is live and the seat's claim-session
@@ -15400,10 +17129,14 @@ refresh `launch` and `resume` already run and regenerates the proxy config
 through the path `doctor --ensure` uses, under the seat's lifecycle lock. It
 refuses, writing nothing, on an UNKNOWN row and while another spawn's PENDING
 attempt owns the seat (the `IN FLIGHT` door every mutating verb asks first). It
-never starts or stops a process: a running pane keeps its model until
-`helm seat resume <seat>`, and a running proxy takes the new config at its
-next `seat up` or ensure pass. It writes nothing outside the seat's own
-directory.
+never starts or stops a process: a running pane keeps its model. Nothing is
+launched, so the re-minted launch.sh no longer states the launch the pane ran:
+a plain `helm seat resume <seat>` brings the seat back on the recipe it ran
+with only from its own process or a capture of it (task/3695), and refuses a
+recipe that mixes the transcript with launch.sh; the re-minted launch reaches
+it through `helm seat resume <seat> --defaults`. A running proxy takes the new
+config at its next `seat up` or ensure pass. It writes nothing outside the
+seat's own directory.
 
 **A default is not a choice.** spawn.json records `model_source` beside a
 persisted model: `explicit` (the operator's `--model`, which outranks the

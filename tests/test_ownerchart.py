@@ -76,6 +76,16 @@ class WhatHasBeenWaitingAndHowLong(unittest.TestCase):
         # MUST-MISS: a future stamp is a broken row, not a negative age.
         self.assertEqual(ownerchart._age("2027-01-01T00:00Z", self.NOW), "")
 
+    def test_age_asks_the_shared_stamp_parser(self):
+        """One grammar reads every board stamp. A second copy in this
+        renderer can accept a shape the shared parser refuses."""
+        with io.open(ownerchart.__file__, encoding="utf-8") as fh:
+            src = fh.read()
+        self.assertIn("pk.parse_ts_epoch", src)
+        self.assertNotIn("strptime", src)
+        self.assertEqual(ownerchart._age("2026-08-04", self.NOW),
+                         "waiting 22 days")
+
     def test_the_oldest_block_is_listed_first_and_carries_its_age(self):
         board = {"tasks": [{"t": "x", "stage": "📡 LIVE"}],
                  "owner_gated_queue": [

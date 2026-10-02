@@ -1,0 +1,1 @@
+mentor observe <project> [--since 7d]|teach <project> "<id> | <steer>" [--attest]|review <project>|log — the inception actuator: critique brief, taught project reflexes with provenance, before/after review (teach is the one write; the rest read-only)

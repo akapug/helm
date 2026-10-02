@@ -174,14 +174,19 @@ class DoorbellReleaseControlTest(ReleaseBase):
 
     def test_an_ack_by_another_seat_releases_nothing_for_this_seat(self):
         """The row asks both seats, and kimi acks it: gemini's count and
-        its fresh waiter's backstop still carry it."""
-        row, = self.ring([("@gemini @kimi both of you please", "main")])
+        its fresh waiter's backstop still carry it. The first ring led with
+        the newer row, so this one was only counted, never shown, and the
+        backstop may still lead with it (task/4019: a row a ring showed
+        never leads again)."""
+        row, _newer = self.ring([("@gemini @kimi both of you please", "main"),
+                                 ("@gemini a newer ask", "main")])
         self.ack(row, seat=OTHER)
         acks = [m for m in chat.read("main")[0] if m.get("ack") == row["id"]]
         self.assertEqual([m.get("from") for m in acks], [OTHER])
-        self.assertEqual(self.ring_count(), 1)
+        self.assertEqual(self.ring_count(), 2)
         lines = self.fresh_waiter()
-        self.assertEqual([_unread(x) for x in lines], [1], lines)
+        self.assertEqual([_unread(x) for x in lines], [2], lines)
+        self.assertIn("both of you please", lines[0])
 
     def test_a_pre_start_row_the_seat_was_never_shown_stays_counted(self):
         """The waiter's drain passed all three rows and holds each one, so

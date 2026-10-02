@@ -38,7 +38,7 @@ import time
 import unittest
 from unittest import mock
 
-from helm import dispatches, eventledger, landreq
+from helm import dispatches, eventledger, home, landreq, seats
 # The module, never its TestCase: tests/test_suite_collection.py says why.
 from tests import test_source_clean_landed as _sc
 from tests import test_verdict_fresh_context as _fresh
@@ -52,7 +52,7 @@ PATCHER = "seat-patcher"         # a reviewer whose FIX names its own cure
 LEGACY = "seat-legacy"           # the author of a chain with no build row
 FIRST = "seat-first"             # a builder the build moved away from
 REBINDER = "seat-rebinder"       # moves a row and does nothing else
-CLEAN = "SOURCE-CLEAN: read clean"
+CLEAN = "SOURCE-CLEAN: read clean; fab Ran 5 tests OK"
 
 
 def setUpModule():
@@ -72,11 +72,28 @@ class AuthorBase(_sc.SourceCleanBase):
         landreq._LEDGER_FOLD_MEMO.clear()
         self.addCleanup(landreq._CHAIN_CONTRIB_MEMO.clear)
         self.addCleanup(landreq._LEDGER_FOLD_MEMO.clear)
+        # These arms deliberately use many recipients rather than the common
+        # fixture's seat-reader. Give each a real exact-session native runtime;
+        # the inherited policy admits this family. An actor-name mock alone
+        # cannot make a proven DOOR hold.
+        for seat in (OTHER, DISPATCHER, BUILDER, RELAY, PATCHER, LEGACY,
+                     FIRST, REBINDER):
+            with mock.patch.dict(os.environ, {"HELM_CHAT_NAME": seat}):
+                seats.write_roster(
+                    seat, session=self.session_for(seat),
+                    runtime={"family": "claude", "agent_harness": "claude",
+                             "backend": "native", "model": "claude-opus-5-5"},
+                    presence_beat=False)
+
+    def session_for(self, seat):
+        return self.READER_SESSION if seat == _sc.READER else "review-author-" + seat
 
     def send(self, sender, recipient, tip, lane, kind="review",
              parent=None, **extra):
         """One row, recorded by `sender` through `dispatches.add`; `extra`
         rides to it (a `decline_patch`)."""
+        if kind == "review" and parent is None:
+            extra.setdefault("task", self.review_task["id"])
         with mock.patch.dict(os.environ, {"HELM_CHAT_NAME": sender}):
             row, why = dispatches.add(
                 recipient, lane, ref=tip, repo=self.repo, kind=kind,
@@ -129,7 +146,9 @@ class AuthorBase(_sc.SourceCleanBase):
         door, and the ledger UNCHANGED when it refuses."""
         before = self.history()
         with mock.patch.object(dispatches, "_acting_author",
-                               return_value=(actor, None)):
+                               return_value=(actor, None)), \
+                mock.patch.object(home, "session_id",
+                                  return_value=self.session_for(actor)):
             out, why = dispatches.mark_hold(row["id"], CLEAN,
                                             source_clean_tip=tip or self.side)
         if out is None:
@@ -146,6 +165,8 @@ class AuthorBase(_sc.SourceCleanBase):
         state = self.state(row["id"])
         self.assertEqual(state["hold_actor"], actor)
         self.assertEqual(state["source_clean_tip"], tip or self.side)
+        self.assertIn("hold_approval", state,
+                      "the accepted hold needs exact-session authority")
 
     def refused_as_author(self, row, actor, tip=None):
         """Assert the hold is REFUSED as a LANE AUTHOR's, naming `actor`."""

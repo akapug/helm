@@ -69,7 +69,6 @@ from .seat_lifecycle_runtime import (
     _resolve_registered_pane,
     _reap_stale,
     SEAT_ROLES,
-    _LEAD_SETTINGS,
     _ROLE_ENV,
     _seat_role,
     _launch_argv,
@@ -785,6 +784,32 @@ def seat_quota_group_phrase(family):
     return seatmod.quota_group_phrase(family)
 
 
+def _where_liveness_only(seat_name, rest, row):
+    """Print a liveness row that is not an adopted pane.
+
+    A family miss is not proof the seat was launched by the metaharness.
+    A wall or a refused census is the answer `seat where` owes, and the
+    adopted LIVE line is not a substitute for it (task/3996)."""
+    from . import seat_rest
+    resting = seat_rest.display(seat_name) or None
+    if "--json" in rest:
+        print(json.dumps(dict(row, rest=resting), indent=2, sort_keys=True))
+        return 0
+    state = row.get("state") or "UNKNOWN"
+    blocked = row.get("blocked_on")
+    line = "%s: liveness %s" % (seat_name, state)
+    if blocked:
+        line += " (%s)" % blocked
+    print(line)
+    if resting:
+        print("  rest    : " + resting)
+    print("  evidence: " + str(row.get("evidence") or "UNKNOWN"))
+    detail = row.get("detail")
+    if detail:
+        print("  detail  : " + detail)
+    return 0
+
+
 def _where(seat_name, rest):
     """seat where <seat> — resolve the spawn register: harness, handle/pid,
     worktree, room, and a liveness probe (headless: the pid; pane: the handle
@@ -795,10 +820,17 @@ def _where(seat_name, rest):
         return 2
     family, err = _seat_family(seat_name)
     if err:
-        # NOT a multimodel family — but that is not the same as unknown. A claude
-        # pane orca launched never went through `seat spawn`, so it has no row
-        # here while helm's chat roster and the live process both know exactly
-        # who it is. Ask the adoption seam before refusing the name.
+        # NOT a multimodel family — but that is not the same as unknown. A
+        # claude pane orca launched never went through `seat spawn`, so it
+        # has no row here while helm's chat roster and the live process both
+        # know exactly who it is. A liveness wall or a refused census is
+        # that answer and is printed before adoption. An adopted pane, or a
+        # name with no register, still goes to the adoption seam.
+        row = seat_liveness(seat_name)
+        evidence = str((row or {}).get("evidence") or "")
+        if row and evidence not in ("no-record",) \
+                and not evidence.startswith("orca-adopted"):
+            return _where_liveness_only(seat_name, rest, row)
         return _where_adopted(seat_name, rest, err)
     d = _instance_dir(family, seat_name)
     rec = _spawn_record(d)
@@ -1071,6 +1103,8 @@ def remediation_text(remediation, owner=False):
         return ("%s; the cure is to restart this exact proxy, and the next "
                 "proxy-watch pass then measures it again"
                 % rem.get("evidence")) if owner else rem["action"]
+    if rem.get("restart") == RESTART_NOT_HELPFUL and rem.get("action"):
+        return rem["action"]
     return "remediation UNKNOWN: cannot derive whether a restart would help (%s)" \
         % (rem.get("evidence") or "no readable remediation evidence")
 
@@ -1086,6 +1120,26 @@ def upstream_remediation(state, family, seat_name):
         return _unknown_remediation(
             "our proxy refused this itself (PROXY-LOCAL-403); read the "
             "proxy's stated reason, fix it, restart and probe")
+    wall = None if err else proxywatch.live_quota_wall(
+        rec, int(time.time() * 1000))
+    if wall and rec.get("dark") is True and \
+            rec.get("state") == proxywatch._PROXY_COOLDOWN:
+        # The cooldown mirrors a vendor quota wall: a restart drops the
+        # proxy's belief and the next request meets the same spent window.
+        balance = proxywatch.quota_wall_kind(rec) == "balance"
+        return {"restart": RESTART_NOT_HELPFUL, "target": "proxy",
+                "evidence": "the local cooldown mirrors a vendor quota wall "
+                            "(%s, %s)" % (wall, rec.get("refusal_provenance")
+                                          or "provenance unrecorded"),
+                "action": ("the vendor refused on an empty balance and the "
+                           "proxy's cooldown mirrors it; a restart re-asks "
+                           "the same empty account, so the repair is a top-up "
+                           "or a plan change by the account owner")
+                if balance else
+                          ("the vendor refused on its usage quota and the "
+                           "proxy's cooldown mirrors it; a restart re-asks "
+                           "the same spent vendor window, so the repair is a "
+                           "wait for the vendor's reset")}
     if err or rec.get("dark") is not True or \
             rec.get("state") != proxywatch._PROXY_COOLDOWN:
         return _unknown_remediation(
@@ -1129,9 +1183,14 @@ def _with_remediation(row):
     """Attach one capability verdict derived from this exact liveness row."""
     state = row.get("state")
     if state == "WALLED":
+        # THE RECORD IS KEYED BY THE PROXY'S STORAGE NAME. A rename keeps
+        # that key and the row above keeps the roster name the caller asked
+        # about, so the restart verdict has to name the register that holds
+        # the clock (task/2476). Absent, the asked name is that key.
         row["remediation"] = upstream_remediation(
             row.pop("upstream_remediation_state", None),
-            row.pop("upstream_family", None), row.get("seat"))
+            row.pop("upstream_family", None),
+            row.pop("upstream_seat", None) or row.get("seat"))
         return row
     restart, target, why = _LIVENESS_REMEDIATION.get(
         state, (RESTART_UNKNOWN, None,
@@ -1224,6 +1283,47 @@ def _current_prompt_line(tail):
     """
     lines = [_PANE_ANSI.sub("", line) for line in (tail or "").splitlines()]
     return _current_prompt_at([line for line in lines if line.strip()])[1]
+
+
+def _current_prompt_body_raw(tail):
+    """The styled body of the current composer row, with the SGR styling the
+    locator would strip KEEPT, or None when the row cannot be read. The raw
+    twin of `composer_body(_current_prompt_line(tail))`: the SAME row, located
+    on the same stripped view, but its bytes reach the caller with their
+    faint/grey rendering intact, so a reader can tell a Claude Code suggestion
+    (drawn dim) from a person's plain draft. task/4001.
+
+    A person's text arrives with no SGR at all, and a mixed row (a styled run
+    beside a plain one) is exactly the case this exists to refuse: the caller
+    must keep its draft refusal when it cannot prove the whole body is
+    rendered as a suggestion.
+    """
+    raw = (tail or "").splitlines()
+    stripped = [_PANE_ANSI.sub("", line) for line in raw]
+    visible = [line for line in stripped if line.strip()]
+    at, _line = _current_prompt_at(visible)
+    if at is None:
+        return None
+    # `at` indexes the NON-EMPTY stripped rows; walk back to the raw row that
+    # produced it so the SGR is the pane's own bytes, not a re-encode.
+    n, raw_line = -1, None
+    for r, s in zip(raw, stripped):
+        if not s.strip():
+            continue
+        n += 1
+        if n == at:
+            raw_line = r
+            break
+    if raw_line is None:
+        return None
+    # The glyph or the rule it follows may itself be styled; strip leading SGR
+    # so the body separator is found, but keep every code from the body on.
+    body = re.sub(r"^(?:\x1b\[[0-9;]*m)*", "", raw_line)
+    if _PANE_PROMPT.match(body):
+        # the `❯`-glyph form: drop the glyph and its U+00A0 separator, keep SGR
+        return re.sub(r"^\s*❯\s*", "", body)
+    # the rule-attached form (`──<body>`): drop the leading rule, keep SGR
+    return re.sub(r"^\s*[─━]{2}", "", body)
 
 
 def _current_prompt_at(visible):
@@ -2183,6 +2283,35 @@ def _liveness_from_orcaadopt(seat_name, census=None, read_pane=True):
     return row
 
 
+def _storage_identity(seat_name):
+    """(storage, record, refusal) when a spawn register declares `seat_name`
+    under a different key. refusal is the walk's own refusal and storage
+    is unset beside it; (None, None, None) is no register.
+
+    THE DIRECTORY KEY IS NOT THE ROSTER NAME. `rename_register_identity`
+    leaves the register keyed by the seat's original name and carries the
+    canonical one in `identity`. `_identity_register` is that inverse. The
+    keys differ exactly: a case-only rename is a different directory, and
+    folding case away drops the wall that still lives under the original
+    spelling (task/3989). A refusal is not a miss: the caller reports
+    UNKNOWN and does not adopt the pane or pick a key the census did not
+    prove (task/3990). Two claimants, an unreadable tree, or no register
+    are not a key — the caller keeps the name it was asked, which is the
+    answer it already had.
+    """
+    try:
+        storage, _d, rec, refusal = _runtime_impl._identity_register(seat_name)
+    except Exception:                    # noqa: BLE001 — unreadable is not absent
+        return None, None, "seat identity register walk failed; ownership is UNKNOWN"
+    if refusal:
+        return None, None, refusal
+    if not storage or not isinstance(rec, dict):
+        return None, None, None
+    if str(storage) == str(seat_name or ""):
+        return None, None, None
+    return storage, rec, None
+
+
 def _seat_liveness_row(seat_name, upstream_sample=(), repair=True):
     """The rich liveness state of one seat: a dict with `state` (one of
     _STATE_NAMES), `blocked_on` (short string or None), and `evidence` (how we
@@ -2207,15 +2336,47 @@ def _seat_liveness_row(seat_name, upstream_sample=(), repair=True):
       - stale handle             -> UNKNOWN (evidence stale-handle): the register
                                     names a pane the harness no longer lists
       - mid-restart / spawn lock -> UNKNOWN (evidence spawn-lock)
+      - identity register refuses -> UNKNOWN (evidence identity-refused):
+                                    a partial census or two claimants names
+                                    no owner, so the pane is not adopted LIVE
+      - renamed roster name      -> the register's ORIGINAL key, where the
+                                    proxy log and the proxywatch record still
+                                    live; the row's seat stays the name asked
     """
+    lookup = seat_name
     family, err = _seat_family(seat_name)
+    d = rec = None
+    if not err:
+        d = _instance_dir(family, seat_name)
+        rec = _spawn_record(d)
+    # A RENAME DOES NOT MOVE THE PROXY. The roster name has no instance
+    # directory of its own; the spawn register, the proxy log and the
+    # proxywatch seat record stay under the original storage key, with the
+    # new name in `identity`. Liveness asked by the roster spelling resolves
+    # that key, or it misses the directory, the family grammar refuses the
+    # new name, and the adopted pane reads LIVE while the family is walled
+    # (task/2476). The register
+    # walk is the miss path only: a seat whose own directory answers never
+    # pays it. An unreadable tree is not a key, and it is not adopted
+    # LIVE (task/3990): the refusal is UNKNOWN, with no owner guessed.
+    if err or rec is None:
+        storage, _stored, refused = _storage_identity(seat_name)
+        if refused:
+            return {"seat": seat_name, "state": "UNKNOWN",
+                    "blocked_on": None, "evidence": "identity-refused",
+                    "detail": refused}
+        if storage:
+            fam, ferr = _seat_family(storage)
+            if not ferr:
+                lookup = storage
+                family, err = fam, None
+                d = _instance_dir(family, lookup)
+                rec = _spawn_record(d)
     if err:
         return _liveness_from_orcaadopt(seat_name,
                                         read_pane=True) or {
             "seat": seat_name, "state": "UNKNOWN", "blocked_on": None,
             "evidence": "no-record", "detail": err}
-    d = _instance_dir(family, seat_name)
-    rec = _spawn_record(d)
     if rec is None:
         return {"seat": seat_name, "state": "UNKNOWN", "blocked_on": None,
                 "evidence": "no-record",
@@ -2229,7 +2390,7 @@ def _seat_liveness_row(seat_name, upstream_sample=(), repair=True):
                 "evidence": "headless",
                 "detail": "headless seat has no pane tail to read; /proc is "
                           "forbidden as a liveness probe"}
-    ad, handle, detail = _resolve_registered_pane(seat_name, d=d,
+    ad, handle, detail = _resolve_registered_pane(lookup, d=d,
                                                  repair=repair)
     if handle is None:
         return {"seat": seat_name, "state": "UNKNOWN", "blocked_on": None,
@@ -2267,7 +2428,7 @@ def _seat_liveness_row(seat_name, upstream_sample=(), repair=True):
                           "derive a destructive recovery action" % seat_name}
     from . import poolwall
     state, blocked_on = _classify_pane_tail(
-        tail, observed=poolwall.pane_anchor(family, seat_name))
+        tail, observed=poolwall.pane_anchor(family, lookup))
     # THE ESCAPE DECISION IS COMPUTED WHERE THE TAIL IS, AND ONLY THE DECISION
     # TRAVELS. The actuator needs to know which option to press, and the option
     # text lives in the pane — but a pane viewport is raw external content, so
@@ -2294,7 +2455,7 @@ def _seat_liveness_row(seat_name, upstream_sample=(), repair=True):
         # bare composer; the seat's proxy.log holds the same refusal with a
         # timestamp, and the delivery pause already holds every keystroke on
         # it. The row says the same thing the pause does, with the instant.
-        wall, _why = poolwall.seat_wall(seat_name, family=family)
+        wall, _why = poolwall.seat_wall(lookup, family=family)
         if wall is not None:
             row = {"seat": seat_name, "state": "BLOCKED_ON_QUOTA",
                    "blocked_on": poolwall.blocked_on(wall),
@@ -2311,7 +2472,7 @@ def _seat_liveness_row(seat_name, upstream_sample=(), repair=True):
         aggregate, aggregate_err = proxywatch.upstream_record(
             snapshot, family) if upstream else (None, _err)
         measured, measured_err = proxywatch.upstream_seat_record(
-            snapshot, family, seat_name) if upstream else (None, _err)
+            snapshot, family, lookup) if upstream else (None, _err)
         aggregate_dark = not aggregate_err and aggregate.get("dark") is True
         seat_dark = not measured_err and measured.get("dark") is True
         # ONE PROXY'S CREDENTIAL FAILING IS THAT SEAT'S WALL even while its
@@ -2324,12 +2485,15 @@ def _seat_liveness_row(seat_name, upstream_sample=(), repair=True):
                 measured["state"], measured.get("since") or "?")
             if measured.get("detail"):
                 wall += " — %s" % measured["detail"]
-            return {"seat": seat_name, "state": "WALLED", "blocked_on": wall,
-                    "evidence": "pane-tail+proxywatch",
-                    "upstream_family": family,
-                    "upstream_remediation_state": snapshot,
-                    "detail": "the pane is idle, but its proxy is refusing work (%s)" % (
-                        measured.get("detail") or "upstream dark")}
+            row = {"seat": seat_name, "state": "WALLED", "blocked_on": wall,
+                   "evidence": "pane-tail+proxywatch",
+                   "upstream_family": family,
+                   "upstream_remediation_state": snapshot,
+                   "detail": "the pane is idle, but its proxy is refusing work (%s)" % (
+                       measured.get("detail") or "upstream dark")}
+            if lookup != seat_name:
+                row["upstream_seat"] = lookup
+            return row
         # A TURN THAT ENDED ON AN UPSTREAM ERROR, OVER THIS SEAT'S OWN PROXY
         # READING HEALTHY AGAIN. The pane is IDLE and stays IDLE; the row
         # carries the dead turn beside the state, because nothing starts the
@@ -2350,7 +2514,7 @@ def _seat_liveness_row(seat_name, upstream_sample=(), repair=True):
         # "(reset in 4m13s)" is the proxy's own short cooldown; when the log
         # shows the upstream refused first (a spent window, an empty balance),
         # that instant is not the wall's end, and the row says what is.
-        wall, _why = poolwall.seat_wall(seat_name, family=family)
+        wall, _why = poolwall.seat_wall(lookup, family=family)
         if wall is not None and wall.get("cause"):
             blocked_on = poolwall.blocked_on(wall)
     row = {"seat": seat_name, "state": state, "blocked_on": blocked_on,

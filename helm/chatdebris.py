@@ -2,12 +2,15 @@
 """The chat directory holds rooms; this module keeps it from holding debris.
 
 WHY IT EXISTS. `chat.list_rooms()` is one getdents over the FLAT chat
-directory, and the PostToolUse delivery hook asks it on every tool call of
+directory, and the PostToolUse delivery hook asked it on every tool call of
 every seat (seats_delivery.deliver_any -> seats_roomscan._scan_rooms). The
 cost is set by EVERY entry in the directory, not by the rooms it returns.
 Measured on the live bus: 108,177 entries for 468 rooms, one
 listing 0.28s warm, delivery p50 630ms against a 2s budget, and the top
-timeout site the listing line itself.
+timeout site the listing line itself. Since task/3848 a delivery pass reads
+the listing the last pass made (`seats_roomscan.room_names`) and lists only
+when a room is created or that listing is 30 s old; every listing that does
+run still pays for every entry, which is why the directory is kept small.
 
 WHAT THE ENTRIES WERE, AND WHICH PRODUCER MADE EACH.
   * 49,718 `<cursor>.lock` siblings. `_cursor_locks` opened one per cursor
@@ -39,7 +42,8 @@ touches every cursor listing on the delivery, rotation, rename, restore and
 gc paths at once. Neither is small. Bounding what the directory holds is: the
 sibling locks go (gc's `chat-cursor-locks` row), cursors of a seat session
 that is over go (`chat-cursors` for dead sessions, `chat-unpaired-cursors`
-for a live session its seat no longer runs), and a meld room idle past the
+for a live session its seat no longer runs), the steer latches of a dead
+session go (`chat-steer-latches`), and a meld room idle past the
 bound, or a finished meld a day after its last post, is archived off the bus
 with every cursor it carried (`helm chat retire-rooms`). The restore honours
 the retirement, so a reboot does not bring the rooms back. `helm doctor` counts entries per room and
@@ -58,7 +62,8 @@ LOCK_EXT = ".lock"
 DAY = 86400
 IDLE_DAYS = 7                 # a meld room this long without a post is over
 CLOSED_IDLE_DAYS = 1          # a FINISHED meld's room this long quiet is over
-RETIRE_PREFIX = "meld-"       # the only room kind retirement may touch
+RETIRE_PREFIX = "meld-"       # a meld room; a task's pair meld is the other
+                              # kind retirement may touch (_meld_room)
 KEEP_PREFIX = "meld-0-standing-"  # a pair's standing room stays open (task/3560)
 PER_ROOM_WARN = 200           # healthy: 2 x (rostered seats + live sessions)
 ENTRIES_WARN = 20000          # ~2.6us/entry measured: 20k is ~50ms a listing
@@ -256,6 +261,41 @@ def unpaired_session_cursors(root=None, liveness=None, rows=None):
     return sorted(out)
 
 
+# ── (b2) the steer latches of a dead session ───────────────────────────────
+
+#: chat._steer_latch's name: ptusteer.<slugged steer>.<session key>[.a<agent
+#: key>], each key a 16-hex blake2b digest (chat._latch_key).
+_LATCH = re.compile(r"^ptusteer\.[A-Za-z0-9_-]+\.([0-9a-f]{16})"
+                    r"(?:\.a[0-9a-f]{16})?$")
+
+
+def dead_steer_latches(root=None, live=None, waiters=None):
+    """The once-per-context steer latches whose SESSION is dead. -> [paths]
+
+    A latch (chat.steer_unfired) is one file per (steer, session[, subagent])
+    in the chat dir, and its only reaper was chat.forget_steers at the SAME
+    session's next context boundary. A session that ended never has one, so
+    every latch it spent stayed in the directory every `list_rooms` reads,
+    and the doors add one per bound rule said. Dead is chat._live_sessions'
+    answer, the one the cursor rows read; the name carries a hash of the
+    session id, so each live id is hashed to compare. Reaping a latch of a
+    live session costs one repeated line at worst, never a lost one.
+
+    No latch in the directory asks no liveness. An unprovable liveness
+    raises: gc shows the row as an error, never as an empty stream."""
+    root = root or chat.chat_dir()
+    found = []
+    for name in _listing(root):
+        m = _LATCH.match(name) if name.startswith("ptusteer.") else None
+        if m:
+            found.append((os.path.join(root, name), m.group(1)))
+    if not found:
+        return []
+    keys = {chat._latch_key(str(s)) for s in chat._live_sessions(live, waiters)
+            if s}
+    return sorted(path for path, key in found if key not in keys)
+
+
 # ── (c) retire idle meld rooms ──────────────────────────────────────────────
 
 
@@ -304,6 +344,13 @@ def _standing_pair_is_kept(room):
     return all(meld_standing.known_seat(p) for p in pair)
 
 
+def _meld_room(room):
+    """A room retirement may touch: a `meld-` room, or a task's pair meld,
+    whose `<scope>-<N>` name carries no prefix (`review_door.is_pair_room`)."""
+    from . import review_door
+    return room.startswith(RETIRE_PREFIX) or review_door.is_pair_room(room)
+
+
 def _finished(room):
     """meld.finished, and any failure to answer is NOT finished."""
     from . import meld
@@ -320,7 +367,7 @@ def _retirable(idle_days=IDLE_DAYS, now=None):
     now = time.time() if now is None else now
     out = []
     for room in chat.list_rooms():
-        if not room.startswith(RETIRE_PREFIX):
+        if not _meld_room(room):
             continue
         try:
             idle = now - os.stat(chat.room_path(room)).st_mtime
@@ -451,7 +498,7 @@ def retire_room(room, idle_days=IDLE_DAYS, now=None, closed=False):
     from .seats_cursor import (_cursor_estate_locks, _cursor_locks,
                                _cursor_room_locks, _cursor_topology_lock)
     now = time.time() if now is None else now
-    if not room.startswith(RETIRE_PREFIX):
+    if not _meld_room(room):
         return None, "not a meld room"
     if room.startswith(KEEP_PREFIX) and _standing_pair_is_kept(room):
         return None, "a pair's standing room stays open while both of its pair " \

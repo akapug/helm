@@ -22,8 +22,9 @@ import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from helm import (dispatches, pk, providers, remote_policy,  # noqa: E402
-                  remote_relay, remote_session as rs, seats)
+from helm import (dispatches, home, pk, providers, remote_policy,  # noqa: E402
+                  remote_relay, remote_session as rs, review_findings, seats,
+                  tasks)
 from tests._tmphome import (dispatch_home, helm_tree,  # noqa: E402
                             pin_dispatch_home, pin_live_seats)
 
@@ -75,6 +76,10 @@ class RelayBase(unittest.TestCase):
         run_git(self.repo, "checkout", "-q", self.main)
         pin_dispatch_home(self, self.repo)
         pin_live_seats(self)
+        task, why = tasks.add("the reviewed lane", "integrator",
+                              project="fixture", force_new=True)
+        self.assertIsNone(why, why)
+        self.task = task["id"]
         self.claude_home = os.path.join(self.tmp, "claude-home")
         os.makedirs(self.claude_home)
         with open(os.path.join(self.claude_home, ".claude.json"), "w") as f:
@@ -188,7 +193,8 @@ class RelayBase(unittest.TestCase):
             row, why, _posted = dispatches.send(
                 recipient, lane, brief, tip or self.tip, repo=self.repo,
                 kind="review", sign=False, new_work=supersedes is None,
-                supersedes=supersedes)
+                supersedes=supersedes,
+                task=self.task if supersedes is None else None)
         return row, why
 
     def row(self, rid):
@@ -264,6 +270,15 @@ class RelayBase(unittest.TestCase):
     def acted(self, row, now=None):
         return dict(remote_relay.tick(now=now)["actions"]).get(row["id"])
 
+    def assert_no_receipt_hold(self, rid):
+        """A clean remote read carries no fab run, so the hold door refuses
+        its source-clean claim (task/4103) and the relay records the read
+        as an ordinary hold that names the missing receipt."""
+        got = self.row(rid)
+        self.assertEqual(got["status"], "held")
+        self.assertFalse(got.get("source_clean_tip"))
+        self.assertIn("no fab receipt", got.get("hold_reason") or "")
+
     def exhaust_nudges(self, row):
         """Two nudges, the cap, and the epoch of the later one."""
         t = time.time()
@@ -287,6 +302,83 @@ class RelayBase(unittest.TestCase):
 
 
 class SendDoorTest(RelayBase):
+
+    def test_a_taskless_cloud_build_cannot_launch_an_uncurable_review(self):
+        with dispatch_home(self.repo):
+            build, why, _posted = dispatches.send(
+                SEAT, "lane-unclaimed", "Build the artifact", self.tip,
+                repo=self.repo, kind="build", new_work=True, sign=False)
+        self.assertIsNone(why, why)
+        self.assertNotIn("task", build)
+        with mock.patch.object(remote_relay, "launch_build",
+                               return_value="cloud launch attempted") as launch:
+            action = self.acted(build)
+        self.assertIn("task", action)
+        self.assertIn("new BUILD", action)
+        launch.assert_not_called()
+
+    def test_a_launched_taskless_build_is_attended_not_held(self):
+        with dispatch_home(self.repo):
+            build, why, _posted = dispatches.send(
+                SEAT, "lane-legacy-build", "Build the artifact", self.tip,
+                repo=self.repo, kind="build", new_work=True, sign=False)
+        self.assertIsNone(why, why)
+        sid = "session_01RelayTest0001"
+        launch = {"event": "launch", "kind": "build", "row": build["id"],
+                  "sid": sid}
+        with mock.patch.object(rs, "sessions", return_value=(
+                {sid: [launch]}, {build["id"]: sid})), \
+                mock.patch.object(rs, "infer_state",
+                                  return_value=(rs.ANSWERED, None)), \
+                mock.patch.object(remote_relay, "attend_build",
+                                  return_value="attended") as attend:
+            action = self.acted(build)
+        self.assertEqual(action, "attended")
+        attend.assert_called_once()
+        self.assertEqual(self.row(build["id"])["status"], "open")
+
+    def test_an_archived_taskless_build_cannot_relaunch(self):
+        with dispatch_home(self.repo):
+            build, why, _posted = dispatches.send(
+                SEAT, "lane-legacy-build", "Build the artifact", self.tip,
+                repo=self.repo, kind="build", new_work=True, sign=False)
+        self.assertIsNone(why, why)
+        sid = "session_01RelayTest0001"
+        launch = {"event": "launch", "kind": "build", "row": build["id"],
+                  "sid": sid}
+        with mock.patch.object(rs, "sessions", return_value=(
+                {sid: [launch]}, {build["id"]: sid})), \
+                mock.patch.object(rs, "infer_state",
+                                  return_value=(rs.ARCHIVED, None)), \
+                mock.patch.object(remote_relay, "launch_build",
+                                  return_value="relaunch attempted") as relaunch:
+            action = self.acted(build)
+        self.assertIn("task before launch", action)
+        self.assertEqual(self.row(build["id"])["status"], "held")
+        relaunch.assert_not_called()
+
+    def test_a_running_build_is_attended_when_the_task_ledger_is_unreadable(self):
+        with dispatch_home(self.repo):
+            build, why, _posted = dispatches.send(
+                SEAT, "lane-running-build", "Build the artifact", self.tip,
+                repo=self.repo, kind="build", new_work=True, sign=False,
+                task=self.task)
+        self.assertIsNone(why, why)
+        sid = "session_01RelayTest0001"
+        launch = {"event": "launch", "kind": "build", "row": build["id"],
+                  "sid": sid}
+        with mock.patch.object(tasks, "snapshot", side_effect=OSError(
+                "task ledger unavailable")), \
+                mock.patch.object(rs, "sessions", return_value=(
+                    {sid: [launch]}, {build["id"]: sid})), \
+                mock.patch.object(rs, "infer_state",
+                                  return_value=(rs.ANSWERED, None)), \
+                mock.patch.object(remote_relay, "attend_build",
+                                  return_value="attended") as attend:
+            action = self.acted(build)
+        self.assertEqual(action, "attended")
+        attend.assert_called_once()
+        self.assertEqual(self.row(build["id"])["status"], "open")
 
     def test_a_remote_seat_is_admitted_and_an_unknown_name_still_refused(self):
         seats.write_roster("some-seat", presence_beat=False)
@@ -481,8 +573,8 @@ class UndeliveredTest(RelayBase):
         self.assertEqual(len(self.delivered), sent)
         # A late report still belongs to the OPEN source row and records there.
         self.report(row)
-        self.assertIn("source-clean-hold", self.acted(row, when + 100))
-        self.assertEqual(self.row(row["id"])["source_clean_tip"], self.tip)
+        self.assertIn("recorded APPROVE as hold", self.acted(row, when + 100))
+        self.assert_no_receipt_hold(row["id"])
 
     def test_an_account_that_moved_after_the_nudge_stays_nudged(self):  # noqa: VACUOUS_ASSERTION — waiting (NUDGED) on the still-open row is the positive control; no dispatcher notice is what that state posts
         row = self.launched()
@@ -513,15 +605,81 @@ class UndeliveredTest(RelayBase):
         self.assertEqual(len(self.journal("launch")), 2)
 
 
+class UndeliveredToAnotherProjectsLeadTest(RelayBase):
+    """THE DISPATCHER IS ANOTHER PROJECT'S LEAD (task/4039). A lead dispatches
+    a cloud read of a lane in a project it does not lead; the relay's
+    undelivered notice goes BACK to that lead, about that row. Under the real
+    lead-context door (not the fixture's pin) a plain row to that lead from
+    the remote seat is refused, and the notice is admitted: it is the lead's
+    own work coming home, which the door reads off the ledger."""
+
+    def setUp(self):
+        super().setUp()
+        dispatches._lead_context_refusal = self._real_lead_context_refusal
+        other = os.path.join(self.tmp, "other-project")
+        os.makedirs(other)
+        path = home.registry_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump({"version": 1, "projects": {
+                "fixture": {"path": os.path.realpath(self.repo)},
+                "otherproj": {"path": os.path.realpath(other)}}}, handle)
+        seats.write_roster(
+            "integrator", cwd=other, home_room="otherproj",
+            home_room_source="explicit", presence_beat=False,
+            runtime={"agent_harness": "claude", "family": "claude",
+                     "backend": "native"})
+
+    def test_RED_a_plain_row_from_the_remote_seat_to_that_lead_is_refused(self):  # noqa: VACUOUS_ASSERTION — the refusal is asserted by its words; the notice arm below proves the same recipient, repo and sender land when the row answers its own
+        with dispatch_home(self.repo), remote_relay.as_seat(SEAT):
+            row, why, _posted = dispatches.send(
+                "integrator", "not-a-notice", "Unrelated work.", self.tip,
+                repo=self.repo, kind="review", sign=False, new_work=True,
+                force=True)
+        self.assertIsNone(row, why)
+        self.assertIn("a-leads-context-holds-only-its-own-projects-work", why)
+        self.assertIn("otherproj", why)
+
+    def test_RED_the_undelivered_notice_reaches_its_dispatcher(self):
+        row = self.launched()
+        self.assertEqual(row["sender"], "integrator")
+        last = self.exhaust_nudges(row)
+        self.credit(last, 6.0)
+        self.credit(last + 1800, 6.0)
+        action = self.acted(row, last + 1900)
+        self.assertIn("source review remains open", action)
+        posted = self.undelivered_rows()
+        self.assertEqual(len(posted), 1, action)
+        self.assertEqual(posted[0]["recipient"], "integrator")
+        self.assertEqual(posted[0]["sender"], SEAT)
+        errored = [e for e in self.journal("undelivered-posted")
+                   if e.get("error")]
+        self.assertEqual(errored, [])
+        # ONE TICK LATER NOTHING RETRIES: the notice stands, unerrored.
+        self.acted(row, last + 1950)
+        self.assertEqual(len(self.undelivered_rows()), 1)
+        self.assertEqual([e for e in self.journal("undelivered-posted")
+                          if e.get("error")], [])
+
+    def test_RED_a_marker_naming_another_row_admits_nothing(self):  # noqa: VACUOUS_ASSERTION — the notice arm above is the control: the marker naming the row it answers lands
+        row = self.launched()
+        with dispatch_home(self.repo), remote_relay.as_seat(SEAT):
+            got, why, _posted = dispatches.send(
+                "integrator", "forged-notice", "Not the row's notice.",
+                self.tip, repo=self.repo, kind="review", sign=False,
+                new_work=True, force=True, answers_row=row["id"] + "x")
+        self.assertIsNone(got, why)
+        self.assertIn("a-leads-context-holds-only-its-own-projects-work", why)
+
+
 class RecordTest(RelayBase):
 
-    def test_a_same_model_clean_read_on_a_reversible_lane_is_a_source_clean_hold(self):
+    def test_a_same_model_clean_read_on_a_reversible_lane_holds_and_names_its_missing_receipt(self):
         row = self.launched()
         self.report(row)
-        self.assertIn("source-clean-hold", self.acted(row))
+        self.assertIn("recorded APPROVE as hold", self.acted(row))
+        self.assert_no_receipt_hold(row["id"])
         got = self.row(row["id"])
-        self.assertEqual(got["status"], "held")
-        self.assertEqual(got["source_clean_tip"], self.tip)
         self.assertEqual(got["hold_actor"], SEAT)
         rec = self.journal("recorded")[0]
         self.assertEqual((rec["class"], rec["relation"], rec["lane"], rec["arm"]),
@@ -549,10 +707,140 @@ class RecordTest(RelayBase):
         self.report(row)
         with mock.patch.object(remote_relay, "author_facts",
                                return_value=("claude-fable-5", "claude")):
-            self.assertIn("source-clean-hold", self.acted(row))
-        self.assertEqual(self.row(row["id"])["source_clean_tip"], self.tip)
+            self.assertIn("recorded APPROVE as hold", self.acted(row))
+        self.assert_no_receipt_hold(row["id"])
         self.assertEqual(self.journal("recorded")[0]["relation"],
                          remote_policy.CROSS_MODEL)
+
+    def test_an_uncured_FIX_files_its_reported_findings_under_the_reviewed_task(self):  # noqa: VACUOUS_ASSERTION — a second tick must add no event; the first tick's named children and recorded event are asserted positively
+        row = self.launched()
+        findings = ["[BLOCKING] [MEASURED] wrong value / app.py:2 / "
+                    "run -> 2 / ran it / print 3",
+                    "[MINOR] [INFERRED] the error message omits the value"]
+        self.report(row, "FIX", findings)
+        self.assertIn("fix-verdict", self.acted(row))
+        got = self.row(row["id"])
+        self.assertEqual((got["status"], got["finding_count"]),
+                         ("verdict", 2))
+        named = ["wrong value / app.py:2 / run -> 2 / ran it / print 3",
+                 "the error message omits the value"]
+        self.assertEqual(got["findings"], named)
+        children = [r for r in tasks.rows().values()
+                    if r.get("found_in") == row["id"]]
+        self.assertEqual({r["title"] for r in children}, set(named))
+        self.assertEqual({r["continues"] for r in children}, {self.task})
+        recorded = self.journal("recorded")
+        self.assertEqual(len(recorded), 1)
+        self.assertEqual(recorded[0]["event"], "recorded")
+        self.acted(row)
+        after = [r for r in tasks.rows().values()
+                 if r.get("found_in") == row["id"]]
+        self.assertEqual({r["title"] for r in after}, set(named))
+        self.assertEqual(len(after), 2)
+        self.assertEqual(len(self.journal("recorded")), 1)
+
+    def test_a_cloud_FIX_retries_after_the_verdict_but_before_its_journal(self):
+        row = self.launched()
+        title = "wrong value / app.py:2 / run -> 2"
+        self.report(row, "FIX", ["[BLOCKING] [MEASURED] " + title])
+        append = rs.append
+
+        def crash_after_verdict(event):
+            if event.get("event") == "recorded":
+                raise RuntimeError("process exited before the recorded journal")
+            return append(event)
+
+        with mock.patch.object(remote_relay, "record", wraps=remote_relay.record) as recording:
+            with mock.patch.object(rs, "append", side_effect=crash_after_verdict):
+                self.assertIn("error: RuntimeError: process exited", self.acted(row))
+        args = recording.call_args.args  # retry can retain the pre-verdict row
+        self.assertEqual(self.row(row["id"])["findings"], [title])
+        self.assertEqual(len(self.journal("recorded")), 0)
+        filed = [r for r in tasks.rows().values()
+                 if r.get("found_in") == row["id"]]
+        self.assertEqual(len(filed), 1)
+        self.assertIn("fix-verdict", remote_relay.record(
+            *args[:7], rs.read_journal(), False))
+        self.assertEqual(len(self.journal("recorded")), 1)
+        self.assertEqual(self.row(row["id"])["findings"], [title])
+        self.assertEqual([r["id"] for r in tasks.rows().values()
+                          if r.get("found_in") == row["id"]],
+                         [filed[0]["id"]])
+        changed = dict(args[5])
+        changed["findings"] = [dict(changed["findings"][0],
+                                    text="another value / app.py:2")]
+        self.assertIn("already has a verdict", remote_relay.record(
+            *args[:5], changed, args[6], rs.read_journal(), False))
+        self.assertEqual(len(self.journal("recorded")), 1)
+
+    def test_a_later_cloud_FIX_carries_the_still_open_finding(self):
+        first = self.launched()
+        finding = "[BLOCKING] [MEASURED] wrong value / app.py:2 / run -> 2"
+        self.report(first, "FIX", [finding])
+        self.assertIn("fix-verdict", self.acted(first))
+        filed = [r for r in tasks.rows().values()
+                 if r.get("found_in") == first["id"]]
+        self.assertEqual(len(filed), 1)
+        run_git(self.repo, "checkout", "-q", "lane-x")
+        next_tip = self.commit("app.py", "print(3)", "try the fix")
+        run_git(self.repo, "checkout", "-q", self.main)
+        second = self.launched(tip=next_tip, supersedes=first["id"])
+        new = "error message still omits the value"
+        self.report(second, "FIX", [finding, "[MINOR] [MEASURED] " + new],
+                    cid=12)
+        self.assertIn("fix-verdict", self.acted(second))
+        got = self.row(second["id"])
+        self.assertEqual(got["findings_carried"], [filed[0]["id"]])
+        self.assertEqual(got["findings"], [new])
+        children = [r for r in tasks.rows().values()
+                    if r.get("found_chain") == first["id"]]
+        self.assertEqual({r["title"] for r in children},
+                         {filed[0]["title"], new})
+        self.assertEqual(len(children), 2)
+        titles = [filed[0]["title"], new]
+        self.assertEqual(review_findings.reported_work(self.row(second["id"]), titles),
+                         ([new], [filed[0]["id"]], None))
+        _closed, why = tasks.close(filed[0]["id"], "cured after the second read")
+        self.assertIsNone(why, why)
+        self.assertEqual(review_findings.reported_work(self.row(second["id"]), titles),
+                         ([new], [filed[0]["id"]], None))
+        self.assertEqual(second["status"], "open")
+        self.assertEqual(review_findings.reported_work(second, titles),
+                         ([new], [filed[0]["id"]], None))
+
+    def test_an_overlong_report_title_is_bounded_without_losing_its_work(self):
+        row = self.launched()
+        self.report(row, "FIX", ["[BLOCKING] [MEASURED] " + "x" * 900])
+        self.assertIn("fix-verdict", self.acted(row))
+        title = "x" * (review_findings.TEXT_CAP - 3) + "..."
+        self.assertEqual(self.row(row["id"])["findings"], [title])
+        self.assertEqual([r["title"] for r in tasks.rows().values()
+                          if r.get("found_in") == row["id"]], [title])
+        self.assertEqual(len(self.journal("recorded")), 1)
+
+    def test_report_titles_that_collide_after_parsing_file_distinct_tasks(self):
+        row = self.launched()
+        self.report(row, "FIX", ["[BLOCKING] [INFERRED] same title\n"
+                                 "  first detail",
+                                 "[MINOR] [MEASURED] same title\n"
+                                 "  second detail"])
+        self.assertIn("fix-verdict", self.acted(row))
+        named = ["same title", "same title (finding 2)"]
+        self.assertEqual(self.row(row["id"])["findings"], named)
+        self.assertEqual(sorted(r["title"] for r in tasks.rows().values()
+                                if r.get("found_in") == row["id"]), named)
+
+    def test_a_generated_title_does_not_take_another_finding_title(self):
+        row = self.launched()
+        self.report(row, "FIX", ["[BLOCKING] [MEASURED] same title (finding 3)",
+                                 "[MINOR] [MEASURED] same title",
+                                 "[MINOR] [MEASURED] same title"])
+        self.assertIn("fix-verdict", self.acted(row))
+        named = ["same title (finding 3)", "same title",
+                 "same title (finding 3.2)"]
+        self.assertEqual(self.row(row["id"])["findings"], named)
+        self.assertEqual(sorted(r["title"] for r in tasks.rows().values()
+                                if r.get("found_in") == row["id"]), sorted(named))
 
     def test_a_FIX_with_a_cure_records_the_reauthored_patch_tip(self):
         row = self.launched()
@@ -573,6 +861,9 @@ class RecordTest(RelayBase):
         got = self.row(row["id"])
         self.assertEqual((got["status"], got["polarity"], got["finding_count"]),
                          ("verdict", "fix", 1))
+        self.assertFalse(got.get("findings"))
+        self.assertFalse([r for r in tasks.rows().values()
+                          if r.get("found_in") == row["id"]])
         self.assertEqual(got["patch_author"], SEAT)
         self.assertEqual(tuple(got.get("worse_than_main_paths") or ()),
                          ("app.py",))
@@ -659,6 +950,8 @@ class DropTest(RelayBase):
         with mock.patch.object(pk, "now_ts",
                                return_value=pk.epoch_ts(t + 1950)):
             self.assertIn("idle-nudge sent", self.acted(row, t + 1950))
+        self.assertEqual(self.journal("deliver")[-1]["ts"],
+                         pk.epoch_ts(t + 1950))
         self.assertIn("CHECK-IN", self.delivered[-1])
         self.assertIn("waiting (NUDGED)", self.acted(row, t + 2100))
         self.assertEqual(len(self.delivered), 1)
@@ -715,9 +1008,9 @@ class DropTest(RelayBase):
         self.report(second, cid=21)
         out = dict(remote_relay.tick()["actions"])
         self.assertIn("superseded", out[first["id"]])
-        self.assertIn("source-clean-hold", out[second["id"]])
+        self.assertIn("recorded APPROVE as hold", out[second["id"]])
         self.assertEqual(self.row(first["id"])["status"], "open")
-        self.assertEqual(self.row(second["id"])["source_clean_tip"], tip2)
+        self.assert_no_receipt_hold(second["id"])
         # the recorded session's branches are gone: the launch's and the
         # re-read's, base, cure and report alike
         self.assertEqual(self.drop_branches(), [])
@@ -814,8 +1107,8 @@ class BranchTransportTest(RelayBase):
                 % (remote_relay.label_of(row), self.tip[:12], EMAIL))
         self.session_pushes(row, branch + "-report",
                             {"REVIEW_REPORT.md": (body, "text")}, "report")
-        self.assertIn("source-clean-hold", self.acted(row))
-        self.assertEqual(self.row(row["id"])["source_clean_tip"], self.tip)
+        self.assertIn("recorded APPROVE as hold", self.acted(row))
+        self.assert_no_receipt_hold(row["id"])
         rec = self.journal("report")[0]
         self.assertEqual(rec["comment"], "branch:%s-report" % branch)
         self.assertEqual(self.drop_branches(), [])
@@ -837,7 +1130,7 @@ class BranchTransportTest(RelayBase):
             return delete(workdir, expected, push_repo)
 
         with mock.patch.object(rs, "delete_branches", side_effect=race):
-            self.assertIn("source-clean-hold", self.acted(row))
+            self.assertIn("recorded APPROVE as hold", self.acted(row))
         self.assertEqual(run_git(self.drop_repo, "rev-parse", report),
                          changed["sha"])
         self.assertEqual(self.drop_branches(), [report])
@@ -859,11 +1152,14 @@ class FalsifierTest(RelayBase):
             with dispatch_home(self.repo):
                 other = dispatches.add(recipient="seat-b", lane="other-%d" % n,
                                        ref=tip, repo=self.repo, kind="review",
-                                       new_work=True, notify=False)
+                                       new_work=True, notify=False,
+                                       task=self.task)
+            self.assertIsNotNone(other)
             _row, err = dispatches.mark_verdict(
                 other["id"], tip, "a codex finding", polarity="fix",
-                basis="measured", finding_count=1,
-                no_patch_because="design finding")
+                basis="measured", finding_count=1, prior_relation="new",
+                no_patch_because="design finding",
+                findings=["a codex finding"])
             self.assertIsNone(err)
 
     def test_two_contradictions_revert_the_arm_with_a_journal_line_and_a_post(self):
@@ -914,6 +1210,286 @@ class FalsifierTest(RelayBase):
     def test_the_switch_turns_the_arm_off_by_hand(self):
         os.environ["HELM_REMOTE_SAME_MODEL_ARM"] = "off"
         self.assertEqual(remote_relay.arm_state([])[0], remote_policy.ARM_OFF)
+
+
+class VerdictCleanupReconcileTest(RelayBase):
+    """A verdict closes the row BEFORE its cleanup: if the process dies
+    between the two, the row is closed yet its cleanup never ran, and the next
+    tick walks only OPEN dispatches, so the branch leaks. The next tick must
+    reconcile those closed rows by exact session identity, run the cleanup
+    once, and never touch a different row's verdict. A failed `recorded`
+    journal write is no such death: the cleanup, the author's DM and the cure
+    round still run in the same pass."""
+
+    FINDINGS = ["[BLOCKING] [MEASURED] wrong value / app.py:2 / run -> 2 / "
+                "ran it / print 3"]
+
+    class Died(Exception):
+        """The process death between the verdict and its cleanup."""
+
+    def _die_before_cleanup(self, fail_row=None):
+        """A `_cleanup` that dies for `fail_row` (every row when None): the
+        verdict has closed the row, and nothing after it in `record()` runs.
+        The tick's snapshot still holds the row open, so the same tick's
+        reconcile skips it, as a dead process would never reach it."""
+        real = remote_relay._cleanup
+
+        def die(journal, sid, rid, own=False):
+            if fail_row is None or rid == fail_row:
+                raise self.Died("the process died before the cleanup")
+            return real(journal, sid, rid, own=own)
+        return die
+
+    def _fail_recorded(self):
+        """An `rs.append` that returns False on the `recorded` event, as an
+        unwritable journal does: the journal append never raises."""
+        real = rs.append
+
+        def fail(event):
+            return False if event.get("event") == "recorded" else real(event)
+        return fail
+
+    def test_a_failed_recorded_write_still_cleans_up_and_tells_the_author(self):  # noqa: VACUOUS_ASSERTION — the branch and checkout are asserted present before the record; the record-refused and the one DM are asserted present
+        row = self.launched()
+        branch = "cloudrev/" + remote_relay.label_of(row)
+        workdir = self.journal("launch")[0]["workdir"]
+        self.assertIn(branch, self.drop_branches())
+        self.assertTrue(os.path.isdir(workdir))
+        self.report(row, "FIX", self.FINDINGS)
+        with mock.patch.object(rs, "append", side_effect=self._fail_recorded()):
+            self.assertIn("fix-verdict", self.acted(row))
+        self.assertEqual(self.row(row["id"])["status"], "verdict")
+        self.assertEqual(len(self.journal("record-refused")), 1)
+        self.assertEqual(len(self.dms), 1)
+        self.assertNotIn(branch, self.drop_branches())
+        self.assertFalse(os.path.isdir(workdir))
+        # the next tick has nothing to reconcile and tells no one again
+        remote_relay.tick()
+        self.assertEqual(len(self.dms), 1)
+        self.assertEqual(len(self.journal("branches-deleted")), 1)
+
+    def test_a_clean_record_and_cleanup_leaves_no_leak_or_branch(self):
+        row = self.launched()
+        branch = "cloudrev/" + remote_relay.label_of(row)
+        self.report(row, "FIX", self.FINDINGS)
+        self.assertIn("fix-verdict", self.acted(row))
+        self.assertNotIn(branch, self.drop_branches())
+        # a later tick is a clean no-op: nothing left to reconcile
+        self.acted(row)
+        self.assertEqual(self.drop_branches(), [])
+
+    def test_a_crash_before_cleanup_still_leaves_the_branch_gone(self):
+        row = self.launched()
+        branch = "cloudrev/" + remote_relay.label_of(row)
+        self.report(row, "FIX", self.FINDINGS)
+        with mock.patch.object(remote_relay, "_cleanup",
+                               side_effect=self._die_before_cleanup()):
+            # the verdict lands and closes the row; the process dies before
+            # its cleanup (the tick catches the death and reports an error)
+            self.assertIn("error", self.acted(row))
+            self.assertEqual(self.row(row["id"])["status"], "verdict")
+            self.assertIn(branch, self.drop_branches())
+        # the next tick reconciles the closed row's cleanup and deletes it
+        self.acted(row)
+        self.assertNotIn(branch, self.drop_branches())
+
+    def test_reconcile_only_handles_the_row_it_owning(self):
+        row_a = self.launched(lane="lane-a")
+        row_b = self.launched(lane="lane-b")
+        branch_a = "cloudrev/" + remote_relay.label_of(row_a)
+        branch_b = "cloudrev/" + remote_relay.label_of(row_b)
+        self.report(row_a, "FIX", self.FINDINGS)
+        self.report(row_b, "FIX", self.FINDINGS)
+        # only A dies before its cleanup; B is recorded and cleaned by the
+        # normal open-rows walk
+        with mock.patch.object(remote_relay, "_cleanup",
+                               side_effect=self._die_before_cleanup(
+                                   fail_row=row_a["id"])):
+            self.acted(row_a)
+            # A's cleanup is starved: its branch leaks; B's verdict is untouched
+            self.assertEqual(self.row(row_a["id"])["status"], "verdict")
+            self.assertEqual(self.row(row_b["id"])["status"], "verdict")
+            self.assertIn(branch_a, self.drop_branches())
+            self.assertNotIn(branch_b, self.drop_branches())
+        # the next tick's reconcile cleans up ONLY the row whose cleanup was
+        # starved — A. It never touches a row whose cleanup already happened.
+        self.acted(row_a)
+        self.assertNotIn(branch_a, self.drop_branches())
+        self.assertEqual(self.drop_branches(), [])
+
+    def test_reconcile_never_touches_a_row_that_already_ended_clean(self):
+        """A row whose cleanup already completed is left alone by the reconcile:
+        it owns no ref, so the reconcile has nothing to re-run and no cleanup to
+        re-record — a row that ended clean is never reopened."""
+        row_a = self.launched(lane="lane-a")
+        self.report(row_a, "FIX", self.FINDINGS)
+        self.assertIn("fix-verdict", self.acted(row_a))
+        self.assertEqual(self.drop_branches(), [])
+        # a later tick's reconcile walk finds nothing to re-run
+        remote_relay.tick()
+        self.assertNotIn("cleanup-unresolved",
+                         [e.get("event") for e in rs.read_journal()])
+
+    def _refuse_all(self, calls):
+        """A `delete_branches` whose every lease refuses. Past five calls it
+        raises, so a cleanup that loops on a refusal fails the arm instead of
+        hanging the run."""
+        def refuse(workdir, expected, push_repo):
+            calls.append(dict(expected))
+            if len(calls) > 5:
+                raise AssertionError("the cleanup kept retrying a refused lease")
+            return {name: "delete lease refused" for name in expected}
+        return refuse
+
+    def test_a_cleanup_whose_every_lease_refuses_returns_and_keeps_evidence(self):
+        row = self.launched()
+        branch = "cloudrev/" + remote_relay.label_of(row)
+        workdir = self.journal("launch")[0]["workdir"]
+        self.report(row, "FIX", self.FINDINGS)
+        calls = []
+        with mock.patch.object(rs, "delete_branches",
+                               side_effect=self._refuse_all(calls)):
+            self.assertIn("fix-verdict", self.acted(row))
+            self.assertEqual(len(calls), 1)
+            self.assertTrue(os.path.isdir(workdir))
+            self.assertIn(branch, self.drop_branches())
+            self.assertEqual(len(self.journal("cleanup-unresolved")), 1)
+            # the next tick's reconcile leaves the recorded evidence alone
+            self.acted(row)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(self.journal("cleanup-unresolved")), 1)
+
+    def test_a_dry_tick_reconciles_nothing(self):  # noqa: VACUOUS_ASSERTION — the same arm's real tick then deletes the branch the dry tick left
+        row = self.launched()
+        branch = "cloudrev/" + remote_relay.label_of(row)
+        workdir = self.journal("launch")[0]["workdir"]
+        self.report(row, "FIX", self.FINDINGS)
+        with mock.patch.object(remote_relay, "_cleanup",
+                               side_effect=self._die_before_cleanup()):
+            self.acted(row)
+        out = dict(remote_relay.tick(dry=True)["actions"])
+        self.assertIn("would reconcile", out[row["id"]])
+        self.assertIn(branch, self.drop_branches())
+        self.assertTrue(os.path.isdir(workdir))
+        self.assertEqual(self.journal("branches-deleted"), [])
+        self.assertIn("reconciled", self.acted(row))
+        self.assertNotIn(branch, self.drop_branches())
+        # the reconcile re-deletes refs only: the checkout is kept
+        self.assertTrue(os.path.isdir(workdir))
+
+    def test_closing_a_parent_never_cleans_its_live_successors_session(self):  # noqa: VACUOUS_ASSERTION — the successor's branch and checkout are asserted present, the cancel is asserted recorded
+        first = self.launched()
+        run_git(self.repo, "checkout", "-q", "lane-x")
+        tip2 = self.commit("app.py", "print(4)", "cure round")
+        run_git(self.repo, "checkout", "-q", self.main)
+        second, why = self.send(tip=tip2, supersedes=first["id"])
+        self.assertIsNotNone(second, why)
+        self.assertIn("re-read", self.acted(second))
+        branch2 = "cloudrev/" + remote_relay.label_of(second)
+        workdir = self.journal("launch")[0]["workdir"]
+        self.assertIn(branch2, self.drop_branches())
+        _row, err = dispatches.mark_cancel(first["id"], "withdrawn by author")
+        self.assertIsNone(err)
+        remote_relay.tick()
+        # the successor still reads in that session: its branch and the
+        # checkout it reads in both survive the parent's close
+        self.assertEqual(self.row(second["id"])["status"], "open")
+        self.assertIn(branch2, self.drop_branches())
+        self.assertTrue(os.path.isdir(workdir))
+        self.assertEqual(self.journal("branches-deleted"), [])
+
+    def test_a_starved_parent_and_successor_both_reconcile_in_one_session(self):  # noqa: VACUOUS_ASSERTION — the successor's branch is asserted present before the reconcile, and both rows' reconcile actions are asserted
+        """Each starved row re-deletes only its own refs, and the reconcile
+        never removes the session checkout, so the order of the two rows
+        does not matter."""
+        first = self.launched()
+        run_git(self.repo, "checkout", "-q", "lane-x")
+        tip2 = self.commit("app.py", "print(4)", "cure round")
+        run_git(self.repo, "checkout", "-q", self.main)
+        second, why = self.send(tip=tip2, supersedes=first["id"])
+        self.assertIsNotNone(second, why)
+        self.assertIn("re-read", self.acted(second))
+        branch2 = "cloudrev/" + remote_relay.label_of(second)
+        workdir = self.journal("launch")[0]["workdir"]
+        _row, err = dispatches.mark_cancel(first["id"], "withdrawn by author")
+        self.assertIsNone(err)
+        self.report(second, "FIX", self.FINDINGS)
+        with mock.patch.object(remote_relay, "_cleanup",
+                               side_effect=self._die_before_cleanup()):
+            self.assertIn("error", self.acted(second))
+        self.assertEqual(self.row(second["id"])["status"], "verdict")
+        self.assertIn(branch2, self.drop_branches())
+        out = dict(remote_relay.tick()["actions"])
+        self.assertIn("reconciled", out[first["id"]])
+        self.assertIn("reconciled", out[second["id"]])
+        self.assertNotIn(branch2, self.drop_branches())
+        self.assertTrue(os.path.isdir(workdir))
+
+    def test_a_reconcile_whose_leases_refuse_records_it_once(self):
+        row = self.launched()
+        self.report(row, "FIX", self.FINDINGS)
+        with mock.patch.object(remote_relay, "_cleanup",
+                               side_effect=self._die_before_cleanup()):
+            self.acted(row)
+        calls = []
+        with mock.patch.object(rs, "delete_branches",
+                               side_effect=self._refuse_all(calls)):
+            for _ in range(3):
+                remote_relay.tick()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(self.journal("branches-deleted")), 1)
+        self.assertEqual(len(self.journal("cleanup-unresolved")), 1)
+
+    def _successor(self, first):
+        """A cure-round row superseding `first`, at a tip that descends from
+        it, so the relay re-reads it in `first`'s session."""
+        run_git(self.repo, "checkout", "-q", "lane-x")
+        tip2 = self.commit("app.py", "print(4)", "cure round")
+        run_git(self.repo, "checkout", "-q", self.main)
+        second, why = self.send(tip=tip2, supersedes=first["id"])
+        self.assertIsNotNone(second, why)
+        return second
+
+    def test_an_unattached_successor_keeps_its_cancelled_parents_checkout(self):  # noqa: VACUOUS_ASSERTION — the refused re-read and the later delivered one are both asserted, and the launch count is pinned
+        """The successor's first re-read fails before it attaches to the
+        session, and its parent is cancelled: the parent's checkout stays,
+        and the next tick re-reads into the old session, not a paid launch."""
+        first = self.launched()
+        workdir = self.journal("launch")[0]["workdir"]
+        second = self._successor(first)
+        _row, err = dispatches.mark_cancel(first["id"], "withdrawn by author")
+        self.assertIsNone(err)
+        with mock.patch.object(rs, "push_reread",
+                               return_value=(None, "transient push failure")):
+            self.assertIn("re-read refused", self.acted(second))
+        self.assertTrue(os.path.isdir(workdir))
+        self.assertEqual(self.journal("branches-deleted"), [])
+        self.assertIn("re-read", self.acted(second))
+        self.assertEqual(self.launches, 1)
+        self.assertEqual(len(self.journal("launch")), 1)
+        self.assertTrue(os.path.isdir(workdir))
+
+    def test_a_refused_cleanup_in_the_session_keeps_its_checkout(self):  # noqa: VACUOUS_ASSERTION — the successor's refused cleanup is asserted recorded before the parent's close
+        """A successor's cleanup refused its refs, so the session checkout is
+        kept as evidence; a later close of the parent never removes it."""
+        first = self.launched()
+        workdir = self.journal("launch")[0]["workdir"]
+        branch1 = "cloudrev/" + remote_relay.label_of(first)
+        second = self._successor(first)
+        self.assertIn("re-read", self.acted(second))
+        self.report(second, "FIX", self.FINDINGS)
+        calls = []
+        with mock.patch.object(rs, "delete_branches",
+                               side_effect=self._refuse_all(calls)):
+            self.assertIn("fix-verdict", self.acted(second))
+        self.assertEqual(len(self.journal("cleanup-unresolved")), 1)
+        self.assertTrue(os.path.isdir(workdir))
+        _row, err = dispatches.mark_cancel(first["id"], "withdrawn by author")
+        self.assertIsNone(err)
+        remote_relay.tick()
+        self.assertTrue(os.path.isdir(workdir))
+        self.assertIn(branch1, self.drop_branches())
+        self.assertEqual(len(self.journal("branches-deleted")), 1)
 
 
 if __name__ == "__main__":

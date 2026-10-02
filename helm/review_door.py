@@ -65,7 +65,8 @@ BAR_TEMPLATE = (
     "  2. FALSIFIERS: the closed set of falsifier classes the next read may "
     "use; a new class comes back to this room, never as a new round.\n"
     "  3. FINDINGS: each open finding's disposition "
-    "(cured-in-patch | inside-bar | note | refuted), or `none` when no "
+    "(cured-in-patch | inside-bar | note | refuted | task/N in this story), "
+    "or `none` when no "
     "finding is open.\n"
     "  4. TIP: the exact tip both sides will judge.\n"
     "Each side's last [DONE] carries one line:\n"
@@ -124,8 +125,10 @@ _DONE_TAIL = re.compile(r"\s*\[DONE\]\s*$")
 
 
 def is_meld_room(room):
-    """Is `room` shaped like a room `meld invite` names (meld-<epoch>-<slug>)?"""
-    return bool(_ROOM.fullmatch(str(room or "")))
+    """Is `room` shaped like a room `meld invite` names (meld-<epoch>-<slug>),
+    or a task's pair meld, whose name carries no `meld-` prefix
+    (`is_pair_room`)?"""
+    return bool(_ROOM.fullmatch(str(room or ""))) or is_pair_room(room)
 
 
 def parse_outcome(text):
@@ -340,8 +343,9 @@ def _finding_error(value):
         if not sep:
             return ("item %r lacks '=' (a round with no open finding writes "
                     "FINDINGS: none)" % key[:40])
-        if disposition not in FINDING_DISPOSITIONS:
-            return ("item %r has disposition %r, not one of %s" % (
+        if disposition not in FINDING_DISPOSITIONS and not re.fullmatch(
+                r"task/[1-9][0-9]*", disposition):
+            return ("item %r has disposition %r, not one of %s or task/N" % (
                 key[:40], disposition[:40],
                 "|".join(sorted(FINDING_DISPOSITIONS))))
     return None
@@ -460,7 +464,7 @@ def converged(st, peer, chain=None, lane=None, tips=()):
     return got["agreed"] and about_chain(got, chain, lane, tips)
 
 
-_MELD_REF = re.compile(r"(meld-\d+-[a-z0-9-]{0,64})(?:@(\d{1,12}))?\Z")
+_MELD_REF = re.compile(r"([a-z0-9-]+)(?:@(\d{1,12}))?\Z")
 _SEED_ROW = re.compile(r"\brow ([0-9a-f]{12}) at ")
 _SEED_CHAIN = re.compile(r"\(chain ([0-9a-f]{12})\)")
 _OPENING = re.compile(
@@ -471,10 +475,11 @@ _LEGACY_PAIR_BOUNDARY = re.compile(r" \| round \d+ \| pairing: ")
 
 
 def split_meld_ref(ref):
-    """(room, epoch | None) for `ROOM` or `ROOM@EPOCH`; (None, None) for a
-    reference that is neither."""
+    """(room, epoch | None) for `ROOM` or `ROOM@EPOCH`, where ROOM is a meld
+    room of either shape (`is_meld_room`); (None, None) for a reference that
+    is neither."""
     m = _MELD_REF.fullmatch(str(ref or "").strip())
-    if not m:
+    if not m or not is_meld_room(m.group(1)):
         return None, None
     return m.group(1), (int(m.group(2)) if m.group(2) else None)
 
@@ -572,6 +577,30 @@ def meld_citation(room, row, tips):
     if why:
         return None, why + ("; a meld that binds opens with %s"
                             % chat._dsan(fix) if fix else "")
+    from . import dispatches, review_findings, tasks
+    assigned = {value for outcome in got["outcomes"].values() if outcome
+                for value in _finding_pairs(outcome["findings"])[0].values()
+                if value.startswith("task/")}
+    if assigned:
+        current, unavailable = dispatches.snapshot()
+        if unavailable:
+            return None, "--meld %s: dispatch chain is unreadable" % ref
+        known, bad = tasks.snapshot(strict=True)
+        if bad:
+            return None, "--meld %s: task ledger is unreadable (%s)" % (ref, bad)
+        reviewed, why = review_findings.chain_task(row, current, known)
+        if why or not reviewed:
+            return None, ("--meld %s: reviewed task is unknown (%s)" %
+                          (ref, why or "no task"))
+        root = tasks._story_root(known, reviewed)
+        for tid in sorted(assigned):
+            target = known.get(tid)
+            if not target or target.get("status") not in tasks.OPEN_STATUSES:
+                return None, ("--meld %s: disposition %s must name an open "
+                              "task" % (ref, tid))
+            if tasks._story_root(known, tid) != root:
+                return None, ("--meld %s: disposition %s is not in reviewed "
+                              "task %s's story" % (ref, tid, reviewed))
     # EXACTLY THE ROOM'S VERDICT: `outcome` reads AGREED only when the
     # parties agreed, so the recorded word can never outrun the agreement.
     # `meld_bytes` is the room's size at the moment the outcome reaches the
@@ -864,9 +893,10 @@ def irreversible_hits(text, phrases=IRREVERSIBLE_PHRASES):
 #   phrase   the T0 phrases above and the wider door phrases below, in the
 #            lane name and its brief;
 #   path     every path any commit of base..tip touches, read per commit by
-#            compose_contract's reader (a door file changed and changed back
-#            is still a door lane), against the exact contract owners the
-#            compose exception already vetoes plus DOOR_OWNERS below;
+#            lane_diff (a door file changed and changed back is still a door
+#            lane; a merge is read against its first parent, and the net
+#            diff of base..tip is added), against the exact contract owners
+#            the compose exception already vetoes plus DOOR_OWNERS below;
 #   scope    a changed line inside a Python function, class, module-level
 #            name or import that a guard-, refusal- or kill-named scope
 #            REACHES (its own body, or any module-level name that body
@@ -878,9 +908,11 @@ def irreversible_hits(text, phrases=IRREVERSIBLE_PHRASES):
 #            live-system marker (os.kill, git push, DROP TABLE, ...).
 #
 # UNKNOWN IS A DOOR. No repository, no base, a diff that cannot be read, an
-# empty diff, a merge in the range, or a changed Python file that does not
-# parse answers the `unknown` class. Where that leaves `paths` empty, the
-# verdict door refuses the read, since no write to the lane can be ruled out.
+# empty commit, or a changed Python file that does not parse answers the
+# `unknown` class. A merge in the range is read against its first parent,
+# with the net diff of base..tip added (lane_diff, task/4041). Where that
+# leaves `paths` empty, the verdict door refuses the read, since no write to
+# the lane can be ruled out.
 
 #: Every class the classifier answers, in the order a refusal names them.
 DOOR_CLASSES = ("prod", "migration", "deletion", "money", "credentials",
@@ -922,6 +954,8 @@ DOOR_OWNERS = (
     ("guard", "helm/shaguard.py"),             # the prose sha guard
     ("guard", "helm/hookstdin.py"),            # what a hook payload weighs
     ("guard", "bin/helm-hook"),                # every hook's entry point
+    ("guard", "bin/helm-hookres"),             # a served hook's warm path
+    ("guard", "helm/hookres.py"),              # the resident that runs it
     ("guard", "helm/review_door.py"),          # this door and the meld door
     ("guard", "helm/review_independence.py"),  # the independence predicate
     ("guard", "helm/runrecord.py"),            # the run record it verifies
@@ -1000,11 +1034,11 @@ def lane_doors(row, current=None):
         return _ordered(out)
     out["base"] = base
     from . import compose_contract
-    diff = compose_contract.measure_diff(repo, base, tip)
+    diff = lane_diff(repo, base, tip)
     if not diff:
         out["doors"].append(("unknown", "the per-commit diff of %s..%s cannot "
-                             "be read (a merge or an empty commit in the "
-                             "range, or git refused)" % (base[:12], tip[:12])))
+                             "be read (an empty commit in the range, a root "
+                             "commit, or git refused)" % (base[:12], tip[:12])))
         return _ordered(out)
     out["paths"] = sorted({p for r in diff for p in r["paths"]})
     for path in out["paths"]:
@@ -1028,6 +1062,58 @@ def lane_doors(row, current=None):
     for record in records or ():
         out["doors"].extend(_changed_line_doors(repo, base, tip, record))
     return _ordered(out)
+
+
+def lane_diff(repo, base, tip):
+    """Every name-status record a commit of base..tip makes, or None when
+    one cannot be read. A single-parent range is compose_contract's reader,
+    unchanged. A range holding a MERGE (task/4041) reads each commit against
+    its FIRST parent: a merge's records are what it brought onto the lane,
+    the trunk side of a main-into-lane merge included, so the door arms and
+    the reader's no-write proof (runrecord.verify) cover every file the
+    lane changed. The NET records of base..tip are unioned in: a merge
+    resolution that reverts trunk's change to a file the lane never touched
+    (`merge -s ours`) brings nothing against its first parent, yet the tip
+    still changes that file against base. A git refusal, a root commit, an
+    unparseable diff, an unreadable net diff or an empty single-parent commit
+    still answers None; a merge may bring nothing new."""
+    from . import compose_contract, vcs
+    linear = compose_contract.measure_diff(repo, base, tip)
+    if linear:
+        return linear
+    if not all(_FULL_SHA.fullmatch(x) for x in (base, tip)) or base == tip:
+        return None
+    backend = vcs.backend(repo)
+    try:
+        rc, chain, _err = backend.text(repo, "rev-list", "--reverse",
+                                       "--parents", base + ".." + tip)
+    except (OSError, ValueError, UnicodeError):
+        return None
+    commits = [line.split() for line in (chain or "").splitlines()]
+    if rc != 0 or tip not in {c[0] for c in commits if c} or any(
+            len(c) < 2 or not all(_FULL_SHA.fullmatch(x) for x in c)
+            for c in commits):
+        return None
+    records = []
+    for commit in commits:
+        try:
+            rc, raw, _err = backend.run(
+                repo, "diff", "--no-ext-diff", "--no-textconv",
+                "--name-status", "-z", "--find-renames", commit[1],
+                commit[0], "--")
+        except (OSError, ValueError):
+            return None
+        merge = len(commit) > 2
+        got = ([] if merge and rc == 0 and raw == b""
+               else compose_contract._diff_records(raw) if rc == 0 else None)
+        if got is None or not (got or merge):
+            return None
+        records.extend(got)
+    net = _net_records(repo, base, tip)
+    if net is None:
+        return None
+    return list({(r["status"], tuple(r["paths"])): r
+                 for r in records + net}.values())
 
 
 def lane_checkouts(row, current=None):
@@ -1091,8 +1177,9 @@ def _ordered(out):
 def _lane_base(repo, row, tip, current):
     """(base, why) — where the lane leaves trunk: the merge-base of its tip
     with the trunk ref. A tip already on trunk has no range there, so the
-    chain's BUILD row base stands in when it is a strict ancestor of the tip;
-    otherwise the base is unknown, never guessed."""
+    chain's BUILD row base stands in when it is a strict ancestor of the tip,
+    else the base off the first parent of the merge that landed it; otherwise
+    the base is unknown, never guessed."""
     from . import vcs
     backend = vcs.backend(repo)
     try:
@@ -1113,9 +1200,26 @@ def _lane_base(repo, row, tip, current):
                 and backend.text(repo, "merge-base", "--is-ancestor", cand,
                                  tip)[0] == 0:
             return cand, None
+    # A TIP A TRAIN MERGED (a car landed before its review): the lane left
+    # trunk where it leaves the landed merge's first parent, so the read
+    # after the land sees the same range as the one before it.
+    try:
+        rc, out, _err = backend.text(repo, "rev-list", "--merges", "--parents",
+                                     "--ancestry-path", "--reverse",
+                                     "%s..%s" % (tip, trunk))
+        merge = next((line.split() for line in str(out or "").splitlines()
+                      if rc == 0 and tip in line.split()[2:]), None)
+        rc, base, _err = backend.text(repo, "merge-base", merge[1], tip) \
+            if merge else (1, "", "")
+    except (OSError, ValueError, UnicodeError):
+        rc, base = 1, ""
+    base = str(base or "").strip().lower()
+    if rc == 0 and _FULL_SHA.fullmatch(base) and base != tip:
+        return base, None
     return None, ("the lane's base cannot be told: its tip %s has no range "
-                  "off %s and no build row on its chain records where it "
-                  "was cut" % (tip[:12], trunk))
+                  "off %s, no build row on its chain records where it was "
+                  "cut, and no merge on %s landed it" % (tip[:12], trunk,
+                                                         trunk))
 
 
 def _net_records(repo, base, tip):
@@ -1702,11 +1806,22 @@ def lapsed_line(peer, room):
 # next reader arrives. The door's own melds (T0, T1, T2) are rounds of it,
 # never rooms of their own.
 #
-# THE NAME IS A PURE FUNCTION OF THE CHAIN, so a second room for one chain
-# cannot be minted (falsifier (b)): the task the chain's FIRST row names in
-# its lane or note, else the chain root, scoped by the project that owns the
-# chain's repository. A chain never leaves its repository, so a reviewer from
-# another project is invited into the owner's room.
+# THE NAME IS A FUNCTION OF THE CHAIN, so a second room for one chain cannot
+# be minted (falsifier (b)): the task the chain's FIRST row names in its lane
+# or note, else the chain root, scoped by the project that owns the chain's
+# repository. A chain never leaves its repository, so a reviewer from another
+# project is invited into the owner's room. A TASK's room is `<scope>-<N>`
+# (helm-3742): one persistent room per task number, the place every agent
+# expects to talk about it. A chain with no task is `meld-0-pair-<scope>-
+# chain-<id12>`.
+#
+# ONE ROOM FOR A CHAIN'S LIFE. Before 0.3.3 a task's room was
+# `meld-0-pair-<scope>-task-<N>`. A task whose room opened under that name
+# keeps it (its chat log or a lifecycle journal is on disk), so no
+# conversation in flight moves or splits; only a task with no room yet gets
+# the new name. New code opens a legacy task room only for a scope the new
+# shape cannot carry, where the answer is always the legacy name, so the
+# answer for a task cannot change under it.
 #
 # THE ROW STAYS THE LEDGER. Verdicts, patch tips and the gate live on rows;
 # the room carries the conversation and the MELD OUTCOME a verdict records
@@ -1716,6 +1831,15 @@ def lapsed_line(peer, room):
 PAIR_PREFIX = "meld-0-pair-"
 _PAIR_ROOM = re.compile(r"meld-0-pair-[a-z0-9-]{1,48}\Z")
 _SCOPE_CHARS = 16
+#: A TASK's room: `<scope>-<N>` (helm-3742), one persistent room per task
+#: number. BOUNDED so a room that merely ends in digits is not read as one:
+#: the scope is at most `_SCOPE_CHARS` characters, starts and ends with a
+#: letter or digit, and is never a `meld-` or `dm-` name (an ad-hoc meld
+#: `meld-<epoch>-<topic>-3131` is not a task's room, and `dm-` is the DM
+#: namespace); the number is a task number with no leading zero.
+_TASK_ROOM = re.compile(
+    r"(?!meld-|dm-)[a-z0-9](?:[a-z0-9-]{0,%d}[a-z0-9])?-[1-9][0-9]{0,8}\Z"
+    % (_SCOPE_CHARS - 2))
 
 #: What round one agrees, in the premise's order.
 PAIR_PLAN = (
@@ -1733,8 +1857,11 @@ PAIR_NEXT_ROUND = (
 
 
 def is_pair_room(room):
-    """Is `room` a task's pair meld (`meld-0-pair-<scope>-<key>`)?"""
-    return bool(_PAIR_ROOM.fullmatch(str(room or "")))
+    """Is `room` a chain's pair meld: a task's `<scope>-<N>` (helm-3742), or
+    the legacy `meld-0-pair-<scope>-<key>`, which a task whose room opened
+    under it keeps for life and a chain with no task is still named?"""
+    room = str(room or "")
+    return bool(_TASK_ROOM.fullmatch(room) or _PAIR_ROOM.fullmatch(room))
 
 
 def _chain_root_row(row, current=None):
@@ -1795,13 +1922,51 @@ def pair_scope(row, current=None):
 
 
 def pair_room(row, current=None):
-    """(room, key) — the chain's pair meld, or (None, why)."""
+    """(room, key) — the chain's pair meld, or (None, why).
+
+    A task's room is `<scope>-<N>` (helm-3742) unless its legacy room
+    (`meld-0-pair-<scope>-task-<N>`) has opened, which it keeps for life; a
+    chain with no task, and a scope the new shape cannot carry (a `meld` or
+    `dm` project), keep the legacy name."""
     key, why = pair_key(row, current)
     if key is None:
         return None, why
-    room = "%s%s-%s" % (PAIR_PREFIX, pair_scope(row, current),
-                        key.replace("/", "-"))
-    return room, key
+    scope = pair_scope(row, current)
+    root = _chain_root_row(row, current)
+    if root and root.get("attached_task") == key:
+        # A taskless chain that already opened its chain-keyed pair room
+        # keeps that conversation after an append-only task attachment.
+        legacy = task_room(scope, "chain/" + root["id"][:12])
+        if _room_opened(legacy):
+            return legacy, key
+    return task_room(scope, key), key
+
+
+def task_room(scope, key):
+    """The room of pair key `key` (`task/N`, or `chain/<id12>`) in project
+    `scope`: a task's `<scope>-<N>`, unless its legacy room has opened; the
+    legacy `meld-0-pair-<scope>-<key>` for a chain with no task and for a
+    scope the new shape cannot carry. The land step asks a task's room by
+    this name (helm/landtask.py), so a land and the task's pair meld talk in
+    one room."""
+    legacy = "%s%s-%s" % (PAIR_PREFIX, scope, key.replace("/", "-"))
+    task = re.fullmatch(r"task/([1-9][0-9]{0,8})", key)
+    room = "%s-%s" % (scope, task.group(1)) if task else None
+    if room is None or not _TASK_ROOM.fullmatch(room) \
+            or _room_opened(legacy):
+        return legacy
+    return room
+
+
+def _room_opened(room):
+    """Has `room` ever opened here: its chat log, or its meld lifecycle
+    journal on the bus or in the durable journal (which a retired room
+    keeps)?"""
+    import os
+    from . import chat, meld
+    return any(os.path.exists(path) for path in (
+        chat.room_path(room), meld.lifecycle_path(room),
+        meld.lifecycle_path(room, durable=True)))
 
 
 def pairing(sender, recipient, families=None):
@@ -2011,19 +2176,21 @@ def pair_room_if_open(row, current=None):
 def _lifecycle_pair_rooms():
     """Every pair room with a meld lifecycle journal, read off the journal
     directory's names (one file a room) rather than the chat directory, whose
-    listing is paid on every stop and holds every cursor on the bus."""
-    import base64
+    listing is paid on every stop and holds every cursor on the bus.
+
+    EVERY NAME IS DECODED. A task's room (`<scope>-<N>`) shares no prefix
+    with the legacy `meld-0-pair-` one, so no prefix of the encoded name can
+    select both; `is_pair_room` decides on the decoded room."""
     import os
     from . import chat, meld
     root = os.path.join(chat.chat_dir(), meld._LIFECYCLE_DIR)
-    head = base64.urlsafe_b64encode(PAIR_PREFIX.encode()).decode()
     try:
         names = os.listdir(root)
     except OSError:
         return []
     out = []
     for name in names:
-        if not name.startswith(head) or not name.endswith(".jsonl"):
+        if not name.endswith(".jsonl"):
             continue
         try:
             room = meld._room_from_key(name[:-len(".jsonl")])
@@ -2156,16 +2323,27 @@ def pair_turn_line(owed):
 T2_JOIN_FLOOR = 0.5
 
 
+def _meld_state_paths():
+    """Every meld actor state file on the bus (`<room>.meld.<seat>.json`): a
+    `meld-` room's, and a task pair meld's, whose name carries no prefix."""
+    import glob
+    import os
+    from . import chat
+    out = []
+    for path in glob.glob(os.path.join(chat.chat_dir(), "*.meld.*.json")):
+        room = os.path.basename(path).split(".meld.", 1)[0]
+        if room.startswith("meld-") or is_pair_room(room):
+            out.append(path)
+    return out
+
+
 def _t2_rooms(rows_by_chain, sender):
     """{chain12: [(room, epoch, state)]} for the melds `sender` convened
     whose topic names a chain: the door opens T2 melds as
     '<lane>: agree the bar (...) (chain <chain12>)'."""
-    import glob
-    import os
     from . import chat, pk
     out = {}
-    pattern = os.path.join(chat.chat_dir(), "meld-*.meld.*.json")
-    for path in glob.glob(pattern):
+    for path in _meld_state_paths():
         st = pk.read_json(path, None)
         if not isinstance(st, dict) or st.get("role") != "convener":
             continue
@@ -2313,7 +2491,7 @@ def mode_metrics(current, accepted, cutoff=0):
     for row in (current or {}).values():
         if not isinstance(row, dict) or row.get("kind") != "review":
             continue
-        mode = dispatches._review_mode_of(row)
+        mode = dispatches._ab_mode_of(row)
         chain = row.get("chain_root")
         when = _mode_ts(row.get("ts"))
         if mode not in dispatches.REVIEW_MODE_LINES or not chain \
@@ -2323,10 +2501,10 @@ def mode_metrics(current, accepted, cutoff=0):
         roots.append(chain)
     for chain in roots:
         rows = _mode_chain_rows(current, chain, cancelled=True)
-        modes = {dispatches._review_mode_of(r) for r in rows
-                 if dispatches._review_mode_of(r) in dispatches.REVIEW_MODE_LINES}
+        modes = {dispatches._ab_mode_of(r) for r in rows
+                 if dispatches._ab_mode_of(r) in dispatches.REVIEW_MODE_LINES}
         mode = next(iter(modes)) if len(modes) == 1 else "UNKNOWN"
-        enrolled = [r for r in rows if dispatches._review_mode_of(r) == mode]
+        enrolled = [r for r in rows if dispatches._ab_mode_of(r) == mode]
         tips = {}
         for order, row in enumerate(rows):
             tips.setdefault(str(row.get("tip") or ""), order)
@@ -2368,7 +2546,7 @@ def mode_metrics(current, accepted, cutoff=0):
                     fixes.add(str(event.get("reviewed_tip") or row_tip))
                     if event.get("patch_tip"):
                         patches.add(str(event["patch_tip"]).lower())
-                    elif dispatches._review_mode_of(row) == "MELD-DIFF" \
+                    elif dispatches._ab_mode_of(row) == "MELD-DIFF" \
                             and dispatches._has_diff_handoff(event):
                         diff_parents[row["id"]] = (row, event)
         # Mirror the spiral fold's advancing, direct MELD-DIFF successor,
@@ -2402,7 +2580,7 @@ def mode_metrics(current, accepted, cutoff=0):
         # clock started at a later fan-out send, after the dispatch that hold
         # answered.
         first = min(((_mode_ts(r.get("ts")), r.get("ts")) for r in rows
-                     if dispatches._review_mode_of(r) == mode
+                     if dispatches._ab_mode_of(r) == mode
                      and _mode_ts(r.get("ts")) is not None),
                     default=(None, None))
         hold_ts, held = (None, None) \
@@ -2523,11 +2701,9 @@ def _prior_join_rate(cutoff, window):
     """Falsifier (a)'s prior: of EVERY meld convened in the window (door or
     hand), how many had the reader join within the entry window. The door's
     own rate is the falsifier; this is the base rate it is judged against."""
-    import glob
-    import os
-    from . import chat, pk
+    from . import pk
     convened = joined = unreadable = 0
-    for path in glob.glob(os.path.join(chat.chat_dir(), "meld-*.meld.*.json")):
+    for path in _meld_state_paths():
         st = pk.read_json(path, None)
         if not isinstance(st, dict) or st.get("role") != "convener":
             continue

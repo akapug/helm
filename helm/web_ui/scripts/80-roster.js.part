@@ -11,6 +11,7 @@ let ROSTER_SORT = {key: "presence", dir: 1};
 let ROSTER_SHOW = {absent: false, sas: false};
 let ROSTER_TODOS = {};                                   // seat -> /api/todos digest
 let ROSTER_GIT = {}, ROSTER_GIT_TIMER = null;            // cwd -> {ts, subject} (60s git side-channel)
+let ROSTER_MOOD = {}, ROSTER_MOOD_TIMER = null;          // seat (lowercase) -> mood face (60s side-channel)
 // UNVERIFIED sorts right under fresh: it is the row that NEEDS the owner's eye
 // (its beat may be another process's \u2014 seats.unverified_seats), so it must not
 // sink below the quiet ones.
@@ -174,6 +175,41 @@ function memBadge(s) {
     (w === "THROTTLED" ? "MEM THROTTLED" : w === "NEAR" ? "MEM NEAR"
      : w === "HIGH-UNREAD" ? "MEM HIGH \u00b7 shmem ?" : "MEM HIGH \u00b7 cache") + '</span>';
 }
+// MOOD = ONE face per seat, measured server-side (`helm seat mood`, served by
+// /api/roster/mood on its own 60s side channel): the measured state's colour
+// on the pulse scale, dim when the seat's last sign of work is over an hour
+// old, and the reason, the seat's own word and any blocker on hover. A seat
+// the server did not measure draws nothing; a state this page does not know
+// draws neutral and says so.
+// The face is an inline SVG in currentColor, so the state's colour and the
+// dim rule reach it exactly as they reached the dot it replaced (task/4034):
+// flowing smiles; stuck and blocked-on-owner frown; grinding, idle, walled
+// and an unknown state keep a level mouth.
+function moodFace(state) {
+  const mouth = state === "flowing" ? "M5 9.6Q8 12.6 11 9.6"
+    : state === "stuck" || state === "blocked-on-owner" ? "M5 11.8Q8 8.8 11 11.8"
+    : "M5.2 10.6H10.8";
+  return '<svg viewBox="0 0 16 16" aria-hidden="true" fill="none" stroke="currentColor"' +
+    ' stroke-width="1.5" stroke-linecap="round">' +
+    '<circle cx="8" cy="8" r="6.75" fill="currentColor" fill-opacity=".14"/>' +
+    '<circle cx="5.7" cy="6.4" r="1.1" fill="currentColor" stroke="none"/>' +
+    '<circle cx="10.3" cy="6.4" r="1.1" fill="currentColor" stroke="none"/>' +
+    '<path d="' + mouth + '"/></svg>';
+}
+function moodDot(m) {
+  if (!m || typeof m !== "object") return "";
+  const known = ["flowing", "grinding", "stuck", "blocked-on-owner", "walled",
+                 "idle"].includes(m.state);
+  const dim = m.recency === "today" || m.recency === "older";
+  const said = m.self ? " \u00b7 says " + m.self + (m.rating ? " " + m.rating + "/5" : "") +
+    (m.divergent ? " \u2014 DIVERGES from the measure" : "") : "";
+  const t = (known ? m.state : "mood unknown") + (m.reason ? " \u00b7 " + m.reason : "") + said +
+    (m.blocker ? " \u00b7 blocker: " + m.blocker : "") +
+    (m.recency ? " \u00b7 last sign of work: " + m.recency : "");
+  const cls = known ? m.state : "unknown";
+  return '<span class="rmood ' + cls + (dim ? " dim" : "") +
+    '" title="' + esc(t) + '">' + moodFace(cls) + '</span>';
+}
 function renderRoster(rep) {
   LAST_ROSTER = rep;                                     // seatPop reads facts here
   const all = (rep && rep.seats) || [], claims = (rep && rep.claims) || [];
@@ -227,6 +263,7 @@ function renderRoster(rep) {
       const namecell = s.owner
         ? '<span class="rowner">' + esc(s.seat) + '</span><span class="rhuman">you · human</span>'
         : '<span class="rseat" data-seat="' + esc(s.seat) + '" data-sess="' + esc(s.session || '') + '" title="facts + transcript">' + esc(chatShort(s.seat)) + '</span>' +
+          moodDot(ROSTER_MOOD[String(s.seat || "").toLowerCase()]) +
           upstreamBadge(s) + memBadge(s) +
           (rt ? '<span class="rruntime">' + esc(rt) + '</span>' : '');
       return '<tr' + (cls ? ' class="' + cls + '"' : '') + '>' +
@@ -386,6 +423,23 @@ async function pollRosterGit() {
     if (LAST_ROSTER) renderRoster(LAST_ROSTER);
   } catch (e) { /* git side-channel fails quiet -- DOING falls back to the home room */ }
 }
+// The mood face's side channel: a full measure of every live seat is ledger
+// folds and git reads, so it rides its own 60s timer beside the git one and a
+// server-side 60s cache, never the 2s presence poll. An unavailable floor
+// clears the faces rather than leaving an older reading standing.
+async function pollRosterMood() {
+  if (!$("#view-roster").classList.contains("on") || document.hidden) return;
+  try {
+    const d = await j("/api/roster/mood");
+    const got = {};
+    Object.entries((d && d.moods) || {}).forEach(([k, v]) => { got[k.toLowerCase()] = v; });
+    ROSTER_MOOD = got;
+    if (LAST_ROSTER) renderRoster(LAST_ROSTER);
+  } catch (e) {
+    ROSTER_MOOD = {}; // a failed fetch cannot leave yesterday's face standing
+    if (LAST_ROSTER) renderRoster(LAST_ROSTER);
+  }
+}
 function initRoster() {
   if (!ROSTER_TIMER) {
     // Presence is not an SSE source: keep the promised two-second heartbeat even
@@ -393,6 +447,7 @@ function initRoster() {
     ROSTER_TIMER = setInterval(pollRoster, 2000);
     ROSTER_TODOS_TIMER = setInterval(esStretch(pollRosterTodos), 2000);
     ROSTER_GIT_TIMER = setInterval(pollRosterGit, 60000);
+    ROSTER_MOOD_TIMER = setInterval(pollRosterMood, 60000);
     // the message-a-seat composer moved here from the ledger -- wire it once
     $("#seatform").addEventListener("submit", sendSeatMsg);
     const key = $("#seatkey");
@@ -408,6 +463,7 @@ function initRoster() {
   pollRoster();
   pollRosterTodos();
   pollRosterGit();
+  pollRosterMood();
 }
 
 

@@ -147,8 +147,37 @@ def _occupants_many(paths, proc_root="/proc"):
     if attempted and not read:
         return {p: ["unknown"] for p in paths}, False
     for p in out:
+        out[p] = [n for n in out[p] if not _git_housekeeping(n, proc_root)]
         out[p].sort(key=lambda n: int(n) if n.isdigit() else -1)
     return out, True
+
+
+def _git_housekeeping(pid, proc_root="/proc"):
+    """True when `pid` is GIT'S OWN auto-housekeeping, which is nobody's live
+    work: `git maintenance run` (git 2.51+ forks `git maintenance run --auto
+    --quiet --detach` into the background after every commit, cwd in the
+    room), `git gc --auto`, or a git process those run (`git repack`,
+    `git pack-objects`), each of which exits by itself. Counted as an
+    occupant, it refused a release made right after a commit and was named
+    as someone's live pane.
+
+    EXACT ARGV, NEVER A PATTERN: the program is `git` and its subcommand is
+    `maintenance run`, or `gc` with `--auto`. A descendant counts only while
+    every hop up to that run is itself `git`, so a person's `git gc`, a git
+    verb under a shell, a hook script and an editor on these words all stay
+    occupants."""
+    hop = int(pid) if str(pid).isdigit() else 0
+    for _ in range(_ANCESTRY_HOPS):
+        if hop <= 1:
+            return False
+        argv = _proc_argv(hop, proc_root)
+        if not argv or os.path.basename(argv[0]) != "git":
+            return False
+        if argv[1:3] == ["maintenance", "run"] or \
+                (argv[1:2] == ["gc"] and "--auto" in argv[2:]):
+            return True
+        hop = _proc_ppid(hop, proc_root)
+    return False
 
 
 def _occupants(path):

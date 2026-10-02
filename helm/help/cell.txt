@@ -1,0 +1,1 @@
+cell join|send|status — the a2a substrate, helm-named (status = node liveness; join and send ride an optional HELM_CELL_BIN transport and degrade honestly without it)

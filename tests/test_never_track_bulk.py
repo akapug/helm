@@ -100,7 +100,10 @@ class BulkLegBase(unittest.TestCase):
         self.sh("git", "commit", "-q", "-m", "landed")
 
     def scan(self):
-        return nevertrack.scan_staged(self.root)
+        # `scan_staged` returns (violations, notes, paths); the bulk suite's
+        # contract is the first two — drop `paths` here so every unpack site
+        # keeps its two-value shape.
+        return nevertrack.scan_staged(self.root)[:2]
 
 
 class ShapesAreRefused(BulkLegBase):
@@ -316,7 +319,7 @@ class TheDeclarationMustBeTracked(BulkLegBase):
         with open(os.path.join(root, "fixtures", "golden.wxr"), "wb") as f:
             f.write(WXR)
         subprocess.run(["git", "add", "-A"], cwd=root, check=True)
-        violations, notes = nevertrack.scan_staged(root)
+        violations, notes, _ = nevertrack.scan_staged(root)
         self.assertEqual(violations, [], notes)
         self.assertFalse(any("could not decide" in n for n in notes), notes)
         self.assertTrue(any("fixtures/golden.wxr" in n and "helm-bulk=ok" in n

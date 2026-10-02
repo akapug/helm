@@ -43,7 +43,7 @@ import time
 import unicodedata
 
 from . import (eventledger, foldckpt, freetext, gate, home, pk, projscope,
-               refstore)
+               refstore, review_findings)
 from .verdicts import (POLARITIES, BASES, BASIS_FLAGS, clean_basis,
                        replay_basis, WORK_POLARITIES as _WORK_POLARITIES)
 
@@ -98,11 +98,20 @@ _FINDING_FIELDS = ("finding_count", "prior_relation")
 PRIOR_RELATIONS = ("regression-of-cure", "uncured", "new")
 
 #: THE REVIEWER'S OWN CURE, RECORDED AS CO-AUTHOR WORK. A reviewer of either
-#: family who finds a MECHANICAL defect patches it in their own worktree on a
-#: branch off the exact reviewed tip, commits there, does not push, and
-#: names the tip here. The lane owner or the integrator rebases the
-#: lane onto that tip or cherry-picks it. A DESIGN finding is not this: it goes
-#: to a meld, because a design disagreement settled by one side's patch is the
+#: family who finds a MECHANICAL defect commits the cure off the exact
+#: reviewed tip, does not push, and names the tip here. A reviewer SUBAGENT
+#: has NO room of its own: it commits in a scratch clone (`git clone --shared
+#: <repo> <scratch>/wt`, detached at the reviewed tip) and fetches that exact
+#: commit back with `git -C <repo> fetch --no-write-fetch-head <scratch>/wt
+#: <sha>` (no refspec, so no ref moves — no shared branch, no shared worktree).
+#: For an explicit BUILD, a parent may instead assign its sole delegate a
+#: REGISTERED lane room (`helm work claim`); the parent owns the lease and
+#: retains it through completion or accepted handoff, then returns the room
+#: (`helm work release`); unfinished work is not released. This narrower build
+#: allocation is never generic reviewer authority. The lane owner or
+#: integrator merges that exact tip into a new composition commit, preserving
+#: both reviewed shas. A DESIGN finding is not this: it goes to a meld, because
+#: a design disagreement settled by one side's patch is the
 #: disagreement unrecorded. The row therefore carries TWO names — the lane's
 #: author and the reviewer who wrote part of the tree — and `lr close --reason
 #: landed` credits both.
@@ -134,6 +143,7 @@ MELD_OUTCOMES = ("agreed", "split", "research")
 _VALUED_VERDICT_FLAGS = ((_WORSE_THAN_MAIN_FLAG, _PATCH_TIP_FLAG,
                           _NO_PATCH_BECAUSE_FLAG, _DIFF_HANDOFF_FLAG, _MELD_FLAG,
                           _DESIGN_FINDING_FLAG) + _FINDING_FLAGS
+                         + review_findings.FLAGS
                          + ("--reviewer-model", "--reviewer-run",
                             "--author-model"))
 
@@ -161,9 +171,12 @@ _WORD = re.compile(r"[a-z0-9]+")
 
 #: The one sentence every review send prints, whatever else it says.
 REVIEW_READER_FIXES_LINE = (
-    "the reader COMMITS its cure on a branch off the exact tip it read and "
-    "returns FIX with --patch-tip; the author reviews that patch; agreement "
-    "on the patch is what lands the chain")
+    "the reader COMMITS its cure off the exact tip it read — a subagent "
+    "reviewer has no room of its own, so it commits in a scratch clone and "
+    "fetches that exact commit back with `git -C <repo> fetch "
+    "--no-write-fetch-head <scratch>/wt <sha>` (no refspec, so no ref moves; "
+    "no shared branch or worktree) — and returns FIX with --patch-tip; the "
+    "author reviews that patch; agreement on the patch is what lands the chain")
 
 
 def _word_tokens(text):
@@ -459,6 +472,80 @@ def _stamp_door(row, door):
         if value:
             row[key] = value
     return row
+
+
+def _lever_rung(row, because, start_anyway=None, alt_ids=(), steer=None):
+    """None, or why a given reason cannot be recorded — the two checks at a
+    chain's first row. NEITHER CHECK REFUSES THE ROW: each STEERS.
+
+    A row that roots its chain is where a seat starts new work (build or
+    review, through the CLI's `send` or `add`), unless the operation is
+    already on the ledger (the row's id or one of `alt_ids`): a retry gets
+    its row back unweighed. THE BIGGEST LEVER FIRST: when it records a task,
+    `tasks.leverage_inversion` weighs it, and the row records the open tasks
+    with more leverage and no lane and the reason (`lever_skipped`,
+    `lever_because`). FINISH FIRST, on a build row (a review moves started
+    work toward landing): `taskkey.in_flight` counts the sending seat's
+    started work sitting unlanded (the fleet's, for the integrator),
+    and the row records it and the reason (`start_anyway_over`,
+    `start_anyway`). With no reason given the row records `tasks.NO_REASON`
+    and the check's line goes to `steer` once per session, task and named
+    lever (`taskkey.steer_once`) for the caller to print. A row on a lane that
+    already records its task is not weighed at all: the claim weighed that
+    pick, and whatever it recorded is copied onto the row
+    (`taskkey.lane_choice`, `reasons_from` names the lane). A later row of a
+    chain is never weighed, and a check that cannot run records
+    `lever_unknown` or `finish_unknown`."""
+    if row.get("supersedes"):
+        return None
+    from . import taskkey, tasks
+    repo, lane = row.get("repo_root"), taskkey.lane_name(row.get("lane"))
+    # ONE READ OF EACH LEDGER FOR THE PICK: the retry lookup, both checks
+    # and the FINISH FIRST line share this dispatch and task snapshot.
+    current, known, why = taskkey.pick_ledgers()
+    if any(i in current for i in [row.get("id")] + list(alt_ids)):
+        return None
+    choice = taskkey.lane_choice(repo, lane, row.get("task"))
+    if choice is not None:
+        row.update(choice)
+        return None
+    lever = tasks.Lever(row.get("task"), (), None)
+    if row.get("task"):
+        lever = (tasks.Lever(row["task"], (), why) if why else
+                 tasks.leverage_inversion(row["task"], known=known, repo=repo,
+                                          current=current))
+    # A REVIEW MOVES STARTED WORK TOWARD LANDING; it starts nothing, so it is
+    # not held to FINISH FIRST.
+    finish = (taskkey.Finish(row.get("sender"), False, (), None)
+              if row.get("kind") == "review" else
+              taskkey.Finish(row.get("sender"), False, (), why) if why
+              else taskkey.in_flight(repo, row.get("sender"), lane=lane,
+                                     task=row.get("task"), current=current,
+                                     known=known))
+    for result, found, key, given, flag in (
+            (lever, lever.skipped, "lever", because, tasks.LEVER_FLAG),
+            (finish, finish.items, "finish", start_anyway,
+             taskkey.START_FLAG)):
+        if result.unknown:
+            row[key + "_unknown"] = result.unknown
+            continue
+        if not found:
+            continue
+        reason = tasks.NO_REASON if given is None else str(given).strip()
+        bad = given is not None and tasks.lever_because_error(reason, flag)
+        if bad:
+            return bad
+        if given is None and steer is not None and taskkey.steer_once(
+                row.get("sender"), key, row.get("task") or lane, result):
+            steer.append(tasks.lever_line(result) if key == "lever"
+                         else taskkey.finish_line(result, known))
+        if key == "lever":
+            row["lever_skipped"] = tasks.lever_skipped(result)
+            row["lever_because"] = reason
+        else:
+            row["start_anyway_over"] = taskkey.finish_over(result)
+            row["start_anyway"] = reason
+    return None
 
 
 def _stamp_read_only(row, because):
@@ -942,7 +1029,7 @@ def _project_of(path, snapshot=False):
     non-empty strings, all arrive here as an EXCEPTION. So "fail open to None"
     describes the ORDINARY read only, and a caller that reads it as the whole
     contract lets the exception escape its own (value, refusal) pair — out of
-    `_base` and `add`, where the CLI has a sentence to print and prints a
+    `_base3` and `add`, where the CLI has a sentence to print and prints a
     traceback instead. Every `snapshot=True` caller therefore owes the raise an
     answer. `write_scope` is the only one: a repository it cannot prove is this
     package's own is refused, naming the registry error
@@ -1002,7 +1089,7 @@ def _unreadable_registry_refusal(repo_id, exc):
     so a malformed, duplicate-keyed or unreadable registry — or one project
     record whose cwd scope is not a list of non-empty strings — reaches this
     door as an exception rather than as None. Letting it escape made a valid
-    `helm dispatch send` traceback out of `_base`/`add` instead of returning
+    `helm dispatch send` traceback out of `_base3`/`add` instead of returning
     the (row, why) pair every caller of those functions handles, so the CLI
     printed a stack trace where it had a sentence to print, and `stalebot`'s
     per-row consultation of this same door died on the first row.
@@ -1092,7 +1179,7 @@ def write_scope(repo_id):
     # for the home row's PROJECT LABEL after the equality had already admitted
     # it: `_project_of(snapshot=True)` is a STRICT read that RAISES on a
     # malformed or unreadable registry, so the exception escaped this pair
-    # through `_base` and `add` and a valid own-repository dispatch died where
+    # through `_base3` and `add` and a valid own-repository dispatch died where
     # trunk admitted it. The label was discarded by every caller (the docstring
     # above states that None project + None why IS the admission), so it bought
     # nothing and cost the guarantee.
@@ -1144,12 +1231,22 @@ def cwd_scope(cwd=None):
     return home_id, (_project_of(home_id) if home_id else None), why
 
 
-def _unique_local_tip_branch(repo, tip):
+def _unique_local_tip_branch(repo, tip, lane=None):
     """One local branch pointing exactly at ``tip``, or None.
 
     This is OPTIONAL write-boundary evidence. A missing/ambiguous answer or a
     failed probe must never erase the exact commit `_resolve_tip` already
     proved: absence of branch evidence leaves the moved-lane guard unarmed.
+
+    AMBIGUITY THE ROW'S OWN LANE RESOLVES (task/4020): when 2+ local branches
+    point at the sha and EXACTLY ONE of them is refs/heads/lane/<the row's
+    lane>, that branch IS the binding — measured three times in one morning
+    (3896, 4002, 3937): a second branch at the reviewed tip (a gc rescue
+    commit, a reviewer-patch branch, a subagent's worktree-agent-*) erased the
+    binding, task/3991's one-car-per-lane guard then bound no branch, and the
+    clean hold was excluded from every train. Lane-free callers (rebind's
+    discovery probe) keep the strict unique-only rule: with no lane to
+    discriminate, ambiguity stays unanswerable.
     """
     try:
         p = subprocess.run(
@@ -1159,8 +1256,14 @@ def _unique_local_tip_branch(repo, tip):
     except (OSError, subprocess.TimeoutExpired, UnicodeError):
         return None
     refs = [x.strip() for x in p.stdout.splitlines() if x.strip()]
-    if p.returncode or len(refs) != 1:
+    if p.returncode or not refs:
         return None
+    if len(refs) != 1:
+        name = _strip_lane_prefix(str(lane or ""))
+        named = "refs/heads/lane/" + name if name else ""
+        if not named or refs.count(named) != 1:
+            return None
+        refs = [named]
     branch = refs[0]
     return branch if branch.startswith("refs/heads/") \
         and not any(c.isspace() for c in branch) else None
@@ -1169,7 +1272,7 @@ def _unique_local_tip_branch(repo, tip):
 _INFER_REF_BRANCH = object()
 
 
-def _resolve_tip(repo, ref, infer_sha_branch=True):
+def _resolve_tip(repo, ref, infer_sha_branch=True, lane=None):
     """(tip, branch) — exactly one commit at WRITE time; replay never calls Git.
 
     ``branch`` is the canonical refs/heads name when the caller names a local
@@ -1180,6 +1283,10 @@ def _resolve_tip(repo, ref, infer_sha_branch=True):
     binding absent without refusing the exact commit — evidence, never a guess.
     Rows written before the field carry none and stay unanswerable, following
     the --kind precedent.
+
+    ``lane`` is the row's own lane, handed to `_unique_local_tip_branch`: when
+    several branches point at the sha, refs/heads/lane/<lane> is the binding
+    if exactly one match carries that name (task/4020).
     """
     ref, err = _clean(ref, "tip", 256)
     if err or not repo or ref.startswith("-"):
@@ -1218,7 +1325,7 @@ def _resolve_tip(repo, ref, infer_sha_branch=True):
     tip = lines[0].strip().lower() if p.returncode == 0 and len(lines) == 1 else ""
     if not _FULL_TIP.fullmatch(tip):
         return None, None
-    return tip, _unique_local_tip_branch(repo, tip) \
+    return tip, _unique_local_tip_branch(repo, tip, lane=lane) \
         if sha_ref and infer_sha_branch else branch
 
 
@@ -1510,6 +1617,17 @@ def _new_state(row):
         out = dict(row)
         for field in VERDICT_AUTHOR_EVIDENCE_FIELDS:
             out.pop(field, None)
+        # Only a validated later chain-task EVENT may project an attachment.
+        # A forged opener carrying these keys is not an attach event and must
+        # not grant a task to a historical taskless chain on replay.
+        for field in ("attached_task", "attached_task_by", "attached_task_ts",
+                      "attach_role"):
+            out.pop(field, None)
+        # The same law for the author's applied cure (task/3937): only a
+        # validated `diff-applied` EVENT may project `diff_applied`. A forged
+        # opener carrying it would confirm an applied tip no receipt bound
+        # and refuse the author's real record as a repeat.
+        out.pop("diff_applied", None)
         out.update(status="open", delivery="needs-confirmation",
                    migration=None, seq=0, tip=str(row["tip"]).lower(),
                    recipient=recipient, recipient_display=recipient_display,
@@ -2123,6 +2241,140 @@ def _standing_concur(row):
             and closed_state(row) != "expired")
 
 
+def _concur_holds_at_own_tip(row, clean_tip):
+    """True when `row` is a CONCUR held source-clean at exactly its own
+    reviewed tip -- the one closed state a hold may fold over (task/4089).
+
+    A CONCUR is the verdict that authorizes nothing: it endorsed the row's
+    work and found nothing, so a source-clean claim on that same tip IS the
+    concur's read, and the hold is the one move that records it on the same
+    row. A verdict can only be written at the row's own tip (the fold binds
+    `reviewed` to `state["tip"]`), so "the concur's own exact tip" is the
+    concur's `reviewed_tip`, and the hold must name exactly it: any other
+    tip is a read the concur did not make. `_standing_concur` also lets a
+    concur the board has since ENDED stand -- a landed or structured-closed
+    one clears `moved_nothing` and is not the `expired` spelling -- but such
+    a row is terminal again, not a hold: its `closed_state` is no longer the
+    bare `verdict`. Requiring that spelling keeps every other hold refusal,
+    so the one hold the door admits is the one on a CONCUR still live. The
+    writer asks this once under its lock and the replay asks it again, so
+    the two cannot drift: a hold the door admits is a hold the fold
+    lands."""
+    if not _standing_concur(row):
+        return False
+    if closed_state(row) != "verdict":
+        return False
+    reviewed = str(row.get("reviewed_tip") or "").strip().lower()
+    held = str(clean_tip or "").strip().lower()
+    return bool(reviewed) and reviewed == held
+
+
+def _held_over_concur(row):
+    """True when `row` is HELD over its own CONCUR -- the one held row that
+    already carries a verdict (`_concur_holds_at_own_tip` admits it).
+
+    Every move off such a hold returns the CONCUR, never an OPEN row: a
+    standing verdict is immutable, and an OPEN row takes a second verdict
+    over the first. So a release restores status `verdict`, and a cancel is
+    refused as it is for any reviewed row. The writer and the replay both
+    ask this, so the two cannot drift."""
+    return (isinstance(row, dict) and row.get("status") == "held"
+            and _replay_polarity(row.get("polarity")) == "concur")
+
+
+def _concur_held_source_clean(row):
+    """True when `row` is HELD over its own STANDING CONCUR at exactly that
+    CONCUR's reviewed tip -- the one row the `source-clean-landed` close door
+    reads as a source-clean hold (task/4089).
+
+    Such a hold IS the CONCUR's clean read, so once the land ships that tip
+    the door that ends a landed source-clean hold must end this row too: for
+    that door, and only that door, its effective polarity is the hold's
+    (None). Every other door still sees `concur`, and `_CLOSE_POLARITY` is
+    not widened: a CONCUR authorizes nothing. A hold naming any other tip is
+    a read the CONCUR did not make, so it stays a CONCUR here as well."""
+    if not (_held_over_concur(row) and _standing_concur(row)):
+        return False
+    reviewed = str(row.get("reviewed_tip") or "").strip().lower()
+    return bool(reviewed) and reviewed == _clean_tip_of(row)
+
+
+#: The read polarities that FOUND something (task/4103). A source-clean hold
+#: says its read found nothing, so a row whose recorded read is one of these
+#: cannot carry that claim.
+_FOUND_POLARITIES = ("fix", "supersede")
+
+
+def _source_clean_finding(row, clean_tip):
+    """The recorded read on `row` that refuses a source-clean hold at
+    `clean_tip`, as (VERDICT, tip, whose), or None (task/4103).
+
+    Two records can say it. A row CLOSED by a FIX or SUPERSEDE verdict is one
+    (any other closed row is refused by the hold door's open-row rule). An
+    OPEN row carrying an advisory read that found something at exactly the
+    held tip is the other: that is how the integrator's fresh read records,
+    and the measured hold came after one. A finding at an EARLIER tip does
+    not refuse, because a cure round moves the tip past it and the hold
+    names the cured one."""
+    if closed_state(row) == "verdict":
+        polarity = _replay_polarity(row.get("polarity"))
+        if polarity in _FOUND_POLARITIES:
+            return (polarity.upper(), str(row.get("reviewed_tip") or ""),
+                    "the row's own verdict")
+    tip = str(clean_tip or "").strip().lower()
+    for read in row.get("advisory_reads") or ():
+        if not isinstance(read, dict):
+            continue
+        polarity = _replay_polarity(read.get("polarity"))
+        if polarity in _FOUND_POLARITIES and tip and str(
+                read.get("reviewed_tip") or "").strip().lower() == tip:
+            return (polarity.upper(), tip, "a read recorded by @%s"
+                    % (read.get("recorded_by") or "an unnamed seat"))
+    return None
+
+
+def _hold_receipt_error(row, actor, clean_tip, reason):
+    """Why a source-clean hold at `clean_tip` carries no fab receipt, or
+    None (task/4103). Measured: seats held rows source-clean minutes after
+    dispatch with reasons that named no run, and auto-land landed them on
+    those holds alone.
+
+    The receipt is `handback_claims.hold_receipt`'s: a passing `Ran N` line
+    or the fab LOG of a run on exactly this tip. The hold's reason carries
+    it, or a read already recorded on this row at this tip does: the
+    standing CONCUR a hold over its own CONCUR rests on
+    (`_concur_holds_at_own_tip`), or the holder's own fresh-context read
+    (`landreq._fresh_instance_read`), which the verdict verb holds on in the
+    same move."""
+    from . import handback_claims, landreq   # DEFERRED — landreq imports us.
+    texts = [reason]
+    over_concur = _concur_holds_at_own_tip(row, clean_tip)
+    if over_concur:
+        texts.append(row.get("verdict_ref"))
+    read = landreq._fresh_instance_read(row, actor, clean_tip)
+    if read:
+        texts.append(read.get("verdict_ref"))
+    receipt, foreign = handback_claims.hold_receipt(
+        "\n".join(str(t or "") for t in texts), clean_tip)
+    if receipt:
+        return None
+    short = clean_tip[:handback_claims.FAB_LOG_TIP_CHARS]
+    return ("--source-clean refused: the hold carries no fab receipt for %s%s. "
+            "A source-clean hold says the tree passed, so its reason names a "
+            "passing `Ran N tests ... OK` line, or the fab LOG of a run on "
+            "exactly this tip (its job name carries %s)%s. Hold again as: "
+            "helm dispatch hold %s \"SOURCE-CLEAN: <what you read>; fab Ran "
+            "N tests ... OK, LOG <host>:~/fab/logs/<job>-%s-<run>.log\" "
+            "--source-clean %s"
+            % (clean_tip[:12],
+               ": the LOG it names (%s) ran on another tip"
+               % ", ".join(foreign) if foreign else "",
+               short,
+               "; a hold over its own CONCUR may rest on that CONCUR's "
+               "evidence instead" if over_concur else "",
+               row["id"][:12], short, clean_tip[:12]))
+
+
 def _read_another_tip(kid, row):
     """True when `kid` recorded a tip and it is not `row`'s own reviewed tip.
 
@@ -2516,8 +2768,8 @@ class _CarrierView(collections.abc.Mapping):
 # A FIX verdict says A CURE IS OWED, so every surface reads the row as "waiting
 # on the lane". WHO writes the cure is not fixed by the polarity: the reviewer
 # may have written it already and named the tip on the verdict (`patch_tip`),
-# in which case what the lane owes is the rebase and the re-dispatch, not the
-# code. When the cure exists and nobody re-dispatched, the row still says FIX
+# in which case the lane owes composition preserving that tip's ancestry and
+# the re-dispatch, not the code. When the cure exists and nobody re-dispatched, the row still says FIX
 # and NOBODY IS WAITING ON ANYBODY: the lane believes it is done, the board
 # says it owes work, no reviewer holds it.
 #
@@ -2585,6 +2837,15 @@ def _cure_index(root=None, trunk="origin/main"):
         if len(parts) != 2:
             continue
         name, tip = parts
+        # PRESERVED-COPY BACKUP REFS ARE NOT CURE CARRIERS. The reaper writes a
+        # reaped lane's tip under `refs/heads/backup/<name>` (and the flat
+        # `backup-<name>` form) before removing the branch, so a preserved copy
+        # holds the SAME commits ahead of trunk as the live branch that is the
+        # real cure. Counting it makes a placeable cure read AMBIGUOUS
+        # ("ambiguous live cure carriers"). `review/` and live lane refs are
+        # REAL carriers and stay.
+        if name.startswith("backup/") or name.startswith("backup-"):
+            continue
         rc, shas, err = back.text(root, "rev-list", tip, "--not", trunk)
         if rc != 0:
             return None, "rev-list failed on %s: %s" % (name, err or rc)
@@ -3216,6 +3477,17 @@ HOLD_ACTOR_BACKFILL_EVENT = "hold-actor-backfill"
 #: from one a transcript proved.
 HOLD_ACTOR_EVIDENCE = "hold_actor_evidence"
 
+#: THE APPEND-ONLY CHAIN-TASK ATTACH (task/4000). A chain minted with no
+#: task (`--new-work` that recorded none) files its findings top-level, and
+#: without this event a later round can never carry them under the task the
+#: chain was later judged to serve (measured live: simbi chain
+#: 89dea44a1662's findings task/3913-3917 continue task/3993, and the new
+#: --task chain refused them as another chain's). ONE event on the chain's
+#: FIRST row records the attach; the row's own `task` key — the immutable
+#: fact of what the opener recorded — is never written, and the join reads
+#: the attach beside it (`taskkey.join`).
+CHAIN_TASK_EVENT = "chain-task"
+
 
 # THE POST-CREATE MUTATOR EVENTS — the ones that move an ACTIVE obligation.
 # Declared as data so the reducer guard and the hostile matrix that proves it
@@ -3225,7 +3497,8 @@ HOLD_ACTOR_EVIDENCE = "hold_actor_evidence"
 # verdict, and their exclusivity from retirement is proven separately.
 _ACTIVE_ONLY_EVENTS = ("delivered", "verdict", "cancel", "hold", "release",
                        "retip", "superseded", "retarget", "advisory-read",
-                       "findings-note", HOLD_ACTOR_BACKFILL_EVENT)
+                       "findings-note", HOLD_ACTOR_BACKFILL_EVENT,
+                       "diff-applied")
 
 
 def _close_position(position):
@@ -3294,7 +3567,11 @@ LEDGER_EVENT_ACTORS = {
     # held, not when the census ran. The hand that ran the census is not
     # recorded, so this kind credits nobody (see `LEDGER_NOT_AN_ACTOR`).
     HOLD_ACTOR_BACKFILL_EVENT: (),
-    "release": (),
+    # A RELEASE STAMPS ITS RELEASING HAND THE WAY A HOLD STAMPS ITS HOLDER
+    # (task/4149): the acting seat, or a programmatic mover's fixed name. A
+    # release written before the stamp existed records no hand, and its
+    # absence reads UNRECORDED.
+    "release": ("release_actor",),
     "delivered": (),
     "notify-failed": (),
     "superseded": (),
@@ -3313,6 +3590,10 @@ LEDGER_EVENT_ACTORS = {
     # THE LOCAL FINDINGS PASS'S NOTE (task/2960) is written by a detached
     # machine process that runs under no seat, so it records no hand at all.
     "findings-note": (),
+    # THE CHAIN-TASK ATTACH (task/4000) names its hand in `attached_by` —
+    # the chain's author or the integrator, the two seats `attach_task`
+    # admits.
+    CHAIN_TASK_EVENT: ("attached_by",),
     # HISTORICAL SPELLINGS, still on the ledger and no longer written: the v1
     # snapshot carried the whole row under no `event` key at all and `retarget`
     # carried it under that one. Both hold a `recipient` and no sender, so the
@@ -3325,6 +3606,10 @@ LEDGER_EVENT_ACTORS = {
     # opens rows from UNKNOWN when one reaches a row that already exists.
     "add": (),
     "posting": (),
+    # THE AUTHOR'S UNCHANGED-CURE RECORD (task/3937): the author's own hand
+    # writes it, but no acting-seat field is stamped today, so it credits
+    # nobody here rather than guess.
+    "diff-applied": (),
 }
 
 
@@ -3770,6 +4055,49 @@ def _apply(state, row, current=None, verdicts=None, position=None):
     # tip, or status; it retires only the operational debt while preserving the
     # contradiction as history. Cancelled rows and every other post-terminal
     # event remain inert.
+    if event == CHAIN_TASK_EVENT and strict:
+        # THE APPEND-ONLY CHAIN-TASK ATTACH (task/4000): it rides the
+        # chain's FIRST row as `attached_task` and moves nothing else —
+        # status, tip, delivery and verdicts stay exactly as they were, so
+        # the attach lands on a row of ANY status: the measured case
+        # (task/4000's note) attached a chain whose root already carried a
+        # FIX, and a closed row is precisely where a review's chain is known
+        # to have served a task. It therefore sits AHEAD of the
+        # terminal-is-immutable block, exactly as discharge does inside it.
+        # The reducer refuses what the writer refuses (`attach_task`): a
+        # task id of no valid shape, a hand no seat would be admitted as,
+        # and — the whole append-only law — a row that ALREADY has a task
+        # answer, whether its opener recorded one (`task`) or an earlier
+        # attach did. A second event would either say the fact twice or
+        # CONTRADICT it, and the ledger's answer to both is to keep the
+        # first.
+        task = row.get("task")
+        if not isinstance(task, str) \
+                or not re.fullmatch(r"task/[1-9][0-9]{0,8}", task):
+            return state
+        by = row.get("attached_by")
+        if not isinstance(by, str) or not by:
+            return state
+        role = row.get("attach_role")
+        if role not in ("author", "integrator", "owner"):
+            return state
+        if not _valid_ts(row.get("ts")):
+            return state
+        if state.get("task") or state.get("attached_task"):
+            return state
+        # THE CHAIN'S TASK IS THE FIRST ROW'S FACT (`taskkey.first_row`),
+        # so the attach folds on the ROOT alone — a v3 root names itself, and
+        # a row predating chains (chain_root absent) is its own first row. An
+        # event appended to a later round is inert, or a hand-append on one
+        # round would mint a task the join never reads while bumping the
+        # row's seq past an event no consumer applied.
+        if state.get("chain_root") not in (None, state["id"]):
+            return state
+        out = dict(state)
+        out.update(attached_task=task, attached_task_by=by,
+                   attached_task_ts=row.get("ts"), attach_role=role,
+                   seq=expected)
+        return out
     if state.get("status") in CLOSED_STATES:
         # One explicit correction may follow a historical cancellation. It does
         # not infer from the cancel prose and does not erase it: the projected
@@ -3804,6 +4132,39 @@ def _apply(state, row, current=None, verdicts=None, position=None):
             out.update(fields)
             out.update(polarity=RETRACTED, verdict_retracted=True,
                        seq=expected)
+            return out
+        # THE AUTHOR'S UNCHANGED-CURE RECORD (task/3937) — the third narrow
+        # exception, and like the other two it rewrites nothing. The verdict
+        # stays exactly as appended; the event only RIDES the verdicted row
+        # as `diff_applied`. Replay re-asks every ledger law the writer's
+        # `_diff_applied_refusal` asked that the LEDGER can answer; the git
+        # measurements (tip^ == reviewed, patch-id equality, the fab
+        # receipt) are the writer's door, exactly as a verdict's gate
+        # binding is.
+        if event == DIFF_APPLIED_EVENT and strict \
+                and state.get("status") == "verdict" \
+                and _has_diff_handoff(state) \
+                and not state.get("diff_applied") \
+                and isinstance(row.get("tip"), str) \
+                and _FULL_TIP.fullmatch(row["tip"]) \
+                and row.get("tip") != state.get("reviewed_tip") \
+                and isinstance(row.get("patch_id"), str) \
+                and re.fullmatch(r"[0-9a-f]{40}\Z", row["patch_id"]) \
+                and row.get("receipt_sha256") \
+                == state["diff_handoff"]["sha256"] \
+                and isinstance(row.get("fab"), str) \
+                and _valid_ts(row.get("ts")):
+            out = dict(state)
+            out["diff_applied"] = {key: row.get(key)
+                                   for key in _DIFF_APPLIED_KEYS}
+            # THE FROZEN LAND AUTHORITY, replayed exactly as recorded — its
+            # anchor binds the fields, and `applied_approval` re-judges it at
+            # read time, so a tampered copy folds and is refused there, never
+            # dropped here into a silent pass.
+            proof = row.get("hold_approval")
+            if isinstance(proof, dict):
+                out["diff_applied"]["hold_approval"] = proof
+            out["seq"] = expected
             return out
         # CLOSED-BY-LANDING is a monotonic historical fact: once Git proved an
         # UNDECLARED reviewed change on one sampled trunk, no later event or ref
@@ -3991,7 +4352,16 @@ def _apply(state, row, current=None, verdicts=None, position=None):
             for key in _CLOSE_STATE_FIELDS[row["close_reason"]]:
                 out[key] = row.get(key)
             return out
-        return state
+        # A CONCUR HELD SOURCE-CLEAN AT ITS OWN REVIEWED TIP (task/4089) is the
+        # one closed state a hold may fold over. The writer admits it above and
+        # appends the SAME `hold` event an open-row hold gets, so the replay
+        # must land it through the SAME fold rather than treat the row as
+        # terminal: falling through lets it reach that hold arm below, whose
+        # condition already widens `open` to this case. Every other closed
+        # state stays terminal here, exactly as before.
+        if not (event == "hold" and strict
+                and _concur_holds_at_own_tip(state, _clean_tip_of(row))):
+            return state
     legacy = state.get("v") != 3
     # Compat replays ONLY rows stamped before the reduced core landed: an
     # event appended today can never drive the removed machinery, however
@@ -4117,6 +4487,7 @@ def _apply(state, row, current=None, verdicts=None, position=None):
             if isinstance(design, list) and design \
                     and all(isinstance(d, str) and d for d in design):
                 out["design_findings"] = list(design)
+            out.update(review_findings.replayed(row))
             # ABSENT stays ABSENT. Setting a default here would erase the
             # difference between "written by a writer with no gate" and
             # "written by one whose stamp we could not read".
@@ -4153,7 +4524,8 @@ def _apply(state, row, current=None, verdicts=None, position=None):
         out = dict(state)
         out.update(status="cancelled", cancel_reason=reason, seq=expected)
         return out
-    if event == "cancel" and state["status"] == "held" and strict:
+    if event == "cancel" and state["status"] == "held" and strict \
+            and not _held_over_concur(state):
         reason, err = _clean(row.get("reason"), "cancel reason",
                              _CANCEL_REASON_CAP)
         if err or not reason:
@@ -4240,7 +4612,9 @@ def _apply(state, row, current=None, verdicts=None, position=None):
         out.update(findings_notes=tuple(state.get("findings_notes") or ())
                    + (record,), seq=expected)
         return out
-    if event == "hold" and state["status"] == "open" and strict:
+    if event == "hold" and strict and \
+            (state["status"] == "open"
+             or _concur_holds_at_own_tip(state, _clean_tip_of(row))):
         reason, err = _clean(row.get("reason"), "hold reason", 256)
         if err or not reason:
             return state
@@ -4309,6 +4683,17 @@ def _apply(state, row, current=None, verdicts=None, position=None):
             out.pop(key, None)
         if clean:
             out.update(_meld_record(row))
+            if isinstance(row.get("hold_approval"), dict):
+                from . import dispatches_tier
+                out["hold_approval"] = dict(row["hold_approval"])
+                valid, _why = dispatches_tier.hold_approval(
+                    out, out.get("repo_root"), current=False)
+                if not valid:
+                    out.pop("hold_approval", None)
+            else:
+                out.pop("hold_approval", None)
+        else:
+            out.pop("hold_approval", None)
         return out
     if event == HOLD_ACTOR_BACKFILL_EVENT and state["status"] == "held" \
             and strict and _hold_actor_backfill_error(row, state) is None:
@@ -4322,10 +4707,21 @@ def _apply(state, row, current=None, verdicts=None, position=None):
         return out
     if event == "release" and state["status"] == "held" and strict:
         out = dict(state)
-        out.update(status="open", release_reason=row.get("reason"),
+        # A HOLD OVER A CONCUR RELEASES TO THAT VERDICT (`_held_over_concur`).
+        out.update(status="verdict" if _held_over_concur(state) else "open",
+                   release_reason=row.get("reason"),
                    release_ts=row.get("ts"), seq=expected)
         for key in _HOLD_STATE_FIELDS + MELD_FIELDS:
             out.pop(key, None)
+        # THE RELEASING HAND, SET OR CLEARED BY THE HOLD FOLD'S LAW: an actor
+        # the writer did not stamp, or one that is not a seat token, reads as
+        # UNRECORDED -- never as whoever released the row before, because that
+        # would answer "who lifted this hold" for somebody else.
+        actor = row.get("release_actor")
+        if isinstance(actor, str) and _TOKEN.fullmatch(actor):
+            out["release_actor"] = actor
+        else:
+            out.pop("release_actor", None)
         return out
     # RETIP: an explicit re-point of an OPEN row's tip with an audit trail —
     # the mirror of rebind for the case where the BASE moved rather than the
@@ -6176,7 +6572,7 @@ def clean_kind(kind):
 
 # WORK IDENTITY IS A CHAIN, NOT A LANE STRING.
 #
-# `_base` minted a row whose only statement of WHAT WORK IT WAS was the LANE:
+# `_base3` minted a row whose only statement of WHAT WORK IT WAS was the LANE:
 # free text, with no link to any prior row — no parent, no supersedes, no
 # lookup. Three separate failures in a single night, pointing in OPPOSITE
 # directions, all reduce to that one missing relation, which is why patching any
@@ -6432,7 +6828,7 @@ def _store_body(message, has_ref=False):
     character; `errors="ignore"` drops exactly the split tail (the source is a
     `str`, so there are no other invalid bytes to lose).
 
-    Returns None for no message at all, so `_base` writes the KNOWN-EMPTY None
+    Returns None for no message at all, so `_base3` writes the KNOWN-EMPTY None
     rather than an empty string that reads as a brief with no words in it."""
     message = str(message or "")
     if not message:
@@ -6502,7 +6898,7 @@ def _store_body(message, has_ref=False):
 #
 # CONTENT-ADDRESSED, NOT ROW-ADDRESSED, and the reason is an ordering one. The
 # row's id is not final until inside the append lock (`send` derives it from an
-# operation key after `_base` has built the row), so a file named for the id
+# operation key after `_base3` has built the row), so a file named for the id
 # could not be written BEFORE the row without duplicating that derivation
 # outside the lock. The brief's blake2b-128 digest is known once its FULL text
 # is final — immediately for ordinary sends, inside the lock after generated
@@ -6771,7 +7167,7 @@ def body_of(row):
 
     THE DISCRIMINATOR IS KEY PRESENCE, not the value — the same reasoning
     `stale_writer_rows` uses on `_V3_TRACKED_KEYS`: a row is not malformed for
-    lacking a field it PREDATES. Every row `_base` writes from now on carries
+    lacking a field it PREDATES. Every row `_base3` writes from now on carries
     `message_body`, explicitly None when the path had no DM; no row written
     before this carries the key at all. v3 replay is `dict(row)` so the
     distinction survives it, and the v1/v2 branch builds a fixed key set that
@@ -6801,7 +7197,8 @@ def body_of(row):
     return body, None
 
 
-def _resolve_chain(new_work, supersedes, current=None, repo_id=None):
+def _resolve_chain(new_work, supersedes, current=None, repo_id=None,
+                   lane=None, repo=None):
     """(parent_id | None, chain_root | None, err) for one NEW row.
 
     `repo_id` is the repository the NEW row binds, and it is the CHAIN
@@ -6811,7 +7208,7 @@ def _resolve_chain(new_work, supersedes, current=None, repo_id=None):
 
     `chain_root=None` with no error means THIS ROW ROOTS ITS OWN CHAIN; the
     single writer seals it to the row's own id once that id is final (`send`
-    derives the id from an operation key AFTER `_base` builds the row, so the
+    derives the id from an operation key AFTER `_base3` builds the row, so the
     seal cannot live here).
 
     ONE HOP, never a walk: the parent already carries its resolved root, so a
@@ -6899,6 +7296,28 @@ def _resolve_chain(new_work, supersedes, current=None, repo_id=None):
             "--supersedes %s: that row's chain_root is malformed, so the chain "
             "it belongs to is UNKNOWN — refusing rather than rooting new work "
             "at a corrupt relation" % parent["id"][:12])
+    # A continuation may rename a lane, but may not borrow a DIFFERENT lane's
+    # proven task and then inherit its parent's task at LAND (task/3995).
+    # A trailing number is not task proof. Read the first row and the new
+    # lane's own record/literal separately; joining them as one row would let
+    # the stored root mask the contradiction.
+    if lane is not None and repo is not None:
+        from . import taskkey
+        first = taskkey.first_row(parent, current)
+        chain_task = (first or {}).get("task") or taskkey.join(
+            row=parent, current=current).task
+        own = taskkey.join(lane=lane, repo=repo)
+        if own.why and own.why != taskkey.NO_TASK:
+            return None, None, ("--supersedes %s: lane %s's task is UNKNOWN "
+                                "(%s); refusing the continuation" % (
+                                    parent["id"][:12], taskkey.lane_name(lane),
+                                    own.why))
+        if chain_task and own.task and own.task != chain_task:
+            return None, None, ("--supersedes %s: its chain serves %s but "
+                                "lane %s proves %s; start a new chain for the "
+                                "other task" % (parent["id"][:12], chain_task,
+                                                taskkey.lane_name(lane),
+                                                own.task))
     # A CANCELLED or still-OPEN parent is a legitimate parent, and a legitimate
     # FORK (two rows naming one parent) is legitimate too — see the lifecycle
     # table in docs/VERBS.md. Refusing any of them would push the caller to
@@ -7150,24 +7569,40 @@ def _patch_refusal(missing, declining, tip):
                ",".join(patch[:12] for patch in declining), retracts))
 
 
-def _base(recipient, lane, ref, note, deadline_s, repo, sender=None,
+def _review_task_refusal():
+    return ("a review chain must name its task: pass --task task/N --part "
+            "(or --whole if this chain finishes the task), or helm work "
+            "claim <lane> --task task/N --part (or --whole); mint work "
+            "first with helm task add <title> --project P")
+
+
+def _base3(recipient, lane, ref, note, deadline_s, repo, sender=None,
           operation_key=None, message_hash=None, rid=None, kind=None,
           new_work=False, supersedes=None, _current=None,
           _ref_branch=_INFER_REF_BRANCH, message_body=None, acted_by=None,
-          custodian=None, brief_ref=None, brief_bytes=None, task=None):
+          custodian=None, brief_ref=None, brief_bytes=None, task=None,
+          whole=False, answers_row=None, _relay_notice=False,
+          _replay_probe=False):
+    """(row, err, advisory) — the row builder every dispatch writer shares.
+
+    `advisory` is task/4020's unbound-branch warning for a review row, or
+    None; it never rides the ledger (`_with_unbound_advisory` attaches it to
+    the row a writer returns). ONE NAME (task/4026): the two-value `_base`
+    wrapper is retired, because two names for one writer let a mock of the
+    one a caller no longer called pass while patching nothing."""
     recipient, err = _recipient_operand(recipient)
     if err:
-        return None, err
+        return None, err, None
     recipient_display = recipient.display
     lane, err = _clean(lane, "lane", LANE_CAP)
     if err:
-        return None, err
+        return None, err, None
     lane = _strip_lane_prefix(lane) or lane
     if note is not None:
         note, err = _clean(note, "note", NOTE_CAP)
         if err:
-            return None, err
-    # THE ONE PLACE THAT KNOWS BOTH. `_base` is the single writer of a dispatch
+            return None, err, None
+    # THE ONE PLACE THAT KNOWS BOTH. `_base3` is the single writer of a dispatch
     # row and the only seam holding the deadline and the kind at once, so it is
     # where an unstated deadline becomes a kind-appropriate one. Callers that
     # state a deadline are untouched.
@@ -7175,17 +7610,17 @@ def _base(recipient, lane, ref, note, deadline_s, repo, sender=None,
         deadline_s = default_deadline_s(kind)
     deadline_s, err = _deadline(deadline_s)
     if err:
-        return None, err
+        return None, err, None
     if sender is not None and not _TOKEN.fullmatch(str(sender)):
-        return None, "sender must be an exact 1-64 character seat token"
+        return None, "sender must be an exact 1-64 character seat token", None
     # SAME GATE, SAME SENTENCE, for the seat that PERFORMED a move. `acted_by`
     # is read off a live process identity rather than off an argument, but it
     # reaches the ledger through this one writer like every other stamp, and a
     # writer that validates one identity field and waves the next one through
     # is a writer with a hole in it.
     if acted_by is not None and not _TOKEN.fullmatch(str(acted_by)):
-        return None, "acting seat must be an exact 1-64 character seat token"
-    # VALIDATED AT THE OWNER LAYER, not only at the CLI. `_base` is the single
+        return None, "acting seat must be an exact 1-64 character seat token", None
+    # VALIDATED AT THE OWNER LAYER, not only at the CLI. `_base3` is the single
     # writer of a dispatch row, and it accepted `kind="buld"` verbatim: the
     # typo reached the ledger, counted as neither build nor review, and showed
     # up in the report as UNKNOWN — indistinguishable from an honestly
@@ -7193,7 +7628,12 @@ def _base(recipient, lane, ref, note, deadline_s, repo, sender=None,
     # protects the CLI, not the DATA.
     kind, err = clean_kind(kind)
     if err:
-        return None, err
+        return None, err, None
+    # A REVIEW NEVER GOES TO A SEAT OUTSIDE THE REVIEW BENCH (task/3855), and
+    # here for the same reason as the light rung below: every writer reaches it.
+    err = _bench_role_refusal(recipient, kind)
+    if err:
+        return None, err, None
     # THE REPOSITORY IS RESOLVED BEFORE THE CHAIN NOW, because the chain's
     # authority IS the repository (task/2437): a parent may only authorize a
     # child in its own repository, and `_resolve_chain` can no longer answer
@@ -7203,7 +7643,7 @@ def _base(recipient, lane, ref, note, deadline_s, repo, sender=None,
     # two mistakes at once and either sentence repairs one of them.
     info = _repo_info(repo)
     if not info:
-        return None, "ref needs a Git working tree (--repo PATH)"
+        return None, "ref needs a Git working tree (--repo PATH)", None
     # BEFORE the tip resolution, because a ref no project claims is not this
     # ledger's to validate.
     #
@@ -7224,19 +7664,28 @@ def _base(recipient, lane, ref, note, deadline_s, repo, sender=None,
     # the registration step named, which is a repair the caller can perform.
     _project, scope_why = write_scope(info["repo_id"])
     if scope_why:
-        return None, scope_why
-    # INSIDE `_base`, BECAUSE FOUR WRITERS SHARE IT AND NOTHING ELSE. `add` and
+        return None, scope_why, None
+    # A LEAD TAKES ONLY ITS OWN PROJECT'S WORK (task/4039), at the writer
+    # every door shares and after the scope, because the lane's project is
+    # its subject.
+    err = _lead_context_refusal(recipient, info["repo_id"], sender=sender,
+                                answers_row=answers_row, current=_current,
+                                supersedes=supersedes)
+    if err:
+        return None, err, None
+    # INSIDE `_base3`, BECAUSE FOUR WRITERS SHARE IT AND NOTHING ELSE. `add` and
     # `send`'s three branches each reach the ledger through here, and a gate
     # bolted beside each of them is the shape that guarantees one never gets it
     # (task/2480 said so about the usability door, one function up).
     light_ok, light_refusal, _light_note = _project_light_rung(
         info["repo"], kind, new_work)
     if not light_ok:
-        return None, light_refusal
+        return None, light_refusal, None
     parent, chain_root, err = _resolve_chain(new_work, supersedes, _current,
-                                             repo_id=info["repo_id"])
+                                             repo_id=info["repo_id"], lane=lane,
+                                             repo=info["repo"])
     if err:
-        return None, err
+        return None, err, None
     # THE TASK THIS CHAIN SERVES, on its FIRST row (task/3643): `--task`
     # (an OPEN task that agrees with the lane's record), else the lane's
     # record, else the one open task the lane or the brief names literally.
@@ -7246,53 +7695,72 @@ def _base(recipient, lane, ref, note, deadline_s, repo, sender=None,
         task, new_work=new_work, lane=lane, repo=info["repo"],
         brief="\n".join(t for t in (message_body, note) if t))
     if err:
-        return None, err
+        return None, err, None
+    if (kind == "review" and new_work and not task
+            and _relay_notice is not _RELAY_NOTICE_MINT and not _replay_probe):
+        return None, _review_task_refusal(), None
+    # THE WHOLE ASK (task/3746): `--whole` records, beside the task on the
+    # chain's first row, that the lane carries the task's whole ask, so its
+    # land leaves the task owing a seen-working check (helm/observed.py). It
+    # names the task a NEW chain records.
+    if whole and not new_work:
+        return None, ("--whole marks the task a NEW chain (--new-work) "
+                      "records; a --supersedes row keeps its chain's first "
+                      "row's"), None
+    if whole and not task:
+        return None, ("--whole records that the lane carries the WHOLE ask "
+                      "of the task this chain records, and it records none; "
+                      "give --task task/N"), None
     display, err = _clean(ref, "ref", REF_CAP)
     if err:
-        return None, "ref is required so the verdict can bind an exact tip"
+        return None, "ref is required so the verdict can bind an exact tip", None
     tip, inferred_branch = _resolve_tip(
-        info["repo"], display, infer_sha_branch=_ref_branch is _INFER_REF_BRANCH)
+        info["repo"], display, infer_sha_branch=_ref_branch is _INFER_REF_BRANCH,
+        lane=lane)
     if not tip:
         return None, ("ref is missing, ambiguous, or not a commit in this "
                       "repository"
-                      + _typedids().tip_hint(info["repo"], display))
+                      + _typedids().tip_hint(info["repo"], display)), None
     # THE DOOR BELONGS HERE, on the EXACT tip every append stores. Its first
     # home was an early check in `send` against `raw_tip`, which is
     # `str(ref).strip().lower()` — so `HEAD` arrived as `head` and any
     # mixed-case ref was mangled BEFORE the door could resolve it, while
-    # `_base` went on to resolve the ORIGINAL spelling. A door reading a
+    # `_base3` went on to resolve the ORIGINAL spelling. A door reading a
     # different string from the one the ledger binds is not a door.
     refusal = snapshot_tip_refusal(info["repo"], tip)
     if refusal:
-        return None, refusal
-    # THE SAME WRITER, THE SAME REASON: four doors share `_base`, and a model
+        return None, refusal, None
+    # THE SAME WRITER, THE SAME REASON: four doors share `_base3`, and a model
     # that may train on the prompt must not be handed private code by any.
     # AFTER the tip resolves, because privacy is per COMMIT: the rung judges
     # the exact tip this row binds, not the repository it lives in.
     terms_ok, terms_refusal = _data_terms_rung(recipient, info["repo"], tip)
     if not terms_ok:
-        return None, terms_refusal
+        return None, terms_refusal, None
     # THE LANE FOR REVIEW: a review row must name the lane whose branch holds
     # the tip. Rows filed under the wrong lane were recorded (task/3511: rows
     # b336dfb43845 and 04a7cfe64327 named "claude" when the tip sat on the
     # real lane). The check resolves which lane/* branches actually contain the
     # tip and refuses if the named lane does not. It never blocks on git failure.
+    # The lane/* holders are read ONCE and handed to both review-lane readers
+    # (task/4026): this refusal, and the unbound-branch advisory below.
+    holders = _lane_holders(info["repo"], tip) if kind == "review" else None
     if kind == "review":
-        refusal = _review_lane_refusal(info["repo"], lane, tip)
+        refusal = _review_lane_refusal(info["repo_id"], lane, tip, holders)
         if refusal:
-            return None, refusal
+            return None, refusal, None
     ref_branch = inferred_branch if _ref_branch is _INFER_REF_BRANCH \
         else _ref_branch
     if ref_branch is not None and (not isinstance(ref_branch, str)
                                    or not ref_branch.startswith("refs/heads/")
                                    or any(c.isspace() for c in ref_branch)):
-        return None, "ref branch override must be a canonical local branch or null"
+        return None, "ref branch override must be a canonical local branch or null", None
     ts = pk.now_ts()
-    return {"v": 3, "event": "dispatch", "seq": 0,
-            "id": rid or os.urandom(16).hex(), "ts": ts,
-            "recipient": str(recipient), "recipient_display": recipient_display,
-            "lane": lane, "tip": tip, "ref": display,
-            "ref_branch": ref_branch,
+    row = {"v": 3, "event": "dispatch", "seq": 0,
+           "id": rid or os.urandom(16).hex(), "ts": ts,
+           "recipient": str(recipient), "recipient_display": recipient_display,
+           "lane": lane, "tip": tip, "ref": display,
+           "ref_branch": ref_branch,
             "note": note, "deadline_s": deadline_s, "kind": kind,
             "source": home.session_id() or "cli", "sender": sender,
             "repo_id": info["repo_id"], "repo_root": info["repo"],
@@ -7313,6 +7781,10 @@ def _base(recipient, lane, ref, note, deadline_s, repo, sender=None,
             # PRESENT ONLY ON A CHAIN'S FIRST ROW THAT SERVES A KNOWN TASK:
             # its absence reads as UNKNOWN to the join, never as "no task".
             **({"task": task} if task else {}),
+            # PRESENT ONLY WHEN THE LANE CARRIES THE TASK'S WHOLE ASK: its
+            # land leaves the task owing a seen-working check
+            # (helm/landtask.py, helm/observed.py).
+            **({"task_whole": True} if task and whole else {}),
             # THE TRUNK AUTHORITY BINDING, resolved ONCE here so no later
             # retip has to DISCOVER it. Absent when the repository declares
             # none — a send is never refused for lack of one, and the cost
@@ -7359,10 +7831,35 @@ def _base(recipient, lane, ref, note, deadline_s, repo, sender=None,
             **({"brief_ref": str(brief_ref), "brief_bytes": int(brief_bytes)}
                if brief_ref and isinstance(brief_bytes, int) else {}),
             **(_authority_binding(info["repo_id"], tip)
-               if kind == "build" else {})}, None
+               if kind == "build" else {})}
+    # task/4020: a review that bound no branch warns AT WRITE TIME instead of
+    # the train finding out hours later. The advisory is the THIRD value —
+    # never on the row, so the ledger event is byte-identical to today's.
+    advisory = _unbound_review_branch_warning(
+        info["repo"], info["repo_id"], lane, tip, row["ref_branch"],
+        holders) if kind == "review" else None
+    return row, None, advisory
 
 
-# Fields `_base` has gained over time. A row is not malformed for lacking one
+def _with_unbound_advisory(row, advisory):
+    """`row` carrying `advisory` (`_base3`'s third value) as a write warning,
+    when the row it describes binds no branch.
+
+    THE WARNING DESCRIBES THE ROW RETURNED (task/4026). A retry reconciles
+    onto the row its first write recorded, whose `ref_branch` is first-write
+    topology, while the advisory was computed from today's: after a gc rescue
+    commit moved the lane branch, a retry printed "binds no local branch"
+    beside a row that binds one. A row that binds no branch takes the
+    advisory whichever write built it — its remedy is today's, which is the
+    one the sender can act on."""
+    if not advisory or row.get("ref_branch"):
+        return row
+    row = dict(row)
+    row[_WRITE_WARNINGS] = list(row.get(_WRITE_WARNINGS, ())) + [advisory]
+    return row
+
+
+# Fields `_base3` has gained over time. A row is not malformed for lacking one
 # it PREDATES — that is ordinary schema growth — so the floor is derived from
 # the ledger itself rather than hardcoded.
 _V3_TRACKED_KEYS = ("chain_root", "supersedes", "ref_branch", "kind",
@@ -7378,7 +7875,7 @@ def stale_writer_rows(path=None):
     binary behind the one already in use.
 
     THE NAIVE VERSION IS WRONG AND I SHIPPED IT FIRST. Comparing against the
-    key set `_base` writes today flagged 714 rows, because chain_root and
+    key set `_base3` writes today flagged 714 rows, because chain_root and
     supersedes appear on 977 of 1375 creations, ref_branch on 852 and
     recipient_display on 185 — those fields were ADDED at different times and a
     row predating one is old, not malformed. The ledger's own history is the
@@ -7816,7 +8313,7 @@ def _written_elsewhere(existing, txn):
 
 def _append_dispatch(row, force=False, alt_ops=(), unique_key=False,
                      cured_operation=None, family_count=None, patch_door=None,
-                     review_guidance=None):
+                     review_guidance=None, review_task_required=False):
     """(row, err, existed) — existed=True means the operation was already on
     the ledger; the caller must treat that as NEVER-SEND-AGAIN.
 
@@ -7829,8 +8326,8 @@ def _append_dispatch(row, force=False, alt_ops=(), unique_key=False,
     reconciles onto the historical row; nothing stored is ever rewritten.
 
     THE SINGLE WRITER, so this is where a new-work row's chain is SEALED to its
-    own id. `send` derives the row id from an operation key after `_base`
-    returns, so `_base` cannot know the id it is rooting; doing the seal in each
+    own id. `send` derives the row id from an operation key after `_base3`
+    returns, so `_base3` cannot know the id it is rooting; doing the seal in each
     caller instead would be two seams that must agree forever, and the one that
     drifts mints a chainless row.
 
@@ -7892,7 +8389,9 @@ def _append_dispatch(row, force=False, alt_ops=(), unique_key=False,
             # `supersedes`/`chain_root` ARE SEMANTIC, for the same reason
             # `kind` is: a retry that changed the parent is naming DIFFERENT
             # WORK, and returning the first row would silently keep a relation
-            # the caller explicitly corrected. `ref_branch` is deliberately NOT:
+            # the caller explicitly corrected. `task` is semantic too: adding
+            # a task to a legacy taskless retry cannot repair its frozen root.
+            # `ref_branch` is deliberately NOT:
             # it is first-write topology evidence, and a retry after rename,
             # movement, or an added alias must return that frozen first row.
             # `message_body` IS DELIBERATELY ABSENT, and leaving it out is the
@@ -7906,7 +8405,7 @@ def _append_dispatch(row, force=False, alt_ops=(), unique_key=False,
             # reason: WHO replayed a move does not change WHICH operation it is.
             semantic = ("recipient", "tip", "note", "deadline_s",
                         "sender", "repo_id", "message_hash",
-                        "kind", "supersedes")
+                        "kind", "supersedes", "task")
             # Generated review guidance changes the stored full brief, but a
             # retry's message hash remains the pre-guidance operation identity.
             # LANE compares CANONICALIZED (#142 r2, finding 3): 128
@@ -7929,11 +8428,32 @@ def _append_dispatch(row, force=False, alt_ops=(), unique_key=False,
                               and row.get("chain_root") == row.get("id"))
                           or (existing.get("chain_root") is None
                               and row.get("chain_root") == row.get("id")))
-            if all(existing.get(k) == row.get(k) for k in semantic) \
-                    and existing.get("operation_key") == matched_key \
-                    and same_chain \
-                    and _strip_lane_prefix(existing.get("lane")) \
-                        == _strip_lane_prefix(row.get("lane")):
+            # A RETRY THAT LOST ITS TASK IS NOT DIFFERENT WORK (task/4050
+            # residual A1). `task` is in `semantic` on purpose — a retry that
+            # NAMES another task is other work — but a retry can also resolve
+            # NO task where the first send resolved one: a task taken from a
+            # literal lane or a note stops resolving when it closes. Plain
+            # equality turned that into "operation key already names different
+            # work", a true sentence about a case that is not different work.
+            # So the task compares as EQUAL, or as the retry resolving NONE
+            # where the standing row resolves one. The reverse, and a
+            # different task, are still different work.
+            def _same(field):
+                if field != "task":
+                    return existing.get(field) == row.get(field)
+                was, now = existing.get("task"), row.get("task")
+                return was == now or (now is None and was is not None)
+            # THE REFUSAL NAMES WHAT DRIFTED: "different work" alone sent the
+            # caller hunting for which of eleven fields it changed.
+            drift = [k for k in semantic if not _same(k)]
+            if existing.get("operation_key") != matched_key:
+                drift.append("operation_key")
+            if not same_chain:
+                drift.append("chain_root")
+            if _strip_lane_prefix(existing.get("lane")) \
+                    != _strip_lane_prefix(row.get("lane")):
+                drift.append("lane")
+            if not drift:
                 # The warning is intentionally not ledger state, but an
                 # idempotent retry still needs the writer's current advisory.
                 # Recompute it from this same locked snapshot without turning a
@@ -7943,7 +8463,16 @@ def _append_dispatch(row, force=False, alt_ops=(), unique_key=False,
                     existing = dict(existing)
                     existing[_WRITE_WARNINGS] = [warning]
                 return _written_elsewhere(existing, txn), None, True
-            return None, "operation key already names different work", True
+            return None, ("operation key already names different work (%s "
+                          "differs%s)" % (", ".join(drift),
+                                          "; standing task %s, retry task %s"
+                                          % (existing.get("task"),
+                                             row.get("task"))
+                                          if "task" in drift else "")), True
+        # A probe may describe a legacy taskless review so its exact operation
+        # can be reconciled above. It never authorizes minting another one.
+        if review_task_required and not row.get("task"):
+            return None, _review_task_refusal(), False
         warning, needs_force = _duplicate_mint_warning(row, current)
         if warning and needs_force and not force:
             return None, warning, False
@@ -7975,7 +8504,7 @@ def _append_dispatch(row, force=False, alt_ops=(), unique_key=False,
             if refusal:
                 return None, refusal, False
         # THE OWNER'S REST IS RE-READ HERE, under the lock and before the row
-        # lands (task/3280): the recipient door read it before `_base` and
+        # lands (task/3280): the recipient door read it before `_base3` and
         # before this lock, and a rest recorded since would file work for a
         # seat the owner has just paused. force files it, as at the door.
         if not force:
@@ -8298,7 +8827,7 @@ def _tier_note(recipient, kind):
 
     AND IT ASKS THE KIND THE ROW WILL CARRY, NOT THE ONE THE CALLER TYPED.
     `clean_kind` lowercases and strips, and BOTH doors normalise AFTER calling
-    this — `add` one line before `_base`, `send` while holding its own
+    this — `add` one line before `_base3`, `send` while holding its own
     `kind_value`. So `--kind Review` minted a row recorded as "review" and got
     no advisory, because a raw-string comparison had already answered no. That
     is the silent half of the very defect this function exists to end: the row
@@ -8310,6 +8839,28 @@ def _tier_note(recipient, kind):
 
 
 _FAMILY_UNRESOLVED = object()
+
+
+def _bench_role_refusal(recipient, kind):
+    """The refusal for a REVIEW row to a seat whose catalog family carries a
+    `bench_role` (seat_catalog.BENCH_ROLES), else None (task/3855).
+
+    `--force` does not open it: force says the seat is offline or not yet
+    joined, and neither makes it a reviewer. Any other kind is admitted, so a
+    proof-of-life seat still takes the small task it exists for."""
+    if kind != "review":
+        return None
+    from . import seat, seat_catalog  # noqa: F401 — the facade first (seat_compat)
+    family = _verified_family(recipient)
+    entry = seat_catalog.FAMILIES.get(family or "")
+    role = entry.get("bench_role") if isinstance(entry, dict) else None
+    if role not in seat_catalog.BENCH_ROLES:
+        return None
+    premise, why = seat_catalog.BENCH_ROLES[role]
+    return ("recipient %r is a seat of family %s, which the catalog marks %s "
+            "(store premise %s): %s. A review row never goes there, and "
+            "--force does not open it. %s"
+            % (str(recipient), family, role, premise, why, review_remedy()))
 
 
 def _verified_family(recipient):
@@ -8332,6 +8883,239 @@ def _verified_family(recipient):
         str(recipient), (None, False))
     family, err = seat.family_for(str(recipient), runtime, verified)
     return None if err else family
+
+
+#: The store premise the lead-context door enforces (task/4039).
+LEAD_CONTEXT_PREMISE = "a-leads-context-holds-only-its-own-projects-work"
+#: The cure every lead-context refusal names, as ONE `corrected:` line.
+LEAD_CONTEXT_CORRECTED = (
+    "corrected: do it in your own subagent or one-agent orchestration run, "
+    "and record its read with `helm dispatch verdict <row> <tip> "
+    "--concur|--fix --measured --reviewer-model <model> --reviewer-run "
+    "<run id> <evidence>` (premise "
+    "integrator-reads-with-its-own-fresh-context-opus-run), or send the row "
+    "to a bench seat (`helm reviewers`)")
+
+
+def _seat_place(name, roster, row):
+    """(kind, register, why) for one recipient, read from its roster `row`
+    (None when it has none), the seat's own spawn register and its family.
+    `kind` is one of:
+
+      bench       a reader that holds no project's context: a seat of a
+                  catalog family no project seat is made of, that no register
+                  binds to a project, or a remote seat the relay drives per row
+      lead        a long-lived seat whose context holds ONE project's work: a
+                  native seat, a seat of a family a project seat is made of
+                  (`project_families`, the owner's one claude and one codex
+                  seat per project), or a seat whose spawn register binds a
+                  project. `register` is that register's (family, project)
+                  pair, for `teams.place` to read beside the row
+      front-door  a seat homed in #main: it builds and lands nothing
+      unknown     nothing here reads as bench or lead; `why` says what is
+                  missing
+
+    AN EMPTY ROSTER IS THE RECIPIENT RUNGS' UNKNOWN, which they proceed on,
+    and this reads it the same way: with no row anywhere, only a register can
+    bind the seat. A POPULATED roster with no row for a seat this cannot
+    place as bench, and a row that names no family, are UNKNOWN."""
+    from . import seat, teams  # noqa: F401 — the facade first (seat_compat)
+    from .seat_lifecycle_sessions import _register_reading, project_families
+    if _remote_seat_door(name) is not None:
+        return "bench", None, None
+    if str((row or {}).get("home_room") or "").strip() == teams.MAIN_ROOM:
+        return "front-door", None, None
+    family, bound, defect = _register_reading(name)
+    if defect:
+        return "unknown", None, defect
+    if bound:
+        return "lead", (family, bound), None
+    if row is None and not roster:
+        return "bench", None, None
+    runtime = (row or {}).get("runtime")
+    if isinstance(runtime, dict) and teams._alias(
+            runtime.get("family")) == teams.NATIVE_FAMILY:
+        return "lead", (None, None), None
+    family = _verified_family(name)
+    if family in project_families():
+        return "lead", (None, None), None
+    if family:
+        return "bench", None, None
+    return "unknown", None, (
+        "no roster row" if row is None else
+        "its roster row names no family, home or project")
+
+
+def _same_seat(a, b):
+    """Do two seat names name one seat (casefold), with neither empty?"""
+    return bool(a) and bool(b) and str(a).casefold() == str(b).casefold()
+
+
+def _roster_row(roster, name):
+    """The one roster row whose key casefold-matches `name`, or None."""
+    return next((r for k, r in (roster or {}).items()
+                 if _same_seat(k, name) and isinstance(r, dict)), None)
+
+
+def _answers_its_sender(recipient, repo_id, sender, answers_row, current):
+    """True when this row is a notice BACK to the sender of row
+    `answers_row`, about that row: the ledger holds that row, its sender is
+    this recipient, its recipient is this sender, and it is bound to this
+    repository. That is the seat's own work coming home, not new work loaded
+    into it (the remote relay's undelivered notice, task/4039). A flag alone
+    admits nothing: every limb is read off the ledger."""
+    if not answers_row or not sender:
+        return False
+    if current is None:
+        current, unavailable = snapshot()
+        if unavailable:
+            return False
+    return _runs_back(current.get(str(answers_row)), recipient, sender,
+                      repo_id)
+
+
+def _runs_back(row, recipient, sender, repo_id):
+    """Is ledger `row` a row FROM `recipient` TO `sender` on `repo_id`: the
+    row a reply from `sender` to `recipient` would answer?"""
+    return isinstance(row, dict) and _same_seat(row.get("sender"), recipient) \
+        and _same_seat(row.get("recipient"), sender) \
+        and row.get("repo_id") == repo_id
+
+
+#: How many rows up a `--supersedes` chain the hand-back walk reads before it
+#: stops and admits nothing (task/4039). Real chains are a few rounds deep.
+HAND_BACK_DEPTH = 64
+
+
+def _hands_back(recipient, repo_id, sender, supersedes, current):
+    """True when this row's `--supersedes` chain holds a row FROM this
+    recipient TO this sender on this repository (task/4039): a bench seat's
+    hand-back to the lead that dispatched its build, and every later round of
+    that chain (a cured successor, a `retract --reissue` successor), is the
+    lead's own dispatched work coming home. `_answers_its_sender`, walked
+    over the chain and read off the ledger, never off a flag: an unreadable
+    ledger, an unresolvable parent, a cycle, a missing ancestor before a
+    match and a walk past `HAND_BACK_DEPTH` all admit nothing."""
+    if not supersedes or not sender:
+        return False
+    if current is None:
+        current, unavailable = snapshot()
+        if unavailable:
+            return False
+    row, err = _resolve_row(current or {}, supersedes, allow_retired=True,
+                            allow_unknown_kinds=True)
+    seen = set()
+    while not err and isinstance(row, dict) and len(seen) < HAND_BACK_DEPTH \
+            and row.get("id") not in seen:
+        if _runs_back(row, recipient, sender, repo_id):
+            return True
+        seen.add(row.get("id"))
+        row = current.get(str(row.get("supersedes") or ""))
+    return False
+
+
+def _team_covers(name, sender, home, lane, roster, projects):
+    """True when `name`, a lead homed in project `home`, is on the TEAM of
+    the lane's project `lane` (task/4039). A team spans repositories two
+    ways helm models: the lane project's authored team names the seat (a
+    seat may sit on several teams, `teams.SHARED_SEATS_ALLOWED`), or the
+    SENDER is that lead's own teammate, placed by `teams.place` on `home`:
+    a product pair's lead and its partner on the product's sibling repo or
+    fork, registered as projects of their own. A front-door sender (home
+    #main) is on no team. Anything unread admits nothing."""
+    from . import registry, teams
+    try:
+        team, _problem = teams.authored(
+            lane, projects.get(lane), registry._authored_load(strict=True))
+    except Exception:                       # noqa: BLE001 — unread is no team
+        team = None
+    if any(_same_seat(m.get("seat"), name)
+           for m in (team or {}).get("members") or () if isinstance(m, dict)):
+        return True
+    if not sender:
+        return False
+    row = _roster_row(roster, sender)
+    if str((row or {}).get("home_room") or "").strip() == teams.MAIN_ROOM:
+        return False
+    try:
+        placed, _source = teams.place(str(sender), row or {}, projects)
+    except Exception:                       # noqa: BLE001 — unread is outside
+        return False
+    return bool(placed) and placed == home
+
+
+def _lead_context_refusal(recipient, repo_id, sender=None, answers_row=None,
+                          current=None, supersedes=None):
+    """The refusal for a row to a long-lived LEAD seat whose home project is
+    not the lane's project, else None (task/4039).
+
+    A LEAD'S CONTEXT WINDOW HOLDS ONLY ITS OWN PROJECT'S WORK. A review or a
+    build booked to another project's lead loads that work into a context the
+    lead keeps, and every later turn it takes pays for it; an idle lead costs
+    nothing. The sender's own subagent or orchestration run spends the same
+    tokens once, in a context that is thrown away.
+
+    Admitted: a bench seat, a lead whose home project IS the lane's, a lead
+    whose TEAM covers the lane's project (`_team_covers`: the lane project's
+    authored team names it, or the sender is its own teammate), a notice
+    back to a row's own sender about that row (`_answers_its_sender`), and a
+    row whose `--supersedes` chain holds a row from this recipient to this
+    sender on this repository (`_hands_back`: a bench seat's hand-back to the
+    lead that sent it the build, and that chain's later rounds).
+    Refused: the front-door seat for any lane, another project's lead, and any
+    seat whose role or home cannot be read, including an unreadable roster
+    or registry. `--force` does not open it: force says the seat is offline,
+    and an offline lead is still a lead. Every kind is asked, because a row
+    with no kind recorded is still a review or a build."""
+    from . import registry, seats, teams
+    from .inject._ledger import project_for_cwd
+    name = str(recipient)
+    if _answers_its_sender(name, repo_id, sender, answers_row, current) \
+            or _hands_back(name, repo_id, sender, supersedes, current):
+        return None
+    roster, failed = seats.roster_checked()
+    row = _roster_row(roster, name)
+    if failed:
+        kind, register, why = "unknown", None, "the seat roster did not read"
+    else:
+        kind, register, why = _seat_place(name, roster, row)
+    if kind == "bench":
+        return None
+    lane = None
+    if kind == "lead":
+        try:
+            projects = registry.load(strict=True).get("projects") or {}
+            lane = project_for_cwd(repo_id, projects=projects)
+            home, source = teams.place(name, row or {}, projects,
+                                       registers={name: register})
+        except Exception as exc:            # noqa: BLE001 — unread is unknown
+            kind, why = "unknown", "the project registry did not read (%s)" \
+                % exc.__class__.__name__
+        else:
+            if not home:
+                kind, why = "unknown", "its home project cannot be read: " \
+                    "%s" % source
+            elif not lane:
+                kind, why = "unknown", "this lane's repository is in no " \
+                    "registered project"
+            elif home == lane or _team_covers(name, sender, home, lane,
+                                              roster, projects):
+                return None
+    if kind == "front-door":
+        said = ("is the front-door seat (home #%s), which builds and lands "
+                "nothing" % teams.MAIN_ROOM)
+    elif kind == "lead":
+        said = ("is a long-lived lead seat of project %s, and this lane is "
+                "project %s, whose team does not name it, sent by %s, who is "
+                "not on its team" % (home, lane, sender or "no seat"))
+    else:
+        said = ("has no readable role and home (%s), so this door cannot "
+                "tell a bench seat from another project's lead and refuses "
+                "rather than guess" % why)
+    return ("recipient %r %s (store premise %s): a lead's context window "
+            "holds only its own project's work, and an idle lead costs "
+            "nothing. --force does not open it.\n%s"
+            % (name, said, LEAD_CONTEXT_PREMISE, LEAD_CONTEXT_CORRECTED))
 
 
 def _validate_recipient_budget(recipient, force, family=_FAMILY_UNRESOLVED):
@@ -8417,7 +9201,8 @@ def _validate_recipient_budget(recipient, force, family=_FAMILY_UNRESOLVED):
     if flag.get("colour") == burnflags.ORANGE:
         notes.append("%s: %s is ORANGE — %s; %s"
                      % (recipient, family, cause,
-                        burnflags.BEHAVIOUR[burnflags.ORANGE]["say"]))
+                        (flag.get("behaviour") or
+                         burnflags.BEHAVIOUR[burnflags.ORANGE])["say"]))
     # AN UNREAD ACCOUNT WARNS WHETHER OR NOT A SIBLING IS OVER (task/2480 R6).
     # This help text and docs/VERBS both promise that any unread account
     # proceeds AND warns, and the promise was kept only through the `mixed`
@@ -8754,22 +9539,58 @@ def _vouches(repo, url, tip, view, overlay):
     return "no tip it advertises now reaches it" if out else None
 
 
-def _review_lane_refusal(repo, lane, tip):
+def _in_helm_tree(repo_id):
+    """Is the repository whose git common dir is `repo_id` (as `_repo_info`
+    stamps it) this helm tree's? False when either side cannot be read: both
+    review-lane readers below skip then, never block.
+
+    ONE READ FOR BOTH READERS (task/4026). `_review_lane_refusal` and
+    `_unbound_review_branch_warning` each spawned the same two
+    `--git-common-dir` probes. The row's side is already measured — it is
+    `repo_id`, which `_base3` resolved through `_repo_info` before either
+    reader runs — and this tree's side is a property of the running package's
+    path, which the seam memoises (`vcs.common_dir`). Judged by repository
+    identity, not working-tree paths: a lane worktree and the shared checkout
+    share one common dir; a temp repo that copied the tree does not."""
+    from . import vcs                  # function-scope by module convention
+    tree = _this_helm_tree()
+    mine = _real(vcs.backend(tree).common_dir(tree))
+    return bool(mine) and mine == _real(repo_id)
+
+
+def _lane_holders(repo, tip):
+    """The refs/heads/lane/* branches that CONTAIN `tip`; [] when none; None
+    when git could not say. Read once per review write and handed to both
+    readers below (task/4026): the refusal judges the row's lane by it, and
+    the advisory tells a lane branch that moved PAST the tip from one that
+    does not hold it."""
+    try:
+        p = subprocess.run(
+            ["git", "-C", repo, "for-each-ref", "--contains", tip,
+             "--format=%(refname)", "refs/heads/lane/"],
+            capture_output=True, text=True, timeout=5, env=_git_env())
+    except (OSError, subprocess.TimeoutExpired, UnicodeError):
+        return None
+    if p.returncode:
+        return None
+    return [h.strip() for h in p.stdout.splitlines() if h.strip()]
+
+
+def _review_lane_refusal(repo_id, lane, tip, holders):
     """Return None or a refusal string.
 
     The incident (task/3511): rows b336dfb43845 and 04a7cfe64327 named lane
     "claude" when the tip sat on the real lane's branch.  The ledger accepted
     them, so the lane field was wrong for anything keyed by lane.
 
-    1. Resolve which lane/* branches actually contain `tip` (git for-each-ref
-       --contains).  If the call fails, return None: this check must never
-       block a send on a git hiccup.
+    1. `holders` is `_lane_holders`' answer: which lane/* branches actually
+       contain `tip`.  None (the probe failed) returns None: this check must
+       never block a send on a git hiccup.
     2. If NO lane branch holds the tip, return None — tests, repositories
        without lane branches, and landed lanes all keep working.
     3. Skip non-helm repositories: temp repos that copy the tree inherit its
-       lane refs and trigger false positives.  We judge a repo when its git
-       common dir equals _this_helm_tree()'s common dir (worktrees share it;
-       a bare temp clone does not).  If either git call fails we skip.
+       lane refs and trigger false positives (`_in_helm_tree`, which skips
+       on a failed read too).
     4. Compute the named branch: "refs/heads/" + lane when lane already
        starts with "lane/", else "refs/heads/lane/" + lane.
     5. If the named branch is among the holders, return None.
@@ -8777,54 +9598,7 @@ def _review_lane_refusal(repo, lane, tip):
 
     A docstring says what and why; it never blocks when no lane branch holds
     the tip or when the repo is not the helm source tree.  """
-    holders = []
-    try:
-        env = _git_env()
-        p = subprocess.run(
-            ["git", "-C", repo, "for-each-ref", "--contains", tip,
-             "--format=%(refname)", "refs/heads/lane/"],
-            capture_output=True, text=True, timeout=5, env=env,
-        )
-        if p.returncode == 0:
-            holders = [
-                h.strip() for h in p.stdout.splitlines() if h.strip()
-            ]
-    except (OSError, subprocess.TimeoutExpired):
-        # git hiccup: never block — the check is advisory for review lanes.
-        return None
-
-    if not holders:
-        return None
-
-    # Judge by repository identity, not working-tree paths.  A lane worktree
-    # and the shared checkout share the same git common dir; a temp repo that
-    # merely copied the tree has a different one.  Use --path-format=absolute
-    # so both sides resolve to the same form (git returns a relative path in
-    # the shared checkout but an absolute one in a worktree), then real-path
-    # to collapse symlinks.
-    try:
-        repo_common = subprocess.run(
-            ["git", "-C", repo, "rev-parse", "--path-format=absolute",
-             "--git-common-dir"], capture_output=True, text=True, timeout=5,
-            env=_git_env(),
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-
-    try:
-        helm_common = subprocess.run(
-            ["git", "-C", _this_helm_tree(), "rev-parse", "--path-format=absolute",
-             "--git-common-dir"], capture_output=True, text=True, timeout=5,
-            env=_git_env(),
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-
-    if repo_common.returncode != 0 or helm_common.returncode != 0:
-        return None
-
-    if os.path.realpath(repo_common.stdout.strip()) != os.path.realpath(
-            helm_common.stdout.strip()):
+    if not holders or not _in_helm_tree(repo_id):
         return None
 
     named_branch = ("refs/heads/" + lane
@@ -8845,6 +9619,104 @@ def _review_lane_refusal(repo, lane, tip):
         "(for example '%s')."
         % (lane, first_twelve, holders_short, named_short, holders_short.split(", ")[0])
     )
+
+
+def _remote_lane_branch(refs, name):
+    """The first of `refs` that IS a remote's lane/<name>, or None.
+
+    ANCHORED (task/4026): `refs/remotes/<remote>/lane/<name>`, and the
+    `refs/remotes/<remote>/refs/heads/lane/<name>` spelling, each with ONE
+    remote segment. A bare suffix match on '/lane/<name>' also took
+    refs/remotes/r/foo/lane/<name> — remote r's branch foo/lane/<name>, which
+    is not this lane."""
+    shape = re.compile(r"refs/remotes/[^/\s]+/(?:refs/heads/)?lane/%s"
+                       % re.escape(name))
+    return next((ref for ref in refs if shape.fullmatch(ref)), None)
+
+
+def _unbound_review_branch_warning(repo, repo_id, lane, tip, ref_branch,
+                                   holders):
+    """A write-time advisory for a REVIEW row that bound no local branch.
+
+    None when nothing is owed. task/4020: a review dispatched with --ref <sha>
+    binds no branch when 0 (or, for a lane-free caller, 2+) local branches
+    point at the sha, and task/3991's one-car-per-lane guard then excludes the
+    clean hold from every train — found hours later by the train. The warning
+    names the remedy at WRITE time: --ref lane/<lane> binds the branch at the
+    row's own boundary. Read-only probes, never a refusal: a git hiccup or an
+    unanswerable topology leaves the row written and unwarned rather than
+    blocked (same polarity as _review_lane_refusal).
+
+    The remedies it names, by where refs/heads/lane/<lane> stands:
+      * AT the sha: bind it with --ref lane/<lane>.
+      * ABSENT: create it from the remote lane/<lane> at the sha
+        (`git branch lane/<lane> <remote>`), or push it when no remote has it.
+      * MOVED PAST the sha (it contains it — `holders`, the refusal's own
+        read): the 3896 shape, a gc rescue commit on top. `git branch` would
+        fail "already exists" (task/4026), so it names the two real paths:
+        review the branch's new tip, or reset the branch back to the sha.
+      * ANYWHERE ELSE (behind, diverged, or containment unknown): a
+        fast-forward to the remote branch (or the sha), which git refuses
+        when the two diverged — never a command that discards a commit.
+
+    HELM-TREE ONLY, like `_review_lane_refusal` beside it: fixture repos and
+    foreign projects have no lane/* train topology to be invisible to, so the
+    advisory would be noise there (`_in_helm_tree`; a failed read skips the
+    warning rather than blocking the write).
+    """
+    if ref_branch or not tip or not _in_helm_tree(repo_id):
+        return None
+    name = _strip_lane_prefix(str(lane or ""))
+    if not name:
+        return None
+    local = "refs/heads/lane/" + name
+    try:
+        p = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "--verify", "-q",
+             local + "^{commit}"], capture_output=True, text=True, timeout=5,
+            env=_git_env())
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    at = p.stdout.strip().lower() if p.returncode == 0 else ""
+    owed = ("this review's tip %s binds no local branch, so its clean hold is "
+            "invisible to the one-car-per-lane train guard; " % tip[:12])
+    if at == tip:
+        return owed + ("the lane branch lane/%s IS at the tip — re-dispatch "
+                       "with --ref lane/%s so the row binds it at write time"
+                       % (name, name))
+    try:
+        p = subprocess.run(
+            ["git", "-C", repo, "for-each-ref", "--format=%(refname)",
+             "--points-at=" + tip, "refs/remotes"],
+            capture_output=True, text=True, timeout=5, env=_git_env())
+    except (OSError, subprocess.TimeoutExpired, UnicodeError):
+        return None
+    if p.returncode:
+        return None
+    remote = _remote_lane_branch(
+        [x.strip() for x in p.stdout.splitlines() if x.strip()], name)
+    shown = remote.replace("refs/remotes/", "", 1) if remote else None
+    where = ("only the REMOTE branch %s is at the tip" % shown if remote
+             else "no lane/%s branch, local or remote, is at the tip" % name)
+    if not at:
+        return owed + where + (
+            " — create the local branch (git branch lane/%s %s) and "
+            "re-dispatch with --ref lane/%s" % (name, remote, name)
+            if remote else
+            " — push the lane branch and re-dispatch with --ref lane/%s"
+            % name)
+    if local in (holders or ()):
+        return owed + where + (
+            "; the local branch lane/%s has moved past it to %s — review the "
+            "branch's new tip (re-dispatch with --ref lane/%s), or, if that "
+            "move should not stand, reset the branch where it is checked out "
+            "(git reset --hard %s) and re-dispatch with --ref lane/%s"
+            % (name, at[:12], name, tip[:12], name))
+    return owed + where + (
+        "; the local branch lane/%s is at %s, which does not hold it — "
+        "fast-forward it where it is checked out (git merge --ff-only %s; "
+        "git refuses if the two diverged) and re-dispatch with --ref lane/%s"
+        % (name, at[:12], shown or tip[:12], name))
 
 
 def _data_terms_rung(recipient, repo, tip):
@@ -9043,12 +9915,14 @@ DOOR_READ_PARKS = ("the door read PARKS until a tier reader can take it, "
 #: cases, price and burn bar. The owner: "let's try not to use fable if we
 #: can help it, claude usage is creeping toward orange"; "no more automatia
 #: fable slots, just for max qc for the most important stuff"; "for every
-#: fable token we can get 3 opus tokens".
+#: fable token we can get 3 opus tokens". And (task/3855), after a door
+#: read with no other reader went to Fable: "Fable? we haven't used
+#: Fable in days. why did we just start again now?" So Fable reads only on
+#: his ask; a door with no other reader takes a fresh-context Opus read.
 FABLE_MAX_QC = ("Fable is for max QC only, never a default and never "
-                "automatic: the most important work (an owner P0, a release, "
-                "a public push, or a money or creds door with no other "
-                "reader), at about 3 Opus tokens per Fable token, and not "
-                "while `helm burn` reads anthropic ORANGE or worse")
+                "automatic: it reads only when the owner asks for it, at "
+                "about 3 Opus tokens per Fable token, and not while `helm "
+                "burn` reads anthropic ORANGE or worse")
 
 
 def review_remedy(rid=None):
@@ -9409,7 +10283,7 @@ def _inherited_origin(supersedes, acting):
             "it%s" % (parent["id"][:12], acting, lost_note)), None
     if not _TOKEN.fullmatch(str(inherited)):
         # A hand-edited or corrupt row is not an author. Refuse rather than
-        # write a malformed stamp `_base` would refuse anyway with a sentence
+        # write a malformed stamp `_base3` would refuse anyway with a sentence
         # that names the wrong culprit.
         return None, None, None, None, (
             "refusing to preserve authorship from %s: its recorded sender is "
@@ -9439,6 +10313,8 @@ def _inherited_origin(supersedes, acting):
 # pass True, and True is now REFUSED. Same shape as takeover's `_REASSIGN_MINT`
 # — the capability is the object, not the value.
 _MOVE_MINT = object()
+# Only remote_relay's undelivered notice may mint a review with no task.
+_RELAY_NOTICE_MINT = object()
 
 
 def add(recipient, lane, ref=None, note=None, deadline_s=None,
@@ -9447,7 +10323,9 @@ def add(recipient, lane, ref=None, note=None, deadline_s=None,
         _ref_branch=_INFER_REF_BRANCH, posture_na=None,
         read_only_because=None, owner_surface_because=None,
         _preserve_origin=False, door=None,
-        pair_meld=None, decline_patch=None, _refusal_door="add", task=None):
+        pair_meld=None, decline_patch=None, _refusal_door="add", task=None,
+        lever_because=None, start_anyway=None, weigh=False, steer=None,
+        whole=False, review_mode=None):
     """Persist a dispatch and post a public @mention to main so the
     reviewer's beacon picks up the obligation — the counterpart to send()
     (which also DMs the reviewer). When notify=False, the dispatch is
@@ -9540,7 +10418,7 @@ def add(recipient, lane, ref=None, note=None, deadline_s=None,
     sender, message_body, acted_by, origin_note = acting, None, None, None
     # BOUND ON EVERY PATH, not just the move one. The inherited-custody read
     # below lives inside the MOVE branch, and using it unconditionally at the
-    # `_base` call would NameError on every ordinary dispatch — the same
+    # `_base3` call would NameError on every ordinary dispatch — the same
     # extracted-without-its-scope defect that bit `_row_is_live` earlier
     # tonight. An ordinary authorship inherits no custody: the author holds it.
     inherited_custodian = None
@@ -9583,7 +10461,7 @@ def add(recipient, lane, ref=None, note=None, deadline_s=None,
             inherited_custodian = None       # cannot read is not a custody move
             inherited_brief_ref = inherited_brief_bytes = None
         # THE INHERITED BODY GETS THE CURRENT CAPS. A move COPIED the parent's
-        # stored body straight through to `_base`, while the ordinary send path
+        # stored body straight through to `_base3`, while the ordinary send path
         # runs it through `_store_body` — so a row written under a larger cap,
         # or one carried across a cap that was later LOWERED, propagated
         # unbounded through every rebind, and the bound this field advertises
@@ -9619,14 +10497,22 @@ def add(recipient, lane, ref=None, note=None, deadline_s=None,
     # know at write time, and refusing here would block legitimate reads by
     # seats whose approve was never the point.
     tier_note = _tier_note(recipient, kind)
-    row, err = _base(recipient, lane, ref, note, deadline_s, repo, kind=kind,
-                     sender=sender, new_work=new_work, supersedes=supersedes,
-                     _ref_branch=_ref_branch, message_body=message_body,
-                     acted_by=acted_by, custodian=inherited_custodian,
-                     brief_ref=inherited_brief_ref,
-                     brief_bytes=inherited_brief_bytes, task=task)
+    row, err, unbound = _base3(
+        recipient, lane, ref, note, deadline_s, repo, kind=kind,
+        sender=sender, new_work=new_work, supersedes=supersedes,
+        _ref_branch=_ref_branch, message_body=message_body,
+        acted_by=acted_by, custodian=inherited_custodian,
+        brief_ref=inherited_brief_ref, brief_bytes=inherited_brief_bytes,
+        task=task, whole=whole)
     if not row:
         return (None, err) if _reason else None
+    # THE SAME TWO CHECKS AS `send` (task/3821), for the CLI (`weigh`): a
+    # first row minted here is new work too. A move re-mints an obligation
+    # that already exists.
+    if weigh and _preserve_origin is not _MOVE_MINT:
+        err = _lever_rung(row, lever_because, start_anyway, steer=steer)
+        if err:
+            return (None, err) if _reason else None
     if str(posture_na or "").strip():
         row["posture_na"] = str(posture_na).strip()   # the recorded escape
     _stamp_read_only(row, read_only_because)
@@ -9642,7 +10528,8 @@ def add(recipient, lane, ref=None, note=None, deadline_s=None,
         else {"decline": decline_patch},
         review_guidance=(lambda built, current: _post_lock_review_guidance(
             built, current, inherited_from=supersedes
-            if _preserve_origin is _MOVE_MINT else None))
+            if _preserve_origin is _MOVE_MINT else None,
+            review_mode=review_mode))
         if row["kind"] == "review" else None)
     if not out:
         return (None, why) if _reason else None
@@ -9693,6 +10580,12 @@ def add(recipient, lane, ref=None, note=None, deadline_s=None,
     # that needs it. Attaching last cannot be undone by a later swap.
     # THE LIGHT'S NOTE RIDES THE SAME CHANNEL: a yellow project admits the row
     # and says its reason, and the row carries the repository it resolved.
+    # task/4020: the unbound-branch advisory `_base3` proved rides the CLI's
+    # row as a WARNING (not an admission note — it is actionable by the sender,
+    # who named --ref), attached AFTER the delivery swap for the same reason
+    # the notes below are: an earlier attach is silently dropped by the
+    # notify-leg re-read.
+    out = _with_unbound_advisory(out, unbound)
     light_note = _project_light_rung(row.get("repo_root") or repo, kind,
                                      new_work)[2]
     share_note = _project_share_note(row.get("repo_root") or repo, recipient,
@@ -9959,7 +10852,7 @@ def snapshot_tip_refusal(root, tip):
     if not isinstance(root, str) or not root or not os.path.isdir(root):
         return None
     # RESOLVE BEFORE JUDGING, for any caller that hands a SPELLING rather than
-    # the resolved tip. `_base` calls this with the exact object it is about to
+    # the resolved tip. `_base3` calls this with the exact object it is about to
     # store, so that path resolves nothing; a direct caller may pass a short
     # sha or a symbolic name and gets the same answer. Never lowercase the
     # input: git refs are case-sensitive and `HEAD` is not `head`.
@@ -10000,11 +10893,17 @@ def snapshot_tip_refusal(root, tip):
 MESSAGE_ARG_CAP = 16000
 
 REVIEW_MODE_LINES = {
-    "PATCH": ("REVIEW FIX MODE: PATCH — commit the cure on a branch off the "
-              "exact tip and return FIX --patch-tip; the author reviews it."),
+    "PATCH": ("REVIEW FIX MODE: PATCH — commit the cure off the exact tip (a "
+              "subagent reviewer has no room of its own: use a scratch clone, "
+              "then `git -C <repo> fetch --no-write-fetch-head <scratch>/wt "
+              "<sha>`, no refspec, no shared branch or worktree) and return FIX "
+              "--patch-tip; the author reviews it."),
     "MELD-DIFF": ("REVIEW FIX MODE: MELD-DIFF — post the exact fix as a diff "
                   "(or file:line plus replacement) in the pair meld; the "
                   "author applies it in one step."),
+    "RED": ("REVIEW FIX MODE: REVIEW ONLY — burn flags are RED for this family, "
+            "so run no fab suite: post any finding as file:line plus the exact "
+            "replacement in the pair meld, the author applies it."),
 }
 
 
@@ -10023,9 +10922,60 @@ def _review_mode_of(row):
     return None
 
 
-_DIFF_HANDOFF_REF = re.compile(r"(meld-0-pair-[a-z0-9-]{1,48})/([0-9a-f]{12})\Z")
+def _ab_mode_of(row):
+    """The task/3698 A/B arm a row enrolls in: its recorded mode, or None for a
+    burn-forced row (`review_mode_cause`), whose mode the live flag chose and
+    not the alternation. Every MELD-DIFF door reads `_review_mode_of`: a
+    forced MELD-DIFF row still records its MELD-DIFF receipt."""
+    return None if row.get("review_mode_cause") else _review_mode_of(row)
+
+
+_REVIEW_FIX_MODE_LINE = re.compile(
+    r"^\s*REVIEW\s+FIX\s+MODE:\s*([A-Za-z0-9_-]+)", re.IGNORECASE
+)
+
+
+def _extract_stated_review_modes(message, flag_mode=None):
+    """(stated_mode, error) — resolved stated review fix mode from brief or flag.
+    Refuses conflicting stated modes naming both (task/4051)."""
+    stated = set()
+    if flag_mode:
+        flag_clean = flag_mode.strip().upper()
+        if flag_clean not in REVIEW_MODE_LINES or flag_clean == "RED":
+            return None, "--review-mode must be PATCH or MELD-DIFF (got %s)" % flag_mode
+        stated.add(flag_clean)
+    if message:
+        for line in str(message or "").splitlines():
+            m = _REVIEW_FIX_MODE_LINE.match(line)
+            if m:
+                tok = m.group(1).upper()
+                if tok == "REVIEW" and line.upper().strip().startswith("REVIEW FIX MODE: REVIEW ONLY"):
+                    tok = "RED"
+                if tok not in REVIEW_MODE_LINES:
+                    return None, "unknown review fix mode stated: %s" % m.group(1)
+                stated.add(tok)
+    if len(stated) > 1:
+        modes_str = " and ".join(sorted(stated))
+        return None, "conflicting review fix modes stated: %s — dispatch NOT recorded" % modes_str
+    if len(stated) == 1:
+        return next(iter(stated)), None
+    return None, None
+
+
+_DIFF_HANDOFF_REF = re.compile(r"([a-z0-9-]{1,60})/([0-9a-f]{12})\Z")
 _DIFF_HANDOFF_KEYS = frozenset(("v", "room", "msg_id", "epoch",
                                "reviewed_tip", "sha256"))
+
+
+def _diff_handoff_ref(ref):
+    """(room, msg_id) for a `--diff-handoff ROOM/MSGID` whose ROOM is a pair
+    meld of either shape (`review_door.is_pair_room`: a task's `<scope>-<N>`
+    or the legacy `meld-0-pair-...`), else None."""
+    from . import review_door
+    match = _DIFF_HANDOFF_REF.fullmatch(str(ref or "").strip())
+    if not match or not review_door.is_pair_room(match.group(1)):
+        return None
+    return match.groups()
 
 
 def _diff_handoff_shape(receipt):
@@ -10109,10 +11059,10 @@ def _cite_diff_handoff(ref, row, current, reviewed):
     sender and epoch marker must agree before the immutable byte digest lands.
     """
     from . import chat, meld, review_door
-    match = _DIFF_HANDOFF_REF.fullmatch(str(ref or "").strip())
+    match = _diff_handoff_ref(ref)
     if not match:
         return None, "--diff-handoff needs the exact pair meld ROOM/MSGID"
-    room, msg_id = match.groups()
+    room, msg_id = match
     expected, why = review_door.pair_room(row, current)
     if not expected or room != expected:
         return None, ("--diff-handoff room is not this chain's pair meld (%s)"
@@ -10236,24 +11186,57 @@ def _index_accepts_patch(repo, tip, patch, reverse=False):
             return False
 
 
-def _diff_application(child, parent, current):
-    """Mint a child proof only if the cited post's exact patch is present.
+def _index_apply_write_tree(repo, tip, patch):
+    """(tree, ok) — the tree a PRIVATE INDEX holds after applying PATCH to
+    TIP's tree through a throwaway index.
 
-    Both checks run against Git trees in isolated indexes. The parent must
-    accept the diff forward, the candidate must accept it in reverse, and the
-    candidate must descend from that reviewed parent. Any unknown is no proof;
-    an ordinary continuation still remains a real round.
+    A DIFFERENT SEAM from _index_accepts_patch: the caller already knows the
+    patch applies, so this writes it (`--cached`, no --check, no --reverse) and
+    returns `git write-tree`'s result. Used by the applied-cure door as the
+    direct WITNESS of what the posted diff produces: a diff is byte-equal only
+    through its patch-id, which hashes the +/- content lines and never the
+    tree they land in. `write_tree(reviewed + posted)` pins the applied tip to
+    the tree the posted diff actually yields, so a same-content hunk that
+    resolved to a different file or position — an UNCHANGED patch-id but a
+    DIFFERENT tree — cannot be recorded as the posted cure. Scrubs every git
+    selector and installs its own index, so the caller's index and worktree
+    are untouched; None on any failure.
     """
-    if not _has_diff_handoff(parent) or child.get("supersedes") != parent.get("id") \
-            or child.get("repo_id") != parent.get("repo_id") \
-            or child.get("chain_root") != parent.get("chain_root"):
-        return None
-    reviewed, candidate = parent.get("reviewed_tip"), child.get("tip")
-    repo = child.get("repo_root")
-    if not repo or not _FULL_TIP.fullmatch(str(candidate or "")) \
-            or candidate == reviewed:
-        return None
+    from . import vcs
+    with tempfile.TemporaryDirectory(prefix="helm-diff-write-") as tmp:
+        env = {key: None for key in _GIT_SELECTION_ENV}
+        env["GIT_INDEX_FILE"] = os.path.join(tmp, "index")
+        try:
+            be = vcs.backend(repo)
+            if be.run(repo, "read-tree", tip, env=env, timeout=15)[0]:
+                return None, False
+            # --whitespace=nowarn: a user's `apply.whitespace=fix` would
+            # rewrite the posted bytes and measure a tree the diff never
+            # posted, refusing a byte-exact cure.
+            rc, out, _err = be.run(
+                repo, "apply", "--cached", "--whitespace=nowarn", env=env,
+                timeout=15, stdin=patch.encode("utf-8"))
+            if rc:
+                return None, False
+            rc, tree, _err = be.run(repo, "write-tree", env=env, timeout=15)
+            return (tree.decode("utf-8", "replace").strip(), rc == 0)
+        except (OSError, subprocess.TimeoutExpired, UnicodeError):
+            return None, False
+
+
+def _handoff_patch(parent, current):
+    """The exact unified diff a parent's typed MELD-DIFF handoff posts, or
+    None when the cited post cannot be re-proven byte for byte.
+
+    THE RECEIPT IS RE-READ AND RE-DERIVED, never trusted from the row: the
+    verdict writer ran the same derivation before minting the receipt, so a
+    post edited or reframed after the verdict proves nothing here either.
+    One extractor for the child-proof fold (`_diff_application`) and the
+    author's `dispatch applied` door (task/3937), so the two can never
+    disagree about which bytes the reviewer handed over.
+    """
     receipt = parent["diff_handoff"]
+    reviewed = parent.get("reviewed_tip")
     ref = receipt["room"] + "/" + receipt["msg_id"]
     reread, err = _cite_diff_handoff(ref, parent, current, reviewed)
     if err or reread != receipt:
@@ -10294,7 +11277,29 @@ def _diff_application(child, parent, current):
         return None
     patch = re.sub(r"\n\[(?:YIELD|HOLD|DONE)\][ \t]*\Z", "\n",
                    text[begin.start():])
-    patch = patch if patch.endswith("\n") else patch + "\n"
+    return patch if patch.endswith("\n") else patch + "\n"
+
+
+def _diff_application(child, parent, current):
+    """Mint a child proof only if the cited post's exact patch is present.
+
+    Both checks run against Git trees in isolated indexes. The parent must
+    accept the diff forward, the candidate must accept it in reverse, and the
+    candidate must descend from that reviewed parent. Any unknown is no proof;
+    an ordinary continuation still remains a real round.
+    """
+    if not _has_diff_handoff(parent) or child.get("supersedes") != parent.get("id") \
+            or child.get("repo_id") != parent.get("repo_id") \
+            or child.get("chain_root") != parent.get("chain_root"):
+        return None
+    reviewed, candidate = parent.get("reviewed_tip"), child.get("tip")
+    repo = child.get("repo_root")
+    if not repo or not _FULL_TIP.fullmatch(str(candidate or "")) \
+            or candidate == reviewed:
+        return None
+    patch = _handoff_patch(parent, current)
+    if patch is None:
+        return None
     from . import vcs
     try:
         env = {key: None for key in _GIT_SELECTION_ENV}
@@ -10307,26 +11312,350 @@ def _diff_application(child, parent, current):
     except (OSError, subprocess.TimeoutExpired):
         return None
     return {"v": 1, "parent_id": parent["id"], "parent_tip": reviewed,
-            "child_tip": candidate, "receipt_sha256": receipt["sha256"]}
+            "child_tip": candidate,
+            "receipt_sha256": parent["diff_handoff"]["sha256"]}
 
 
-def _review_mode_choice(current, recipient, repo_id, root):
+# ---------------------------------------------------------------------------
+# THE APPLIED-CURE DOOR (task/3937, 0.3.3 release gate 3)
+# ---------------------------------------------------------------------------
+# An author whose applied MELD-DIFF cure is UNCHANGED — patch-id equal to the
+# posted diff, tip^ the reviewed tip, an OK focused fab receipt — records it on
+# the ORIGINAL row with ONE `diff-applied` event: no child row, no pair round,
+# no reviewer mention. A CHANGED cure refuses and names the delta child send
+# (`git range-diff`) that wakes the reviewer instead.
+#: The event kind `mark_applied` appends to the parent row.
+DIFF_APPLIED_EVENT = "diff-applied"
+
+#: The keys a diff-applied event and its folded record carry, exactly.
+_DIFF_APPLIED_KEYS = ("tip", "patch_id", "receipt_sha256", "fab",
+                      "receipt_id")
+
+
+def _verbatim_patch_id(repo, diff_text):
+    """`git patch-id --verbatim` of one unified diff, or None on any failure.
+
+    BYTES END TO END (landreq._range_patch_id's law): the diff is hashed
+    exactly as posted, and diff.noprefix is pinned because user config yields
+    a DIFFERENT id for identical content. VERBATIM, never --stable, on BOTH
+    sides: --stable strips every whitespace byte, so a cure that re-indents a
+    Python line or changes the spaces inside a string hashed equal to the
+    posted diff and recorded as UNCHANGED, waking no reviewer. None is a
+    REFUSAL to every caller, never agreement: two unmeasurable sides
+    "matching" is the vacuous-oracle shape, not an identity.
+    """
+    from . import vcs
+    if not repo or not isinstance(diff_text, str) or not diff_text:
+        return None
+    try:
+        be = vcs.backend(repo)
+        env = {key: None for key in _GIT_SELECTION_ENV}
+        rc, raw, _err = be.run(repo, "-c", "diff.noprefix=false",
+                               "-c", "core.pager=cat",
+                               "patch-id", "--verbatim",
+                               stdin=diff_text.encode("utf-8"),
+                               env=env, timeout=15)
+    except (OSError, subprocess.TimeoutExpired, UnicodeError):
+        return None
+    if rc != 0:
+        return None
+    parts = raw.decode("utf-8", "replace").split()
+    return parts[0] if len(parts) == 2 \
+        and re.fullmatch(r"[0-9a-f]{40}\Z", parts[0]) else None
+
+
+def _focused_fab_receipt(fab_ref, repo, tip):
+    """(receipt, err) — the OK focused fab receipt the author cites, or why
+    it cannot stand for the cure round.
+
+    THE SEAM, small on purpose: binding at the exact tip is necessary but
+    insufficient. An assembled local focused receipt can bind without running
+    tests (gate._bind_focused documents that residue). Require a canonical
+    Fab-completion or routed-custody record as well; a local mint or generic
+    import cannot pass for a witnessed run. This is an honest-path filter, NOT
+    an adversarial attestation: all of these ledgers share a uid and remain
+    forgeable by someone who controls the local store. In particular, this
+    writer check alone does not grant the resulting FIX row land authority.
+    """
+    from . import gate, gateimport
+    evidence = str(fab_ref or "").strip()
+    if not evidence:
+        return None, ("dispatch applied needs --fab-receipt R naming an OK "
+                      "focused fab receipt on the applied tip")
+    if not evidence.startswith("gate:"):
+        evidence = "gate:" + evidence
+    state, rid, why = gate.bind(evidence, tip, repo_id=repo,
+                                need=gate.NEED_FOCUSED)
+    if state != "VERIFIED" or not rid:
+        return None, ("the focused fab receipt does not bind at %s: %s"
+                      % (str(tip)[:12] or "<tip>", why))
+    receipt, err = gate.by_id(rid)
+    if err or not isinstance(receipt, dict):
+        return None, ("the focused fab receipt's origin cannot be read: %s"
+                      % (err or "receipt absent"))
+    if receipt.get("v") != gate.FOCUSED_VERSION:
+        return None, ("dispatch applied requires a focused Fab or routed run, "
+                      "not a whole-suite receipt")
+    proven, origin = gateimport.land_provenance(receipt, repo)
+    if proven is not True or not any(
+            str(origin or "").startswith(kind + ":")
+            for kind in (gateimport.LAND_FAB, gateimport.LAND_ROUTED)):
+        return None, ("the focused receipt has no witnessed Fab completion or "
+                      "routed run at this repository (%s); NEED_FOCUSED "
+                      "binding alone cannot prove a run" % origin)
+    return {"status": "OK", "focused": True, "ref": evidence,
+            "id": receipt.get("id")}, None
+
+
+def _diff_applied_refusal(parent, tip, current, fab_receipt=None):
+    """Why `tip` is NOT the parent's unchanged applied MELD-DIFF cure, or None.
+
+    Every clause is measured against the row's own repository and the exact
+    cited post, re-derived through the same extractor the child-proof fold
+    uses: the parent carries a typed handoff, tip^ IS the reviewed tip, the
+    applied diff's verbatim patch-id EQUALS the posted diff's, and an OK
+    focused fab receipt binds at the tip. Any unknown refuses.
+
+    RETURNS (err, measured), ALWAYS a 2-tuple: the refusal and None, or
+    None and {"patch_id", "receipt_id"} when the door passed. `patch_id` is
+    the applied diff's verbatim id THIS door measured and matched (a 40-hex,
+    never re-measured by the writer, so the event cannot record an id the door
+    never checked); `receipt_id` is the focused fab receipt's OWN id
+    (task/4114 item 6) -- the handle `gate.by_id` resolved, bound onto the
+    diff-applied event so the event names WHICH witnessed run it spent, not
+    just the citing ref.
+    """
+    if not _has_diff_handoff(parent):
+        return ("dispatch %s is not a MELD-DIFF FIX with a typed diff handoff; "
+                "`dispatch applied` records only the cure of a posted exact "
+                "diff" % parent.get("id")), None
+    if parent.get("status") != "verdict":
+        return ("dispatch %s is %s — `dispatch applied` records a cure on the "
+                "verdicted FIX row" % (parent.get("id"), parent.get("status"))
+                ), None
+    if parent.get("diff_applied"):
+        return ("dispatch %s already records an applied cure at %s; a second "
+                "event is not admitted" % (parent.get("id"),
+                                           applied_tip(parent)[:12])), None
+    repo = parent.get("repo_root")
+    reviewed = parent.get("reviewed_tip")
+    if not repo or not _FULL_TIP.fullmatch(str(reviewed or "")):
+        return ("dispatch %s records no repository or no reviewed tip; the "
+                "applied cure cannot be measured" % parent.get("id")), None
+    resolved, _branch = _resolve_tip(repo, tip)
+    if not resolved:
+        return ("tip %r is not exactly one commit in %s"
+                % (tip, repo)), None
+    from . import vcs
+    env = {key: None for key in _GIT_SELECTION_ENV}
+    try:
+        rc, out, _err = vcs.backend(repo).run(
+            repo, "rev-list", "--parents", "-n", "1", resolved,
+            env=env, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return ("the applied tip %s could not be read in %s"
+                % (resolved[:12], repo)), None
+    if rc != 0:
+        return ("the applied tip %s could not be read in %s"
+                % (resolved[:12], repo)), None
+    fields = out.decode("utf-8", "replace").split()
+    parents = fields[1:]
+    if parents != [reviewed]:
+        return ("the applied cure must be ONE commit on the reviewed tip: %s^ "
+                "is %s, not the reviewed %s"
+                % (resolved[:12],
+                   " ".join(p[:12] for p in parents) or "(no parent)",
+                   reviewed[:12])), None
+    patch = _handoff_patch(parent, current)
+    if patch is None:
+        return ("the posted diff of dispatch %s can no longer be re-proven; "
+                "`dispatch applied` records only a cure it can measure"
+                % parent.get("id")), None
+    posted_id = _verbatim_patch_id(repo, patch)
+    rc, raw, _err = (0, b"", b"")
+    try:
+        rc, raw, _err = vcs.backend(repo).run(
+            repo, "-c", "diff.noprefix=false", "diff", "--no-ext-diff",
+            "--no-textconv", "--no-color",
+            reviewed + ".." + resolved, env=env, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return ("the applied diff %s..%s could not be read"
+                % (reviewed[:12], resolved[:12])), None
+    if rc != 0:
+        return ("the applied diff %s..%s could not be read"
+                % (reviewed[:12], resolved[:12])), None
+    applied_id = _verbatim_patch_id(repo, raw.decode("utf-8", "replace"))
+    if not posted_id or not applied_id:
+        return ("patch identity could not be measured for the posted or the "
+                "applied diff; UNKNOWN is not a match"), None
+    if applied_id != posted_id:
+        return _changed_cure_message(parent, reviewed, resolved,
+                                     "the patch-id differs"), None
+    # task/4114: a patch-id is byte-equal only through its content, which hashes
+    # the +/- lines and never the TREE they resolve in. The same hunk that
+    # lands on the posted file can land, at a different position or in a
+    # different file, on a DIFFERENT tree and still read UNCHANGED — an applied
+    # tip that is not the posted cure. The tree IS the witness: apply the posted
+    # diff to `reviewed` in a private index and require its write-tree to equal
+    # the applied tip's tree. A mismatch names the delta child, so the
+    # reviewer-wake and the record-unchanged paths both honour one tree.
+    tree, ok = _index_apply_write_tree(repo, reviewed, patch)
+    tip_tree = None
+    try:
+        rc, raw, _err = vcs.backend(repo).run(
+            repo, "rev-parse", "--verify", "-q", resolved + "^{tree}",
+            env=env, timeout=15)
+        tip_tree = raw.decode("utf-8", "replace").strip() if rc == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        tip_tree = None
+    if not ok or not tree or not tip_tree:
+        return ("the applied tip is not the posted diff resolved in %s: its "
+                "tree could not be measured; UNKNOWN is not a match"
+                % resolved[:12]), None
+    if tip_tree != tree:
+        return _changed_cure_message(parent, reviewed, resolved,
+                                     "the resolved tree is not the posted "
+                                     "diff"), None
+    receipt, err = _focused_fab_receipt(fab_receipt, repo, resolved)
+    if err:
+        return err, None
+    if not isinstance(receipt, dict) or receipt.get("status") != "OK" \
+            or not receipt.get("focused"):
+        return ("dispatch applied needs an OK FOCUSED fab receipt on the "
+                "applied tip; this one is %s"
+                % ("not focused" if isinstance(receipt, dict)
+                   and receipt.get("status") == "OK"
+                   else "not OK")), None
+    return None, {"patch_id": applied_id, "receipt_id": receipt.get("id")}
+
+
+def _changed_cure_message(parent, reviewed, resolved,
+                          mismatch="the patch-id differs"):
+    """The refusal that names the DELTA child the reviewer must see instead.
+
+    THE DELTA IS THE APPLIED COMMIT ITSELF, shown as the reviewer reads a
+    cure: the posted diff it must equal is already in the pair meld, so the
+    wake carries only what CHANGED — the full `git diff reviewed..tip`,
+    plus the `git range-diff` command that answers it against any other
+    cure commit the reviewer holds.
+    """
+    repo = parent.get("repo_root")
+    delta = "(delta unreadable)"
+    from . import vcs
+    try:
+        env = {key: None for key in _GIT_SELECTION_ENV}
+        rc, out, _err = vcs.backend(repo).run(
+            repo, "-c", "diff.noprefix=false", "diff", "--no-ext-diff",
+            "--no-textconv", "--no-color",
+            reviewed + ".." + resolved, env=env, timeout=15)
+        if rc == 0 and out:
+            delta = out.decode("utf-8", "replace")
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return ("the applied cure is NOT the posted diff: %s, so "
+            "the reviewer must see the delta. Send the child round:\n"
+            "  helm dispatch send %s %s --ref %s --kind review "
+            "--supersedes %s \"cure applied with changes; delta below\"\n"
+            "against another cure commit, `git range-diff <reviewed>.."
+            "<other> %s..%s` is the delta; the applied change itself:\n%s"
+            % (mismatch, parent.get("recipient"), parent.get("lane"), resolved,
+               parent.get("id"), reviewed[:12], resolved[:12], delta))
+
+
+def mark_applied(rid, tip, fab_receipt=None):
+    """Record an unchanged applied MELD-DIFF cure on its OWN row (task/3937).
+
+    ONE `diff-applied` event on the PARENT: no child row, no pair round, no
+    reviewer mention. The event proves PATCH IDENTITY; the LAND AUTHORITY it
+    may carry is the reviewer's own approval-tier proof, frozen at the FIX's
+    hold and spent onto this event (`dispatches_tier.record_applied_approval`,
+    task/3976's machinery) — present only when the verdict froze it and the
+    hold-time policy admitted the hand, re-judged at read time by
+    `dispatches_tier.applied_approval`, whose CURRENT-policy veto still
+    stands. The applied event alone never lands anything; the land gate's
+    whole-suite receipt is still owed. A CHANGED cure refuses and names the
+    delta child send that wakes the reviewer with only the delta.
+    """
+    path = ledger_path()
+
+    def attempt(txn):
+        if not txn.held:
+            return None, "ledger unwritable (%s) -- diff-applied NOT recorded" % path
+        current, unavailable = snapshot()
+        if unavailable:
+            return None, "dispatch ledger unavailable: %s" % unavailable
+        row, err = _resolve_row(current, rid)
+        if err:
+            return None, err
+        err, measured = _diff_applied_refusal(row, tip, current,
+                                              fab_receipt=fab_receipt)
+        if err:
+            return None, err
+        resolved, _branch = _resolve_tip(row.get("repo_root"), tip)
+        # task/4114: record the patch-id the door above MEASURED AND MATCHED
+        # (a 40-hex, so replay's `[0-9a-f]{40}` check admits the event it just
+        # wrote). Re-measuring here could write None on a transient git
+        # failure, and replay would then drop the event the writer admitted.
+        fab = fab_receipt if isinstance(fab_receipt, str) else ""
+        event = {"v": 3, "event": DIFF_APPLIED_EVENT, "seq": row["seq"] + 1,
+                 "id": row["id"], "ts": pk.now_ts(),
+                 "tip": resolved, "patch_id": measured["patch_id"],
+                 "receipt_sha256": row["diff_handoff"]["sha256"],
+                 "fab": fab, "receipt_id": measured["receipt_id"]}
+        from . import dispatches_tier
+        proof = dispatches_tier.record_applied_approval(row, resolved,
+                                                        event["ts"])
+        if proof:
+            event["hold_approval"] = proof
+        if not txn.append(event):
+            return None, "ledger unwritable (%s) -- diff-applied NOT recorded" % path
+
+        def finish():
+            out = dict(row)
+            out["diff_applied"] = {key: event[key]
+                                   for key in _DIFF_APPLIED_KEYS}
+            if proof:
+                out["diff_applied"]["hold_approval"] = proof
+            out["seq"] = event["seq"]
+            pk.event("dispatch-diff-applied", row["id"], resolved)
+            return out, None
+        return txn.then(finish)
+    return _ledger_write(attempt, path)
+
+
+def applied_tip(parent):
+    """The applied tip a parent row's `diff-applied` event confirmed, or "".
+
+    A subset, not an equality: the record may ALSO carry the frozen
+    `hold_approval` proof (task/3937's land-authority half), which is
+    `applied_approval`'s to judge, never this extractor's."""
+    proof = parent.get("diff_applied") if isinstance(parent, dict) else None
+    if not isinstance(proof, dict) \
+            or not set(_DIFF_APPLIED_KEYS) <= set(proof):
+        return ""
+    tip = proof.get("tip")
+    return tip if isinstance(tip, str) and _FULL_TIP.fullmatch(tip) else ""
+
+
+def _review_mode_choice(current, recipient, repo_id, root, stated=None):
     """Alternate new chains sent to this reader across repositories."""
-    chosen = {_review_mode_of(r) for r in current.values()
+    if stated is not None:
+        return stated
+    chosen = {_ab_mode_of(r) for r in current.values()
               if r.get("repo_id") == repo_id
               and (r.get("chain_root") or r.get("id")) == root
-              and _review_mode_of(r) is not None}
+              and _ab_mode_of(r) is not None}
     if chosen:
         return next(iter(chosen)) if len(chosen) == 1 \
             and chosen <= REVIEW_MODE_LINES.keys() else None
     roots = {(r.get("repo_id"), r.get("chain_root") or r.get("id"))
              for r in current.values() if r.get("recipient") == recipient
-             and _review_mode_of(r) in REVIEW_MODE_LINES}
+             and _ab_mode_of(r) in REVIEW_MODE_LINES}
     return "MELD-DIFF" if len(roots) % 2 else "PATCH"
 
 
 def _post_lock_review_guidance(built, current, message="", door=None,
-                               inherited_from=None):
+                               inherited_from=None, review_mode=None):
     """Stamp a review's mode and round from the snapshot held by the writer.
 
     A moved row carries the sender's *whole* brief, not its bounded row copy.
@@ -10378,17 +11707,59 @@ def _post_lock_review_guidance(built, current, message="", door=None,
     whisper = review_door.round_whisper(rounds) if new_round else ""
     if whisper:
         built["round_whisper"] = whisper
+    stated_mode, mode_err = _extract_stated_review_modes(message, flag_mode=review_mode)
+    if mode_err:
+        return None, mode_err
     mode = None
     if _verified_family(built["recipient"]) == "codex":
-        mode = _review_mode_choice(current, built["recipient"],
-                                   built["repo_id"], built["chain_root"])
-        if mode is None:
-            return None, "review fix mode conflicts on this chain — dispatch NOT recorded"
-        built["review_mode"] = mode
+        from . import burnflags
+        flag = burnflags.family_flag("codex")
+        flag = flag if isinstance(flag, dict) else {}
+        colour = flag.get("colour")
+        reach = (flag.get("axes") or {}).get("reach")
+        # THE LIVE BURN FLAG GOVERNS THE FIX MODE (task/4005). It is read here
+        # so the footer never outruns it: a codex row that would PATCH falls to
+        # MELD-DIFF on ORANGE (no worktree, no fab, the cheaper live mode),
+        # records RED with no fix-mode footer on RED (the family runs nothing
+        # new; the send prints the review-only procedure), and
+        # keeps the A/B alternation on a measured GREEN or YELLOW whose reach
+        # axis does not refuse. An absent, stale or GREY flag, and a refusing
+        # reach axis, are MELD-DIFF: the cheapest live mode, never PATCH on
+        # UNKNOWN.
+        if colour == burnflags.RED:
+            # RED carries the REVIEW ONLY line: the family runs nothing new,
+            # so the reader is told it reviews and fixes nothing, and the
+            # brief's suffix binds the recorded mode as every other mode does.
+            built["review_mode"] = "RED"
+            mode = "RED"
+            built["review_mode_cause"] = "burn flags RED for this family"
+        elif colour not in (burnflags.GREEN, burnflags.YELLOW) \
+                or reach in (burnflags.ORANGE, burnflags.RED):
+            built["review_mode"] = "MELD-DIFF"
+            mode = "MELD-DIFF"
+            built["review_mode_cause"] = (
+                "a fresh burn flag is absent for this family" if not colour
+                else "burn flags %s for this family" % colour
+                if colour not in (burnflags.GREEN, burnflags.YELLOW)
+                else "burn flags reach %s for this family" % reach)
+        else:
+            if stated_mode:
+                mode = stated_mode
+            else:
+                mode = _review_mode_choice(current, built["recipient"],
+                                           built["repo_id"], built["chain_root"])
+                if mode is None:
+                    return None, "review fix mode conflicts on this chain — dispatch NOT recorded"
+            built["review_mode"] = mode
+            built.pop("review_mode_cause", None)
     full = message or ""
-    for text in (whisper, REVIEW_MODE_LINES.get(mode)):
+    mode_line = REVIEW_MODE_LINES.get(mode)
+    for text in (whisper, mode_line):
         if text:
-            full += ("\n\n" if full else "") + text
+            if full == text or full.endswith("\n\n" + text):
+                pass
+            else:
+                full += ("\n\n" if full else "") + text
     if not full:
         # A moved Codex add can consist entirely of generated guidance. When
         # that review moves to a non-Codex seat on the same tip, no authored
@@ -10414,8 +11785,22 @@ def send(recipient, lane, message, ref, note=None, deadline_s=None,
          supersedes=None, force=False, posture_na=None, unique_key=False,
          read_only_because=None, owner_surface_because=None,
          _cured_operation=None, door=None, pair_meld=None, decline_patch=None,
-         task=None):
+         task=None, lever_because=None, start_anyway=None, weigh=False,
+         steer=None, whole=False, review_mode=None, answers_row=None,
+         _relay_notice=False):
     """Persist first, attempt one DM, never auto-retry an existing operation.
+
+    `answers_row` is a row id, and only helm's own notice writers pass it: it
+    says this row is a notice back to that row's own sender, about that row
+    (the remote relay's undelivered notice), which the lead-context door
+    admits when the ledger proves the shape (`_answers_its_sender`).
+
+    `weigh` runs the two first-row checks (`_lever_rung`, task/3821) and is
+    set by the CLI alone: a seat choosing work is weighed, and helm's own
+    senders (a relay notice, a cured successor) never are. `lever_because`
+    and `start_anyway` are the one-line reasons a first row goes ahead of a
+    bigger lever or of started work sitting unlanded; `steer`, a list, takes
+    the lines the checks say when no reason was given.
 
     `decline_patch` is the `--decline-patch PATCH[,PATCH...]=REASON` value
     that declines, by name, chain reviewer patches a superseding ref does
@@ -10432,9 +11817,14 @@ def send(recipient, lane, message, ref, note=None, deadline_s=None,
     and appended from that same locked snapshot, so concurrent retries append at
     most once and a different/additional successor refuses atomically.
     """
+    if _relay_notice is not False and _relay_notice is not _RELAY_NOTICE_MINT:
+        return None, "_relay_notice requires the internal relay mint", False
     message = str(message or "").strip()
     if not message or len(message) > MESSAGE_ARG_CAP or "\x00" in message:
         return None, "message must be 1-16000 characters without NUL", False
+    stated_mode, mode_err = _extract_stated_review_modes(message, flag_mode=review_mode)
+    if mode_err:
+        return None, mode_err, False
     # THE BYTE CEILING, AND IT REFUSES RATHER THAN CUTS (see BRIEF_CEILING).
     # Checked here, at the send door, BEFORE any file is written and before any
     # row is built — the sender is present, can split the brief, and a refusal
@@ -10576,6 +11966,11 @@ def send(recipient, lane, message, ref, note=None, deadline_s=None,
                   "kind": kind_value, "supersedes": raw_parent}
 
     sender = usability_note = None
+    # THE ADVISORY OF THE LAST BUILD (task/4026): the probe sets it, and a
+    # `prepare` that rebuilds the row under the lock overwrites it — even
+    # with None, which is an answer (the rebuilt row bound its branch), never
+    # a reason to fall back to the probe's.
+    unbound = None
 
     def _op_id(author, repo_id, operation):
         return hashlib.blake2b(
@@ -10603,11 +11998,13 @@ def send(recipient, lane, message, ref, note=None, deadline_s=None,
         ok, why, usability_note = _validate_recipient_usable(recipient, force)
         if not ok:
             return None, why, False
-        probe, err = _base(
+        probe, err, unbound = _base3(
             recipient, lane, ref, note, deadline_s, repo, kind=kind,
             sender=sender, new_work=new_work, supersedes=supersedes,
             message_hash=message_hash, message_body=message_body,
-            brief_ref=brief_ref, brief_bytes=brief_bytes, task=task)
+            brief_ref=brief_ref, brief_bytes=brief_bytes, task=task,
+            whole=whole, answers_row=answers_row,
+            _relay_notice=_relay_notice, _replay_probe=True)
         if err:
             return None, err, False
         def _auto_key(lane_spelling):
@@ -10651,6 +12048,11 @@ def send(recipient, lane, message, ref, note=None, deadline_s=None,
         _stamp_read_only(probe, read_only_because)
         _stamp_owner_surface(probe, owner_surface_because)
         _stamp_door(probe, door)
+        if weigh:
+            err = _lever_rung(probe, lever_because, start_anyway,
+                              alt_ids=[i for _k, i in alt_ops], steer=steer)
+            if err:
+                return None, err, False
     elif not intent:
         sender, err = _acting_author()
         if err:
@@ -10669,11 +12071,13 @@ def send(recipient, lane, message, ref, note=None, deadline_s=None,
         ok, why, usability_note = _validate_recipient_usable(recipient, force)
         if not ok:
             return None, why, False
-        probe, err = _base(
+        probe, err, unbound = _base3(
             recipient, lane, ref, note, deadline_s, repo, kind=kind,
             sender=sender, new_work=new_work, supersedes=supersedes,
             message_hash=message_hash, message_body=message_body,
-            brief_ref=brief_ref, brief_bytes=brief_bytes, task=task)
+            brief_ref=brief_ref, brief_bytes=brief_bytes, task=task,
+            whole=whole, answers_row=answers_row,
+            _relay_notice=_relay_notice, _replay_probe=True)
         if err:
             return None, err, False
         probe["id"] = _op_id(sender, probe["repo_id"], key)
@@ -10685,9 +12089,14 @@ def send(recipient, lane, message, ref, note=None, deadline_s=None,
         _stamp_read_only(probe, read_only_because)
         _stamp_owner_surface(probe, owner_surface_because)
         _stamp_door(probe, door)
+        if weigh:
+            err = _lever_rung(probe, lever_because, start_anyway,
+                              steer=steer)
+            if err:
+                return None, err, False
 
     def prepare(current):
-        nonlocal sender, recipient, usability_note
+        nonlocal sender, recipient, usability_note, unbound
         sender, why = _acting_author()
         if why:
             return None, (), why
@@ -10704,12 +12113,13 @@ def send(recipient, lane, message, ref, note=None, deadline_s=None,
         if seats.recipient_matches(sender, recipient):
             return None, (), ("reviewer resolves to the executing sender; "
                               "self-delivery is refused before persistence")
-        built, why = _base(
+        built, why, unbound = _base3(
             recipient, lane, ref, note, deadline_s, repo, kind=kind,
             sender=sender, new_work=new_work, supersedes=supersedes,
             message_hash=message_hash, message_body=message_body,
             brief_ref=brief_ref, brief_bytes=brief_bytes, _current=current,
-            task=task)
+            task=task, whole=whole, answers_row=answers_row,
+            _relay_notice=_relay_notice)
         if why:
             return None, (), why
         built["id"] = _op_id(sender, built["repo_id"], key)
@@ -10723,7 +12133,7 @@ def send(recipient, lane, message, ref, note=None, deadline_s=None,
         _stamp_door(built, door)
         # LAST FALLIBLE READ BEFORE APPEND. Git refs do not share the dispatch
         # lock, so cure membership must be re-measured after every other
-        # admission/build step rather than allowed to age while `_base` probes.
+        # admission/build step rather than allowed to age while `_base3` probes.
         if _cured_operation:
             why = _cured_operation["validate"](current)
             if why:
@@ -10740,10 +12150,20 @@ def send(recipient, lane, message, ref, note=None, deadline_s=None,
         unique_key=unique_key, cured_operation=operation, family_count=tally,
         patch_door={"decline": decline_patch},
         review_guidance=(lambda built, current: _post_lock_review_guidance(
-            built, current, message=message, door=door))
-        if kind_value == "review" else None)
+            built, current, message=message, door=door,
+            review_mode=review_mode))
+        if kind_value == "review" else None,
+        review_task_required=(kind_value == "review" and new_work
+                              and _relay_notice is not _RELAY_NOTICE_MINT))
     if why:
         return None, why, False
+    # task/4020: the unbound-branch advisory `_base3` proved rides the row the
+    # CLI prints, NEVER the ledger — it is the third value of `_base3`, raised
+    # out of `prepare` for the cured-operation path, merged into the ephemeral
+    # _WRITE_WARNINGS here, and only onto a row that binds no branch: an
+    # `existed` retry returns its frozen first row, whose binding is
+    # first-write topology (task/4026).
+    row = _with_unbound_advisory(row, unbound)
     # A RACE LOST IS NOT A SEND. Another send of this same operation wrote
     # the row, and delivered it, while this call was reading; this call did
     # neither, so it must not report `sent`, whatever the row now says.
@@ -10935,7 +12355,7 @@ def _patch_tip_ancestry(row, reviewed, patch):
     """None when `patch` is a commit whose ancestry contains `reviewed`.
 
     THE CLAIM THE FIELD MAKES IS THE ONE CHECKED. Naming a patch tip says "I
-    committed this cure on a branch off the exact tip I reviewed", which is
+    committed this cure off the exact tip I reviewed", which is
     exactly the claim `merge-base --is-ancestor` answers in the bound
     repository's immutable object view: no replacements or legacy grafts,
     and no shallow history mistaken for a complete negative. The history
@@ -11020,7 +12440,7 @@ def _patch_tip_ancestry(row, reviewed, patch):
         timeout=10, env=env)
     if rc == 1:
         return ("patch tip %s does not descend from the reviewed tip %s — "
-                "branch off the exact tip you reviewed and commit there, or "
+                "commit off the exact tip you reviewed, or "
                 "the lane would carry work reviewed against a different tree"
                 % (patch[:12], reviewed[:12]))
     if rc != 0:
@@ -11079,9 +12499,10 @@ def _patch_tip_off_the_lane(row, patch, be, repo, env):
                              timeout=10, env=env)
     if rc == 0:
         return ("patch tip %s: that tip is on the lane's own branch (%s): a "
-                "reviewer's patch lives on the reviewer's branch off the "
-                "reviewed tip (commit it there, then return FIX; the author "
-                "fast-forwards after agreeing)" % (patch[:12], name))
+                "reviewer's patch lives off the reviewed tip — a subagent "
+                "with no room of its own commits it in a scratch clone — so "
+                "commit it there, then return FIX; the author "
+                "fast-forwards after agreeing" % (patch[:12], name))
     if rc != 1:
         return ("patch tip %s cannot be proven off the lane's own branch: its "
                 "ancestry against %s at %s could not be read (git exited %d)"
@@ -11407,14 +12828,25 @@ def _on_behalf_binding(row, given, current=None):
             independence = "fable"
         else:
             refusal = ("%s is the same family (%s) as the author's %s, and it "
-                       "is not Fable reading a Claude author, so this record "
+                       "is neither an Opus model read as a fresh-context run "
+                       "nor Fable reading a Claude author, so this record "
                        "does not take it as another family's read. %s"
                        % (reader, family, author,
                           review_remedy(row.get("id"))))
     if refusal:
         applies, why = _fresh_context_read(row, given, current)
-        if not applies or why:
-            return None, "%s. %s" % (refusal, why) if why else refusal
+        if not applies:
+            return None, refusal
+        # AN OPUS READER IS JUDGED BY ITS RUN ALONE, so a failed bound LEADS
+        # (task/3855). Leading with the model sentence above told a seat an
+        # Opus read of Opus work "is not an independent review" while the
+        # bound that really refused it sat after the whole ladder; the door
+        # read went to Fable.
+        if why:
+            return None, ("%s is an Opus model, so helm judges it as a "
+                          "fresh-context run, whatever model the author ran. "
+                          "%s. %s" % (reader, why,
+                                      review_remedy(row.get("id"))))
         # A RETRY OF THE READ THIS ROW ALREADY CARRIES passes, and
         # `mark_verdict` reports the row as it stands. Anything else is a
         # second spend, on another row or on this one at a new tip, and is
@@ -11425,7 +12857,9 @@ def _on_behalf_binding(row, given, current=None):
             return None, ("run %s is already recorded on dispatch %s: one "
                           "fresh-context run gives one review answer and "
                           "cannot be spent again, on another row or on a "
-                          "retipped one. Instead, record a NEW fresh-context "
+                          "retipped one (a Workflow run of several reader "
+                          "agents is still ONE run, so it records one "
+                          "verdict). Instead, record a NEW fresh-context "
                           "run that read %s. %s"
                           % (given["reviewer_run"], owner[:12],
                              str(row.get("tip") or "")[:12],
@@ -11473,7 +12907,7 @@ def _fresh_context_read(row, given, current=None):
     return True, None if fresh else "%s: %s" % (head, err)
 
 
-def reading_instance_is_fresh(run, lane_files, tip, checkouts):
+def reading_instance_is_fresh(run, lane_files, tip, checkouts, model=None):
     """(True, None) when the READING INSTANCE, the run `run` names, is a
     fresh one for the lane whose changed files are `lane_files` at `tip`,
     else (False, why) with the bound it failed.
@@ -11493,11 +12927,24 @@ def reading_instance_is_fresh(run, lane_files, tip, checkouts):
       * (c) its own lineage: no fork mark on its lines, and no conversation
         it continues before a turn of its own.
     The seat and the session that spawned it, what that session wrote, how
-    it began and who wrote the brief are no input. The arm is Opus's
-    (`_OPUS`), as the fresh-context read it serves. Every refusal names the
+    it began and who wrote the brief are no input. `model` is the model the
+    run must be, as a casefolded substring; it defaults to Opus (`_OPUS`),
+    the fresh-context arm's own reader. A caller that verifies a read of
+    ANOTHER family passes that read's model, so the bound is the reader the
+    read names, never a family — the instance decides, not the family
+    (task/3887, the integrator's ruling (1)). Every refusal names the
     input it could not read."""
     from . import runrecord
-    _run, err = runrecord.verify(run, lane_files, _OPUS, tip, checkouts)
+    # AN OPUS SPELLING KEEPS THE OPUS PATTERN, so a declared long id and a
+    # transcript that logs the short alias still agree — the fresh-context
+    # arm's reader is unchanged. Any OTHER model is matched as a LITERAL of
+    # the name the read carries, so a model id's own dots and dashes are not
+    # read as regex; an empty name matches nothing, because a run that must
+    # be "" is no reader at all.
+    key = _model_key(model)
+    pattern = _OPUS if model is None or _OPUS.search(key) else re.compile(
+        re.escape(key) if key else r"\A\Z")
+    _run, err = runrecord.verify(run, lane_files, pattern, tip, checkouts)
     return (False, err) if err else (True, None)
 
 _ADVISORY_EXIT_FIELDS = ("exit_answer", "worse_than_main_paths", "patch_tip",
@@ -11536,6 +12983,17 @@ def _advisory_record(event, state):
               "verdict_ref": evidence, "polarity": event["polarity"]}
     if "basis" in event:
         record["basis"] = replay_basis(event["basis"])
+    # THE VERIFIED-RUN FACT (task/3887) rides the read record, so
+    # `_fresh_instance_read` reads it from the row without probing git. It is
+    # admitted only for the run and tip this read itself names.
+    verified = event.get("read_run_verified")
+    if isinstance(verified, dict) and verified.get("run") \
+            and _clean_tip_of({"source_clean_tip": verified.get("tip")}) \
+            and _advisory_run_key(verified["run"]) \
+            == _advisory_run_key(event.get("reviewer_run")) \
+            and str(verified.get("tip") or "").lower() == reviewed:
+        record["read_run_verified"] = {"run": verified["run"],
+                                       "tip": verified["tip"]}
     record.update({key: event[key] for key in REVIEWER_FIELDS})
     record.update({key: event[key] for key in _ADVISORY_EXIT_FIELDS
                    if key in event})
@@ -11597,9 +13055,11 @@ def advisory_read_lines(row):
     tip if any, its exit answer and its evidence. One closing line says what
     the reads did, in the words the row's state makes true: the seat
     verdict is the lifecycle once one is recorded; a source-clean hold its
-    holder rests on a fresh-context read of the held tip is owed the land
-    gate (task/3658); else the row stays OWED. A row with no read gets no
-    line, so every surface prints byte for byte what it did."""
+    holder rests on a fresh-context read of the held tip, or on a
+    cross-family/fable read whose run was verified at write time
+    (task/3887), is owed the land gate (task/3658); else the row stays
+    OWED. A row with no read gets no line, so every surface prints byte for
+    byte what it did."""
     reads = [r for r in (row or {}).get("advisory_reads") or ()
              if isinstance(r, dict)]
     if not reads:
@@ -11628,8 +13088,9 @@ def advisory_read_lines(row):
         patch = str(read.get("patch_tip") or "")
         if patch:
             lines.append("  patch tip %s — the run's committed cure off the "
-                         "reviewed tip; rebase the lane onto it or "
-                         "cherry-pick it, and credit both authors"
+                         "reviewed tip; merge that exact tip into a new "
+                         "composition commit, keeping both reviewed shas "
+                         "reachable, and credit both authors"
                          % _one_line(patch, 64)[:12])
         if read.get("no_patch_because"):
             lines.append("  no cure committed, because: %s"
@@ -11638,7 +13099,11 @@ def advisory_read_lines(row):
         if answer != "UNMARKED":
             lines.append("  exit: " + answer)
         lines.append("  evidence: " + _one_line(read.get("verdict_ref"), 4096))
-    clean = str(row.get("source_clean_tip") or "")
+    # THE HELD TIP AS THE DOOR READS IT (`landreq._tip`: stripped, lowered),
+    # so the line names the tip the door admits the hold at.
+    clean = str(row.get("source_clean_tip") or "").strip().lower()
+    rest = _hold_rests_on(reads, clean, row.get("hold_actor")) if clean \
+        else None
     if row.get("reviewed_tip"):
         lines.append("ADVISORY: a model run's read discharges nothing — the "
                      "seat verdict is this row's lifecycle, and no read "
@@ -11647,19 +13112,20 @@ def advisory_read_lines(row):
         lines.append("ADVISORY: a model run's read discharges nothing — the "
                      "row ended on its own lifecycle, and no read above "
                      "moved it.")
-    elif clean and any(read.get("independence") == "fresh-context"
-                       and read.get("polarity") == "concur"
-                       and read.get("reviewed_tip") == clean
-                       and read.get("recorded_by") == row.get("hold_actor")
-                       for read in reads):
+    elif rest:
         # THE READ COUNTS (task/3658): the standing source-clean hold rests
         # on it (a release clears the held tip), so the row is owed the land
         # gate, not another read. The dispatch row and its land-loop
-        # projection both carry the held tip and its holder.
+        # projection both carry the held tip and its holder. A cross-family
+        # or fable read counts the same once the verdict writer recorded its
+        # run as verified (task/3887), and the line names which read it is.
         lines.append("ADVISORY: the SOURCE-CLEAN hold at %s by @%s rests on "
-                     "the fresh-context read above; what it owes now is the "
-                     "integrator's land gate" % (clean[:12],
-                                                 row.get("hold_actor")))
+                     "the %s read above; what it owes now is the "
+                     "integrator's land gate"
+                     % (clean[:12], row.get("hold_actor"),
+                        "fresh-context"
+                        if rest.get("independence") == "fresh-context"
+                        else "verified %s" % rest.get("independence")))
     else:
         lines.append("ADVISORY: the row stays OWED — a model run's read "
                      "discharges nothing: its record is unattested, and no "
@@ -11668,12 +13134,33 @@ def advisory_read_lines(row):
     return lines
 
 
+def _hold_rests_on(reads, clean, holder):
+    """The CONCURring read of the held tip `clean`, recorded by the holder,
+    that a source-clean hold rests on, or None: a fresh-context read, or a
+    cross-family/fable read carrying the verdict writer's verified-run fact
+    for that tip (`landreq_close._read_run_verified`, task/3887).
+
+    THE DOOR'S OWN PREDICATE, NOT A COPY OF IT: `landreq._fresh_instance_read`
+    is what admits an author's hold, and it reads the holder through
+    `landreq._same_seat` and both tips through `landreq._tip`. A restated
+    comparison drifted from it once per input (seat spelling, then tip
+    spelling), and each drift printed OWED for a hold the door admits
+    (task/4164)."""
+    from . import landreq                # DEFERRED — landreq imports us.
+    return landreq._fresh_instance_read({"advisory_reads": reads}, holder,
+                                        clean)
+
+
 #: What a superseded row's reads are worded from: the reads (a model run's
-#: `advisory_reads`, a hold) and the facts of the row their lines name.
+#: `advisory_reads`, a hold) and the facts of the row their lines name. A
+#: release is one of those reads: it names who lifted the hold, and a
+#: darkmove-released row is a cancelled row whose only surviving read fact is
+#: the release (its hold was popped by it).
 _SUPERSEDED_READ_KEYS = ("id", "status", "cancel_reason", "tip",
                          "reviewed_tip", "advisory_reads", "hold_reason",
                          "hold_ts", "hold_actor", "source_clean_tip",
-                         "owner_gated")
+                         "owner_gated", "release_reason", "release_ts",
+                         "release_actor")
 
 
 def superseded_reads(row, current):
@@ -11703,7 +13190,8 @@ def superseded_reads(row, current):
             and _same_chain(current[up], kid):
         seen.add(up)
         kid = current[up]
-        if kid.get("advisory_reads") or kid.get("hold_reason"):
+        if kid.get("advisory_reads") or kid.get("hold_reason") \
+                or kid.get("release_reason"):
             record = {k: kid[k] for k in _SUPERSEDED_READ_KEYS if k in kid}
             if "advisory_reads" in record:
                 record["advisory_reads"] = [
@@ -11737,6 +13225,14 @@ def superseded_read_lines(records):
                 kind, record.get("hold_actor") or "?",
                 record.get("hold_ts") or "?",
                 _one_line(record["hold_reason"], 256)))
+        if record.get("release_reason"):
+            # WHO LIFTED THE HOLD, or UNRECORDED when a release written before
+            # the stamp did: never a blank, never a guess (task/4149).
+            actor = record.get("release_actor")
+            lines.append("  RELEASED by %s at %s: %s" % (
+                ("@" + actor) if actor else "(unrecorded)",
+                record.get("release_ts") or "?",
+                _one_line(record["release_reason"], 256)))
     return lines
 
 
@@ -12149,6 +13645,8 @@ VERDICT_EVIDENCE_BUDGET = 256
 HOLD_REASON_CAP = 256
 NO_PATCH_REASON_CAP = 256
 DESIGN_FINDING_CAP = 256
+#: A `--finding` or `--note` on a verdict (helm/review_findings.py).
+FINDING_TEXT_CAP = review_findings.TEXT_CAP
 LANE_CAP = 160
 REF_CAP = 256
 NOTE_CAP = 1000
@@ -12174,7 +13672,8 @@ def mark_verdict(rid, reviewed_tip, evidence, polarity=None, basis=None,
                  finding_count=None, prior_relation=None, patch_tip=None,
                  imperfect=False, no_patch_because=None, reviewer_model=None,
                  reviewer_run=None, author_model=None, declared_unknown=None,
-                 meld_room=None, design_findings=None, diff_handoff=None):
+                 meld_room=None, design_findings=None, diff_handoff=None,
+                 findings=None, findings_carried=None, notes=None):
     reviewed = str(reviewed_tip or "").strip().lower()
     if not _FULL_TIP.fullmatch(reviewed):
         return None, "verdict needs the full exact reviewed commit id"
@@ -12232,6 +13731,17 @@ def mark_verdict(rid, reviewed_tip, evidence, polarity=None, basis=None,
     # AN INVALID value is still an error HERE, exactly as clean_polarity is:
     # absent is a permissive default, wrong is never quietly coerced.
     basis, err = clean_basis(basis)
+    if err:
+        return None, err
+    # THE REVIEW'S FINDINGS AND NOTES (helm/review_findings.py): cleaned here
+    # so a retry compares what the event stores, and a FIX that names its
+    # findings has counted them, so the count is derived from them.
+    review, err = review_findings.clean_args(findings, findings_carried,
+                                             notes)
+    if err:
+        return None, err
+    finding_count, err = review_findings.derive_count(
+        finding_count, declared_unknown, review)
     if err:
         return None, err
     err = _finding_error(finding_count, prior_relation)
@@ -12323,6 +13833,7 @@ def mark_verdict(rid, reviewed_tip, evidence, polarity=None, basis=None,
         # here is a model run, not a seat, so the event is written without it
         # (v3, and a tier reader answers PRE-TIER: it authorizes nothing).
         bind_author = False
+
     path = ledger_path()
     given_on_behalf = on_behalf
 
@@ -12374,12 +13885,15 @@ def mark_verdict(rid, reviewed_tip, evidence, polarity=None, basis=None,
                     == tuple(worse_paths or ()) and not on_behalf \
                     and str(row.get("meld_room") or "") == (
                         _review_door_ref_room(meld_room)) \
-                    and list(row.get("design_findings") or ()) == design:
+                    and list(row.get("design_findings") or ()) == design \
+                    and review_findings.same(row, review):
                 # Idempotent retry RECONCILES the standing attestation (the
-                # _reconcile_send law): report what IS, never re-emit.
+                # _reconcile_send law): report what IS, never re-emit. The
+                # findings it names are filed now if a first run could not.
                 out = dict(row)
                 out["announce"] = _reconcile_announce(row)
-                return out, None
+                return txn.then(lambda: (
+                    review_findings.with_report(out, current), None))
             # A DIFFERENT polarity or basis on the same tip+evidence is not a
             # retry, it is an attempt to flip a standing verdict's semantics.
             # Terminal is immutable: it falls through to the refusal below,
@@ -12407,6 +13921,18 @@ def mark_verdict(rid, reviewed_tip, evidence, polarity=None, basis=None,
             return None, ("dispatch %s is held (%s) -- %s"
                           % (rid, row.get("hold_reason") or "no reason given",
                              held_remedy(row, "verdict")))
+
+        # Shared write door, not only the CLI: an uncured positive count without
+        # named work would append an immutable FIX while plan() has nothing to file.
+        # An advisory run cannot file findings; the seat must name them on its FIX.
+        # Applied ONLY to a new verdict (task/4050 residual A2).
+        if (polarity == "fix" and not on_behalf
+                and isinstance(finding_count, int) and finding_count > 0
+                and not review_findings.named(review)
+                and not patch and diff_handoff is None):
+            return None, ("name each uncured finding with --finding or "
+                          "--finding-carried; --finding-count alone files no work "
+                          "(a committed patch or cited diff cure is the alternative)")
         if not row.get("tip"):
             return None, "historical dispatch lacks an exact tip; redispatch it"
         if reviewed != row["tip"]:
@@ -12433,6 +13959,12 @@ def mark_verdict(rid, reviewed_tip, evidence, polarity=None, basis=None,
                                    patch=patch, no_patch=no_patch_reason)
             if err:
                 return None, err
+        # EVERY CHECK THE TASK LEDGER WOULD MAKE OF THE FINDINGS, BEFORE THE
+        # APPEND: a finding it would refuse refuses the verdict instead.
+        filed, err = review_findings.plan(row, current, polarity, review,
+                                          advisory=bool(on_behalf))
+        if err:
+            return None, err
         if on_behalf:
             # ADVISORY, NEVER A VERDICT (see REVIEWER_FIELDS). One run is
             # recorded once: a retry of the same run on the same tip reports
@@ -12447,6 +13979,26 @@ def mark_verdict(rid, reviewed_tip, evidence, polarity=None, basis=None,
             if basis:
                 event["basis"] = basis
             event.update(on_behalf)
+            # A READ THAT IS NOT FRESH-CONTEXT WAS ADMITTED ON THE MODEL
+            # DIFFERENCE ALONE, so its run was never checked (task/3887, the
+            # integrator's ruling). Verify it ONCE, HERE, at write time — the
+            # one instance test, with the model the read names — and record
+            # the fact, so a lane author's hold may rest on it while
+            # `_fresh_instance_read`, the train planner and the post-land
+            # close read the LEDGER and never re-probe git or a transcript (a
+            # probe after a land refuses: the tip has no lane base there).
+            if on_behalf["independence"] != "fresh-context" and polarity == \
+                    "concur":
+                from . import review_door
+                lane = review_door.lane_doors(dict(row, tip=reviewed), current)
+                checkouts, cerr = review_door.lane_checkouts(row, current)
+                if lane["paths"] and not cerr:
+                    ok, _why = reading_instance_is_fresh(
+                        on_behalf["reviewer_run"], lane["paths"], reviewed,
+                        checkouts, model=on_behalf["reviewer_model"])
+                    if ok:
+                        event["read_run_verified"] = {
+                            "run": on_behalf["reviewer_run"], "tip": reviewed}
             if worse_paths:
                 event.update(exit_answer="worse-than-main",
                              worse_than_main_paths=list(worse_paths))
@@ -12564,8 +14116,8 @@ def mark_verdict(rid, reviewed_tip, evidence, polarity=None, basis=None,
             # THE REPAIR THIS NAMES IS THE ONE THE SEQUENCE ACTUALLY RUNS.
             # Sending the reviewer to run the whole suite on the REVIEWED tip
             # spends a suite on a tree nothing will land. A reviewer whose
-            # source read is clean HOLDS; the integrator rebases and runs the
-            # one whole-suite gate on the tree that lands; this approve binds
+            # source read is clean HOLDS; the integrator merges exact shas and
+            # runs the one whole-suite gate on the tree that lands; this approve binds
             # THAT token. The refusal names exactly that one repair, because a
             # refusal naming two teaches neither.
             return None, ("approve verdict requires a verified gate:<token>: an "
@@ -12620,6 +14172,8 @@ def mark_verdict(rid, reviewed_tip, evidence, polarity=None, basis=None,
         event.update(meld)
         if design:
             event["design_findings"] = design
+        # THE FINDINGS RIDE THE VERDICT ITSELF: one append records both.
+        event.update(filed)
         if author:
             event.update(author)
             projected = _apply(row, event)
@@ -12705,7 +14259,8 @@ def mark_verdict(rid, reviewed_tip, evidence, polarity=None, basis=None,
             if pin_warning:
                 out["pin_warning"] = pin_warning
             out["announce"] = _announce_verdict(out, reviewed, evidence)
-            return out, None
+            # THE FINDINGS' PROJECTION INTO THE TASK LEDGER, after the lock.
+            return review_findings.with_report(out, current), None
         return txn.then(finish)
     return _ledger_write(attempt, path)
 
@@ -14116,6 +15671,11 @@ def mark_cancel(rid, reason, chain=False, outcome=None, dry_run=False):
         if row.get("verdict_retracted"):
             return None, retracted_refusal(
                 row, "there is no standing verdict left to cancel")
+        if _held_over_concur(row):
+            return None, ("dispatch %s is HELD over its own CONCUR -- a "
+                          "reviewed dispatch is not cancelled. `helm dispatch "
+                          "release %s` returns it to that verdict"
+                          % (row["id"], row["id"][:12]))
         if row["status"] == "verdict" and not advisory_close:
             # THE REFUSAL NAMES THE DOOR IT IS NOT (task/2619). This sentence
             # is correct for the cancel invariant and, stopping there, it was
@@ -14440,7 +16000,9 @@ def mark_hold(rid, reason, owner_gated=False, source_clean_tip=None,
             # HERE, before the claim reaches the ledger and moves the row onto
             # the integrator's plate (task/3053). The one other hand is a
             # party of the row holding on a fresh-context read it recorded
-            # here at this tip: the reader is then that run (task/3658).
+            # here at this tip, or a cross-family/fable one whose run the
+            # verdict writer verified (task/3887): the reader is then that
+            # run (task/3658).
             recipient = str(row.get("recipient") or "")
             mine = recipient and seats.recipient_matches(actor, recipient)
             if not mine and not holds_on_its_fresh_read(row, actor, clean_tip):
@@ -14449,8 +16011,9 @@ def mark_hold(rid, reason, owner_gated=False, source_clean_tip=None,
                     "and this process is @%s: the hold says the row's read "
                     "found nothing, and the land closes the row on it. Its "
                     "sender holds only on a fresh-context read it recorded "
-                    "here at that tip. An ordinary hold (no --source-clean) "
-                    "names a dependency anybody may record"
+                    "here at that tip, or a cross-family/fable read whose "
+                    "run the verdict verified. An ordinary hold (no "
+                    "--source-clean) names a dependency anybody may record"
                     % (recipient or "(unnamed)", actor))
             # AND THAT RECIPIENT WROTE NO ROUND OF THE LANE (the integrator's
             # ruling, task/3053 22:01Z), or its claim rests on a reading
@@ -14501,6 +16064,21 @@ def mark_hold(rid, reason, owner_gated=False, source_clean_tip=None,
                                                clean_tip)
             if lerr:
                 return None, "--source-clean refused: %s" % lerr
+            # A READ THAT FOUND SOMETHING IS NOT A CLEAN ONE (task/4103): a
+            # seat held a row source-clean after a fresh read on it recorded
+            # a FIX, and the hold was the authority its land closed on.
+            found = _source_clean_finding(row, clean_tip)
+            if found:
+                return None, (
+                    "--source-clean refused: dispatch %s carries a %s verdict "
+                    "at %s (%s): a source-clean hold says the read found "
+                    "nothing, and this row's read found something. Cure it "
+                    "on the lane and send the cured tip for a fresh read "
+                    "(`helm dispatch send <reader> <lane> <brief> --ref "
+                    "<cured tip> --kind review --supersedes %s`); an ordinary "
+                    "hold (no --source-clean) still names a dependency"
+                    % (row["id"][:12], found[0], found[1][:12], found[2],
+                       row["id"][:12]))
         meld = {}
         if str(meld_room or "").strip():
             if not clean_tip:
@@ -14528,6 +16106,13 @@ def mark_hold(rid, reason, owner_gated=False, source_clean_tip=None,
                                   "--meld to record it"
                                   % (row["id"], clean_tip or "no tip",
                                      meld.get("meld_room")))
+                # AN IDENTICAL RE-HOLD REPAIRS THE FINDINGS CLOSE a first run
+                # missed; the close takes only rows still open, so a repeat
+                # closes nothing twice (helm/review_findings.py).
+                if clean_tip:
+                    return txn.then(lambda: (review_findings.with_closed(
+                        row, *review_findings.close_on_hold(row, current)),
+                        None))
                 return row, None
             if row.get("hold_reason") == reason:
                 return None, ("dispatch %s is already held at source-clean tip "
@@ -14543,8 +16128,14 @@ def mark_hold(rid, reason, owner_gated=False, source_clean_tip=None,
                             is True else "release it first, or cancel and "
                             "re-dispatch"))
         if row["status"] in CLOSED_STATES:
-            return None, ("dispatch %s is %s -- only an OPEN row can be held"
-                         % (row["id"], row["status"]))
+            if not _concur_holds_at_own_tip(row, clean_tip):
+                return None, ("dispatch %s is %s -- only an OPEN row can be "
+                              "held"
+                              % (row["id"], row["status"]))
+        if clean_tip:
+            err = _hold_receipt_error(row, actor, clean_tip, reason)
+            if err:
+                return None, err
         event = {"v": 3, "event": "hold", "seq": row["seq"] + 1,
                  "id": row["id"], "ts": pk.now_ts(), "reason": reason,
                  "owner_gated": bool(owner_gated)}
@@ -14554,6 +16145,11 @@ def mark_hold(rid, reason, owner_gated=False, source_clean_tip=None,
         # comparing equal across the door that added this field.
         if clean_tip:
             event["source_clean_tip"] = clean_tip
+            from . import dispatches_tier
+            proof = dispatches_tier.record_hold_approval(
+                row, actor, clean_tip, event["ts"])
+            if proof:
+                event["hold_approval"] = proof
         # WHO HELD IT, STAMPED BY THE LOCK AND NEVER TYPED (task/3053). A
         # source-clean hold is a claim that the review is over, and the land
         # may close the row on it — but only when the hand that recorded the
@@ -14583,12 +16179,19 @@ def mark_hold(rid, reason, owner_gated=False, source_clean_tip=None,
                 out["hold_actor"] = event["hold_actor"]
             if clean_tip:
                 out["source_clean_tip"] = clean_tip
+                if proof:
+                    out["hold_approval"] = proof
             out.update(meld)
             pk.event("dispatch-hold", row["id"],
                      "%s%s" % (reason, " [source-clean %s]" % clean_tip[:12]
                                if clean_tip else ""))
             if pin_warning:
                 out["pin_warning"] = pin_warning
+            # A CLEAN READ ANSWERS THE FINDINGS ITS CHAIN FILED at a tip that
+            # descends from them (helm/review_findings.py).
+            if clean_tip:
+                out = review_findings.with_closed(
+                    out, *review_findings.close_on_hold(out, current))
             return out, None
         return txn.then(finish)
     return _ledger_write(attempt, path)
@@ -14609,8 +16212,10 @@ def held_tip_doors(row, tip, current=None):
 
 def holds_on_its_fresh_read(row, seat, tip):
     """Is `seat` the row's sender or custodian holding it source-clean on a
-    fresh-context read it recorded on this row at exactly `tip` (task/3658)?
-    Then the reader is that run and the party only its recorder, so the
+    fresh-context read it recorded on this row at exactly `tip` (task/3658),
+    or a cross-family/fable one whose run the verdict writer verified there
+    (task/3887, `landreq._fresh_instance_read`)? Then the reader is that run
+    and the party only its recorder, so the
     hold is the author's one verb for making its own fresh subagent's read
     count. The recipient holds with no such read. The hold door and the
     close's holder rung (`landreq.source_clean_holder_error`) ask this one
@@ -14634,8 +16239,18 @@ def held_remedy(row, then):
             % (str(row.get("id") or "")[:12], then))
 
 
-def mark_release(rid):
-    """Return a HELD dispatch to OPEN."""
+def mark_release(rid, actor=None):
+    """Return a HELD dispatch to OPEN, or to its CONCUR when the hold was
+    over one (`_held_over_concur`).
+
+    WHO RELEASED IS THE SAME IDENTITY A HOLD RECORDS (task/4149): a deliberate
+    release must read as somebody's, not an unattributed one. When `actor` is
+    omitted it is resolved through the hold's own door, so a `helm dispatch
+    release` stamps the acting seat exactly as a hold stamps its holder; a
+    programmatic caller (the dark-seat mover) names its own fixed hand. A hand
+    that is not a seat token refuses here, the way a malformed hold actor does
+    on replay; a release whose identity the door cannot corroborate records no
+    hand, never a floor name."""
     path = ledger_path()
 
     def attempt(txn):
@@ -14652,15 +16267,33 @@ def mark_release(rid):
                          "row can be released" % (row["id"], row["status"]))
         if row["status"] == "open":
             return row, None
+        # THE RELEASING HAND, RESOLVED OR NAMED. An explicit actor is a
+        # caller's own hand and is only checked, not corroborated; an omitted
+        # one goes through the hold's identity door and records nothing the
+        # door would not.
+        if actor is not None:
+            hand, err = actor, None
+            if not isinstance(hand, str) or not _TOKEN.fullmatch(hand):
+                err = ("release actor %r is not a seat token" % (actor,))
+                return None, err
+        else:
+            # An omitted hand goes through the hold's own identity door and
+            # records nothing it cannot corroborate: an ordinary release
+            # stamps nobody, the way an ordinary hold does -- never a
+            # refusal, and never a floor name.
+            hand, _ident = _hold_actor()
         event = {"v": 3, "event": "release", "seq": row["seq"] + 1,
                  "id": row["id"], "ts": pk.now_ts(),
                  "reason": row.get("hold_reason")}
+        if hand:
+            event["release_actor"] = hand
         if not txn.append(event):
             return None, "ledger unwritable (%s) -- release NOT recorded" % path
 
         def finish():
             out = dict(row)
-            out.update(status="open", release_reason=event["reason"],
+            out.update(status="verdict" if _held_over_concur(row) else "open",
+                       release_reason=event["reason"],
                        release_ts=event["ts"], seq=event["seq"])
             # THE SAME KEYS THE REPLAY DROPS. A return that kept the claim while the
             # fold dropped it made the in-process answer and the stored one disagree
@@ -14668,6 +16301,10 @@ def mark_release(rid):
             # future caller reads the wrong one.
             for key in _HOLD_STATE_FIELDS + MELD_FIELDS:
                 out.pop(key, None)
+            if hand:
+                out["release_actor"] = hand
+            else:
+                out.pop("release_actor", None)
             pk.event("dispatch-release", row["id"], event["reason"])
             return out, None
         return txn.then(finish)
@@ -14860,7 +16497,7 @@ def record_hold_actor_backfill(rid, hold_seq, evidence):
 #: survive a release in the other.
 _HOLD_STATE_FIELDS = ("owner_gated", "hold_reason", "hold_ts",
                       "source_clean_tip", "hold_actor", "hold_seq",
-                      HOLD_ACTOR_EVIDENCE)
+                      "hold_approval", HOLD_ACTOR_EVIDENCE)
 
 
 def _hold_actor():
@@ -15715,7 +17352,7 @@ def retip(rid, ref, reason=None, repo=None, notify=True):
         return None, ("dispatch %s already names %s — nothing to re-point"
                       % (row["id"], new_tip[:12]))
     # A NEW TIP IS A NEW COMMIT FOR THE SAME READER, and privacy is per
-    # commit: the data-terms rung every minted row passes in `_base` is asked
+    # commit: the data-terms rung every minted row passes in `_base3` is asked
     # of the hop too, or a row admitted on a public commit is re-pointed at a
     # private one. Before any write, like every refusal here.
     terms_ok, terms_refusal = _data_terms_rung(row.get("recipient"),
@@ -15829,6 +17466,163 @@ def retip(rid, ref, reason=None, repo=None, notify=True):
                 _notify_public(out, "RETIPPED %s -> %s [identity %s]: %s%s"
                                % (event["old_tip"][:12], new_tip[:12], identity,
                                   reason, (" — " + how) if how else ""))
+            return out, None
+        return txn.then(finish)
+    return _ledger_write(attempt, path)
+
+
+def attach_task(rid, task, owner=None):
+    """(row, err) — record that the chain of `rid`, minted naming NO task,
+    now serves `task`: `helm dispatch attach-task <row> --task task/N`
+    (task/4000).
+
+    ONE EVENT ON THE CHAIN'S FIRST ROW, APPEND-ONLY. The opener's own `task`
+    key is the immutable fact of what the mint recorded and is never
+    written; the attach lands beside it as `attached_task`, and every reader
+    of the chain's task (`taskkey.join` on the first row) answers from both.
+    History is untouched: findings the chain already filed keep their rows,
+    their found_chain and their continuation, and the pair room the chain
+    already opened keeps its name (`review_door.task_room`: an opened legacy
+    room keeps for life). What changes is the NEXT round: its FIX files and
+    carries under the attached task instead of top-level — the carry the
+    measured simbi case (chain 89dea44a1662, findings task/3913-3917
+    continuing task/3993) could not make a new --task chain accept.
+
+    FAIL CLOSED, in the task note's own words. The attach refuses when the
+    chain's first row ALREADY names a task (a chain serving one task is not
+    re-pointed by an append; that is a new chain), when the task is closed
+    (a finding filed under it would be open work under a closed parent — the
+    same law the verdict door keeps), when the caller is neither the chain's
+    AUTHOR (its first row's sender) nor the INTEGRATOR (the two hands the
+    door admits, exactly as a verdict's retraction admits its author or the
+    integrator), when the attach already stands (the fact is recorded once;
+    the refusal NAMES it rather than reconcile a retry — unlike a retip
+    there is no lost response to repair: a refused caller saw the refusal),
+    and when either ledger cannot be read, because a chain whose first row
+    is UNKNOWN may name a task this write would contradict.
+
+    `owner` is the owner's capability (`ownerasks.OwnerDoor`) and nothing
+    else, the same shape `retract` takes: the owner acts as the owner, never
+    as a caller-stated name."""
+    from . import tasks
+    tid = tasks.normalize_id(task)
+    if tid is None:
+        return None, ("attach-task: %r is not a task id (want task/N)"
+                      % (task,))
+    current, unavailable = snapshot()
+    if unavailable:
+        return None, "dispatch ledger unavailable: %s" % unavailable
+    row, err = _resolve_row(current, rid)
+    if err:
+        return None, err
+    from . import taskkey
+    root = taskkey.first_row(row, current)
+    if root is None:
+        return None, ("attach-task REFUSED: the chain of dispatch %s is "
+                      "UNKNOWN or unreadable, so whether it already names a "
+                      "task cannot be proven — a chain whose first row "
+                      "cannot be read is never taskless by default"
+                      % row["id"][:12])
+    if root.get("task"):
+        return None, ("attach-task REFUSED: chain %s already names %s on "
+                      "its first row — a chain serves one task, and serving "
+                      "another is a new chain, never a rewrite of this one"
+                      % (root["id"][:12], root["task"]))
+    if root.get("attached_task"):
+        return None, ("attach-task REFUSED: chain %s is already attached to "
+                      "%s (by @%s at %s) — the attach is one fact, recorded "
+                      "once; nothing was changed"
+                      % (root["id"][:12], root["attached_task"],
+                         root.get("attached_task_by") or "?",
+                         root.get("attached_task_ts") or "an unrecorded "
+                         "time"))
+    # A CHAIN WHOSE OPENER RECORDED NO `task` MAY STILL SERVE ONE: its lane
+    # or note can cite exactly one task literally, and `taskkey.join` (the
+    # reader the findings and the pair room use) answers it. The attach is
+    # a STORED key and stored wins over a literal, so attaching another task
+    # would silently re-point the chain: findings it already filed continue
+    # the literal and could no longer be carried ("it continues X, not Y").
+    prior = taskkey.join(row=root, current={}, lanes=False)
+    if prior.task:
+        return None, ("attach-task REFUSED: chain %s already serves %s (its "
+                      "lane or note cites it, and its findings file under "
+                      "it) — serving another task is a new chain; nothing "
+                      "was recorded" % (root["id"][:12], prior.task))
+    known, bad = tasks.snapshot(strict=True)
+    if bad:
+        return None, ("attach-task REFUSED: the task ledger could not be "
+                      "read (%s), so whether %s is open is UNKNOWN; nothing "
+                      "was recorded" % (bad, tid))
+    got = known.get(tid)
+    if not isinstance(got, dict):
+        return None, ("attach-task REFUSED: %s is not in the task ledger"
+                      % tid)
+    if got.get("status") not in tasks.OPEN_STATUSES:
+        return None, ("attach-task REFUSED: %s is %s — attaching the chain "
+                      "to it would file open work under a closed parent; "
+                      "reopen it (`helm task update %s --status open`) if "
+                      "its work goes on; nothing was recorded"
+                      % (tid, got.get("status") or "of no status", tid))
+    if owner is not None:
+        from . import ownerasks
+        if not isinstance(owner, ownerasks.OwnerDoor):
+            return None, ("the owner's door is a capability, never a name: "
+                          "attach as your own seat")
+        seat, role = ownerasks.OWNER, "owner"
+    else:
+        seat, err = _acting_author("attach a task to a chain")
+        if err:
+            return None, err
+        role = None
+        from . import seats
+        if seats.recipient_matches(root.get("sender") or "", seat):
+            role = "author"
+        else:
+            from . import seats_integrator
+            integrator, why = seats_integrator.integrator_seat()
+            if integrator and seats.recipient_matches(integrator, seat):
+                role = "integrator"
+        if role is None:
+            return None, (
+                "attach-task REFUSED as @%s: a chain is attached to a task "
+                "by its AUTHOR (@%s, the first row's sender) or the "
+                "INTEGRATOR — the two hands a verdict's retraction admits "
+                "for the same reason: the attach re-reads what the chain's "
+                "review meant, and a seat that merely disagrees names the "
+                "task on a NEW chain (--new-work --task)"
+                % (seat, root.get("sender") or "?"))
+    path = ledger_path()
+
+    def attempt(txn):
+        if not txn.held:
+            return None, "ledger unwritable (%s) — attach NOT recorded" % path
+        live_snap, unavailable = snapshot()
+        if unavailable:
+            return None, "dispatch ledger unavailable: %s" % unavailable
+        live = live_snap.get(root["id"])
+        refusal = unknown_kinds_refusal(live)
+        if refusal:
+            return None, refusal
+        # THE RE-READ THE WRITE BINDS: the checks above read an earlier
+        # snapshot, and a verdict, a task change or a first attach landing
+        # since must never be written over. The fold refuses every one of
+        # those shapes on read, so a writer that missed one would append an
+        # event that replays inert while the caller read success — the
+        # refusal here is what the fold arm's existence makes cheap.
+        if live is None or live.get("task") or live.get("attached_task"):
+            return None, ("chain %s moved while attach-task was validating "
+                          "— nothing was changed; re-run against its "
+                          "current state" % root["id"][:12])
+        event = {"v": 3, "event": CHAIN_TASK_EVENT,
+                 "seq": live["seq"] + 1, "id": root["id"], "ts": pk.now_ts(),
+                 "task": tid, "attached_by": seat, "attach_role": role}
+        if not txn.append(event):
+            return None, "ledger unwritable (%s) — attach NOT recorded" % path
+
+        def finish():
+            out = _apply(live, event, live_snap)
+            pk.event("dispatch-attach-task", root["id"],
+                     "%s attached by @%s (%s)" % (tid, seat, role))
             return out, None
         return txn.then(finish)
     return _ledger_write(attempt, path)
@@ -16364,15 +18158,19 @@ USAGE = ("usage: helm dispatch send <recipient> <lane> <message...> --ref TIP "
          "heredocs substitute backticks and $() before helm ever sees them) "
          "[--key K] [--note N] [--deadline SECONDS] [--repo PATH] [--force] "
          "[--reason R] [--posture-na REASON] [--read-only-because REASON] "
-         "[--decline-patch PATCH[,PATCH...]=REASON] [--task task/N] | "
+         "[--decline-patch PATCH[,PATCH...]=REASON] [--review-mode PATCH|MELD-DIFF] "
+         "[--task task/N --whole|--part] | "
          "add <recipient> <lane> --ref TIP --kind build|review "
          "--new-work|--supersedes ID [--note N] "
          "[--deadline SECONDS] [--repo PATH] [--force] [--reason R] "
          "[--posture-na REASON] [--read-only-because REASON] "
-         "[--decline-patch PATCH[,PATCH...]=REASON] [--task task/N] "
+         "[--decline-patch PATCH[,PATCH...]=REASON] [--review-mode PATCH|MELD-DIFF] "
+         "[--task task/N [--whole]] "
          "(--task: the OPEN task a --new-work chain serves, recorded on its "
          "first row; without it the lane's record, else one task/N the lane "
-         "or brief names) "
+         "or brief names; --whole: the lane carries that task's WHOLE ask, "
+         "so its land leaves the task owing a seen-working check, "
+         "closed by `helm task observed`) "
          "(the lane is a LABEL; --new-work / --supersedes is WORK IDENTITY and "
          "exactly one is REQUIRED, because a renamed continuation is invisible "
          "to any same-lane rule) | verdict <id-or-unique-prefix> "
@@ -16383,6 +18181,7 @@ USAGE = ("usage: helm dispatch send <recipient> <lane> <message...> --ref TIP "
          "[--patch-tip SHA|--no-patch-because REASON "
          "[--diff-handoff PAIR-ROOM/MSGID]] "
          "[--design-finding TEXT ...] [--meld ROOM[@EPOCH]] "
+         "[--finding TEXT ...] [--finding-carried task/N ...] [--note TEXT ...] "
          "[--reviewer-model M --reviewer-run RUN [--author-model M]] <evidence> "
          "(the reviewed tip and --patch-tip take the full commit id or any "
          "unique prefix of at least 7 hex, resolved in the row's repository "
@@ -16391,15 +18190,31 @@ USAGE = ("usage: helm dispatch send <recipient> <lane> <message...> --ref TIP "
          "polarity is REQUIRED: an omitted flag records immutable UNDECLARED; "
          "--fix also REQUIRES --finding-count and --prior-relation, either "
          "of which may be the literal UNKNOWN, recorded as declared; "
+         "a FIX names each finding that is WORK with --finding TEXT (one "
+         "line each, repeatable), filed in the same write as a sub-task of "
+         "the task the chain serves, owned by the lane's author, and "
+         "--finding-count is then derived from them: a count that "
+         "disagrees refuses. "
+         "--finding-carried task/N names an open finding an earlier round "
+         "of this chain filed, instead of filing it twice. "
+         "A chain that names no task files its findings top-level, tagged "
+         "with the review row. "
+         "A finding closes when a row of its chain is held source-clean at "
+         "a tip descending from every FIX that named it, at the chain's "
+         "LAND, or as retracted with the FIX that filed it. "
+         "--note TEXT (any polarity) is an observation: a comment on that "
+         "task, never a row. "
          "FIX/SUPERSEDE also require the exit answer: only a named touched path "
          "that regresses relative to main is a block; --imperfect teaches "
          "APPROVE plus separately filed remainder. --approve also "
          "requires evidence containing a verified gate:<token>, because an "
          "ungated approve is immutable and can never authorize landing. "
-         "--patch-tip rides a FIX and names the cure the REVIEWER committed on "
-         "a branch off the exact reviewed tip: the row then records two "
-         "authors, and the lane owner or integrator rebases onto that tip or "
-         "cherry-picks it. A design finding takes a meld instead, and a FIX "
+         "--patch-tip rides a FIX and names the cure the REVIEWER committed "
+         "off the exact reviewed tip (a subagent reviewer, with no room of its "
+         "own, uses a scratch clone fetched back with `git -C <repo> fetch "
+         "--no-write-fetch-head <scratch>/wt <sha>`): the row then records two "
+         "authors; merge that exact tip as a parent of the new composition "
+         "commit. A design finding takes a meld instead, and a FIX "
          "with no --patch-tip REFUSES unless --no-patch-because REASON (one "
          "quoted argv token) records which reason applied. --diff-handoff "
          "PAIR-ROOM/MSGID on a MELD-DIFF FIX checks the recipient's exact "
@@ -16431,6 +18246,14 @@ USAGE = ("usage: helm dispatch send <recipient> <lane> <message...> --ref TIP "
          "binds a verified whole-suite token only the land gate produces. The "
          "two are refused together because one row cannot owe two holders) | "
          "release <id-or-unique-prefix> (return a HELD row to OPEN) | "
+         "applied <parent-id-or-unique-prefix> <tip> [--fab-receipt R] "
+         "(the author's UNCHANGED applied MELD-DIFF cure, recorded on the "
+         "ORIGINAL verdicted FIX row with ONE diff-applied event — the "
+         "applied diff's verbatim patch-id must equal the posted diff's, tip^ "
+         "must be the reviewed tip, and an OK focused fab receipt must bind "
+         "at the tip. No child row is minted and the reviewer is not woken; "
+         "a CHANGED cure refuses and prints the delta child send with "
+         "`git range-diff` for the reviewer instead) | "
          "retract <id-or-unique-prefix> --reason R "
          "--reads source-clean|fix|supersede|unknown --measured|--inferred "
          "[--reissue|--successor ID] [--json] (withdraw a WRONG verdict's "
@@ -16462,6 +18285,15 @@ USAGE = ("usage: helm dispatch send <recipient> <lane> <message...> --ref TIP "
          "row with no derivable current tip (legacy needs-redispatch), and "
          "when the successor frontier cannot be READ because a not-closed "
          "row replays a malformed supersedes) | "
+         "attach-task <id-or-unique-prefix> --task task/N "
+         "(record, as ONE new event on the chain's FIRST row, that a chain "
+         "minted naming no task now serves task/N — later rounds file and "
+         "carry the chain's findings under it; history, filed findings and "
+         "the opened pair room are never rewritten. REFUSED when the chain "
+         "already names a task, when the attach already stands, when task/N "
+         "is closed or unknown, when the caller is neither the chain's "
+         "author nor the integrator, and when either ledger cannot be "
+         "read) | "
          "list [--open|--overdue|--held] [--source-clean] [--no-holder] "
          "[--mine] [--issued] [--to SEAT] "
          "[--all-projects] [--json] "
@@ -17121,15 +18953,17 @@ def _ref_sanity(ref, lane, repo=None, kind=None):
                            "that author-side check cannot stay true while "
                            "another land moves trunk. Do not rebase or re-gate "
                            "as author; the reviewer binds this exact tip, then "
-                           "the integrator chooses landing order, rebases the "
-                           "chain, and runs the final exact-tree gate once."
+                           "the integrator chooses landing order, merges the "
+                           "chain at those exact shas, and runs the final "
+                           "exact-tree gate once."
                            % (ref[:12], trunk))
             elif relation == vcs.NOT_ANCESTOR:
                 out.append("NOTE: review --ref %s is NOT ff-able from %s. This "
                            "is structural, not author error: do not rebase or "
                            "re-gate as author. The reviewer binds this exact "
-                           "tip; the integrator chooses landing order, rebases "
-                           "the chain, and runs the final exact-tree gate once."
+                           "tip; the integrator chooses landing order, merges "
+                           "the chain at those exact shas, and runs the final "
+                           "exact-tree gate once."
                            % (ref[:12], trunk))
             else:
                 out.append("NOTE: review --ref %s base relation to %s is "
@@ -17401,7 +19235,9 @@ _OWNER_NAMES = (
         "non_author_tier_error", "approval_tier", "_TIER_LENS", "tier_lens",
         "_EPOCH_LENS", "epoch_lens", "_approval_tier_key",
         "_approval_tier_memo", "_approval_tier_uncached",
-        "_approval_tier_advisory",
+        "_approval_tier_advisory", "_hold_policy", "_resting_run",
+        "record_hold_approval", "hold_approval", "record_applied_approval",
+        "applied_approval",
     )),
     ("dispatches_carriage", (
         "_carriage_trunk_sha", "_carriage_shallow_refusal",

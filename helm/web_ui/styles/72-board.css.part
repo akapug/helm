@@ -56,8 +56,14 @@
 .blight{display:grid;place-items:center;width:22px;height:22px;padding:0;border:0;border-radius:50%;background:none;cursor:pointer}
 .blight:hover{background:var(--line)}
 .blight:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
-.bname{min-width:0;font-weight:700;font-size:var(--f3);letter-spacing:-.01em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.brow.unset .bname{color:var(--mut);font-weight:600}
+.bname{display:flex;flex-direction:column;gap:1px;min-width:0}
+.bname-t{font-weight:700;font-size:var(--f3);letter-spacing:-.01em;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.brow.unset .bname-t{color:var(--mut);font-weight:600}
+/* THE PROJECT'S HEALTH LINE, the second line of the name cell (task/3745):
+   the one reader's facts — open stories, today's flow, the 7-day net —
+   muted, and wrapped under the name inside its cell (a phone has no hover),
+   never truncated. */
+.bhealth{font-size:var(--f1);color:var(--sub);font-variant-numeric:tabular-nums;min-width:0;white-space:normal}
 /* the project's team on its line (task/3445): its version and live seats,
    then the share marks of a binding team */
 .bteam{display:flex;flex-wrap:wrap;align-items:center;gap:4px 6px;min-width:0;font-size:var(--f1)}

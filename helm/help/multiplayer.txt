@@ -1,0 +1,1 @@
+multiplayer set|status|publish|read|presence|peers|leave [--backend V] — metaharness-agnostic local multiplayer: blind opaque-update relay + decoupled TTL presence (set/status drive the built-in LWW demo board; --backend on any verb selects the adapter pair, default local/HELM_MULTIPLAYER_BACKEND)

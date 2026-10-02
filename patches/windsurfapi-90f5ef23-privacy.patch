@@ -1,0 +1,506 @@
+# SOURCE-ONLY proposal; NOT_APPLIED, NOT_RUN, NO LIVE CAPTURE.
+# Upstream: dwgx/WindsurfAPI (MIT), commit 90f5ef2368b35bd1b4b057bd3c8a02296177f98c.
+# Exact context quoted from pinned public src/devin-connect.js; not vendor proof.
+# Incomplete until the parser, caller, retry and other modules are reviewed.
+diff --git a/src/devin-connect.js b/src/devin-connect.js
+--- a/src/devin-connect.js
++++ b/src/devin-connect.js
+@@ -46,3 +46,55 @@
+ const HOST = 'server.codeium.com';
+ const PATH = '/exa.api_server_pb.ApiServerService/GetChatMessage';
++// Trial-only privacy policy; never turn this into a route from a source-only patch.
++const PRIVACY = process.env.HELM_DEVIN_PRIVACY_PROFILE === '1';
++const PRIVACY_REQUEST_MAX = 1024 * 1024;
++const PRIVACY_RESPONSE_MAX = 8 * 1024 * 1024;
++const PRIVACY_FRAME_MAX = 128 * 1024;
++const PRIVACY_FRAMES_MAX = 2048;
++const PRIVACY_CALLS_MAX = 16;
++const PRIVACY_ARGS_MAX = 16 * 1024;
++function privacyError(code) { return Object.assign(new Error(code), { code }); }
++export function privacyTransport(host, path, bytes) {
++  if (!PRIVACY) return {};
++  // Do not forward a session token to another origin, port or RPC. No redirects:
++  // https.request itself does not follow Location. Pin the native TLS transport.
++  if (host !== HOST || ![PATH, USER_JWT_PATH].includes(path)
++      || requestImpl !== https.request || bytes.length > PRIVACY_REQUEST_MAX) {
++    throw privacyError('ERR_DEVIN_PRIVACY_TRANSPORT');
++  }
++  // ALL credential-bearing paths, including direct GetUserJwt, remain closed.
++  throw privacyError('ERR_DEVIN_PRIVACY_UNVERIFIED_BRIDGE');
++}
++function privacyJsonObject(value) {
++  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
++  const finite = (v) => typeof v === 'number' ? Number.isFinite(v)
++    : Array.isArray(v) ? v.every(finite)
++      : v && typeof v === 'object' ? Object.values(v).every(finite) : true;
++  return finite(value);
++}
++export function validatePrivacyToolHistory(messages) {
++  // Shape/correlation only: the bridge must independently prove upstream custody.
++  const pending = new Map();
++  const seen = new Set();
++  for (const msg of messages) {
++    if (msg.role === 'assistant' && msg.tool_calls?.length) {
++      for (const call of msg.tool_calls) {
++        const id = call.id;
++        const name = call.function?.name;
++        const args = call.function?.arguments;
++        if (!/^[A-Za-z0-9_-]{1,128}$/.test(id)
++            || !/^[A-Za-z_][A-Za-z0-9_-]{0,127}$/.test(name)
++            || seen.has(id) || typeof args !== 'string' || Buffer.byteLength(args) > PRIVACY_ARGS_MAX)
++          throw privacyError('ERR_DEVIN_PRIVACY_HISTORY_CALL');
++        try { if (!privacyJsonObject(JSON.parse(args))) throw Error('not object'); }
++        catch { throw privacyError('ERR_DEVIN_PRIVACY_HISTORY_ARGS'); }
++        seen.add(id);
++        pending.set(id, name);
++      }
++    } else if (msg.role === 'tool') {
++      if (!pending.delete(msg.tool_call_id)) throw privacyError('ERR_DEVIN_PRIVACY_RESULT_ID');
++    }
++  }
++  if (pending.size) throw privacyError('ERR_DEVIN_PRIVACY_MISSING_RESULT');
++}
+ // Short-lived user JWT. Four independent .proto reimplementations agree on the
+@@ -82,4 +134,5 @@
+ let _wireSeq = 0;
+ function dumpWire(kind, bytes, meta = {}) {
++  if (PRIVACY) return; // disable wire dump and trace sinks even when enabled
+   const wireDump = String(process.env.DEVIN_CONNECT_WIRE_DUMP || '') === '1';
+   const traced = String(process.env.WINDSURFAPI_TRACE || '') === '1' && meta.traceId;
+@@ -756,6 +809,8 @@
+ function postConnectUnary(host, path, framed, sessionToken, signal) {
+   return new Promise((resolve) => {
++    try { privacyTransport(host, path, framed); }
++    catch { resolve(null); return; }
+     let settled = false;
+     const done = (v) => { if (!settled) { settled = true; resolve(v); } };
+     let req;
+     try {
+@@ -762,5 +817,6 @@
+       req = requestImpl({
++        ...privacyTransport(host, path, framed),
+         hostname: host,
+         port: 443,
+         path,
+         method: 'POST',
+@@ -773,5 +829,10 @@
+       }, (res) => {
+         const chunks = [];
+-        res.on('data', (c) => chunks.push(c));
++        let size = 0;
++        res.on('data', (c) => {
++          size += c.length;
++          if (PRIVACY && size > PRIVACY_FRAME_MAX) { req.destroy(); done(null); return; }
++          chunks.push(c);
++        });
+         res.on('end', () => {
+           if (res.statusCode !== 200) return done(null);
+@@ -778,3 +839,6 @@
+           const body = Buffer.concat(chunks);
++          if (PRIVACY && (body.length < 5 || body.length > PRIVACY_FRAME_MAX
++              || body.length !== 5 + body.readUInt32BE(1) || body[0] !== 0))
++            return done(null); // no compressed/trailer/oversized optional JWT
+           // Connect envelope: [flags][len:4BE][payload]. A trailer-only response
+           // (flag 0x02) carries no message and must not be parsed as one.
+@@ -1562,3 +1626,24 @@
+ function decodeOneToolCall(sub, tags) {
++  if (PRIVACY) {
++    // A fragment is NOT a call. Permit only {id,name} starts or id-less
++    // arguments bytes; correlation and JSON validation happen at completion.
++    if (sub.some((f) => f.wireType !== 2 || ![tags.id, tags.name, tags.arguments_json].includes(f.field)))
++      throw privacyError('ERR_DEVIN_PRIVACY_TOOL_TAG');
++    const one = (tag) => {
++      const found = getAllFields(sub, tag);
++      if (found.length > 1) throw privacyError('ERR_DEVIN_PRIVACY_TOOL_DUPLICATE');
++      return found[0]?.value.toString('utf8');
++    };
++    const id = one(tags.id);
++    const name = one(tags.name);
++    const args = one(tags.arguments_json);
++    if ((id !== undefined && !/^[A-Za-z0-9_-]{1,128}$/.test(id))
++        || (name !== undefined && !/^[A-Za-z_][A-Za-z0-9_-]{0,127}$/.test(name))
++        || (args !== undefined && Buffer.byteLength(args) > PRIVACY_ARGS_MAX)
++        || (id === undefined && (name !== undefined || args === undefined)))
++      throw privacyError('ERR_DEVIN_PRIVACY_TOOL_SHAPE');
++    return { ...(id !== undefined ? { id } : {}), ...(name !== undefined ? { name } : {}),
++      ...(args !== undefined ? { arguments: args } : {}) };
++  }
+   const tc = {};
+   if (tags.id) { const v = getField(sub, tags.id, 2); if (v) tc.id = v.value.toString('utf8'); }
+@@ -1620,3 +1705,22 @@
+ export function mergeToolCallFragment(acc, tc) {
++  if (PRIVACY) {
++    if (tc.id) {
++      if (!tc.name || acc.some((call) => call.id === tc.id)
++          || acc.length >= PRIVACY_CALLS_MAX
++          || Buffer.byteLength(tc.arguments || '') > PRIVACY_ARGS_MAX)
++        throw privacyError('ERR_DEVIN_PRIVACY_CALL_CORRELATION');
++      acc.push({ id: tc.id, name: tc.name, arguments: tc.arguments || '' });
++    } else {
++      // Never attach an id-less fragment to the arbitrary last of several
++      // active calls. No index/correlation evidence means no assembly.
++      if (acc.length !== 1 || tc.name || tc.arguments === undefined)
++        throw privacyError('ERR_DEVIN_PRIVACY_AMBIGUOUS_FRAGMENT');
++      const open = acc[0];
++      if (Buffer.byteLength(open.arguments) + Buffer.byteLength(tc.arguments) > PRIVACY_ARGS_MAX)
++        throw privacyError('ERR_DEVIN_PRIVACY_ARGS_LENGTH');
++      open.arguments += tc.arguments;
++    }
++    return;
++  }
+   const open = acc.length ? acc[acc.length - 1] : null;
+   const startsNew = !open || (tc.id && tc.id !== open.id);
+@@ -1632,4 +1736,19 @@
+ }
+
+-function decodeToolCalls(fields, tags, toolNames = null) {
++export function validatePrivacyCalls(calls, toolNames) {
++  if (!PRIVACY) return calls;
++  if (calls.length > PRIVACY_CALLS_MAX) throw privacyError('ERR_DEVIN_PRIVACY_CALL_COUNT');
++  for (const tc of calls) {
++    if (!tc.id || !tc.name || !toolNames?.includes(tc.name)
++        || !tc.arguments || Buffer.byteLength(tc.arguments) > PRIVACY_ARGS_MAX)
++      throw privacyError('ERR_DEVIN_PRIVACY_FINAL_CALL');
++    let parsed;
++    try { parsed = JSON.parse(tc.arguments); }
++    catch { throw privacyError('ERR_DEVIN_PRIVACY_FINAL_JSON'); }
++    if (!privacyJsonObject(parsed)) throw privacyError('ERR_DEVIN_PRIVACY_FINAL_JSON');
++  }
++  return calls;
++}
++
++function decodeToolCalls(fields, tags, toolNames = null) {
+   const out = [];
+@@ -1640,6 +1759,8 @@
+   for (const f of getAllFields(fields, tags.outer)) {
++    if (PRIVACY && f.wireType !== 2) throw privacyError('ERR_DEVIN_PRIVACY_TOOL_WIRE');
+     if (f.wireType !== 2) continue;
+     let sub;
+     try { sub = parseFields(f.value); }
+-    catch { continue; } // malformed sub-message → skip this item, never throw
++    catch { if (PRIVACY) throw privacyError('ERR_DEVIN_PRIVACY_TOOL_PARSE');
++      continue; } // malformed sub-message → skip this item, never throw
+     const tc = decodeOneToolCall(sub, tags);
+@@ -1647,3 +1768,5 @@
+-    if (!tc.name && soleName) tc.name = soleName;
++    if (!PRIVACY && !tc.name && soleName) tc.name = soleName;
++    if (PRIVACY && tc.id && (!tc.name || !toolNames?.includes(tc.name)))
++      throw privacyError('ERR_DEVIN_PRIVACY_TOOL_NAME');
+     // Keep any item that carried real content (id / name / args / a malformed-args
+     // signal). isCustom alone (a bare bool) isn't enough to count as a call.
+@@ -1735,3 +1858,7 @@
+ export function decodeFrame(payload, opts = {}) {
++  if (PRIVACY && payload.length > PRIVACY_FRAME_MAX)
++    throw privacyError('ERR_DEVIN_PRIVACY_FRAME_LENGTH');
++  if (PRIVACY && (opts.dumpMeta || opts.signatureTags))
++    throw privacyError('ERR_DEVIN_PRIVACY_DEBUG');
+   // Malformed / truncated upstream protobuf must never bubble out of here: this
+   // runs inside the res.on('data') callback (devin-connect.js:1097), and a synchronous
+@@ -1745,5 +1872,6 @@
+   try { fields = parseFields(payload); }
+   catch (err) {
++    if (PRIVACY) throw privacyError('ERR_DEVIN_PRIVACY_FRAME_PARSE');
+     log.warn(`DEVIN_CONNECT: skipping malformed frame (parse failed): ${err.message}`);
+     return { content: '', reasoning: '', finish: null, usage: null, billing: null };
+   }
+@@ -1750,3 +1878,10 @@
+   const content = getField(fields, FIELD.CONTENT, 2);
++  if (PRIVACY && fields.some((f) => f.wireType !== ({ 3: 2, 5: 0, 6: 2, 7: 2, 9: 2 })[f.field]))
++    throw privacyError('ERR_DEVIN_PRIVACY_UNKNOWN_TAG');
++  if (PRIVACY && getAllFields(fields, 6).length
++      && (!opts.toolCallTags || !['outer', 'id', 'name', 'arguments_json'].every(
++        (key) => opts.toolCallTags[key] === DEFAULT_CALL_TAGS[key])
++        || !Array.isArray(opts.toolNames)))
++    throw privacyError('ERR_DEVIN_PRIVACY_UNPINNED_TOOL_TAGS');
+   const reasoning = getField(fields, FIELD.REASONING, 2);
+   const finish = getField(fields, FIELD.FINISH, 0);
+@@ -1806,5 +1941,9 @@
+     try { mf = parseFields(meta.value); }
+-    catch (err) { log.warn(`DEVIN_CONNECT: skipping malformed frame metadata: ${err.message}`); mf = []; }
++    catch (err) { if (PRIVACY) throw privacyError('ERR_DEVIN_PRIVACY_META_PARSE');
++      log.warn(`DEVIN_CONNECT: skipping malformed frame metadata: ${err.message}`); mf = []; }
+     const prompt = getField(mf, 2, 0);
++    // #7.4/#7.5 paid/cache counters remain unsupported, not zero-cost proof.
++    if (PRIVACY && mf.some((f) => f.wireType !== ({ 2: 0, 3: 0 })[f.field]))
++      throw privacyError('ERR_DEVIN_PRIVACY_UNKNOWN_METADATA_TAG');
+     const completion = getField(mf, 3, 0);
+     // actual_model_uid at #7.9 (frame-verified) — read from the metadata block.
+@@ -1922,5 +2061,7 @@
+   if (opts.toolCallTags) {
+     const calls = decodeToolCalls(fields, opts.toolCallTags, opts.toolNames);
++    if (PRIVACY && calls.length > PRIVACY_CALLS_MAX)
++      throw privacyError('ERR_DEVIN_PRIVACY_CALLS');
+     if (calls.length) out.toolCalls = calls;
+   }
+   if (metaDump) out.metaDump = metaDump;
+@@ -2374,4 +2515,11 @@
+   const absoluteDeadlineMs = Number.isFinite(deadlineMs) && deadlineMs > 0
+     ? deadlineMs : (Number(env.DEVIN_CONNECT_TIMEOUT_MS) || 600000);
++  if (PRIVACY && (!nativeToolCall || idleTimeoutMs > 30_000 || absoluteDeadlineMs > 120_000))
++    throw privacyError('ERR_DEVIN_PRIVACY_MODE_OR_DEADLINE');
++  if (PRIVACY) validatePrivacyToolHistory(messages || []);
++  // Source-only instrumentation cannot establish third-party ingress, login,
++  // served-UID provenance, native-tool custody or parser internals. No live
++  // egress is permitted until a separate reviewed change removes this door.
++  if (PRIVACY) throw privacyError('ERR_DEVIN_PRIVACY_UNVERIFIED_BRIDGE');
+   const sessionToken = token || getConnectToken(env);
+   if (!sessionToken) {
+@@ -2385,3 +2533,4 @@
+   const dumpMeta = env.DEVIN_CONNECT_DEBUG_META === '1';
++  if (PRIVACY && (dumpMeta || env.DEVIN_CONNECT_DUMP_RAW === '1')) throw privacyError('ERR_DEVIN_PRIVACY_DEBUG');
+   // Optional: surface actual_model_uid (concrete model behind a router) when the
+   // operator has pinned its tag from a capture. Off → never decoded.
+@@ -2388,3 +2537,5 @@
+   const actualModelTag = Number.parseInt(env.DEVIN_CONNECT_ACTUAL_MODEL_TAG || '', 10) || null;
++  // Until the #7.9 report is independently corroborated, served UID is UNKNOWN.
++  if (PRIVACY && actualModelTag) throw privacyError('ERR_DEVIN_PRIVACY_MODEL_PROVENANCE');
+   // Optional: native tool-call decode (repeated ChatToolCall) when the response
+   // tags are calibrated. Off → tool calls come from prompt emulation as today.
+@@ -2470,3 +2621,4 @@
+   const req = requestImpl({
++    ...privacyTransport(effectiveHost, PATH, framed), // before credential egress
+     hostname: effectiveHost,
+     port: 443,
+@@ -2481,3 +2633,4 @@
+   }, (res) => {
++    if (PRIVACY && effectiveHost !== HOST) { streamError = privacyError('ERR_DEVIN_PRIVACY_HOST'); done = true; req.destroy(); pump(); return; }
+     // Non-200: the body is an error payload (JSON/text), NOT connect frames.
+     // Buffer it and classify, so callers get a stable code (MODEL_BLOCKED for
+@@ -2486,3 +2639,13 @@
+     if (res.statusCode && res.statusCode !== 200) {
++      if (PRIVACY) {
++        // Do not read, log, classify or return upstream body/trailer text. 3xx
++        // is an error, never a credential-bearing redirect follow.
++        streamError = Object.assign(privacyError('ERR_DEVIN_PRIVACY_HTTP_STATUS_CLASS'),
++          { status: Math.floor(res.statusCode / 100) * 100 });
++        done = true;
++        req.destroy();
++        pump();
++        return;
++      }
+       const chunks = [];
+       res.on('data', (c) => chunks.push(c));
+@@ -2515,8 +2678,22 @@
+-    const parser = new StreamingFrameParser();
++    const parser = new StreamingFrameParser(PRIVACY ? PRIVACY_FRAME_MAX : undefined);
+     const _wireCapture = String(process.env.DEVIN_CONNECT_WIRE_DUMP || '') === '1'
+       || (String(process.env.WINDSURFAPI_TRACE || '') === '1' && !!traceId);
+-    const _wireResChunks = _wireCapture ? [] : null;
++    const _wireResChunks = !PRIVACY && _wireCapture ? [] : null;
++    let privacyBytes = 0;
++    let privacyFrames = 0;
+     res.on('data', (chunk) => {
+       if (_wireResChunks) _wireResChunks.push(chunk);
++      if (PRIVACY) {
++        privacyBytes += chunk.length;
++        // Node chunks are arbitrary partitions, not Connect frames.
++        if (privacyBytes > PRIVACY_RESPONSE_MAX) {
++          streamError = privacyError('ERR_DEVIN_PRIVACY_RESPONSE_BOUND');
++          done = true;
++          req.destroy();
++          pump();
++          return;
++        }
++      }
++      try {
+       parser.push(chunk);
+       let frames;
+@@ -2524,3 +2701,11 @@
+-      catch (err) { streamError = err; done = true; req.destroy(); pump(); return; }
++      catch (err) { streamError = PRIVACY ? privacyError('ERR_DEVIN_PRIVACY_PARSER') : err; done = true; req.destroy(); pump(); return; }
+       for (const frame of frames) {
++        if (PRIVACY && (++privacyFrames > PRIVACY_FRAMES_MAX
++            || frame.payload.length > PRIVACY_FRAME_MAX)) {
++          streamError = privacyError('ERR_DEVIN_PRIVACY_FRAME_BOUND');
++          done = true;
++          req.destroy();
++          pump();
++          return;
++        }
+         if (frame.isEndStream) {
+@@ -2536,3 +2721,6 @@
+           if (text && text !== '{}') {
++            if (PRIVACY) {
++              streamError = privacyError('ERR_DEVIN_PRIVACY_TRAILER');
++            } else {
+             try {
+               const parsed = JSON.parse(text);
+@@ -2548,3 +2736,4 @@
+             } catch { /* non-JSON trailer — leave as success */ }
++            }
+           }
+           if (_wireResChunks) dumpWire('res', Buffer.concat(_wireResChunks), { model, traceId, note: `raw connect frames (gzip-as-sent), trailer=${text.slice(0, 200)}` });
+@@ -2602,11 +2791,18 @@
+         if (reasoning || content || frameDump || metaDump || signature) pump();
+       }
++      } catch (err) {
++        if (!PRIVACY) throw err;
++        streamError = privacyError('ERR_DEVIN_PRIVACY_FRAME');
++        done = true;
++        req.destroy();
++        pump();
++      }
+     });
+     res.on('end', () => { done = true; pump(); });
+-    res.on('error', (err) => { streamError = err; done = true; pump(); });
++    res.on('error', (err) => { if (!streamError) streamError = PRIVACY ? privacyError('ERR_DEVIN_PRIVACY_SOCKET') : err; done = true; pump(); });
+   });
+
+   req.on('error', (err) => {
+-    if (!streamError) streamError = err;
++    if (!streamError) streamError = PRIVACY ? privacyError('ERR_DEVIN_PRIVACY_SOCKET') : err;
+     done = true;
+     pump();
+@@ -2675,3 +2871,4 @@
+         const finishUsage = normalizeConnectUsage(lastUsage);
++        if (PRIVACY) validatePrivacyCalls(nativeToolCalls, toolNames);
+         yield {
+           type: 'finish',
+diff --git a/src/connect.js b/src/connect.js
+--- a/src/connect.js
++++ b/src/connect.js
+@@ -111,5 +111,6 @@
+ export class StreamingFrameParser {
+-  constructor() {
++  constructor(maxFrameSize = MAX_FRAME_SIZE) {
++    this.maxFrameSize = maxFrameSize;
+     this._chunks = [];
+     this._head = 0;
+     this._offset = 0;
+@@ -188,6 +189,6 @@
+       let len = 0;
+       for (let i = 1; i < 5; i++) len = len * 256 + this._byteAt(i);
+-      if (len > MAX_FRAME_SIZE) {
++      if (len > this.maxFrameSize) {
+-        throw new Error(`HTTP/2 frame size ${len} exceeds ${MAX_FRAME_SIZE}`);
++        throw new Error(`HTTP/2 frame size ${len} exceeds ${this.maxFrameSize}`);
+       }
+       if (this._length < 5 + len) break;
+@@ -203,3 +204,3 @@
+-        try { payload = gunzipSync(payload, { maxOutputLength: MAX_FRAME_SIZE }); }
++        try { payload = gunzipSync(payload, { maxOutputLength: this.maxFrameSize }); }
+         catch (err) {
+           // Don't silently drop a frame whose body we couldn't decompress —
+
+diff --git a/test/helm-devin-privacy-profile.test.mjs b/test/helm-devin-privacy-profile.test.mjs
+new file mode 100644
+--- /dev/null
++++ b/test/helm-devin-privacy-profile.test.mjs
+@@ -0,0 +1,117 @@
++// Proposed synthetic controls only. NOT_RUN; no credentials, network or capture.
++import { test } from 'node:test';
++import assert from 'node:assert/strict';
++import https from 'node:https';
++process.env.HELM_DEVIN_PRIVACY_PROFILE = '1';
++const { decodeFrame, streamChat, mintUserJwt, DEFAULT_CALL_TAGS,
++  mergeToolCallFragment, validatePrivacyCalls, validatePrivacyToolHistory,
++  __setRequestImpl } = await import('../src/devin-connect.js');
++const { StreamingFrameParser } = await import('../src/connect.js');
++const field = (tag, value) => Buffer.concat([
++  Buffer.from([(tag << 3) | 2, value.length]), value,
++]);
++const call = (fields) => field(6, Buffer.concat(fields));
++const nativeOpts = { toolCallTags: DEFAULT_CALL_TAGS, toolNames: ['read_file'] };
++
++test('bounded response and strict numeric tag/wire/metadata shape', () => {
++  assert.throws(() => decodeFrame(Buffer.alloc(128 * 1024 + 1)),
++    { code: 'ERR_DEVIN_PRIVACY_FRAME_LENGTH' });
++  assert.throws(() => decodeFrame(Buffer.from([0x50, 0x01])),
++    { code: 'ERR_DEVIN_PRIVACY_UNKNOWN_TAG' });
++  assert.throws(() => decodeFrame(Buffer.from([0x1a, 0x04])),
++    { code: 'ERR_DEVIN_PRIVACY_FRAME_PARSE' });
++  assert.throws(() => decodeFrame(Buffer.from([0x3a, 0x02, 0x20, 0x01])),
++    { code: 'ERR_DEVIN_PRIVACY_UNKNOWN_METADATA_TAG' });
++  assert.throws(() => decodeFrame(Buffer.alloc(0), { dumpMeta: true }),
++    { code: 'ERR_DEVIN_PRIVACY_DEBUG' });
++});
++
++test('fragmented calls assemble only while one ID is pinned', () => {
++  const id = field(1, Buffer.from('call_1'));
++  const name = field(2, Buffer.from('read_file'));
++  const args = (s) => field(3, Buffer.from(s));
++  const assembled = [];
++  for (const frag of [call([id, name]), call([args('{"p')]), call([args('ath":"x"}')])]) {
++    for (const tc of decodeFrame(frag, nativeOpts).toolCalls) mergeToolCallFragment(assembled, tc);
++  }
++  assert.equal(validatePrivacyCalls(assembled, ['read_file'])[0].id, 'call_1');
++  // Structural result correlation only; external upstream custody is still unproven.
++  const history = [{ role: 'assistant', tool_calls: [{ id: assembled[0].id,
++    function: { name: assembled[0].name, arguments: assembled[0].arguments } }] },
++  { role: 'tool', tool_call_id: 'call_1', content: 'synthetic' }];
++  assert.doesNotThrow(() => validatePrivacyToolHistory(history));
++  assert.throws(() => validatePrivacyToolHistory([history[0],
++    { ...history[1], tool_call_id: 'call_wrong' }]),
++  { code: 'ERR_DEVIN_PRIVACY_RESULT_ID' });
++  assert.throws(() => decodeFrame(call([id, args('{}')]), nativeOpts),
++    { code: 'ERR_DEVIN_PRIVACY_TOOL_NAME' });
++  assert.throws(() => decodeFrame(call([id, name, args('{}'), field(4, Buffer.from('secret'))]), nativeOpts),
++    { code: 'ERR_DEVIN_PRIVACY_TOOL_TAG' });
++  assert.throws(() => mergeToolCallFragment(assembled, { id: 'call_1', name: 'read_file' }),
++    { code: 'ERR_DEVIN_PRIVACY_CALL_CORRELATION' });
++  mergeToolCallFragment(assembled, { id: 'call_2', name: 'read_file' });
++  assert.throws(() => mergeToolCallFragment(assembled, { arguments: '{"x":1}' }),
++    { code: 'ERR_DEVIN_PRIVACY_AMBIGUOUS_FRAGMENT' });
++  for (const json of ['{broken', '{"x":1e999}', '{"x":[1e999]}', '{"x":{"n":1e999}}']) {
++    assert.throws(() => validatePrivacyCalls([{ id: 'call_1', name: 'read_file', arguments: json }], ['read_file']),
++      { code: 'ERR_DEVIN_PRIVACY_FINAL_JSON' });
++  }
++});
++
++test('Connect frame accounting is chunk independent', () => {
++  const wire = Buffer.concat([Buffer.from([0, 0, 0, 0, 2, 0x1a, 0]),
++    Buffer.from([2, 0, 0, 0, 2, 0x7b, 0x7d])]);
++  const one = new StreamingFrameParser(128 * 1024);
++  one.push(wire);
++  const two = new StreamingFrameParser(128 * 1024);
++  two.push(wire.subarray(0, 3));
++  two.push(wire.subarray(3));
++  assert.equal(one.drain().length, 2);
++  assert.equal(two.drain().length, 2);
++  // One >128KiB Node chunk may hold TWO valid <128KiB Connect frames.
++  const envelope = () => { const header = Buffer.alloc(5); header.writeUInt32BE(70 * 1024, 1);
++    return Buffer.concat([header, Buffer.alloc(70 * 1024)]); };
++  const coalesced = Buffer.concat([envelope(), envelope()]);
++  assert.ok(coalesced.length > 128 * 1024);
++  const whole = new StreamingFrameParser(128 * 1024);
++  whole.push(coalesced);
++  const split = new StreamingFrameParser(128 * 1024);
++  for (let i = 0; i < coalesced.length; i += 997)
++    split.push(coalesced.subarray(i, i + 997));
++  assert.equal(whole.drain().length, 2);
++  assert.equal(split.drain().length, 2);
++  const oversized = new StreamingFrameParser(128 * 1024);
++  oversized.push(Buffer.from([0, 0, 2, 0, 1]));
++  assert.throws(() => oversized.drain(), /frame size/);
++});
++
++test('the source-only privacy profile refuses before any credential egress', async () => {
++  let attempts = 0;
++  __setRequestImpl(() => { attempts++; throw Error('synthetic network attempted'); });
++  await assert.rejects(streamChat({ token: 'synthetic', model: 'synthetic',
++    nativeToolCall: true, timeoutMs: 1000, deadlineMs: 1000 }).next(),
++  { code: 'ERR_DEVIN_PRIVACY_UNVERIFIED_BRIDGE' });
++  assert.equal(await mintUserJwt('synthetic', { host: 'unapproved.invalid' }), null);
++  assert.equal(await mintUserJwt('synthetic', { host: 'server.codeium.com' }), null);
++  assert.equal(attempts, 0);
++  __setRequestImpl(null);
++});
++
++test('approved-host JWT refuses at native transport request seam', async () => {
++  const original = https.request;
++  let attempts = 0;
++  try {
++    // Re-import after swapping the production https.request seam so its
++    // module-scoped requestImpl captures this synthetic low-level transport.
++    https.request = () => { attempts++; throw Error('synthetic network attempted'); };
++    const { mintUserJwt: minted, streamChat: streamed } =
++      await import('../src/devin-connect.js?helm-privacy-native-seam-control');
++    assert.equal(await minted('synthetic', { host: 'server.codeium.com' }), null);
++    await assert.rejects(streamed({ token: 'synthetic', model: 'synthetic',
++      nativeToolCall: true, timeoutMs: 1000, deadlineMs: 1000 }).next(),
++    { code: 'ERR_DEVIN_PRIVACY_UNVERIFIED_BRIDGE' });
++    assert.equal(attempts, 0);
++  } finally {
++    https.request = original;
++  }
++});

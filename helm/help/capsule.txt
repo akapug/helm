@@ -1,0 +1,1 @@
+capsule <sid> — the session's git era: worktree + resume commands

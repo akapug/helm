@@ -57,6 +57,7 @@ import json
 import math
 import os
 import re
+import subprocess
 
 HOSTS_ENV = "HELM_GATE_HOSTS"
 EXCLUDE_ENV = "FAB_EXCLUDE_HOSTS"
@@ -70,6 +71,10 @@ EXCLUDE_ENV = "FAB_EXCLUDE_HOSTS"
 KEY_ENV = "HELM_GATE_WINDOW_KEY"
 KEY_TRUNK = "trunk"
 KEY_HOST = "host"
+
+FAB_BINARY = "fab"
+GATE_REQUEST_CORES = 16
+DEFAULT_UNMEASURED_GATE_SECONDS = 1100.0
 
 SERIAL = "serial"
 SLICED = "sliced"
@@ -248,8 +253,35 @@ def _elapsed(row, now):
     return max(0.0, now - launched) if math.isfinite(launched) else 0.0
 
 
+def read_capacity(environ=None, runner=None):
+    """The parsed JSON from `fab capacity --json`, or None if unreadable."""
+    try:
+        if runner is not None:
+            res = runner([FAB_BINARY, "capacity", "--json"])
+            if isinstance(res, dict):
+                return res
+            if res is None:
+                return None
+            if isinstance(res, tuple):
+                # gatewindow's fab seam answers (rc, stdout, stderr): a
+                # non-zero rc or an rc of None (fab could not run) is UNKNOWN
+                if len(res) < 2 or res[0] != 0:
+                    return None
+                return json.loads(res[1])
+            out = res.stdout if hasattr(res, "stdout") else str(res)
+            return json.loads(out)
+        proc = subprocess.run([FAB_BINARY, "capacity", "--json"],
+                              capture_output=True, text=True, timeout=10,
+                              env=_env(environ))
+        if proc.returncode != 0:
+            return None
+        return json.loads(proc.stdout)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
 def plan(mode, live, logs, environ=None, now=0.0, unread_hosts=(),
-         failed=()):
+         failed=(), capacity=None, capacity_runner=None):
     """The route for one land gate of `mode` given the `live` window rows.
 
     -> {"host": the host to pin, or None to let Fab place;
@@ -289,6 +321,24 @@ def plan(mode, live, logs, environ=None, now=0.0, unread_hosts=(),
         est = {h: estimate(samples, h, ANY) for h in cands}
         basis = "%s (no %s gate measured yet)" % (ANY, mode)
 
+    # UNMEASURED ESTIMATE AND SOURCE (task/3923): when choosing whether an
+    # unmeasured host is faster than waiting on a busy measured host, the door
+    # estimates the unmeasured host's whole-suite time from the fleet median
+    # of the mode (or any mode) in the gate logs, falling back to gatehost.py's
+    # measured fast build host median.
+    fleet_samples = [s for (h, m), vals in samples.items() if m == mode for s in vals]
+    if not fleet_samples:
+        fleet_samples = [s for (h, m), vals in samples.items() if m == ANY for s in vals]
+    fleet_est = median(fleet_samples) if fleet_samples else DEFAULT_UNMEASURED_GATE_SECONDS
+    fleet_source = ("fleet median over %d gate(s)" % len(fleet_samples)) \
+        if fleet_samples else "gatehost.py fast build host median"
+
+    # FAB CAPACITY (task/3923): read each candidate's free cores and queued work.
+    cap_data = capacity if capacity is not None else read_capacity(environ, capacity_runner)
+    cap_nodes = {n["host"]: n for n in (cap_data.get("nodes") or [])
+                 if isinstance(n, dict) and "host" in n} \
+        if isinstance(cap_data, dict) and isinstance(cap_data.get("nodes"), list) else None
+
     def remaining(host):
         left = 0.0
         for row in busy.get(host, ()):
@@ -298,7 +348,64 @@ def plan(mode, live, logs, environ=None, now=0.0, unread_hosts=(),
                 left = max(left, own[0] - _elapsed(row, now))
         return left
 
-    finish = {h: est[h][0] + remaining(h) for h in cands if est[h]}
+    start_delays = {}
+    cap_statuses = {}
+    for h in cands:
+        gate_left = remaining(h)
+        if cap_nodes is None or h not in cap_nodes:
+            cap_delay = 0.0
+            cap_status = "capacity UNKNOWN"
+        else:
+            node = cap_nodes[h]
+            state = node.get("state")
+            if state != "UP":
+                cap_delay = float("inf")
+                cap_status = "node %s" % (state or "DOWN")
+            elif node.get("blocked"):
+                cap_delay = float("inf")
+                cap_status = "blocked: %s" % node["blocked"]
+            else:
+                free_cores = (node.get("free") or {}).get("cores")
+                if free_cores is None:
+                    cap_delay = 0.0
+                    cap_status = "capacity UNKNOWN"
+                else:
+                    budget_cores = node.get("budget_cores") or 30
+                    queued = node.get("queued") or []
+                    queued_cores = node.get("queued_cores")
+                    if queued_cores is None:
+                        queued_cores = sum(j.get("cores", 0) for j in queued
+                                           if isinstance(j, dict))
+                    deficit = max(0, GATE_REQUEST_CORES - free_cores)
+                    if deficit == 0 and not queued:
+                        cap_delay = 0.0
+                        cap_status = "capacity free (%d cores free)" % free_cores
+                    else:
+                        h_est = est[h][0] if est.get(h) else fleet_est
+                        run_delay = (float(deficit) / float(GATE_REQUEST_CORES)) * h_est
+                        queue_delay = (float(queued_cores) / float(GATE_REQUEST_CORES)) * h_est
+                        cap_delay = run_delay + queue_delay
+                        cap_status = "busy (%d/%d cores running, %d queued, ~%s start delay)" % (
+                            budget_cores - free_cores, budget_cores, len(queued),
+                            _minutes(cap_delay))
+        start_delays[h] = max(gate_left, cap_delay)
+        cap_statuses[h] = cap_status
+
+    measured_finish = {h: est[h][0] + start_delays[h] for h in cands if est[h]}
+    finish = {}
+    unmeasured_evaluated = set()
+    if measured_finish:
+        best_measured = min(measured_finish, key=lambda h: (measured_finish[h], cands.index(h)))
+        # A host with no measured gate may be chosen when the measured host's start delay
+        # exceeds the unmeasured host's whole-suite estimate (task/3923).
+        if start_delays[best_measured] > fleet_est:
+            for h in cands:
+                if est[h] is None and start_delays[h] < float("inf"):
+                    finish[h] = start_delays[h] + fleet_est
+                    unmeasured_evaluated.add(h)
+        for h, f in measured_finish.items():
+            finish[h] = f
+
     for host in known:
         if host in shut:
             lines.append("  %-12s excluded (%s)" % (host, EXCLUDE_ENV))
@@ -307,15 +414,23 @@ def plan(mode, live, logs, environ=None, now=0.0, unread_hosts=(),
                 host, "Fab could not place a gate there" if host in failed
                 else "its node could not be read"))
         elif est[host] is None:
-            lines.append("  %-12s no %s gate measured here (%s)" % (
-                host, mode, "busy" if host in busy else "free"))
+            c_stat = "busy" if host in busy else cap_statuses.get(
+                host, "capacity UNKNOWN" if cap_nodes is None else "free")
+            if host in unmeasured_evaluated and host in finish:
+                lines.append("  %-12s no %s gate measured here (est ~%s from %s, %s) -> "
+                             "finishes in ~%s" % (
+                                 host, mode, _minutes(fleet_est), fleet_source,
+                                 c_stat, _minutes(finish[host])))
+            else:
+                lines.append("  %-12s no %s gate measured here (%s)" % (
+                    host, mode, c_stat))
         else:
+            c_stat = ("busy, ~%s left" % _minutes(remaining(host))) if host in busy \
+                else cap_statuses.get(host, "capacity UNKNOWN" if cap_nodes is None else "free")
             lines.append("  %-12s median %s over %d %s gate(s), %s -> "
                          "finishes in ~%s" % (
                              host, _minutes(est[host][0]), est[host][1], basis,
-                             "busy, ~%s left" % _minutes(remaining(host))
-                             if host in busy else "free",
-                             _minutes(finish[host])))
+                             c_stat, _minutes(finish[host])))
     if not cands:
         return {"host": None, "wait": None, "lines": lines,
                 "exclude": sorted(set(busy) | shut | down),
@@ -323,9 +438,14 @@ def plan(mode, live, logs, environ=None, now=0.0, unread_hosts=(),
                        "it"}
     if finish:
         best = min(finish, key=lambda h: (finish[h], cands.index(h)))
-        why = "expected to finish first (~%s)" % _minutes(finish[best])
+        if best in unmeasured_evaluated and measured_finish:
+            why = "expected to finish first (~%s; unmeasured %s starts in ~%s while measured %s is delayed ~%s)" % (
+                _minutes(finish[best]), best, _minutes(start_delays[best]),
+                best_measured, _minutes(start_delays[best_measured]))
+        else:
+            why = "expected to finish first (~%s)" % _minutes(finish[best])
     else:
-        free = [h for h in cands if h not in busy]
+        free = [h for h in cands if h not in busy and start_delays.get(h, 0.0) == 0.0]
         best = free[0] if free else cands[0]
         why = "no %s gate is measured on any host, so the config order " \
             "decides%s" % (mode, "" if free else ", and every host is busy")

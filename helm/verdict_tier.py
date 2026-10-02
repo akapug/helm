@@ -43,6 +43,58 @@ def admit(policy, recipient, families, model):
     return _admit(policy, recipient, families, model, True)
 
 
+def admit_window(policy, recipient, family, models):
+    """(state, why) — `admit` for EVERY model one read may have been made
+    on: a native seat's own answer and each other model its subagents named
+    in the window before the read (`native_turn.native_turn_candidates`).
+
+    ONE model is its own admission, under any rule. SEVERAL are admitted only
+    when the ambiguity cannot change the answer: each model of `family`
+    (`window_family`), and each "ok" by the FAMILY rule. A `model:` selector
+    admits one id, so when the ids disagree, which one read decides, and the
+    window cannot say."""
+    several = len(models) > 1
+    for model in models:
+        if several and window_family(model, family) != family:
+            return "outside", ("the window before the read named %s, which "
+                               "is not a %s model" % (model, family))
+        state, why, rule = admit(policy, recipient, {family}, model)
+        if state != "ok":
+            return state, why
+        if several and rule != RULE_FAMILY:
+            return "outside", ("a per-model rule admits %s, and the window "
+                               "also named %s" % (model, ", ".join(
+                                   m for m in models if m != model)))
+    return "ok", None
+
+
+#: Model ids helm's catalog does not carry that a NATIVE Claude seat's own
+#: window was measured naming, read as the claude family for APPROVAL only
+#: (`window_family`). Routing never reads this table: the proxy-routing
+#: catalog is `seat_catalog`, and an id here routes nowhere new. A new id is
+#: added only with measured evidence, a native seat's transcript that names
+#: it, never because its spelling looks like a Claude id; every other
+#: uncatalogued id fails closed. `claude-opus-4-8` is the id a Workflow
+#: agent of a native Opus seat writes in `subagents/workflows/`.
+NATIVE_WINDOW_MODELS = frozenset({"claude-opus-4-8"})
+
+
+def window_family(model, family):
+    """The family of one model a native seat's window named, or None.
+
+    A model helm catalogues answers with its catalogued family
+    (`dispatches._model_family`). An uncatalogued id is the claude family
+    only when the seat's family is claude and the id is one
+    `NATIVE_WINDOW_MODELS` names. Any other id is unknown, whatever its
+    spelling: `claude-foo` is what an invented model looks like."""
+    from .dispatches import _model_family, _model_key
+    found = _model_family(model)
+    if found:
+        return found
+    return "claude" if family == "claude" \
+        and _model_key(model) in NATIVE_WINDOW_MODELS else None
+
+
 def _model_keys(model):
     """The spellings one recorded model id answers to."""
     from .dispatches import _model_key

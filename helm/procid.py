@@ -239,7 +239,8 @@ def is_seat_process(pid, comm_raw=None, proc=None):
     accept or lose its comm-OR. This predicate is the seat gate.
 
     On this host `grep` is `exec -a ugrep` of the Claude binary, so an
-    orphan keeps a Claude exe and whatever HELM_CHAT_NAME it inherited.
+    orphan keeps a Claude exe, the version comm and whatever HELM_CHAT_NAME
+    it inherited; only its argv[0] tells it from the seat.
     Accepting every Claude exe counts that orphan as the seat. A seat
     process is one whose comm is `claude` or a version string,
     confirmed by the exe when the exe can be read. comm exactly `claude`
@@ -266,11 +267,30 @@ def is_seat_process(pid, comm_raw=None, proc=None):
     if comm == "node" or exe_is_node(pid, proc) is True:
         return False
     if _comm_looks_versioned(comm_raw):
+        if _argv0_is_tool(pid, proc):
+            return False
         seen = exe_is_claude(pid, proc)
         if seen is None:
             return None
         return bool(seen)
     return False
+
+
+def _argv0_is_tool(pid, proc=None):
+    """True when argv[0] names a tool, not the seat binary.
+
+    `exec -a ugrep` renames argv[0] only: comm still comes from the exec'd
+    file, so the grep keeps the version comm and the Claude exe. A seat's
+    argv[0] is `claude` or the versioned path. An unreadable cmdline is not
+    evidence either way.
+    """
+    try:
+        with open(os.path.join(proc_root(proc), str(pid), "cmdline"), "rb") as f:
+            argv0 = f.read().split(b"\0", 1)[0].decode("utf-8", "replace")
+    except OSError:
+        return False
+    name = os.path.basename(argv0)
+    return bool(name) and name != "claude" and not _VERSION_COMM.match(name)
 
 
 def _comm_looks_versioned(raw):

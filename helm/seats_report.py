@@ -740,6 +740,16 @@ def empty_roster_ending(failed, has_claims):
             "(helm hooks install wires it)", True)
 
 
+def _mood_cell(seat):
+    """The row's mood: its latest measure, its own word, DIVERGES (two small
+    file reads, helm/seatmood_surface.py). Never takes a row down."""
+    try:
+        from .seatmood_surface import cell
+        return cell(seat)
+    except Exception:                         # noqa: BLE001 — a cell, not a row
+        return ""
+
+
 def render_roster(room, show_all):
     """The `helm chat seats` screen — the CLI table this module's own docstring
     already claims it renders. -> exit code.
@@ -849,11 +859,11 @@ def render_roster(room, show_all):
             # its own memory cgroup reads `fresh` on every other column.
             if s.get("mem_pressure_mark"):
                 vendor += "  " + s["mem_pressure_mark"]
-            print("  %s %-*s  %-10s  pending %-3d %s · home %s%s%s%s%s%s%s" % (
+            print("  %s %-*s  %-10s  pending %-3d %s · home %s%s%s%s%s%s%s%s" % (
                 s.get("dot") or presence_dot(s["presence"]),
                 w, label, s["presence"], s["pending"],
                 (s.get("project") or ""), scope, source, alias, line, task, warn,
-                vendor))
+                _mood_cell(s["seat"]), vendor))
         if hidden:
             print("  (%d absent seat%s hidden — --all shows them; `helm chat "
                   "seat gc` prunes evidence-free rows)"

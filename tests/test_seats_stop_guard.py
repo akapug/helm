@@ -206,6 +206,66 @@ class StopGuardTest(SeatsBase):
         self.assertTrue(seats._pending_all(
             "main", "codex", "s-codex", scan_lane="test"))
 
+    # task/4019 slice A cure 1a: 50 of 235 integrator wakes overnight were
+    # stop-guard blocks on rows that needed no act. The two FYI arms are red
+    # on the pre-cure tree; the twins below them block on the same guard.
+
+    _KEEP_SWEEP = ("@{seat} [stale-bot] 1 aged or cure-awaiting row(s) on "
+                   "your name — PROPOSED dispositions below.\n"
+                   "1. abc123 (task, untouched 4d) PROPOSED still-live-keep: "
+                   "live")
+
+    def _stop(self, seat, session):
+        blocks, warns = seats.stop_guard(session=session, room="main",
+                                         seat=seat)
+        return any("undelivered message(s)" in b for b in blocks), warns
+
+    def test_no_act_rows_never_block_the_stop_and_are_not_consumed(self):
+        """An all-keep sweep and a row for another joined seat: the stop is
+        not blocked, the guard says why, and both rows stay pending and are
+        delivered by the next boundary."""
+        seats.join(session="s-hc", seat="seat-b", cwd="/tmp/p",
+                   room="team-hc")
+        seats.join(session="s-na", seat="nadia", cwd="/tmp/p",
+                   room="team-na")
+        chat.post("@seat-b 9a5c2ff9: meld-diff-applied-3937", who="bob",
+                  room="team-na")
+        chat.post(self._KEEP_SWEEP.format(seat="nadia"), who="stale-bot",
+                  room="team-na")
+        blocked, warns = self._stop("nadia", "s-na")
+        self.assertFalse(blocked, warns)
+        self.assertTrue(any("2 row(s) pending that need no ACT" in w
+                            for w in warns), warns)
+        self.assertEqual(len(seats._pending_all(
+            "main", "nadia", "s-na", scan_lane="test")), 2)
+        first = seats.deliver_any(session="s-na", seat="nadia")
+        self.assertIn("meld-diff-applied-3937", first)
+
+    def test_act_rows_still_block_the_stop(self):
+        """Falsifier twins: a row for THIS seat, an owner row, a deadline
+        row, a failure row and a sweep proposing a terminal each block, even
+        when the row also names another seat."""
+        texts = (("@{seat} review the branch", "bob", None),
+                 ("@seat-b hold all lands", "daria", "web"),
+                 ("@seat-b land due by 17:00", "bob", None),
+                 ("@seat-b the gate FAILED", "bob", None),
+                 ("@nobody-joined-by-this-name take it", "bob", None))
+        seats.join(session="s-hc", seat="seat-b", cwd="/tmp/p",
+                   room="team-hc")
+        for i, (text, who, origin) in enumerate(texts):
+            seat, session = "abner%d" % i, "s-ab%d" % i
+            seats.join(session=session, seat=seat, cwd="/tmp/p",
+                       room="team-ab%d" % i)
+            chat.post(text.format(seat=seat), who=who, origin=origin,
+                      room="team-ab%d" % i)
+            self.assertTrue(self._stop(seat, session)[0], text)
+        seats.join(session="s-sw", seat="swen", cwd="/tmp/p",
+                   room="team-sw")
+        chat.post(self._KEEP_SWEEP.format(seat="swen").replace(
+            "still-live-keep", "supersede-candidate"), who="stale-bot",
+            room="team-sw")
+        self.assertTrue(self._stop("swen", "s-sw")[0])
+
     def test_block_exit_skips_invisible_claim_evidence_work(self):  # noqa: VACUOUS_ASSERTION — the unconditional inbox block proves this is the block-exit arm before assert_not_called
         """A block exit discards WARNs, so it must not parse or latch one."""
         from helm import claimev
@@ -1254,6 +1314,11 @@ class StopGuardGatePendingTest(SeatsBase):
         # otherwise refuse every row here as FOREIGN.
         from tests._tmphome import helm_tree, pin_admission, pin_dispatch_home
         self._real_home_repo_id = pin_dispatch_home(self, self.root)
+        from helm import tasks
+        self.review_task, why = tasks.add(
+            "check the fixture lane's stop guard", "gate-fixture",
+            project="helm", force_new=True)
+        self.assertIsNone(why, why)
         # `plant` mints through gate.run: admission on a fixture box, never
         # this node's live cap (task/1740).
         pin_admission(self)
@@ -1327,6 +1392,7 @@ class StopGuardGatePendingTest(SeatsBase):
             row = dispatches.add(recipient, lane, ref=ref or self.head,
                                  kind=kind, notify=False,
                                  repo=repo or self.root, new_work=True,
+                                 task=self.review_task["id"] if kind == "review" else None,
                                  force=force)
         self.assertIsNotNone(row, "plant: the real writer refused")
         # delivery OBSERVED, or the stop-whisper's needs-confirmation rung
@@ -1391,7 +1457,7 @@ class StopGuardGatePendingTest(SeatsBase):
         """Hold the planted row as its RECIPIENT, through the real door."""
         with mock.patch.dict(os.environ, {"HELM_CHAT_NAME": row["recipient"]}):
             out, err = dispatches.mark_hold(
-                row["id"], "read the delta, found nothing",
+                row["id"], "read the delta, found nothing; fab Ran 5 tests OK",
                 source_clean_tip=source_clean_tip)
         self.assertIsNone(err, "plant hold: %s" % err)
         return out

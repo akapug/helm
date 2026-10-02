@@ -27,7 +27,7 @@ on purpose: an unconditional top-level `def`, `async def` or `class` of the
 name, with no module-scope `del` of it after that statement and no `global`
 or `nonlocal` of it anywhere in the file (`still_defines`). No other binder
 counts, so when in doubt the rung refuses. This narrow rule is the shape-A
-clearance; a declared satellite is read by the wider `defines_at_top_level`.
+clearance; a declared satellite is read by the wider `_top_level_names`.
 A merge is judged like every commit, against its first parent, so merging
 trunk into a lane is charged with trunk's retirements: lanes compose in the
 train room with trunk as the first parent, and HELM_RETIRED_NAME_SKIP=1
@@ -119,6 +119,7 @@ direct spawn. One-commit owner override: HELM_RETIRED_NAME_SKIP=1, honoured
 by the hook block that invokes this rung.
 """
 import ast
+import functools
 import io
 import os
 import re
@@ -126,8 +127,13 @@ import subprocess
 import sys
 import tokenize
 import unicodedata
+import warnings
 
 TAG = "[helm retired-name]"
+#: The prefix of the line each refused read ends with. This rung runs as a
+#: stdlib-only snapshot, so it holds its own copy of the prefix
+#: helm/review_done.py prints.
+CORRECTED = "corrected: "
 
 _DEF = re.compile(r"^([-+])(?:async\s+)?(?:def|class)\s+([A-Za-z_][A-Za-z0-9_]*)")
 #: A column-zero assignment, including the tuple form `FOO, BAR = 1, 2` — a
@@ -216,6 +222,79 @@ def parse(diff):
     return out
 
 
+def replacements(diff):
+    """{(old_path, name): (new_path, new_name)} -- what replaces each name
+    the diff removes, read from the same diff, for the refusal to print.
+
+    It judges nothing: `parse` decides what is retired, and this only names
+    the way out. Two shapes are read. A MOVE: the same name added at column
+    zero in another .py file, so the reader now imports it from there. A
+    RENAME: inside one hunk, the column-zero names removed and the ones added
+    (a name on both sides is a change, not either) pair in order when there
+    are as many of each. Anything else names no replacement, because a guess
+    printed as a cure is a second wrong edit."""
+    old = new = None
+    hunks, added_at = [], {}
+    for line in (diff or "").splitlines():
+        m = _OLD.match(line)
+        if m:
+            old = m.group(1)
+            continue
+        m = _NEW.match(line)
+        if m:
+            new = m.group(1)
+            continue
+        if line.startswith("---") or line.startswith("+++"):
+            continue
+        if line.startswith("@@") or not hunks:
+            hunks.append((old, new, [], []))
+            if line.startswith("@@"):
+                continue
+        m = _DEF.match(line) or _ASSIGN.match(line)
+        if not m:
+            continue
+        sign = m.group(1)
+        path = old if sign == "-" else new
+        if not path or not path.endswith(".py"):
+            continue
+        names = [n.strip() for n in m.group(2).split(",") if n.strip()]
+        hunks[-1][2 if sign == "-" else 3].extend(names)
+        if sign == "+":
+            for name in names:
+                added_at.setdefault(name, []).append(new)
+    out = {}
+    for old_path, new_path, removed, added in hunks:
+        gone = [n for n in removed if n not in added]
+        fresh = [n for n in added if n not in removed]
+        for i, name in enumerate(gone):
+            elsewhere = [p for p in added_at.get(name, ())
+                         if p not in (old_path, new_path)]
+            if len(elsewhere) == 1:
+                out[(old_path, name)] = (elsewhere[0], name)
+            elif len(gone) == len(fresh):
+                out[(old_path, name)] = (new_path or old_path, fresh[i])
+    return out
+
+
+def cure(live, name, where, swap):
+    """The text after `corrected: <where>:<line>: ` for one refused read.
+    `live` is the path the retiring file now has, the module its readers
+    spell, as `_Pair.mod` reads it."""
+    mod = module_token(live) or live
+    inside = where == live
+    if swap is None:
+        return "%s -> (this commit adds no replacement: rewrite this read, " \
+               "or keep %s defined in %s)" % (name if inside else "%s.%s" % (
+                   mod, name), name, live)
+    to_path, to_name = swap
+    if to_path == live:
+        return "%s -> %s" % ((name, to_name) if inside else (
+            "%s.%s" % (mod, name), "%s.%s" % (mod, to_name)))
+    to_mod = module_token(to_path) or to_path
+    return "%s -> %s.%s (import it from %s)" % (
+        name if inside else "%s.%s" % (mod, name), to_mod, to_name, to_path)
+
+
 def module_token(path):
     """The token a consumer spells before the dot."""
     base = os.path.basename(path)
@@ -232,8 +311,47 @@ def _index_text(root, path):
     return os.fsdecode(done.stdout)
 
 
-def _names_and_strings(text):
-    """({NAME tokens}, {string literal values}) for one python source.
+#: The token types whose text is part of a str constant's value: a literal,
+#: and the literal parts of an f-string (3.12+) or a t-string (3.14+).
+_VALUE_PARTS = frozenset(getattr(tokenize, t) for t in (
+    "STRING", "FSTRING_MIDDLE", "TSTRING_MIDDLE") if hasattr(tokenize, t))
+
+
+def _string_value(tok):
+    """The text a string token adds to a str constant's value, or None where
+    only the parser can say (task/3840).
+
+    A literal with no backslash, or a raw one, holds its body verbatim; a
+    plain literal with an escape is evaluated. The literal part of an
+    f-string or t-string -- a 3.12+ token, or before 3.12 the whole f-string,
+    whose body also carries its `{expressions}` -- is taken verbatim without
+    a backslash and is None with one, because an escape or a line
+    continuation can spell what the text does not. A bytes literal adds
+    nothing: it is never a str constant."""
+    text = tok.string
+    if tok.type != tokenize.STRING:
+        return None if "\\" in text else text
+    head = len(text) - len(text.lstrip("rRbBuUfFtT"))
+    prefix, rest = text[:head].lower(), text[head:]
+    if "b" in prefix:
+        return ""
+    quote = 3 if rest[:3] in ('"""', "'''") else 1
+    body = rest[quote:-quote]
+    if "\\" not in body or "r" in prefix:
+        return body
+    if "f" in prefix or "t" in prefix:
+        return None
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            return ast.literal_eval(text)
+    except _UNPARSED:
+        return None
+
+
+def _tokens(text):
+    """({NAME tokens}, string values) for one python source, or None when it
+    does not tokenize.
 
     THE TOKENIZER IS THE INSTRUMENT, and the line-oriented regexes it replaces
     were wrong in BOTH directions. They missed a consumer that imports across
@@ -257,20 +375,30 @@ def _names_and_strings(text):
     spellings are added, so a hit on either answers yes; the raw form stays
     because it is what a reader greps for.
 
-    A source that does not tokenize answers ({}, {}) rather than raising: a
-    file this rung cannot read is not a file it may accuse."""
-    names, strings = set(), set()
+    THE STRING VALUES are every string token's value (`_string_value`)
+    joined in source order, so the parts of an implicit concatenation read
+    as the one constant they make; None when one of them needs the parser.
+    `_may_read` asks them whether a string can name the module.
+
+    NONE IS NOT "HOLDS NOTHING". An empty answer for a source that does not
+    tokenize looked exactly like a file holding no name, so a consumer with
+    an unclosed bracket at the BOTTOM and a live use of the retired name at
+    the TOP was dropped and the commit passed unchecked (found in review). A
+    guard may not turn "I cannot read this" into "this is clean", so the
+    caller keeps such a candidate."""
+    names, parts, known = set(), [], True
     try:
         for tok in tokenize.generate_tokens(io.StringIO(text).readline):
             if tok.type == tokenize.NAME:
                 names.add(tok.string)
                 names.add(unicodedata.normalize("NFKC", tok.string))
-            elif tok.type == tokenize.STRING:
-                body = tok.string.strip("rbuf").strip("'\"")
-                strings.add(body)
+            elif tok.type in _VALUE_PARTS and known:
+                value = _string_value(tok)
+                known = value is not None
+                parts.append(value)
     except (tokenize.TokenError, IndentationError, SyntaxError, ValueError):
-        return set(), set()
-    return names, strings
+        return None
+    return names, "".join(parts) if known else None
 
 
 #: PYTHON'S LINE BREAKS, AND ONLY THOSE. `str.splitlines` also breaks at a
@@ -290,23 +418,6 @@ def _lines_with(text, name):
     return [(n, line.rstrip())
             for n, line in enumerate(_source_lines(text), 1)
             if pat.search(line)]
-
-
-def _source_parses(text):
-    """Did this source tokenize? A file that did NOT is a file this rung
-    could not clear, which is not the same as a file it cleared.
-
-    `_names_and_strings` answers empty sets for an unparseable source, and
-    empty sets look exactly like "holds nothing" to the caller -- so a
-    consumer with an unclosed bracket at the BOTTOM of the file and a live
-    use of the retired name at the TOP was silently dropped and the commit
-    passed unchecked (found in review). A guard may not turn "I cannot read
-    this" into "this is clean", so the caller now keeps the candidate."""
-    try:
-        list(tokenize.generate_tokens(io.StringIO(text).readline))
-    except (tokenize.TokenError, IndentationError, SyntaxError, ValueError):
-        return False
-    return True
 
 
 #: THE TWO PATCH-SITE EVIDENCES ARE NOT INTERCHANGEABLE, so the predicate
@@ -410,7 +521,92 @@ def _computed(reach):
         for k in reach[0]))
 
 
-def _string_reads(tree, mod, name, to_mod):
+def _key_spellings(node):
+    """Every string a key of `node` can spell, for the `_Index` filing.
+
+    A constant in a subscript's key, in a call's arguments or keywords, or
+    in the arguments of the call it calls (`attrgetter("NAME.x")(M)`) --
+    whole, and its first dotted segment. That is every expression `_reach`
+    and `_string_reads` take a key from, and more, so the filing can only
+    hand `_string_reads` a node it then clears; it can never hide one."""
+    if isinstance(node, ast.Subscript):
+        exprs = [node.slice]
+    else:
+        exprs = node.args + [k.value for k in node.keywords]
+        if isinstance(node.func, ast.Call):
+            exprs = exprs + node.func.args
+    return {s for e in exprs
+            if isinstance(e, ast.Constant) and isinstance(e.value, str)
+            for s in (e.value, e.value.partition(".")[0])}
+
+
+class _Index:
+    """One parsed file, walked ONCE, its nodes filed under the spelling each
+    question asks with (task/3840).
+
+    THE COST THIS REPLACES WAS NAMES x FILES x NODES. For EACH (module,
+    name) pair, `_module_reads` walked a consumer's whole tree four times
+    and ran `_reach` over every node twice. py-spy measured the pre-commit
+    scan at 6+ minutes and 55% CPU on one 9-file commit, the stack ending
+    in `_string_reads` -> `_reach`.
+
+    A pair does not need the whole tree. A name is read at the attribute,
+    import, keyword, constant or bare name that spells it, and a string
+    reach carries it only in a key `_key_spellings` files. So the one walk
+    files those nodes by spelling, and a pair reads its own buckets. Two
+    answers depend on the module alone -- what the imports bind to it, and
+    whether the file reaches it by a computed name -- and `reached` keeps
+    the second per module, so it costs modules x files, never names.
+
+    The answers are the per-pair walk's. tests/test_retired_name_rung.py
+    keeps that walk as the parity oracle and asks both the same pairs."""
+
+    def __init__(self, tree):
+        self.tree = tree
+        self.imports, self.reaches = [], []
+        self.attrs, self.keyed, self.dotted = {}, {}, {}
+        self.spelled, self.bare = {}, {}
+        self.scoped, self.memo = set(), {}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                self.imports.append(node)
+            elif isinstance(node, ast.Attribute):
+                self.attrs.setdefault(node.attr, []).append(node)
+            elif isinstance(node, ast.Name):
+                self.bare.setdefault(node.id, set()).add(node.lineno)
+            elif isinstance(node, ast.keyword):
+                if node.arg:
+                    self.spelled.setdefault(node.arg, set()).add(node.lineno)
+            elif isinstance(node, ast.Constant) and isinstance(node.value,
+                                                               str):
+                self.spelled.setdefault(node.value, set()).add(node.lineno)
+                if "." in node.value:
+                    self.dotted.setdefault(node.value.rpartition(".")[2],
+                                           []).append(node)
+            elif isinstance(node, (ast.Subscript, ast.Call)):
+                self.reaches.append(node)
+                for key in _key_spellings(node):
+                    self.keyed.setdefault(key, []).append(node)
+            elif isinstance(node, (ast.Global, ast.Nonlocal)):
+                self.scoped.update(node.names)
+        self.owners = _owner_pairs(tree)
+
+    def reached(self, mod, to_mod):
+        """(dynamic, star) for `mod`: does a call or subscript reach it by a
+        computed name, by `patch.multiple` or by `globals().update(vars(M))`
+        (`dynamic`), and by that last one (`star`)? Kept per module and its
+        bindings, because no name changes the answer."""
+        key = (mod, frozenset(to_mod))
+        if key not in self.memo:
+            on_mod = _module_test(mod, to_mod)
+            star = any(_globals_from(n, on_mod) for n in self.reaches)
+            self.memo[key] = (star or any(
+                _multiple_on(n, mod, on_mod) or _computed(_reach(n, on_mod))
+                for n in self.reaches), star)
+        return self.memo[key]
+
+
+def _string_reads(ix, mod, name, to_mod):
     """{lineno: PATCH_DOTTED | PATCH_STRUCTURAL} -- where `name` is a STRING
     that reaches into `mod`, keyed to the string's own line.
 
@@ -418,14 +614,13 @@ def _string_reads(tree, mod, name, to_mod):
     whose key is the constant `name`, and a call spelled getattr, setattr,
     delattr, hasattr, patch or patch.object that holds `name` as a string
     and the module as ANY argument. The module is `_module_test`. On one
-    line DOTTED wins, because it is the stronger evidence."""
+    line DOTTED wins, because it is the stronger evidence. Asked of the
+    file's `_Index`: a string can be DOTTED only where its last segment is
+    `name`, and STRUCTURAL only in a node `_key_spellings` filed under it."""
     on_mod = _module_test(mod, to_mod)
-    found = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Constant) and _dotted_hit(node.value, mod,
-                                                          name):
-            found[node.lineno] = PATCH_DOTTED
-            continue
+    found = {node.lineno: PATCH_DOTTED for node in ix.dotted.get(name, ())
+             if _dotted_hit(node.value, mod, name)}
+    for node in ix.keyed.get(name, ()):
         reach = _reach(node, on_mod)
         keys = [k for k in reach[0] if _spells(k, name, reach[1])] \
             if reach else []
@@ -465,7 +660,7 @@ def _globals_from(node, on_mod):
             and len(node.args) == 1 and _namespace(node.args[0], on_mod))
 
 
-def _dynamic_reads(tree, mod, name, to_mod):
+def _dynamic_reads(ix, mod, name, to_mod):
     """{lineno} -- where a file with a DYNAMIC REACH on `mod` spells `name`
     (task/3418, round 2).
 
@@ -488,19 +683,15 @@ def _dynamic_reads(tree, mod, name, to_mod):
     `patch.multiple`'s own keywords are among them. `globals().update(
     vars(M))` is `from M import *` at run time, so there a bare `name` is
     the module's as well. A reach on ANOTHER module counts nothing here,
-    and without a reach a bare `name` is still the file's own binding."""
-    on_mod = _module_test(mod, to_mod)
-    nodes = list(ast.walk(tree))
-    star = any(_globals_from(n, on_mod) for n in nodes)
-    if not star and not any(_multiple_on(n, mod, on_mod)
-                            or _computed(_reach(n, on_mod)) for n in nodes):
+    and without a reach a bare `name` is still the file's own binding.
+    Whether the file has a reach is the module's question alone, and
+    `_Index.reached` keeps its answer."""
+    dynamic, star = ix.reached(mod, to_mod)
+    if not dynamic:
         return set()
-    at = {n.lineno for n in nodes
-          if (isinstance(n, ast.keyword) and n.arg == name)
-          or (isinstance(n, ast.Constant) and n.value == name)}
+    at = set(ix.spelled.get(name, ()))
     if star:
-        at.update(n.lineno for n in nodes
-                  if isinstance(n, ast.Name) and n.id == name)
+        at |= ix.bare.get(name, set())
     return at
 
 
@@ -530,19 +721,18 @@ def _patch_site(text, mod, name):
 
     This asks through the module's own name only; the door
     (`_module_reads`) asks the same question through every name an import
-    binds to the module. An unparseable source answers False here;
-    `_source_parses` is what keeps such a file from reading as clean."""
-    try:
-        tree = ast.parse(text)
-    except _UNPARSED:
+    binds to the module. An unparseable source answers False here; `_tokens`
+    answering None is what keeps such a file from reading as clean."""
+    ix = _Source(text).index
+    if ix is None:
         return False
-    kinds = set(_string_reads(tree, mod, name, {mod}).values())
+    kinds = set(_string_reads(ix, mod, name, {mod}).values())
     if PATCH_DOTTED in kinds:
         return PATCH_DOTTED
     return PATCH_STRUCTURAL if kinds else None
 
 
-def _bindings(tree, mod):
+def _bindings(ix, mod):
     """({names an import binds TO `mod`}, {names an import binds elsewhere}).
 
     To `mod`: always its own token, the alias of `import helm.mod as m`, and
@@ -551,7 +741,7 @@ def _bindings(tree, mod):
     the dotted chain itself. A plain assignment (`c = mod`) is never
     resolved, and a name bound both ways counts as the module's."""
     to_mod, to_other = {mod}, set()
-    for node in ast.walk(tree):
+    for node in ix.imports:
         if isinstance(node, ast.Import):
             for a in node.names:
                 if a.asname:
@@ -572,7 +762,7 @@ def _satellite_paths(here, token):
             os.path.join(here, token, "__init__.py")}
 
 
-def _module_reads(tree, names, mod, name, cand, retiring):
+def _module_reads(ix, names, mod, name, cand, retiring):
     """{lineno} -- where ANOTHER file reads `name` FROM `mod` (task/3418).
 
     A RETIRED NAME IS `mod.name`, NEVER EVERY `name` IN THE TREE. Removing
@@ -606,27 +796,158 @@ def _module_reads(tree, names, mod, name, cand, retiring):
     carry the module as a string, so they are asked of every file; the rest
     need the module's NAME token in `names`, and a file without it cannot
     spell them. The lines are where the name is read, so the refusal names
-    the read and not the file's own unrelated lines."""
-    to_mod, to_other = _bindings(tree, mod)
-    at = set(_string_reads(tree, mod, name, to_mod))
-    at |= _dynamic_reads(tree, mod, name, to_mod)
+    the read and not the file's own unrelated lines.
+
+    `ix` is the file's `_Index`, so a pair reads only the imports and the
+    attributes named `name`, never the whole tree (task/3840)."""
+    to_mod, to_other = _bindings(ix, mod)
+    at = set(_string_reads(ix, mod, name, to_mod))
+    at |= _dynamic_reads(ix, mod, name, to_mod)
     here = os.path.dirname(cand)
-    at.update(line for token, owned, line in _owner_pairs(tree)
+    at.update(line for token, owned, line in ix.owners
               if owned == name and _satellite_paths(here, token) & retiring)
     if mod not in names:
         return at
-    for node in ast.walk(tree):
+    for node in ix.imports:
         if isinstance(node, ast.ImportFrom):
             src = (node.module or "").rpartition(".")[2]
             if src == mod or not node.module:
                 at.update(getattr(a, "lineno", node.lineno)
                           for a in node.names if a.name in (name, "*"))
-        elif isinstance(node, ast.Attribute) and node.attr == name:
-            recv = node.value
-            if not (isinstance(recv, ast.Name) and recv.id in to_other
-                    and recv.id not in to_mod):
-                at.add(node.end_lineno)
+    for node in ix.attrs.get(name, ()):
+        recv = node.value
+        if not (isinstance(recv, ast.Name) and recv.id in to_other
+                and recv.id not in to_mod):
+            at.add(node.end_lineno)
     return at
+
+
+class _Source:
+    """One index file as a scan reads it, each reading made on first use:
+    the tokens always, the tree only for a question the tokens cannot
+    answer. A scan holds ONE at a time (task/3840)."""
+
+    def __init__(self, text):
+        self.text = text
+
+    @functools.cached_property
+    def tokens(self):
+        return _tokens(self.text)
+
+    @functools.cached_property
+    def lines(self):
+        return _source_lines(self.text)
+
+    @functools.cached_property
+    def index(self):
+        """The file's `_Index`, or None where `ast` cannot read it: every
+        parse this rung makes is this one."""
+        try:
+            tree = ast.parse(self.text)
+        except _UNPARSED:
+            return None
+        return _Index(tree)
+
+
+def _read(root, path):
+    """The index's copy of `path` as a `_Source`, or None."""
+    text = _index_text(root, path)
+    return None if text is None else _Source(text)
+
+
+#: A spelling holding one of these can differ between a string's text and
+#: its value (an f-string's doubled brace, an escape, a normalised line
+#: break), so `_may_read` sends a file to the parse rather than rule on it.
+_UNSAFE = frozenset("{}\\\r\n")
+
+
+def _may_read(src, mod, retiring):
+    """Can this candidate, which tokenizes, read anything from `mod`? When
+    it cannot, `_reads` answers without parsing it (task/3840).
+
+    A FILE READS FROM A MODULE ONLY THROUGH A SPELLING OF IT. Every read
+    `_module_reads` finds holds the module as an identifier -- an import, a
+    receiver or an alias, the object a reach is on -- or as a string: a
+    dotted target, a `patch.multiple` target, or a facade token that names a
+    retiring file (`_satellite_paths`: `x` for `x.py`, and the directory
+    only for a package's own `__init__.py`; the directory of EVERY path made
+    `helm` a spelling of `helm/x.py`, and nearly every file was parsed,
+    task/3840 round 3). An identifier is a NAME token, NFKC-normalised as
+    Python binds it; a string is in the file's string values, where an implicit
+    concatenation reads as one. A file with neither the module's token nor
+    one of its spellings in a string value answers nothing, which is what
+    the parse answers too. A value only the parser can read (`_string_value`)
+    and a spelling that holds an `_UNSAFE` character send the file to the
+    parse instead.
+
+    THIS IS NOT A GREP FOR THE MODULE. Intersecting the name's grep with a
+    text grep for the module would drop files the parse refuses: a file that
+    does not tokenize (reported on the name alone, UNREADABLE IS NOT CLEAN),
+    a module spelled in fullwidth latin, and a string that spells it through
+    an escape or across an implicit concatenation (`mock.patch("pkg.m"
+    "od.NAME")`). The tokens and the values come from the one tokenize every
+    candidate already gets."""
+    names, values = src.tokens
+    if mod in names or values is None:
+        return True
+    spellings = {mod} | {os.path.basename(p)[:-3] for p in retiring} | {
+        os.path.basename(os.path.dirname(p)) for p in retiring
+        if os.path.basename(p) == "__init__.py"}
+    return any(t is not None and (t in values or bool(_UNSAFE & set(t)))
+               for t in spellings)
+
+
+def _reads(src, cand, mod, name, retiring):
+    """[(path, lineno, text)] -- where one candidate still reads the retired
+    name: the per-file question `consumers` asks, of a file read once."""
+    if src.tokens is None:
+        # UNREADABLE IS NOT CLEAN. The prefilter already matched the name
+        # in this file's text and nothing here can rule it out, so it is
+        # reported rather than dropped.
+        return [(cand, n, t) for n, t in _lines_with(src.text, name)]
+    names = src.tokens[0]
+    if cand in retiring:
+        # In the retiring file a bare token IS the module's own name; a
+        # mere string or comment is not a use.
+        return [(cand, n, t) for n, t in _lines_with(src.text, name)] \
+            if name in names else []
+    if not _may_read(src, mod, retiring):
+        return []
+    if src.index is None:
+        # IT TOKENIZES AND DOES NOT PARSE, so no binding can be resolved:
+        # a file holding both the name and the module token is reported.
+        return [(cand, n, t) for n, t in _lines_with(src.text, name)] \
+            if name in names and mod in names else []
+    return [(cand, n, src.lines[n - 1].rstrip()) for n in sorted(
+        _module_reads(src.index, names, mod, name, cand, retiring))]
+
+
+class _Pair:
+    """One retired name, keyed to its module: the files its grep names, and
+    each file's reads, answered on that file's one visit (task/3840)."""
+
+    def __init__(self, root, path, name, live):
+        self.path, self.name, self.live = path, name, live
+        self.mod = module_token(live) or module_token(path)
+        self.retiring = {path, live}
+        self.kept, self.satellites, self.hits = False, [], {}
+        done = _git(root, "grep", "-l", "--cached", "-E", "-e",
+                    r"\b%s\b" % re.escape(name), "--", "*.py")
+        self.err = None if done.returncode in (0, 1) else (
+            os.fsdecode(done.stderr).strip() or "git grep failed")
+        self.files = [] if self.err else [
+            os.fsdecode(raw) for raw in done.stdout.splitlines()]
+        self.wanted = set(self.files)
+
+    def answer(self, cand, src):
+        """Record `cand`'s reads, when the grep named it."""
+        if cand in self.wanted:
+            self.hits[cand] = [] if src is None else _reads(
+                src, cand, self.mod, self.name, self.retiring)
+
+    def reads(self):
+        """Every read, file by file in the grep's order."""
+        return [h for f in self.files for h in self.hits.get(f, ())]
 
 
 def consumers(root, path, name, live_path=None):
@@ -657,7 +978,7 @@ def consumers(root, path, name, live_path=None):
     a real consumer and `git grep -e '\\bNAME\\b'` cannot see it, because the
     bytes it searches for are not there.
 
-    The TEST half is closed: `_names_and_strings` adds the NFKC form of every
+    The TEST half is closed: `_tokens` adds the NFKC form of every
     token, so once a file reaches the test its equivalent spellings are found.
     The PREFILTER half is NOT, and cannot be cheaply: git grep would have to
     search every NFKC-equivalent spelling of the name, an unbounded set.
@@ -669,44 +990,12 @@ def consumers(root, path, name, live_path=None):
     a completeness it does not have teaches the next reader to stop looking.
     This rung already chose the miss direction once, for comments and
     docstrings, and for the same stated reason."""
-    live = live_path or path
-    mod = module_token(live) or module_token(path)
-    retiring = {path, live}
-    done = _git(root, "grep", "-l", "--cached", "-E", "-e",
-                r"\b%s\b" % re.escape(name), "--", "*.py")
-    if done.returncode not in (0, 1):
-        return None, os.fsdecode(done.stderr).strip() or "git grep failed"
-    hits = []
-    for raw in done.stdout.splitlines():
-        cand = os.fsdecode(raw)
-        text = _index_text(root, cand)
-        if text is None:
-            continue
-        if not _source_parses(text):
-            # UNREADABLE IS NOT CLEAN. The prefilter already matched the name
-            # in this file's text and nothing here can rule it out, so it is
-            # reported rather than dropped.
-            hits.extend((cand, n, t) for n, t in _lines_with(text, name))
-            continue
-        names, _strings = _names_and_strings(text)
-        if cand in retiring:
-            # In the retiring file a bare token IS the module's own name; a
-            # mere string or comment is not a use.
-            if name in names:
-                hits.extend((cand, n, t) for n, t in _lines_with(text, name))
-            continue
-        try:
-            tree = ast.parse(text)
-        except _UNPARSED:
-            # IT TOKENIZES AND DOES NOT PARSE, so no binding can be resolved:
-            # a file holding both the name and the module token is reported.
-            if name in names and mod in names:
-                hits.extend((cand, n, t) for n, t in _lines_with(text, name))
-            continue
-        lines = _source_lines(text)
-        hits.extend((cand, n, lines[n - 1].rstrip()) for n in sorted(
-            _module_reads(tree, names, mod, name, cand, retiring)))
-    return hits, None
+    pair = _Pair(root, path, name, live_path or path)
+    if pair.err:
+        return None, pair.err
+    for cand in pair.files:
+        pair.answer(cand, _read(root, cand))
+    return pair.reads(), None
 
 
 def _owner_pairs(tree):
@@ -737,49 +1026,25 @@ def _owner_pairs(tree):
     return out
 
 
-def owner_declarations(text):
-    """{(satellite token, NAME)} one module DECLARES it has handed away.
-
-    The literal is the form `web_compat` already uses for the web split: a
-    module-level `_OWNER_NAMES` bound to a sequence of (satellite module
-    token, (names...)) pairs. It is read from the INDEX with `ast` and never
-    imported, so this stays a stdlib textual rung.
-
-    NONE MEANS UNKNOWN AND EXEMPTS NOTHING. A file that does not parse has
-    not been cleared, which is not the same as a file that was; the caller
-    then judges every retirement in it, which is this rung's behaviour
-    without the declaration.
-
-    A DECLARATION IS A CLAIM, NEVER A CLEARANCE ON ITS OWN. The caller also
-    requires the named satellite to DEFINE the name at column zero, so a
-    table cannot vouch for a name nobody wrote -- otherwise the exemption
-    would be available by typing.
-    """
-    try:
-        tree = ast.parse(text)
-    except _UNPARSED:
-        return None
-    return {(mod, name) for mod, name, _line in _owner_pairs(tree)}
-
-
-def defines_at_top_level(text, name):
-    """Does this source bind `name` at column zero? Parsed, never imported."""
-    try:
-        tree = ast.parse(text)
-    except _UNPARSED:
-        return False
-    for node in tree.body:
+def _top_level_names(src):
+    """{names this source binds at column zero}: a def, async def or class,
+    and a bare name an assignment or annotated assignment binds. Empty for
+    a source that does not parse. Parsed, never imported; the satellite
+    half of a declared move, and wider than `still_defines` on purpose."""
+    ix = src.index
+    if ix is None:
+        return set()
+    out = set()
+    for node in ix.tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
-                             ast.ClassDef)) and node.name == name:
-            return True
-        if isinstance(node, ast.Assign):
-            if any(isinstance(t, ast.Name) and t.id == name
-                   for t in node.targets):
-                return True
-        if isinstance(node, ast.AnnAssign):
-            if isinstance(node.target, ast.Name) and node.target.id == name:
-                return True
-    return False
+                             ast.ClassDef)):
+            out.add(node.name)
+        elif isinstance(node, ast.Assign):
+            out.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target,
+                                                            ast.Name):
+            out.add(node.target.id)
+    return out
 
 
 #: A `del` or `except ... as` inside one of these touches that scope's own
@@ -787,29 +1052,26 @@ def defines_at_top_level(text, name):
 _SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
 
 
-def still_defines(text, name):
-    """Does this source still DEFINE `name`? Parsed, never imported.
+def still_defines(src, name):
+    """Does this `_Source` still DEFINE `name`? Parsed, never imported.
 
     The shape-A clearance in `scan_staged`; a declared satellite is read by
-    the wider `defines_at_top_level`.
+    the wider `_top_level_names`.
 
     Yes only for an unconditional module-top-level `def`, `async def` or
     `class` of the name, when no module-scope statement after the last one
     deletes it (`del NAME`, or `except ... as NAME`, which Python deletes as
     the handler ends) and no `global` or `nonlocal` of the name appears
-    anywhere in the file. No other binder counts -- an assignment, an
-    annotation, an import, a loop or with target -- and neither does a
-    definition under an `if` or `try`. That refuses some correct commits (a
-    def moved to a sibling and imported back), which the override is for. A
-    deletion built at runtime (`globals()`, `exec`) is not seen. An
-    unparseable source answers False."""
-    try:
-        tree = ast.parse(text)
-    except _UNPARSED:
+    anywhere in the file (`_Index.scoped`, so no name walks the tree). No
+    other binder counts -- an assignment, an annotation, an import, a loop
+    or with target -- and neither does a definition under an `if` or `try`.
+    That refuses some correct commits (a def moved to a sibling and imported
+    back), which the override is for. A deletion built at runtime
+    (`globals()`, `exec`) is not seen. An unparseable source answers False."""
+    ix = src.index
+    if ix is None or name in ix.scoped:
         return False
-    if any(isinstance(n, (ast.Global, ast.Nonlocal)) and name in n.names
-           for n in ast.walk(tree)):
-        return False
+    tree = ix.tree
     last = None
     for i, node in enumerate(tree.body):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef,
@@ -830,60 +1092,82 @@ def still_defines(text, name):
     return True
 
 
-def moved_to_a_declared_satellite(root, path, name):
-    """Did `name` leave `path` for a satellite that path DECLARES and that
-    actually defines it? Then it was never retired.
-
-    BOTH HALVES OR NEITHER. The declaration answers "this module handed the
-    name away on purpose"; the satellite's own definition answers "and it is
-    really there". A move that declares nothing, and a declaration whose
-    satellite lacks the name, are both still retirements -- which keeps the
-    shape this rung exists for: a split that forgets to republish leaves
-    every `module.NAME` consumer dangling, and a focused set cannot see it.
-    """
-    text = _index_text(root, path)
-    if text is None:
-        return False
-    declared = owner_declarations(text)
-    if not declared:
-        return False
-    here = os.path.dirname(path)
-    for mod, owned_name in declared:
-        if owned_name != name:
-            continue
-        satellite = os.path.join(here, mod + ".py") if here else mod + ".py"
-        stext = _index_text(root, satellite)
-        if stext is not None and defines_at_top_level(stext, name):
-            return True
-    return False
-
-
 def scan_staged(root):
     """({(path, name): [(path, lineno, text)]}, error).
 
     The staged diff is taken against HEAD, so a merge is judged against its
-    first parent, as every commit is."""
+    first parent, as every commit is.
+
+    A NAME IS RETIRED UNLESS ITS FILE STILL DEFINES IT (`still_defines`,
+    asked at the live path, the file a rename produced) OR IT MOVED TO A
+    DECLARED SATELLITE. The move needs BOTH HALVES OR NEITHER: the retiring
+    file's `_OWNER_NAMES` naming the satellite for the name answers "this
+    module handed the name away on purpose", and the satellite's own
+    column-zero binding answers "and it is really there". A move that
+    declares nothing, and a declaration whose satellite lacks the name, are
+    both still retirements -- which keeps the shape this rung exists for: a
+    split that forgets to republish leaves every `module.NAME` consumer
+    dangling, and a focused set cannot see it. A declaration is a claim and
+    never a clearance on its own, so a table cannot vouch for a name nobody
+    wrote; and a retiring file that does not parse declares nothing, because
+    UNKNOWN exempts nothing.
+
+    FILE-MAJOR, SO A SCAN HOLDS ONE FILE AT A TIME (task/3840). Every
+    name's grep runs first, so one visit to a file answers every pair that
+    names it, and the file is dropped before the next: each file is shown,
+    tokenized and parsed at most once, and the peak is one file, never the
+    tree. Holding every candidate's tree for the scan's life was 2.3 GB for
+    one retired `path` (1001 candidates). The visits go in three passes --
+    the retiring files, then the declared satellites of the names they do
+    not keep, then the other candidates of the names still retired -- and
+    the reads are collated per name in its grep's order."""
     done = _git(root, "diff", "--cached", "-U0", "--no-color", "--", "*.py")
     if done.returncode != 0:
         return None, os.fsdecode(done.stderr).strip() or "git diff failed"
+    pairs = [_Pair(root, path, name, live)
+             for path, name, live in parse(os.fsdecode(done.stdout))]
+    top, seen = {}, set()
+
+    def visit(cand, asked, keep_top):
+        seen.add(cand)
+        src = _read(root, cand)
+        for pair in pairs:
+            if pair.live == cand:
+                pair.kept = src is not None and still_defines(src, pair.name)
+            if pair.path == cand and src is not None and src.index is not None:
+                here = os.path.dirname(cand)
+                pair.satellites = [
+                    os.path.join(here, token + ".py") if here else token + ".py"
+                    for token, owned, _line in src.index.owners
+                    if owned == pair.name]
+        if keep_top:
+            top[cand] = set() if src is None else _top_level_names(src)
+        for pair in asked:
+            pair.answer(cand, src)
+
+    for cand in dict.fromkeys(p for pair in pairs
+                              for p in (pair.live, pair.path)):
+        visit(cand, pairs, True)
+    for cand in dict.fromkeys(s for pair in pairs if not pair.kept
+                              for s in pair.satellites):
+        if cand not in seen:
+            visit(cand, pairs, True)
+    retired = [pair for pair in pairs if not pair.kept and not any(
+        pair.name in top[s] for s in pair.satellites)]
+    for cand in dict.fromkeys(f for pair in retired for f in pair.files):
+        if cand not in seen:
+            visit(cand, retired, False)
     found = {}
-    for path, name, live in parse(os.fsdecode(done.stdout)):
-        # One of two top-level definitions removed leaves the name defined.
-        # Asked at the live path, the file a rename produced.
-        text = _index_text(root, live)
-        if text is not None and still_defines(text, name):
-            continue
-        if moved_to_a_declared_satellite(root, path, name):
-            continue
-        hits, err = consumers(root, path, name, live_path=live)
-        if err:
-            return None, err
+    for pair in retired:
+        if pair.err:
+            return None, pair.err
+        hits = pair.reads()
         if hits:
-            found[(path, name)] = hits
+            found[(pair.path, pair.name)] = hits
     return found, None
 
 
-def report(found, out=sys.stderr):
+def report(found, out=sys.stderr, diff=None):
     print("%s REFUSED: %d retired top-level name(s) still read from their "
           "module in the tree this commit would produce:" % (TAG, len(found)),
           file=out)
@@ -902,6 +1186,15 @@ def report(found, out=sys.stderr):
           "binds, a relative `from . import`, a string or keyword in a file "
           "that reaches the module by a computed name), one-commit owner "
           "override: HELM_RETIRED_NAME_SKIP=1" % TAG, file=out)
+    # EVERY READ, NOT THE FIRST EIGHT: these lines are the cure, and a cure
+    # that stops partway leaves the next commit refused again.
+    swaps = replacements(diff)
+    lives = {(path, name): live for path, name, live in parse(diff)}
+    for (path, name), hits in sorted(found.items()):
+        swap, live = swaps.get((path, name)), lives.get((path, name), path)
+        for where, lineno, _text in hits:
+            print("%s%s:%s: %s" % (CORRECTED, where, lineno,
+                                   cure(live, name, where, swap)), file=out)
 
 
 def main(argv=None):
@@ -923,8 +1216,20 @@ def main(argv=None):
         return 2
     if not found:
         return 0
-    report(found)
+    report(found, diff=staged_diff(root))
     return 1
+
+
+def staged_diff(root):
+    """The staged diff `scan_staged` read, for the cure lines; "" when git
+    cannot answer, since the refusal stands on `scan_staged` alone and only
+    its cure is lost."""
+    try:
+        done = _git(root, "diff", "--cached", "-U0", "--no-color", "--",
+                    "*.py")
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return os.fsdecode(done.stdout) if done.returncode == 0 else ""
 
 
 if __name__ == "__main__":

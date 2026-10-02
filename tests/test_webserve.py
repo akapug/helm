@@ -16,6 +16,7 @@ import unittest
 from unittest import mock
 
 from helm import doctor, home, pk, webserve
+from tests._tmphome import import_home_freezers
 
 
 def levels(results, level):
@@ -30,10 +31,12 @@ class WebServeBase(unittest.TestCase):
     BLIND = True
 
     def setUp(self):
+        import_home_freezers()
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.envp = mock.patch.dict(
-            os.environ, {"HELM_HOME": os.path.join(self.tmp.name, "helm-home")})
+            os.environ, {"HELM_HOME": os.path.join(self.tmp.name, "helm-home"),
+                         "HOME": self.tmp.name, "HELM_PROC": "/proc"})
         self.envp.start()
         self.addCleanup(self.envp.stop)
         self.assertTrue(home.helm_home().startswith(self.tmp.name))

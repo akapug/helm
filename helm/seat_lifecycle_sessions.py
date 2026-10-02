@@ -382,6 +382,16 @@ def _prune_source(path):
     never carries a session_id that differs from its own sessionId, so a
     foreign session_id IS the lineage stamp, never an accident of quoting.
     """
+    stamp = prune_lineage(path)
+    return stamp if stamp is True or stamp is None else stamp[0]
+
+
+def prune_lineage(path):
+    """(source, own) session ids a PRUNED COPY's lineage stamp names —
+    `_prune_source`'s one reading, both halves kept — True for a
+    slot-shaped copy (lineage unrecorded), or None. A caller binding a
+    copy to its source checks BOTH halves: `own` must be the copy it
+    resumes and `source` the session it asked for (task/3695)."""
     try:
         with open(path, "rb") as f:
             head = f.read(_PRUNE_HEAD_BYTES)
@@ -393,7 +403,7 @@ def _prune_source(path):
     src = re.search(rb'"session_id"\s*:\s*"([0-9a-f-]{36})"', head)
     own = re.search(rb'"sessionId"\s*:\s*"([0-9a-f-]{36})"', head)
     if src and own and src.group(1) != own.group(1):
-        return src.group(1).decode("ascii")
+        return src.group(1).decode("ascii"), own.group(1).decode("ascii")
     return None
 
 
@@ -625,8 +635,9 @@ def onboarding_prompt(seat_name, room=None, role="worker"):
         "LEAD: when your assigned rows are empty, inspect `helm task list` and "
         "unowned OPEN dispatches for eligible project work; claim or route a "
         "bounded lane instead of parking. Use subagents for independent work "
-        "and workflows when ultracode is enabled. After handing work off, post "
-        "progress and STOP instead of holding the parent turn open; delegate "
+        "and workflows to stack builds and reviews when speed matters. After "
+        "handing work off, post progress and STOP instead of holding the "
+        "parent turn open; delegate "
         "completion re-invokes you. The stop guard retains a held lease only on "
         "positive live/recent delegation evidence; UNKNOWN still blocks. Do not "
         "duplicate delegated work. Do not park while eligible work queues."

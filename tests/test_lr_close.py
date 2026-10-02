@@ -23,7 +23,7 @@ from unittest import mock
 
 from helm import (carriageckpt, dispatches, eventledger, foldckpt, gitfacts,
                   landreq, obligation, projscope, proxywatch, rowstate,
-                  rowworld, seats, vcs)
+                  rowworld, seats, tasks, vcs)
 from tests._satellite_resolution import ledger_sources
 # The module, never its TestCase: tests/test_suite_collection.py says why.
 from tests import test_landreq as _landreq
@@ -85,6 +85,13 @@ class TheLivenessStandInIsInEffectHereTooTest(unittest.TestCase):
 
 class CloseBase(_landreq.LandReqBase):
     """Fixture verbs shared by every close-reason suite."""
+
+    def setUp(self):
+        super().setUp()
+        self.review_task, why = tasks.add(
+            "close fixture reviewed work", "integrator", project="helm-test",
+            force_new=True)
+        self.assertIsNone(why, why)
 
     def landed_then_trunk_edits(self, same_line):
         """Trunk CARRIES the reviewed delta by ancestry and has edited the same
@@ -251,7 +258,8 @@ class CloseBase(_landreq.LandReqBase):
         lane = lane or "lane/close-%s" % (polarity or "undeclared")
         row, why, sent = dispatches.send(
             recipient, lane, "review " + lane, tip, repo=self.repo,
-            key="key-" + lane, sign=False, new_work=True)
+            key="key-" + lane, sign=False, new_work=True,
+            task=self.review_task["id"])
         self.assertIsNone(why)
         self.assertTrue(sent)
         if polarity is None:
@@ -305,7 +313,8 @@ class CloseBase(_landreq.LandReqBase):
                          confirmation_statement=None):
         target = dispatches.add(
             "codex-3", "lane/evolved-r1", ref=self.side, repo=self.repo,
-            kind=original_kind, notify=False, new_work=True)
+            kind=original_kind, notify=False, new_work=True,
+            task=self.review_task["id"] if original_kind == "review" else None)
         out, err = self.mark_verdict(
             target["id"], self.side, "original verdict",
             polarity=original_polarity)
@@ -326,7 +335,9 @@ class CloseBase(_landreq.LandReqBase):
         if gate_prefixed:
             evidence = "gate:%s 42 OK/0 at deadbeef. %s" % (
                 "a" * 16, evidence)
-        kw = {"supersedes": target["id"]} if same_chain else {"new_work": True}
+        kw = {"supersedes": target["id"]} if same_chain else {
+            "new_work": True,
+            "task": self.review_task["id"] if confirmation_kind == "review" else None}
         confirmation = dispatches.add(
             "claude-reviewer", "lane/evolved-r2", ref=confirmation_tip,
             repo=self.repo, kind=confirmation_kind, notify=False, **kw)
@@ -1813,7 +1824,8 @@ class CloseBoundaryPhysicsTest(CloseBase):
             "worktree_state": "none"}
         first = dispatches.add(
             "codex-3", "lane/abandon-first", ref=self.side, repo=self.repo,
-            kind="review", notify=False, new_work=True)
+            kind="review", notify=False, new_work=True,
+            task=self.review_task["id"])
         _out, err = self.mark_verdict(
             first["id"], self.side, "findings", polarity="fix")
         self.assertIsNone(err)
@@ -1833,7 +1845,8 @@ class CloseBoundaryPhysicsTest(CloseBase):
 
         second = dispatches.add(
             "codex-3", "lane/close-before-abandon", ref=self.side,
-            repo=self.repo, kind="review", notify=False, new_work=True)
+            repo=self.repo, kind="review", notify=False, new_work=True,
+            task=self.review_task["id"])
         _out, err = self.mark_verdict(
             second["id"], self.side, "findings", polarity="fix")
         self.assertIsNone(err)
@@ -2796,7 +2809,8 @@ class CloseLiveStepTest(CloseBase):
             kind="build", notify=False, new_work=True)
         child = dispatches.add(
             "reviewer", "lane/unchained-review", ref=self.side,
-            repo=self.repo, kind="review", notify=False, new_work=True)
+            repo=self.repo, kind="review", notify=False, new_work=True,
+            task=self.review_task["id"])
         _out, err = self.mark_verdict(
             child["id"], self.side, "reviewed", polarity="approve")
         self.assertIsNone(err)
@@ -2820,7 +2834,7 @@ class CloseLiveStepTest(CloseBase):
         child = dispatches.add(
             "reviewer", "lane/roots-review-%s-%s" % (review_root, parent_root),
             ref=self.side, repo=self.repo, kind="review", notify=False,
-            new_work=True)
+            new_work=True, task=self.review_task["id"])
         _out, err = self.mark_verdict(
             child["id"], self.side, "reviewed", polarity="approve")
         self.assertIsNone(err)
@@ -2881,7 +2895,8 @@ class CloseLiveStepTest(CloseBase):
             kind="build", notify=False, new_work=True)
         child = dispatches.add(
             "reviewer", "lane/legacy-review", ref=self.side,
-            repo=self.repo, kind="review", notify=False, new_work=True)
+            repo=self.repo, kind="review", notify=False, new_work=True,
+            task=self.review_task["id"])
         _out, err = self.mark_verdict(
             child["id"], self.side, "reviewed", polarity="approve")
         self.assertIsNone(err)
@@ -3763,7 +3778,8 @@ class WithdrawalIsTheThirdAnswerToAFixTest(CloseBase):
     def fix_row(self, lane="lane/withdraw-third-answer", polarity="fix"):
         row, why, sent = dispatches.send(
             "seat-b", lane, "review " + lane, self.side, repo=self.repo,
-            key="key-" + lane, sign=False, new_work=True)
+            key="key-" + lane, sign=False, new_work=True,
+            task=self.review_task["id"])
         self.assertIsNone(why)
         self.assertTrue(sent)
         _out, err = self.mark_verdict(
@@ -4067,9 +4083,12 @@ class CloseOutOfScopeTest(CloseBase):
         self.assertIn("live at refs/heads/lane/oos-advanced-r2", err)
 
     def test_a_dirty_family_worktree_refuses(self):
-        row = self.dispatch(lane="lane/oos-dirty-family", ref=self.b)
+        # tip off trunk so the #187 own-tip guard does not preempt the
+        # worktree-liveness path this arm measures — the worktree is matched
+        # by lane family (path stem), not by tip.
+        row = self.dispatch(lane="lane/oos-dirty-family", ref=self.side)
         wt = os.path.join(self.tmp, "oos-dirty-family-wt")
-        self.git("worktree", "add", "--detach", "-q", wt, self.b)
+        self.git("worktree", "add", "--detach", "-q", wt, self.side)
         with open(os.path.join(wt, "uncommitted.txt"), "w",
                   encoding="utf-8") as f:
             f.write("live work\n")
@@ -4085,18 +4104,119 @@ class CloseOutOfScopeTest(CloseBase):
                                       evidence="moot")
         self.assertIn("FAIL-CLOSED", err)
 
-    def test_a_landed_tip_on_an_open_row_is_tolerated_and_annotated(self):
-        row = self.dispatch(lane="lane/oos-already-landed", ref=self.b)
+    def test_a_not_landed_tip_is_closed_and_annotated_absent(self):
+        """#187 part 2 inverts the test this replaced: a row whose own tip is
+        ON TRUNK is no longer 'tolerated' and closed out-of-scope — the DID
+        IT SHIP block (now including the own-tip guard) REFUSES it, and
+        CloseOwnTipOnTrunkTest pins that refusal. The annotation block below
+        the guard is still exercised here, with the one tip that can still
+        REACH it through out-of-scope: a tip NOT on trunk. The check therefore
+        records `landed_check: "absent"`, and the row still closes — the
+        annotation never gates (it never authors or blocks), only notes that
+        the dispatched tip is absent from trunk."""
+        row = self.dispatch(lane="lane/oos-already-landed", ref=self.side)
         out, err = landreq.close(row["id"], "out-of-scope",
                                  evidence="review became moot")
         self.assertIsNone(err)
-        self.assertEqual(out["landed_check"], "true")
+        self.assertEqual(out["landed_check"], "absent")
         self.assertEqual(out["status"], "cancelled")
 
     def test_evidence_is_required(self):
         row = self.dispatch(lane="lane/oos-no-evidence")
         _out, err = landreq.close(row["id"], "out-of-scope")
         self.assertIn("needs evidence", err)
+
+
+class CloseOwnTipOnTrunkTest(CloseBase):
+    """#187 part 2 — the SAME adjacent-question hole as the discharger guard,
+    one rung wider: the "DID IT SHIP?" block asked only whether a SUCCESSOR's
+    land discharges the row (`discharging_row`), never whether the row's OWN
+    `tip` landed. A row with no successor and its own tip on trunk passed that
+    check honestly — a ghost build whose change the fleet is running — and
+    out-of-scope closed it, recording shipped work as unwanted.
+
+    The fix asks git, BEFORE the successor check, whether the row's own tip is
+    on trunk via the same tri-state `landreq._landed` the discharger door uses:
+      * True  (on trunk)  — refuse: the work SHIPPED; name the `--reason
+                           landed` door (read live from CLOSE_CLI_REASONS).
+      * None  (unknown)   — refuse FAIL-CLOSED, same posture as the unreadable-
+                           trunk `terr` case.
+      * False (absent)    — fall through to the successor/liveness checks
+                           unchanged, so real out-of-scope work still closes.
+
+    The trunk here is `master` (renamed in setUp), so these also pin that a
+    non-`main` trunk is handled — the simbi case that measured the original
+    bug (simbi's trunk is `master`). `CloseOutOfScopeTest`'s own tests cannot
+    share this rename because several `checkout self.main`, so the rename lives
+    in this sibling class's setUp; the three tips here are SHAs, never `main`."""
+
+    def setUp(self):
+        super().setUp()
+        # THE NON-DEFAULT TRUNK: the measured bug bit simbi, whose trunk is
+        # `master`, not this fixture's default branch. Renaming before any read
+        # pins `LOCAL_TRUNK`'s second entry, not just the default branch.
+        self.git("branch", "-M", "master")
+
+    def _no_successor(self):
+        """No discharger exists — a fresh row with no successor. Mocked to
+        (None, None, ...) exactly as the real no-successor read returns: tier
+        None, so ONLY the own-tip leg can refuse (or the door still closes)."""
+        return mock.patch.object(
+            dispatches, "discharging_row",
+            return_value=(None, None, "nothing records it"))
+
+    def test_own_tip_on_trunk_is_refused(self):
+        """No successor, own tip is an ANCESTOR of the trunk: out-of-scope
+        REFUSES (the work SHIPPED), names `--reason landed` (read live), and
+        writes nothing — the ledger history is UNCHANGED and the row stays
+        open."""
+        row = self.dispatch(ref=self.a,
+                            lane="lane/oos-own-tip-on-trunk")
+        before = self.history_len(row["id"])
+        with self._no_successor():
+            rc, _out, err = run(
+                ["close", row["id"][:12], "--reason", "out-of-scope",
+                 "--evidence", "moot"])
+        self.assertEqual(rc, 1)
+        self.assertIn("ON TRUNK", err)
+        self.assertIn("--reason landed", err)
+        self.assertEqual(self.history_len(row["id"]), before,
+                         "the refusal wrote to the ledger")
+        self.assertEqual(dispatches.snapshot()[0][row["id"]]["status"],
+                         "open", "nothing may be written")
+
+    def test_own_tip_not_on_trunk_still_closes(self):
+        """CONTROL — same shape but the tip is NOT on trunk and not live on a
+        lane ref: out-of-scope still closes it. The door still works for REAL
+        out-of-scope work; the new guard only adds the shipped case (the fix
+        must not close over a genuinely out-of-scope row)."""
+        row = self.dispatch(ref=self.side,
+                            lane="lane/oos-own-tip-not-on-trunk")
+        with self._no_successor():
+            rc, _out, err = run(
+                ["close", row["id"][:12], "--reason", "out-of-scope",
+                 "--evidence", "moot"])
+        self.assertEqual((rc, err), (0, ""))
+        self.assertEqual(dispatches.snapshot()[0][row["id"]]["status"],
+                         "cancelled")
+
+    def test_own_tip_unknown_fails_closed(self):  # noqa: VACUOUS_ASSERTION — needles "UNKNOWN"/"FAIL-CLOSED" are the same ones test_an_unreadable_trunk_FAILS_CLOSED pins on the real unreadable-trunk path; with the guard the code genuinely emits a FAIL-CLOSED refusal, so the effect assertions (rc, status-open, unchanged history) are non-trivial
+        """_landed answers UNKNOWN (patched to None): out-of-scope refuses
+        FAIL-CLOSED, same posture as the unreadable-trunk `terr` case — an
+        unreadable trunk must refuse rather than assume the work never landed.
+        Same leg, same tri-state: unknown is never assumed absent."""
+        row = self.dispatch(ref=self.a, lane="lane/oos-own-tip-unknown")
+        before = self.history_len(row["id"])
+        with mock.patch.object(landreq, "_landed", return_value=None), \
+             self._no_successor():
+            rc, _out, err = run(
+                ["close", row["id"][:12], "--reason", "out-of-scope",
+                 "--evidence", "moot"])
+        self.assertEqual(rc, 1)
+        self.assertIn("UNKNOWN", err)
+        self.assertIn("FAIL-CLOSED", err)
+        self.assertEqual(self.history_len(row["id"]), before,
+                         "the refusal wrote to the ledger")
 
 
 class CloseTranslatedSupersededTest(CloseBase):
@@ -5298,8 +5418,7 @@ class CloseResolvedTest(CloseBase):
         # HELM_CHAT_NAME, so a fixture that does not seed it can never reach
         # the rungs past it. Mirrors the live shape exactly: a claude-family
         # author confirmed by a kimi reviewer.
-        os.environ["HELM_CHAT_NAME"] = "opus-integrator"
-        self.addCleanup(os.environ.pop, "HELM_CHAT_NAME", None)
+        os.environ["HELM_CHAT_NAME"] = "opus-integrator"  # noqa: SEAT_NAME — author fixture requires claude family; LandReqBase.tearDown restores it
         original = self.verdict_row(polarity, recipient="codex-3")
         self.git("merge", "--no-edit", "-q", "side")
         tip = self.git("rev-parse", self.main)
@@ -5309,7 +5428,7 @@ class CloseResolvedTest(CloseBase):
         confirmation, why, sent = dispatches.send(
             confirm_recipient, "lane/confirming-round", "confirm the round",
             tip, repo=self.repo, key="key-confirming-round", sign=False,
-            kind="review", new_work=True)
+            kind="review", new_work=True, task=self.review_task["id"])
         self.assertIsNone(why)
         self.assertTrue(sent)
         ref = self.RESOLUTION if confirm_ref is None else confirm_ref
@@ -6551,7 +6670,8 @@ class CloseContradictedWithdrawalDischargeTest(CloseBase):
         # verdict" before the phrase rung this arm exists to reach.
         confirmation = dispatches.add(
             "seat-a", "lane/cwd-resolved-conf", ref=self.b, repo=self.repo,
-            kind="review", notify=False, new_work=True)
+            kind="review", notify=False, new_work=True,
+            task=self.review_task["id"])
         _out, err = self.mark_verdict(confirmation["id"], self.b,
                                             "findings", polarity="approve")
         self.assertEqual(err, None)
@@ -6797,7 +6917,8 @@ class CloseContradictedWithdrawalDischargeTest(CloseBase):
         self.git("merge", "--no-edit", "-q", "side")   # the contradiction
         confirmation = dispatches.add(
             "claude-reviewer", "lane/cwd-chain-conf", ref=self.b,
-            repo=self.repo, kind="review", notify=False, new_work=True)
+            repo=self.repo, kind="review", notify=False, new_work=True,
+            task=self.review_task["id"])
         _out, err = self.mark_verdict(
             confirmation["id"], self.b,
             "Resolution verified on trunk: the withdrawn guard landed via "
@@ -7012,7 +7133,8 @@ class CloseContradictedWithdrawalDischargeTest(CloseBase):
         self.git("merge", "--no-edit", "-q", "side")
         confirmation = dispatches.add(
             "claude-reviewer", "lane/cwd-replay2-conf", ref=self.b,
-            repo=self.repo, kind="review", notify=False, new_work=True)
+            repo=self.repo, kind="review", notify=False, new_work=True,
+            task=self.review_task["id"])
         _out, err = self.mark_verdict(
             confirmation["id"], self.b,
             "Resolution verified on trunk: the withdrawn guard landed via "
@@ -7740,7 +7862,8 @@ class CarriedReviewedPatchIdentityTest(CloseBase):
     def fix_row(self, reviewed, patch, lane="lane/cured-fix"):
         row, why, sent = dispatches.send(
             "codex-3", lane, "review " + lane, reviewed, repo=self.repo,
-            key="key-" + lane, sign=False, new_work=True)
+            key="key-" + lane, sign=False, new_work=True,
+            task=self.review_task["id"])
         self.assertIsNone(why)
         self.assertTrue(sent)
         out, err = self.mark_verdict(row["id"], reviewed, "findings",
@@ -9107,7 +9230,9 @@ class CloseLandedFansOutToSameTipPeersTest(CloseBase):
         row, why, sent = dispatches.send(
             recipient, lane, "review " + lane, tip, repo=self.repo,
             key="key-%s-%s" % (lane, recipient), sign=False, kind=kind,
-            new_work=supersedes is None, supersedes=supersedes, force=True)
+            new_work=supersedes is None, supersedes=supersedes, force=True,
+            task=self.review_task["id"] if supersedes is None and kind == "review"
+            else None)
         self.assertIsNone(why)
         self.assertTrue(sent)
         if polarity:

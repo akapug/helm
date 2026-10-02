@@ -1305,6 +1305,44 @@ def quota_wall(record):
         and held in _UPSTREAM_QUOTA else None
 
 
+def live_quota_wall(record, now_ms):
+    """`quota_wall`, except that a HELD wall whose own recorded reset has
+    passed holds nothing -> the state name, or None.
+
+    A cooldown or auth hold mirrors the vendor's wall only until the vendor
+    resets: once the recorded horizon is past, the next request may succeed,
+    so the hold no longer answers why the seat is dark and a restart is again
+    worth asking about. A wall the canary measures this pass stands as it
+    is; a hold with no recorded horizon keeps holding (UNKNOWN is not past)."""
+    held = quota_wall(record)
+    if held and record.get("state") not in _UPSTREAM_QUOTA \
+            and type(record.get("resets_at_ms")) is int \
+            and record["resets_at_ms"] <= now_ms:
+        return None
+    return held
+
+
+def quota_wall_kind(record):
+    """"balance" / "window" for the vendor quota wall a family or seat record
+    stands on, or None when there is no wall or its kind is unrecorded or
+    mixed.
+
+    The record's own ``refusal_kind`` answers first; a durable family record
+    carries none, so its walled seats answer, and only when they agree. The
+    kind is `poolwall.quota_kind`'s, written where the wall was measured."""
+    if not quota_wall(record):
+        return None
+    kind = record.get("refusal_kind")
+    if kind in ("balance", "window"):
+        return kind
+    seats = record.get("seats")
+    kinds = {seat.get("refusal_kind") for seat in (
+        seats.values() if isinstance(seats, dict) else ())
+        if isinstance(seat, dict) and quota_wall(seat)}
+    return kinds.pop() if len(kinds) == 1 and \
+        kinds <= {"balance", "window"} else None
+
+
 def dark_origin(state):
     """Who produced this dark state -> DARK_OURS / DARK_OUR_VALIDATION / DARK_UNTYPED.
 
@@ -2801,6 +2839,16 @@ def _refusal_provenance(state, detail):
     return "body-signature:%s" % match[0] if match else "body-signature:quota"
 
 
+def _refusal_kind(detail):
+    """The repair kind of a canary-measured quota wall (`poolwall.quota_kind`
+    over the same detail the provenance label reads) -> str or None."""
+    try:
+        from . import poolwall
+        return poolwall.quota_kind(str(detail or "").lower())
+    except Exception:                        # noqa: BLE001 — a watch never raises
+        return None
+
+
 def _vendor_quota(low):
     """Does this lower-cased refusal body name a vendor quota wall -> bool."""
     words = _vendor_words(low)
@@ -3392,6 +3440,36 @@ def _prior_seats(record):
     return seats if isinstance(seats, dict) else {}
 
 
+def vendor_cause(family, seat_name, now=None):
+    """The vendor refusal behind one seat's proxy cooldown -> poolwall's
+    cause ({kind, vendor, observed_at, ...}), or None.
+
+    A PROXY-COOLDOWN names WHERE the refusal happened, not WHY. The proxy
+    cools a credential because the vendor refused it, and when the canary
+    only ever meets the proxy's own 429 it never measures that refusal, so
+    the cooldown read as ours and its repair as a restart. The seat's
+    proxy.log carries the vendor's refusal, and `poolwall.seat_wall` already
+    walks back to it (the cause and its episode); this asks that one reader
+    rather than growing a second. A missing or unreadable log, no wall in
+    force, or a wall with no vendor cause answers None: the cooldown keeps
+    reading ours, which is the loud direction. Never raises."""
+    try:
+        from . import poolwall
+        wall, _why = poolwall.seat_wall(seat_name, family=family, now=now)
+    except Exception:                        # noqa: BLE001 — a watch never raises
+        return None
+    cause = wall.get("cause") if isinstance(wall, dict) else None
+    return cause if isinstance(cause, dict) and cause.get("kind") in (
+        "window", "balance") else None
+
+
+def _cause_provenance(cause):
+    """A bounded producer label for a wall the proxy log names; never the
+    body: ``proxy-log:<vendor>:<window|balance>``."""
+    vendor = re.sub(r"[^A-Za-z0-9._-]", "", str(cause.get("vendor") or ""))
+    return "proxy-log:%s:%s" % (vendor[:40] or "upstream", cause["kind"])
+
+
 def upstream_seat_sample(upstream, family, seat_name):
     """One report-time seat observation, falling back only for legacy records."""
     family_record = upstream.get(family) if isinstance(upstream, dict) else None
@@ -3404,8 +3482,14 @@ def upstream_seat_sample(upstream, family, seat_name):
 
 
 def _compose_upstream_seat(seat_name, result, before, now, birth=None,
-                           identity_state="NO-REPRESENTATIVE"):
-    """One canonical local-process verdict with cooldown continuity."""
+                           identity_state="NO-REPRESENTATIVE", cause=None):
+    """One canonical local-process verdict with cooldown continuity.
+
+    ``cause`` is the vendor refusal behind a PROXY-COOLDOWN (`vendor_cause`).
+    With one, and no wall already held, the cooldown holds a QUOTA-WALL the
+    proxy log measured, exactly as it holds one a canary measured: the local
+    cooldown is the vendor's refusal mirrored, and its repair is the vendor's
+    reset, not a restart."""
     state, detail, elapsed = result
     before = before if isinstance(before, dict) else {}
     # A BUSY READING OVER A HEALTHY RECORD KEEPS IT HEALTHY. Keepalive bytes
@@ -3427,6 +3511,8 @@ def _compose_upstream_seat(seat_name, result, before, now, birth=None,
         and wall_at is not None and 0 <= now - wall_at <= QUOTA_WALL_INHERIT_S \
         and before_reset
     held_wall = prior_wall if state == _PROXY_COOLDOWN or auth_hold else None
+    caused = cause if state == _PROXY_COOLDOWN and not held_wall \
+        and isinstance(cause, dict) else None
     before_dark = bool(before.get("dark") or
                        _named_upstream_dark(before.get("state")))
     dark = _named_upstream_dark(state) or state == "UNKNOWN" and before_dark
@@ -3440,6 +3526,7 @@ def _compose_upstream_seat(seat_name, result, before, now, birth=None,
         current.update({
             "refusal_class": "money",
             "refusal_provenance": _refusal_provenance(state, detail),
+            "refusal_kind": _refusal_kind(detail),
             "wall_observed_at": _iso(now),
         })
         reset = _quota_reset_ms(detail, now)
@@ -3454,10 +3541,20 @@ def _compose_upstream_seat(seat_name, result, before, now, birth=None,
         current.update({"quota_wall": held_wall,
                         "wall_observed_at": before.get("wall_observed_at") or
                                             before.get("since")})
-        for key in ("refusal_class", "refusal_provenance", "resets_at_ms",
-                    "reset_kind", "reset_source"):
+        for key in ("refusal_class", "refusal_provenance", "refusal_kind",
+                    "resets_at_ms", "reset_kind", "reset_source"):
             if before.get(key) is not None:
                 current[key] = before[key]
+    elif caused:
+        # The proxy log measured the vendor's refusal the canary could not.
+        # It states no reset instant, so the horizon stays UNKNOWN unless the
+        # owner enters one (`owner_reset_fields`).
+        at = caused.get("observed_at")
+        current.update({"quota_wall": _QUOTA_WALL, "refusal_class": "money",
+                        "refusal_provenance": _cause_provenance(caused),
+                        "refusal_kind": caused["kind"],
+                        "wall_observed_at": _iso(at) if isinstance(
+                            at, (int, float)) else _iso(now)})
 
     # The falsification clock is a COOLDOWN's: it times a belief the proxy
     # will drop on restart. A PROXY-LOCAL-403 carries no clock and no
@@ -3617,7 +3714,9 @@ def upstream_health(rows, now=None, prior=None, frozen_families=()):
                 before = {}
             seats[name] = _compose_upstream_seat(
                 name, result, before, now,
-                birth=birth, identity_state=identity_state)
+                birth=birth, identity_state=identity_state,
+                cause=vendor_cause(family, name, now)
+                if result[0] == _PROXY_COOLDOWN else None)
             if measured_by:
                 seats[name]["measured_by"] = measured_by
         for name, before in sorted(before_seats.items()):
@@ -3682,9 +3781,17 @@ def upstream_health(rows, now=None, prior=None, frozen_families=()):
             wall_rows, key=lambda record: record["resets_at_ms"])) \
             if wall_rows else seats[selected]
         held = quota_wall(wall)
-        if state in _UPSTREAM_QUOTA or state == "AUTH-UNAVAILABLE" and held:
+        # A family dark in PROXY-COOLDOWN stands on the vendor's wall only
+        # when EVERY seat's cooldown mirrors one: a seat cooling on its own
+        # keeps the family's repair ours.
+        mirrored = state == _PROXY_COOLDOWN and \
+            all(live_quota_wall(record, now * 1000)
+                for record in seats.values())
+        if state in _UPSTREAM_QUOTA or \
+                (state == "AUTH-UNAVAILABLE" or mirrored) and held:
             current.update({key: wall.get(key) for key in (
-                "refusal_class", "refusal_provenance", "wall_observed_at",
+                "refusal_class", "refusal_provenance", "refusal_kind",
+                "wall_observed_at",
                 "resets_at_ms", "reset_kind", "reset_source")
                             if wall.get(key) is not None})
             if held and state not in _UPSTREAM_QUOTA:
@@ -5703,29 +5810,83 @@ def _merge_transitions(*groups):
     return out
 
 
+def _seat_event(row):
+    """One family edge as a seat event (seatevents): a local family's is a
+    serving outage owned by the local-serving steward, any other family's a
+    credential wall owned by the credentials steward. Its key is the family
+    (the episode) and its identity is the one `_merge_transitions` dedups on,
+    so a re-offered edge is one event."""
+    from . import burnflags, seatevents
+    local = row["family"] in burnflags.local_families()
+    said = {"family-dark": "dark", "family-down": "stood down"}
+    kind = {"family-dark": "outage" if local else "wall",
+            "family-down": "stood-down"}.get(
+                row["kind"], "recovered" if local else "unblock")
+    since, detail = row.get("since"), row.get("detail")
+    more = "; ".join(x for x in (since and "since %s" % since,
+                                 detail and str(detail)[:160]) if x)
+    return seatevents.event(
+        "local-serving" if local else "credentials",
+        "family:%s" % row["family"], kind,
+        "%s|%s" % (row.get("state"), since),
+        "%s %s %s" % (row["family"], said.get(row["kind"], "recovered"),
+                      row["state"]),
+        more=more or None, push=True, title="helm upstream transition",
+        head="helm proxywatch: ")
+
+
+def _seat_ledger():
+    """The seat-event ledger, beside this watch's own state."""
+    from . import seatevents
+    return os.path.join(os.path.dirname(_state_path()),
+                        seatevents.LEDGER_NAME)
+
+
+def _seat_events_pass(seats, flag_body, now):
+    """The pass's #seats rows with no phone push (task/3876): the burn-flag
+    fold's FAMILY-BUDGET-LOW crossing and one row per new pool wall, each
+    @mentioning its component's steward. The crossing is latched by the fold
+    and a wall by poolwall's claim, so each is a new event here: a crossing
+    is keyed on this pass, a wall on its seat and expiry. Never raises."""
+    try:
+        from . import poolwall, seatevents
+        events = []
+        if flag_body:
+            events.append(seatevents.event(
+                "credentials", "burn-flags", "budget", "%d" % now, flag_body))
+        for seat, wall in poolwall.claims(seats, now=now):
+            at = int(wall["expires_at"])
+            events.append(seatevents.event(
+                poolwall.component(wall), "pool:%s@%d" % (seat, at), "wall",
+                "%d" % at, poolwall.room_line(wall)))
+        if not events:
+            return None
+        return seatevents.announce(events, now=now, path=_seat_ledger())
+    except Exception as e:                  # noqa: BLE001
+        print("helm proxywatch: the #seats rows failed (%s)" % e,
+              file=sys.stderr)
+        return None
+
+
 def _owner_push(transitions):
-    """One optional phone push for the whole transition batch -> delivered.
+    """One optional phone push for the whole transition batch -> delivered,
+    and one #seats row per edge, from the SAME events (task/3876).
 
     The owner is GUI-first and off-host: family dark/recovered edges are the
     two he must not learn about by running anything. HELM_NTFY_TOPIC absent is
     a deliberate opt-out and acknowledges the batch; a failed POST returns
     False so the caller's outbox keeps the edges for at-least-once retry.
 
-    THE TRANSPORT IS `notify.owner_push` AND NOTHING HERE, since 2026-08-03:
-    this function used to carry its own copy of the endpoint resolution, the
-    timeout and the fail-open receipt, and so did the store's graduation push.
-    A third caller (beacons' reachability alarm) made the duplication a bug —
-    the owner has ONE phone channel and every alarm composes onto it.
+    THE TRANSPORT IS `notify.owner_push` AND NOTHING HERE, reached through
+    `seatevents.announce` (task/3876): the edge that rings the owner's phone
+    also posts once to #seats, @mentioning the steward of that family's
+    credentials (or of local serving), whose beacon an @mention wakes. The #helm health report is unchanged. The seat-event
+    ledger sits beside this watch's own state and re-sends only the channel
+    still owed, so a re-offered edge neither re-posts nor re-pushes.
     """
-    if not transitions:
-        return True
-    from . import notify
-    said = {"family-dark": "dark", "family-down": "stood down"}
-    body = "helm proxywatch: " + "; ".join(
-        "%s %s %s" % (row["family"], said.get(row["kind"], "recovered"),
-                      row["state"]) for row in transitions)
-    return notify.owner_push(body, title="helm upstream transition",
-                             receipt=("proxywatch.notify_failed", "upstream"))
+    from . import seatevents
+    events = [_seat_event(row) for row in transitions or ()]
+    return seatevents.announce(events, path=_seat_ledger())["pushed"]
 
 
 def _codexbudget():
@@ -5843,9 +6004,33 @@ def _claude_pace_pass(rep):
     Never raises: a reporting rung must not take the watchdog down."""
     try:
         from . import claudepace
-        return claudepace.watch_pass(now=rep["ts"])
+        reading = claudepace.watch_pass(now=rep["ts"])
     except Exception as e:                  # noqa: BLE001
         print("helm proxywatch: claude 5h pace unread (%s)" % e,
+              file=sys.stderr)
+        return None
+    _seat_switch(reading, rep["ts"])
+    return reading
+
+
+def _seat_switch(reading, now):
+    """The default Claude home's latest switch (task/3871) as one #seats row,
+    @mentioning the credentials steward, once per switch and only while it is
+    news (claudepace.HANDOFF_SAY_S, the window each seat hears it in). It
+    rides no phone push: none existed for a switch. Never raises."""
+    try:
+        from . import claudepace, seatevents
+        last = (reading or {}).get("switch")
+        at = last.get("at") if isinstance(last, dict) else None
+        if not isinstance(at, (int, float)) \
+                or not 0 <= now - at <= claudepace.HANDOFF_SAY_S:
+            return None
+        return seatevents.announce([seatevents.event(
+            "credentials", "claude-default-home", "switch", "%d" % at,
+            "claudepace: " + claudepace.switched_text(reading))],
+            now=now, path=_seat_ledger())
+    except Exception as e:                  # noqa: BLE001
+        print("helm proxywatch: the switch row failed (%s)" % e,
               file=sys.stderr)
         return None
 
@@ -6402,13 +6587,10 @@ def _family_quota_wall(row, before, now_ms):
     upstream refusals read PROXY-COOLDOWN. The quota verdict is held across
     those passes and only those: any other state ends it, PROXY-LOCAL-403
     included, because nothing measured ties a 403 our proxy minted to the
-    vendor's refusal. An AUTH-UNAVAILABLE hold whose own reset has passed
-    holds nothing."""
+    vendor's refusal. A held wall (AUTH-UNAVAILABLE or PROXY-COOLDOWN) whose
+    own reset has passed holds nothing (`live_quota_wall`)."""
     state = row.get("state")
-    current = quota_wall(row)
-    if state == "AUTH-UNAVAILABLE" and type(row.get("resets_at_ms")) is int \
-            and row["resets_at_ms"] <= now_ms:
-        current = None
+    current = live_quota_wall(row, now_ms)
     legacy = quota_wall(dict(before, state=state)) \
         if state == _PROXY_COOLDOWN and before else None
     if type(before.get("resets_at_ms")) is int \
@@ -7449,8 +7631,8 @@ def cmd_proxywatch(args):
         else:
             flag_body, rep["burn_flag_colours"] = _burnflags().watch_notice(
                 rep["burn_flags"].get("families"), prior_flags.get("colours"))
-        if flag_body:
-            pending_chat.append(flag_body)
+        # THE CROSSING GOES TO #SEATS, not #helm (task/3876): its steward is
+        # woken, and it rides the seat-event ledger with the pool walls below.
         # PROJECT-BUDGET, PER PROJECT, TO THE PROJECT'S LEAD (task/3156):
         # the same fold read against each authored team's share, latched on
         # the project's colour and never on the numbers, and posted once the
@@ -7500,12 +7682,12 @@ def cmd_proxywatch(args):
             rep["codex_resets_blocked"] = reset_blocked
         # ONE ROOM LINE PER POOL WALL PER SEAT (helm/poolwall.py). The pass
         # is the observer; the claim is taken here, once, and the line rides
-        # the same durable outbox as every other alert, so a failed post is
+        # the seat-event ledger to #seats (task/3876), so a failed post is
         # retried next cadence and never re-claimed.
-        from . import poolwall
-        pending_chat.extend(body for _seat, body in poolwall.announcements(
+        _seat_events_pass(
             sorted({row["seat"] for row in rep["seats"]
-                    if row.get("family") and not row.get("error")})))
+                    if row.get("family") and not row.get("error")}),
+            flag_body, rep["ts"])
         # Persist both channel outboxes and the family latch before delivery.
         failed = _deliver(rep, prior, pending_chat, pending_ntfy)
         if failed is not None:

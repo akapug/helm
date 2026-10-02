@@ -31,6 +31,7 @@ from tests._tmphome import home as _tmp_home  # noqa: E402
 _tmp_home(prefix="helm-test-home-", var="HELM_HOME")
 
 from helm import cli, handoff, hooks, inject, pk, record, resumeturn, session  # noqa: E402
+from helm import workingset  # noqa: E402
 
 # HELM_CHAT_NAME is SET by the attribution tests, so it belongs here: setUp
 # pops this tuple and tearDown restores it, which means a key that is set but
@@ -604,6 +605,13 @@ class CheckBase(HandoffBase):
             return self.run_cmd(handoff.cmd_handoff, ["check", "--hook-json"],
                                 payload)
 
+    def nag(self):
+        """What a PreCompact check said. It never reaches PreCompact stdout,
+        which Claude Code hands the summarizer: it goes to the session's nag
+        file, and the working-set hook gives it to the seat after the
+        compaction (task/4054). Read once, as that hook reads it."""
+        return "\n".join(workingset.take_nag(self.SID))
+
 
 class CheckTest(CheckBase):
     """The handoff-check arms, on CheckBase's fixture.
@@ -781,6 +789,20 @@ class CheckTest(CheckBase):
         def rewrite_in_place(path, text=None):
             answer = classify(path, text)
             if not rewrote:
+                # The kernel stamps ctime from a coarse clock, so an in-place
+                # rewrite inside one tick leaves st_ctime_ns equal to identity's
+                # and the assert below flakes under load (train554). Force the
+                # coarse clock past identity before the rewrite — a tiny probe
+                # touch, bounded, never a fixed sleep — so the ctime the
+                # identity proves has genuinely moved past the value it must not
+                # equal.
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    now_ns = os.stat(path).st_ctime_ns
+                    if now_ns > identity.st_ctime_ns:
+                        break
+                    os.utime(path)
+                    time.sleep(0.001)
                 with open(path, "r+", encoding="utf-8") as f:
                     f.write(replacement)
                     f.truncate()
@@ -1245,16 +1267,18 @@ class CheckTest(CheckBase):
         self.assertIn(handoff.REPO_FILE, out)
 
     def test_hook_mode_two_legs_one_trigger(self):
-        # missing contract: nag on stdout, rc 0, AND the snapshot was taken
+        # missing contract: nag in the nag file and NOT on stdout (the
+        # summarizer reads PreCompact stdout), rc 0, AND the snapshot was taken
         rc, out, err = self.hook_check(json.dumps(
             {"session_id": self.SID, "cwd": self.wd,
              "hook_event_name": "PreCompact", "trigger": "auto",
              "transcript_path": self.tp}))
-        self.assertEqual((rc, err), (0, ""))
-        self.assertIn("NO handoff artifact", out)
-        self.assertIn("helm handoff write", out)
-        self.assertIn("helm now show", out)
-        self.assertLessEqual(len(out.splitlines()), 4)   # PreCompact fires late
+        self.assertEqual((rc, out, err), (0, "", ""))
+        nag = self.nag()
+        self.assertIn("NO handoff artifact", nag)
+        self.assertIn("helm handoff write", nag)
+        self.assertIn("helm now show", nag)
+        self.assertLessEqual(len(nag.splitlines()), 4)   # PreCompact fires late
         self.assertIn("sid=aaaabbbb", self.read_now())   # leg 2 rode the trigger
 
     def precompact_record(self):
@@ -1286,8 +1310,8 @@ class CheckTest(CheckBase):
             {"session_id": self.SID, "cwd": self.wd,
              "hook_event_name": "PreCompact", "trigger": "auto",
              "transcript_path": self.tp}))
-        self.assertEqual((rc, err), (0, ""))
-        self.assertIn("NO handoff artifact", out)   # the nag legs still ran
+        self.assertEqual((rc, out, err), (0, "", ""))
+        self.assertIn("NO handoff artifact", self.nag())   # the nag legs still ran
         rec = self.precompact_record()
         self.assertEqual(rec["trigger"], "auto")
         self.assertEqual(rec["session"], self.SID)
@@ -1582,7 +1606,7 @@ class CompactionFloorTest(CheckBase):
             handoff.compaction_floor(boundary - 3600, tp, now=boundary + 60),
             boundary)
 
-    def test_a_37h_old_handoff_no_longer_satisfies_a_compaction(self):
+    def test_a_37h_old_handoff_no_longer_satisfies_a_compaction(self):  # noqa: VACUOUS_ASSERTION — the empty stdout is the cure (task/4054); the same nag is asserted present on its new channel, unconditionally, right after
         """The live case, end to end through the hook."""
         with mock.patch.object(inject, "project_for_cwd", return_value="proj"):
             p = self.journal_entry(age_h=37)
@@ -1594,11 +1618,12 @@ class CompactionFloorTest(CheckBase):
             # inside 48h; what changed is which question a compaction asks
             self.assertEqual(handoff.check(self.SID, self.wd, None), p)
             rc, out, err = self.hook_check(payload)
-            self.assertEqual((rc, err), (0, ""))
-            self.assertIn("predates this compaction", out)
-            self.assertIn("37h old", out)
-            self.assertIn(os.path.basename(p), out)
-            self.assertIn("helm handoff write", out)
+            self.assertEqual((rc, out, err), (0, "", ""))
+            nag = self.nag()
+            self.assertIn("predates this compaction", nag)
+            self.assertIn("37h old", nag)
+            self.assertIn(os.path.basename(p), nag)
+            self.assertIn("helm handoff write", nag)
 
     def test_a_handoff_written_FOR_the_compaction_is_silent(self):
         with mock.patch.object(inject, "project_for_cwd", return_value="proj"):
@@ -1622,8 +1647,8 @@ class CompactionFloorTest(CheckBase):
                 {"session_id": self.SID, "cwd": self.wd,
                  "hook_event_name": "PreCompact",
                  "transcript_path": self.transcript(boundary_at=stamp)}))
-            self.assertEqual(rc, 0)
-            self.assertIn("predates this compaction", out)
+            self.assertEqual((rc, out), (0, ""))
+            self.assertIn("predates this compaction", self.nag())
 
     def test_SessionEnd_keeps_the_STANDING_question(self):
         """Scoped, not a blanket tightening: nothing is discarded mid-flight at
@@ -1769,10 +1794,11 @@ class UnreadableIsNotAbsentTest(CheckBase):
         with mock.patch.object(inject, "project_for_cwd", return_value="proj"):
             rc, out, _err = self.run_cmd(handoff.cmd_handoff,
                                          ["check", "--hook-json"], payload)
-        self.assertEqual(rc, 0, "the hook stays fail-open TOTAL")
-        self.assertIn("UNKNOWN", out)
-        self.assertNotIn("starts blind", out)
-        self.assertIn("not author a second handoff", out)
+        self.assertEqual((rc, out), (0, ""), "the hook stays fail-open TOTAL")
+        nag = self.nag()
+        self.assertIn("UNKNOWN", nag)
+        self.assertNotIn("starts blind", nag)
+        self.assertIn("not author a second handoff", nag)
 
     def test_the_hollow_candidate_is_REMEMBERED_by_the_same_walk(self):
         """The half that makes deleting the second look possible, and a
@@ -1825,9 +1851,10 @@ class UnreadableIsNotAbsentTest(CheckBase):
         self.assertEqual(m.call_count, 1,
                          "contract_state must scan ONCE — a second look gated "
                          "on disliking the first is the defect codex named")
-        self.assertEqual(rc, 0)
-        self.assertIn("UNKNOWN", out)
-        self.assertIn("the only scan", out)
+        self.assertEqual((rc, out), (0, ""))
+        nag = self.nag()
+        self.assertIn("UNKNOWN", nag)
+        self.assertIn("the only scan", nag)
 
     def test_the_CLI_separates_UNKNOWN_from_UNMET_by_RC(self):
         """rc 1 already means the contract is unmet. A script must be able to
@@ -1882,6 +1909,12 @@ class SwallowClosureAuditTest(unittest.TestCase):
         ("contract_state", "check_checked"):
             "THE surface seam: asks ONCE and folds every err plus the hollow "
             "classification the scan already computed, so no caller drops one",
+        ("cmd_handoff", "check_checked"):
+            "the direct `check` verb's satisfied path (task/4132): it must "
+            "print the NEWER hollow beside the winner, and contract_state "
+            "folds the hollow away once a winner exists — so the verb asks "
+            "the scan itself, ONCE, and derives loose/missing from the same "
+            "answer the way contract_state does",
         ("check_checked", "hollow_checked"):
             "the scan classifies each candidate DURING its own walk — this is "
             "the edge that lets contract_state never re-read the entry, so it "
@@ -1947,7 +1980,7 @@ class SwallowClosureAuditTest(unittest.TestCase):
         return {(who, seam): n for seam in self.SEAMS
                 for who, n in self._calls(seam).items()}
 
-    def test_no_edge_is_walked_TWICE(self):  # noqa: VACUOUS_ASSERTION — emptiness IS the claim; assertEqual(len(counts), 4) is the unconditional control on the same sweep
+    def test_no_edge_is_walked_TWICE(self):  # noqa: VACUOUS_ASSERTION — emptiness IS the claim; assertEqual(len(counts), len(DECLARED)) is the unconditional control on the same sweep
         """codex, gate 3e543d9036bd8435: "duplicate same-edge calls ... leave
         the audit green". They did — the edge set collapsed them. Each declared
         edge is ONE call, and a second one on the SAME edge is exactly the
@@ -1957,13 +1990,13 @@ class SwallowClosureAuditTest(unittest.TestCase):
         # Positive control on the same observable: an empty count map would
         # make the emptiness below vacuous, which is the failure mode this
         # whole class keeps re-learning.
-        self.assertEqual(len(counts), 4, sorted(counts))
+        self.assertEqual(len(counts), len(self.DECLARED), sorted(counts))
         extra = sorted((e, n) for e, n in counts.items() if n != 1)
         self.assertEqual(extra, [], "an edge is walked more than once — a "
                          "second read of the same entry can disagree with the "
                          "first: %r" % extra)
 
-    def test_no_DYNAMIC_route_to_a_seam_exists(self):  # noqa: VACUOUS_ASSERTION — emptiness IS the claim; assertEqual(len(self._edges()), 4) is the unconditional control on the same sweep
+    def test_no_DYNAMIC_route_to_a_seam_exists(self):  # noqa: VACUOUS_ASSERTION — emptiness IS the claim; assertEqual(len(self._edges()), len(DECLARED)) is the unconditional control on the same sweep
         """getattr and aliasing CANNOT be resolved by an AST sweep, so this
         audit refuses them instead of missing them (codex's escape list).
         A seam name reached through getattr(), or bound to another name and
@@ -1974,7 +2007,7 @@ class SwallowClosureAuditTest(unittest.TestCase):
         # Positive control FIRST: the sweep parsed a real module and can see
         # the seams. Without it, a parse that returned nothing would report
         # "no dynamic routes" about a file it never read.
-        self.assertEqual(len(self._edges()), 4)
+        self.assertEqual(len(self._edges()), len(self.DECLARED))
         for node in ast.walk(tree):
             # getattr(x, "check_checked") — a route no static reader can follow
             if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
@@ -1996,7 +2029,7 @@ class SwallowClosureAuditTest(unittest.TestCase):
         # positive control: the sweep found the graph at all. Without this, a
         # parser that silently returned nothing would make BOTH set-diffs empty
         # and this audit would certify every future rewiring.
-        self.assertEqual(len(edges), 4, "expected the four declared edges; the "
+        self.assertEqual(len(edges), len(self.DECLARED), "expected the declared edges; the "
                          "sweep found %r" % sorted(edges))
         undeclared = sorted(edges - set(self.DECLARED))
         self.assertEqual(undeclared, [], "a consumer reached a seam it does "
@@ -2609,6 +2642,138 @@ class AHandoffDescriptionSaysWhenItIsShortTest(HandoffBase):
         description is the lead line and nothing else."""
         _path, desc, _text = self.entry("ship it")
         self.assertEqual(desc, "handoff: ship it")
+
+
+class JournalReadCapTest(CheckBase):
+    """task/4132: the journal scan reads each handoff WHOLE up to a named cap
+    far above any real one, says UNKNOWN past it, and names a newer hollow
+    candidate beside the older winner — never classifying a 64 KiB prefix as
+    the entry (the silent-hollow defect this class pins)."""
+
+    def _typed_handoff(self, name, body, age_s=0, sid=None, kind="handoff"):
+        d = os.path.join(os.environ["HELM_HOME"], "proj", "journal")
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, name)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("---\nmetadata:\n  type: %s\n"
+                    "  session_id: %s\n---\n\n%s" % (kind, sid or self.SID,
+                                                     body))
+        if age_s:
+            t = time.time() - age_s
+            os.utime(p, (t, t))
+        return p
+
+    def test_a_handoff_whose_next_starts_past_64k_is_found_whole(self):
+        # RED at f.read(65536): the NEXT heading sits past the old prefix, so
+        # the snapshot classified the entry hollow on 'next' and the check
+        # reported nothing found.
+        filler = "\n" + ("context line\n" * 6000)  # ~72k chars of body
+        p = self._typed_handoff(
+            "2026-10-02-handoff-big.md",
+            "## DONE\n- x\n\n## REMAINING\n- y\n" + filler +
+            "\n## NEXT\n- the real next step\n")
+        with mock.patch.object(inject, "project_for_cwd",
+                               return_value="proj"), \
+                mock.patch.object(handoff.home, "session_id",
+                                  return_value=self.SID):
+            found, _m, hollow, unread = handoff.check_checked(
+                self.SID, self.wd, None)
+        self.assertIsNone(unread, unread)
+        self.assertEqual(found, p, "a 72k handoff must be read whole, not "
+                         "classified hollow from its first 65536 chars")
+        self.assertIsNone(hollow)
+
+    def test_an_oversize_handoff_is_unknown_never_truncated(self):
+        big = handoff.JOURNAL_READ_CAP + 100
+        p = self._typed_handoff(
+            "2026-10-02-handoff-huge.md",
+            "## DONE\n- x\n\n## REMAINING\n- y\n\n## NEXT\n- z\n"
+            + "pad\n" * (big // 4))
+        with mock.patch.object(inject, "project_for_cwd",
+                               return_value="proj"), \
+                mock.patch.object(handoff.home, "session_id",
+                                  return_value=self.SID):
+            found, _m, _hollow, unread = handoff.check_checked(
+                self.SID, self.wd, None)
+        self.assertIsNone(found)
+        self.assertIsNotNone(unread, "an oversize entry is UNKNOWN, never "
+                             "silently classified from a prefix")
+        self.assertIn("read cap", unread)
+        self.assertIn("huge", unread)
+        self.assertIn("(%d bytes)" % os.path.getsize(p), unread,
+                      "the UNKNOWN names the entry's size, not only the cap")
+
+    FULL = "## DONE\n- x\n\n## REMAINING\n- y\n\n## NEXT\n- z\n"
+
+    def _scan(self):
+        with mock.patch.object(inject, "project_for_cwd",
+                               return_value="proj"), \
+                mock.patch.object(handoff.home, "session_id",
+                                  return_value=self.SID), \
+                mock.patch.object(handoff, "JOURNAL_READ_CAP", 1024):
+            return handoff.check_checked(self.SID, self.wd, None)
+
+    def test_an_oversize_entry_that_is_not_a_candidate_hides_nothing(self):
+        # RED when the cap fired before the window, type and owner filters:
+        # one stale, foreign or non-handoff entry past the cap on a SHARED
+        # shelf turned every seat's check UNKNOWN (rc 2), where the prefix
+        # read had filtered it out. Those filters read the stamp and the
+        # frontmatter at the top, which the capped snapshot holds whole.
+        pad = "pad\n" * 600                  # ~2.4k chars, over the 1k cap
+        self._typed_handoff("2026-10-02-handoff-foreign.md", self.FULL + pad,
+                            sid="ffffeeee-9999-8888-7777-666655554444")
+        self._typed_handoff("2026-10-02-note-big.md", self.FULL + pad,
+                            kind="note")
+        self._typed_handoff("2026-10-02-handoff-stale.md", self.FULL + pad,
+                            age_s=(handoff.FRESH_H + 1) * 3600)
+        found, _m, hollow, unread = self._scan()
+        self.assertEqual((found, hollow, unread), (None, None, None),
+                         "no candidate on the shelf: an honest absence, not "
+                         "UNKNOWN")
+        # control, same fixture and cap: an OWNED fresh entry past the cap
+        # is a candidate, so the same scan says UNKNOWN naming it.
+        self._typed_handoff("2026-10-02-handoff-mine.md", self.FULL + pad)
+        found, _m, _hollow, unread = self._scan()
+        self.assertIsNone(found)
+        self.assertIn("handoff-mine.md is over the 1024-char handoff read "
+                      "cap", unread or "")
+        self.assertNotIn("foreign", unread)
+        self.assertNotIn("note-big", unread)
+        self.assertNotIn("stale", unread)
+
+    def test_hollow_checked_past_the_cap_answers_unknown_never_raises(self):
+        # RED when its own read raised past the cap: the `_checked` seam
+        # answers ((), err) for every entry it could not look at whole.
+        p = self._typed_handoff("2026-10-02-handoff-solo.md",
+                                self.FULL + "pad\n" * 600)
+        with mock.patch.object(handoff, "JOURNAL_READ_CAP", 1024):
+            missing, err = handoff.hollow_checked(p)
+        self.assertEqual(missing, ())
+        self.assertIn("read cap (%d bytes)" % os.path.getsize(p), err or "")
+        # control: under the cap the same seam classifies it
+        self.assertEqual(handoff.hollow_checked(p), ((), None))
+
+    def test_a_newer_hollow_is_named_beside_the_older_winner(self):
+        older = self._typed_handoff(
+            "2026-10-02-handoff-older.md",
+            "## DONE\n- x\n\n## REMAINING\n- y\n\n## NEXT\n- z\n", age_s=3600)
+        newer = self._typed_handoff(
+            "2026-10-02-handoff-newer.md",
+            "## DONE\n- x\n", age_s=5)  # hollow: no REMAINING, no NEXT
+        with mock.patch.object(handoff.home, "session_id",
+                               return_value=self.SID), \
+                mock.patch.object(handoff, "canonical_sid",
+                                  side_effect=lambda s: s), \
+                self.git_mock(), \
+                mock.patch.object(inject, "project_for_cwd",
+                                  return_value="proj"):
+            rc, out, err = self.run_cmd(handoff.cmd_handoff, ["check"])
+        self.assertEqual(rc, 0, err)
+        self.assertIn(older, out)
+        self.assertIn(os.path.basename(newer), err,
+                      "the newer hollow must be named beside the winner, not "
+                      "hidden behind it")
+        self.assertIn("NEWER", err)
 
 
 if __name__ == "__main__":

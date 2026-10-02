@@ -2085,7 +2085,14 @@ def _say(notes, line):
 
 
 def _refuse(err, rc=2):
-    print("helm goal: " + str(err), file=sys.stderr)
+    # THE DOOR IS ALREADY ON THE SENTENCE when the project check wrote it.
+    # require_project starts with "helm goal add:"; a second "helm goal:"
+    # in front of that is the double prefix (task/3994). A sentence that
+    # names no door still gets this one.
+    text = str(err)
+    if not text.startswith("helm goal"):
+        text = "helm goal: " + text
+    print(text, file=sys.stderr)
     return rc
 
 
@@ -2145,8 +2152,15 @@ def _cmd_add(rest):
     if not (title or "").strip() and not opts["--from"]:
         return _refuse("add needs a title (or --from task/NNN to promote a "
                        "row)\n" + USAGE)
-    project, _how, err = tasks.resolve_scope(opts["--project"],
-                                             "helm goal add")
+    # A NEW GOAL NAMES ITS PROJECT, through the check `helm task add` makes
+    # (task/3745). `--from` promotes a row that already exists and files
+    # nothing new, so it keeps the plain scope read.
+    if opts["--from"]:
+        project, _how, err = tasks.resolve_scope(opts["--project"],
+                                                 "helm goal add")
+    else:
+        project, _how, err = tasks.require_project(opts["--project"],
+                                                   "helm goal add")
     if err:
         return _refuse(err)
     words, criteria, err = parse_body(_stdin())

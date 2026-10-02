@@ -129,7 +129,8 @@ class SubsumedTest(_Seat, _close.CloseBase):
         with self.acting(READER if wrote else AUTHOR):
             target = dispatches.add(
                 "seat-c", "lane/subsumed-%d-r1" % n, ref=original,
-                repo=self.repo, kind="review", notify=False, new_work=True)
+                repo=self.repo, kind="review", notify=False, new_work=True,
+                task=self.review_task["id"])
         _out, err = self.mark_verdict(target["id"], original,
                                       "original verdict", polarity="approve")
         self.assertIsNone(err, err)
@@ -182,7 +183,7 @@ class ResolvedTest(_Seat, _close.CloseBase):
             original, why, sent = dispatches.send(
                 "seat-c", "lane/resolved-%d" % n, "review it", reviewed,
                 repo=self.repo, key="key-resolved-%d" % n, sign=False,
-                kind="review", new_work=True)
+                kind="review", new_work=True, task=self.review_task["id"])
         self.assertIsNone(why, why)
         _out, err = self.mark_verdict(original["id"], reviewed, "findings",
                                       polarity="supersede")
@@ -193,7 +194,7 @@ class ResolvedTest(_Seat, _close.CloseBase):
             confirmation, why, sent = dispatches.send(
                 READER, "lane/confirming-%d" % n, "confirm the round", tip,
                 repo=self.repo, key="key-confirming-%d" % n, sign=False,
-                kind="review", new_work=True)
+                kind="review", new_work=True, task=self.review_task["id"])
         self.assertIsNone(why, why)
         self.read(confirmation, tip, self.RESOLUTION, "supersede", model)
         return original, confirmation
@@ -233,7 +234,8 @@ class ApprovedRecordTest(_Seat, _close.CloseBase):
         with self.acting(READER if wrote else AUTHOR):
             first = dispatches.add(
                 "seat-c", "lane/approved-%d" % n, ref=tip,
-                repo=self.repo, kind="review", notify=False, new_work=True)
+                repo=self.repo, kind="review", notify=False, new_work=True,
+                task=self.review_task["id"])
         with self.acting(AUTHOR):
             row = dispatches.add(
                 READER, "lane/approved-%d" % n, ref=tip,

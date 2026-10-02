@@ -1,0 +1,1 @@
+corpus backup [--dry] [--dest DIR] | status — training-corpus transcript backup: copy-only incremental archive of every CLAUDE + CODEX + /tmp-estate session/subagent/workflow transcript (opencode and pi transcripts are NOT collected; default ~/corpus-archive; HELM_CORPUS_DEST)

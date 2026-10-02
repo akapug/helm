@@ -785,6 +785,107 @@ class NativeTurnSubagentAdmissionTest(unittest.TestCase):
                              (None, MODEL_UNKNOWN))
 
 
+class NativeTurnCandidatesTest(unittest.TestCase):
+    """THE SET BEHIND THE REFUSAL (task/4055). `native_turn_model` stays
+    UNKNOWN when a subagent named another model in the window; a reader
+    that admits by FAMILY asks `native_turn_candidates` for the seat's
+    answer and those other models apart, and gets None wherever the set
+    itself could not be read. The fixture is the admission arms' own,
+    borrowed rather than inherited so their arms run once."""
+
+    T0, HOLD = NativeTurnSubagentAdmissionTest.T0, \
+        NativeTurnSubagentAdmissionTest.HOLD
+    setUp = NativeTurnSubagentAdmissionTest.setUp
+    _subagent = NativeTurnSubagentAdmissionTest._subagent
+
+    def candidates(self, at=None):
+        from helm.native_turn import native_turn_candidates
+        return native_turn_candidates(SESSION, self.HOLD if at is None
+                                      else at, root=self.dir)
+
+    def test_a_workflow_agent_of_another_model_is_kept_apart(self):
+        # POSITIVE CONTROL: the seat alone has no other model.
+        self.assertEqual(self.candidates(),
+                         ("claude-opus-5-5", frozenset()))
+        self._subagent([(self.HOLD - 180, "claude-opus-4-8")],
+                       run="wf_4055")
+        self._subagent([(self.HOLD - 120, "claude-opus-5-5")],
+                       name="agent-a2.jsonl")
+        # The refusal is unchanged, and the set names what it refused on.
+        self.assertEqual(native_turn_model(SESSION, at=self.HOLD,
+                                           root=self.dir),
+                         (None, MODEL_UNKNOWN))
+        self.assertEqual(self.candidates(),
+                         ("claude-opus-5-5", frozenset({"claude-opus-4-8"})))
+
+    def test_a_main_file_sidechain_model_is_a_candidate(self):
+        lines = [_entry_line(t, m) for t, m in self.main]
+        lines.append(_entry_line(self.HOLD - 180, "claude-sonnet-5",
+                                 isSidechain=True))
+        lines.sort(key=lambda line: json.loads(line)["timestamp"])
+        with open(os.path.join(self.dir, "projects", "proj",
+                               "%s.jsonl" % SESSION), "w",
+                  encoding="utf-8") as handle:
+            handle.writelines(lines)
+        self.assertEqual(self.candidates(),
+                         ("claude-opus-5-5", frozenset({"claude-sonnet-5"})))
+
+    def test_routing_and_an_unpinned_answer_have_no_candidates(self):  # noqa: VACUOUS_ASSERTION — the unconditional control is the first assertion: the same session at the hold returns its answer and an empty set
+        from helm.native_turn import native_turn_candidates
+        # POSITIVE CONTROL: the same session at the hold has candidates.
+        self.assertEqual(self.candidates(),
+                         ("claude-opus-5-5", frozenset()))
+        self.assertIsNone(native_turn_candidates(SESSION, None,
+                                                 root=self.dir))
+        # Thirty-one minutes past the seat's last turn: no answer to keep.
+        self.assertIsNone(self.candidates(at=self.T0 + 1140 + 31 * 60))
+
+    def test_an_unreadable_subagent_transcript_is_no_set(self):
+        from helm import native_turn
+        path = self._subagent([(self.HOLD - 180, "claude-opus-4-8")])
+        real = open
+
+        def refuse(name, *rest, **kw):
+            if name == path:
+                raise PermissionError(13, "denied", name)
+            return real(name, *rest, **kw)
+
+        # POSITIVE CONTROL: the same file read is a set.
+        self.assertIsNotNone(self.candidates())
+        with mock.patch.object(native_turn, "open", refuse, create=True):
+            self.assertIsNone(self.candidates())
+
+    def test_a_subagent_walk_the_byte_bound_cuts_is_no_set(self):
+        from helm import native_turn
+        path = self._subagent([(self.HOLD - 180, "claude-opus-4-8")],
+                              mtime=self.HOLD + 60)
+        filler = json.dumps({
+            "type": "user", "sessionId": SESSION, "isSidechain": True,
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z",
+                                       time.gmtime(self.HOLD + 60)),
+            "message": {"role": "user", "content": "x" * 4000}}) + "\n"
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.writelines([filler] * 16)
+        os.utime(path, (self.HOLD + 60, self.HOLD + 60))
+        self.assertEqual(self.candidates(),
+                         ("claude-opus-5-5", frozenset({"claude-opus-4-8"})))
+        with mock.patch.object(native_turn, "_TURN_READ_BYTES", 8192):
+            self.assertIsNone(self.candidates())
+
+    def test_a_record_of_another_harness_has_no_window(self):
+        from helm.native_turn import evidence_turn_candidates
+        self._subagent([(self.HOLD - 180, "claude-opus-4-8")], run="wf_4055")
+        with mock.patch.dict(os.environ, {"HELM_CLAUDE_DIR": self.dir}):
+            # POSITIVE CONTROL: the claude harness's record reads its window.
+            self.assertEqual(
+                evidence_turn_candidates(_native_evidence(), self.HOLD),
+                ("claude-opus-5-5", frozenset({"claude-opus-4-8"})))
+            for harness in ("pi", None):
+                with self.subTest(harness=harness):
+                    self.assertIsNone(evidence_turn_candidates(
+                        _native_evidence(agent_harness=harness), self.HOLD))
+
+
 def _native_evidence(session=SESSION, version=5, **runtime):
     """The family evidence `_approval_identity_family_evidence` returns for
     a verified native roster runtime (dispatches_tier.py)."""

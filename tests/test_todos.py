@@ -49,6 +49,8 @@ ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "CLAUDE_CONFIG_DIR")
 
 SID = "sess-todo-1"
+# The placeholder project a promoted row is filed under (task/3745).
+PROJ = "todoproj"
 
 
 def todo_list(*pairs):
@@ -815,6 +817,90 @@ if __name__ == "__main__":
     unittest.main()
 
 
+class PromoteNamesAProjectTest(TodosBase):
+    """A promoted todo names its project (task/3745): `helm todos promote`
+    takes the cwd's project, the way `helm task add` does, and refuses when
+    the cwd is inside none. `todos.promote` refuses a call with no project."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ["CLAUDE_CONFIG_DIR"] = os.path.join(self.tmp, "claude")
+        os.environ["CLAUDE_CODE_SESSION_ID"] = SID
+        self.pdir = todos.personal_dir(SID)
+        os.makedirs(self.pdir, exist_ok=True)
+        with open(os.path.join(self.pdir, "1.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump({"id": "1", "subject": "placeholder personal work",
+                       "status": "pending"}, fh)
+        self.repo = os.path.realpath(os.path.join(self.tmp, "todoproj-repo"))
+        os.makedirs(self.repo)
+        pk.write_json(os.path.join(os.path.dirname(tasks.ledger_path()),
+                                   "registry.json"),
+                      {"version": 1, "projects": {PROJ: {
+                          "name": PROJ, "path": self.repo}}})
+        self.prior_cwd = os.getcwd()
+
+    def tearDown(self):
+        os.chdir(self.prior_cwd)
+        super().tearDown()
+
+    def test_the_library_door_refuses_a_row_with_no_project(self):  # noqa: VACUOUS_ASSERTION — the same call given a project is the positive control: it files a row whose project equals the literal 'todoproj'
+        ledger = os.path.join(self.tmp, "tasks.jsonl")
+        row, err = todos.promote(SID, "1", "seat-a", path=ledger)
+        self.assertEqual(row, None)
+        self.assertIn("a task must name its project", err)
+        self.assertFalse(os.path.exists(ledger))
+        row, err = todos.promote(SID, "1", "seat-a", path=ledger, project=PROJ)
+        self.assertEqual(err, None)
+        self.assertEqual(row["project"], "todoproj")
+
+    def test_the_cli_takes_the_cwd_project_and_refuses_without_one(self):  # noqa: VACUOUS_ASSERTION — the promote from the project's checkout is the positive control: rc 0 and a filed row whose project equals the literal 'todoproj'
+        os.chdir(self.tmp)
+        self.assertEqual(tasks.current_project(), None)
+        rc, _out, err = self.run_cli(["promote", "1", "--owner", "seat-a"])
+        self.assertEqual(rc, 1, err)
+        self.assertIn("a task must name its project", err)
+        self.assertFalse(os.path.exists(tasks.ledger_path()))
+        os.chdir(self.repo)
+        rc, out, err = self.run_cli(["promote", "1", "--owner", "seat-a"])
+        self.assertEqual(rc, 0, err)
+        rows = list(tasks.rows().values())
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["project"], "todoproj")
+
+    def test_the_cli_takes_a_project_outside_a_checkout(self):  # noqa: VACUOUS_ASSERTION — the promote from outside a checkout with the flag files a row whose project equals the flag, against the refusal the previous arm already proved
+        os.chdir(self.tmp)
+        self.assertEqual(tasks.current_project(), None)
+        rc, out, err = self.run_cli(
+            ["promote", "--project", PROJ, "1", "--owner", "seat-a"])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("placeholder personal work", out)
+        rows = list(tasks.rows().values())
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["project"], PROJ)
+
+    def test_an_unregistered_project_is_refused_and_the_item_stays_unstamped(self):  # noqa: VACUOUS_ASSERTION — the same item promoted under the registered name files and stamps, so the missing stamp is the refusal and not a promote that never writes
+        """An explicit project is a registered name or nothing is filed
+        (task/3994). A typo leaves the personal item unstamped."""
+        ledger = os.path.join(self.tmp, "tasks-typo.jsonl")
+        full = os.path.join(self.pdir, "1.json")
+        row, err = todos.promote(SID, "1", "seat-a", path=ledger,
+                                 project="not-a-project")
+        self.assertEqual(row, None)
+        self.assertIn("not a registered project", err)
+        self.assertIn("helm todos promote", err)
+        self.assertFalse(os.path.exists(ledger))
+        with open(full, encoding="utf-8") as fh:
+            personal = json.load(fh)
+        self.assertNotIn(todos.STAMP, personal)
+        row, err = todos.promote(SID, "1", "seat-a", path=ledger, project=PROJ)
+        self.assertEqual(err, None)
+        self.assertEqual(row["project"], PROJ)
+        with open(full, encoding="utf-8") as fh:
+            personal = json.load(fh)
+        self.assertEqual(personal[todos.STAMP], row["id"])
+
+
 class LedgerBridgeTest(TodosBase):
     """task/327 — the two writers. The read window has existed for a while;
     these are the legs that let a teammate durably interact with what it
@@ -828,6 +914,20 @@ class LedgerBridgeTest(TodosBase):
         self.ledger = os.path.join(self.tmp, "tasks.jsonl")
         self.pdir = todos.personal_dir(SID)
         os.makedirs(self.pdir, exist_ok=True)
+        # A PROMOTED ROW NAMES ITS PROJECT (task/3745): these arms promote
+        # from inside a registered placeholder project's checkout.
+        repo = os.path.realpath(os.path.join(self.tmp, "todoproj-repo"))
+        os.makedirs(repo)
+        pk.write_json(os.path.join(os.path.dirname(tasks.ledger_path()),
+                                   "registry.json"),
+                      {"version": 1, "projects": {PROJ: {
+                          "name": PROJ, "path": repo}}})
+        self.prior_cwd = os.getcwd()
+        os.chdir(repo)
+
+    def tearDown(self):
+        os.chdir(self.prior_cwd)
+        super().tearDown()
 
     def personal(self, pid, subject, **over):
         row = {"id": str(pid), "subject": subject, "status": "pending"}

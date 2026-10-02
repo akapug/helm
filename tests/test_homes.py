@@ -115,8 +115,17 @@ class HomesTest(HomesBase):
         self.assertIn(res["home"], res["login_cmd"])
         # no credentials were minted or seated
         self.assertFalse(os.path.exists(os.path.join(res["home"], ".credentials.json")))
-        # idempotent re-prepare
-        self.assertTrue(homes.home_create("claude", "new@user.example")["existing"])
+        # idempotent re-prepare over a home stamped under the retired default:
+        # it says the home existed, says it corrected the drift, and never
+        # claims nothing was overwritten (it just rewrote settings.json)
+        with open(os.path.join(res["home"], "settings.json"), "w") as fh:
+            json.dump({"ultracode": True, "modelSettings": {
+                "claude-opus-5-5": {"effortLevel": "xhigh"}}}, fh)
+        again = homes.home_create("claude", "new@user.example")
+        self.assertTrue(again["existing"])
+        self.assertIn("home already existed", again["note"])
+        self.assertIn("settings drift corrected", again["note"])
+        self.assertNotIn("nothing was overwritten", again["note"])
 
     def test_a_prepared_home_carries_no_ai_attribution_before_its_first_session(self):
         """task/3591: the owner's rule is no AI authoring line anywhere. A
@@ -242,8 +251,8 @@ class HomesTest(HomesBase):
 
     def test_prepare_names_a_foreign_skills_link_and_never_rewires_it(self):
         """An existing home whose skills/ points elsewhere is REPORTED, not
-        rewired — prepare promises 'nothing was overwritten' on an existing
-        home; `helm skills sync --apply` is the deliberate normalizer."""
+        rewired — prepare reports the foreign link without replacing it;
+        `helm skills sync --apply` is the deliberate normalizer."""
         hub = self._hub()
         elsewhere = os.path.join(self.tmp, "elsewhere")
         os.makedirs(elsewhere)
@@ -763,8 +772,8 @@ class HomeBenefitListTest(HomesBase):
         self.assertEqual([b.name for b in homes.BENEFITS],
                          ["shared session store", "skills hub", "skill deck",
                           "mcp servers", "project mcp approvals",
-                          "global instructions", "opus xhigh + ultracode",
-                          "hook contract", "auto-memory base"])
+                          "global instructions", "effort high",
+                          "lead lean", "hook contract", "auto-memory base"])
         for b in homes.BENEFITS:
             self.assertTrue(b.source and b.remedy and callable(b.missing), b)
 
@@ -893,21 +902,22 @@ class HomeBenefitListTest(HomesBase):
         self.assertIn("check_home_benefits", doctor.CHECKS)
 
 
-class OpusDefaultsBenefitTest(HomesBase):
-    """OWNER RULING (premise opus-agents-xhigh-ultracode-subagents-for-same-
-    model): every Opus agent runs at xhigh effort with ultracode on.
-    A claude credential home carries that as two settings.json keys, and it
-    carries them because they are ONE ENTRY in homes.BENEFITS: the pass that
-    makes a home writes them, the drift report names a home without them.
-    Proxy seats for other families get neither key (their credentials are
-    limited). The pass adds a key the home lacks and never changes one the
-    home already sets.
+class LeadLeanBenefitTest(HomesBase):
+    """task/4056: the fleet's Claude leads run on NATIVE homes (the default
+    home and credhomes), never on a spawned seat's config dir, so the
+    lead-lean profile is ONE ENTRY in homes.BENEFITS. A native lead has no
+    spawn register, so it reads as a worker to seat_role.recorded_role and
+    the role-keyed path alone never reaches it.
 
-    The expected values are LITERALS here and never read back from the
-    module's own table, so a wrong value in the table fails these arms."""
+    The entry runs at every `helm launch` over every home, the owner's own
+    default home included, so it is ADDITIVE like every benefit: it fills a
+    key the home does not hold and never replaces a value the home holds.
+
+    The expected values are LITERALS, never read back from seat_catalog, so a
+    wrong table fails these arms."""
 
     PROVIDER = "claude"  # noqa: SEAT_NAME — provider key, not a seat
-    NAME = "opus xhigh + ultracode"
+    TRIO = ["Artifact", "ArtifactComments", "ArtifactData"]
 
     @staticmethod
     def _settings(home):
@@ -919,34 +929,240 @@ class OpusDefaultsBenefitTest(HomesBase):
         with open(os.path.join(home, "settings.json"), "w") as fh:
             json.dump(body, fh)
 
+    def _baks(self, home):
+        return [n for n in os.listdir(home)
+                if n.startswith("settings.json.bak-lead-lean-")]
+
+    def test_a_native_home_gets_the_profile_and_a_recorded_artifact_deny(self):  # noqa: VACUOUS_ASSERTION — the same arm asserts every profile key written
+        """THE CONTROL: a home that holds none of the profile's keys gets the
+        whole profile, and the keys it does hold survive."""
+        home = self._plant_claude_home("lean-user-example", "lean@user.example")
+        self._write_settings(home, {
+            "theme": "dark",
+            "permissions": {"deny": ["Bash(rm -rf /)"], "allow": ["Read"]},
+            "enabledPlugins": {"playwright@claude-plugins-official": True}})
+        from helm import localnames
+        with mock.patch.object(localnames, "words",
+                               return_value=("alpha", "beta")):
+            self.assertIn("lead-lean", homes._miss_lead_lean(home))
+            notes, err = homes._prov_lead_lean(home)
+        self.assertIsNone(err)
+        self.assertIn("lead lean set", " ".join(notes))
+        got = self._settings(home)
+        self.assertEqual(got["deniedMcpServers"],
+                         [{"serverName": "alpha"}, {"serverName": "beta"}])
+        self.assertEqual(got["skillListingBudgetFraction"], 0.0025)
+        # the plugin is switched off and the OTHER plugin entry survives
+        self.assertEqual(got["enabledPlugins"],
+                         {"plugin-dev@claude-plugins-official": False,
+                          "playwright@claude-plugins-official": True})
+        # the operator's own deny is kept, the trio appended and RECORDED
+        self.assertEqual(got["permissions"]["deny"],
+                         ["Bash(rm -rf /)"] + self.TRIO)
+        self.assertEqual(got["permissions"]["allow"], ["Read"])
+        self.assertEqual(got["helm"]["seeded_denies"], self.TRIO)
+        self.assertEqual(got["theme"], "dark")
+        # every write was an addition, so nothing needed a backup
+        self.assertEqual(self._baks(home), [], os.listdir(home))
+        # a second pass is a pure read: same bytes, no note, no backup
+        path = os.path.join(home, "settings.json")
+        with open(path, "rb") as fh:
+            before = fh.read()
+        with mock.patch.object(localnames, "words",
+                               return_value=("alpha", "beta")):
+            self.assertEqual(homes._prov_lead_lean(home), ([], None))
+            self.assertIsNone(homes._miss_lead_lean(home))
+        with open(path, "rb") as fh:
+            self.assertEqual(fh.read(), before)
+        self.assertEqual(self._baks(home), [])
+
+    def test_an_owner_value_survives_every_launch(self):  # noqa: VACUOUS_ASSERTION — the same passes write the trio deny
+        """The owner turns plugin-dev back on and sets his own skill budget.
+        Three launch passes later both are his, and no backup was written:
+        the profile only fills a key the home does not hold."""
+        home = self._plant_claude_home("own-user-example", "own@user.example")
+        self._write_settings(home, {
+            "skillListingBudgetFraction": 0.05,
+            "enabledPlugins": {"plugin-dev@claude-plugins-official": True}})
+        miss = homes._miss_lead_lean(home) or ""
+        self.assertNotIn("skillListingBudgetFraction", miss)
+        self.assertNotIn("enabledPlugins", miss)
+        for _ in range(3):
+            notes, err = homes.provision(home, at_launch=True)
+            self.assertIsNone(err, notes)
+        got = self._settings(home)
+        self.assertEqual(got["skillListingBudgetFraction"], 0.05)
+        self.assertEqual(got["enabledPlugins"],
+                         {"plugin-dev@claude-plugins-official": True})
+        self.assertEqual(self._baks(home), [], os.listdir(home))
+        # THE POSITIVE CONTROL on the same passes: the profile really ran on
+        # this home, so the kept values are the additive rule, not a skip.
+        self.assertEqual(got["permissions"]["deny"], self.TRIO)
+        self.assertIsNone(homes._miss_lead_lean(home))
+
+    def test_an_operator_denied_server_is_kept_and_the_profile_names_join(self):
+        """deniedMcpServers is MERGED by serverName: an entry the operator
+        wrote stays where it is, byte for byte, and a profile name the list
+        already holds is not added twice."""
+        home = self._plant_claude_home("mcp-user-example", "mcp@user.example")
+        self._write_settings(home, {"deniedMcpServers": [
+            {"serverName": "own"}, {"serverName": "alpha", "note": "mine"}]})
+        from helm import localnames
+        with mock.patch.object(localnames, "words",
+                               return_value=("alpha", "beta")):
+            self.assertIn("deniedMcpServers", homes._miss_lead_lean(home))
+            homes._prov_lead_lean(home)
+            self.assertIsNone(homes._miss_lead_lean(home))
+        self.assertEqual(self._settings(home)["deniedMcpServers"], [
+            {"serverName": "own"}, {"serverName": "alpha", "note": "mine"},
+            {"serverName": "beta"}])
+        self.assertEqual(self._baks(home), [], os.listdir(home))
+
+    def test_a_malformed_server_entry_does_not_stop_the_launch(self):
+        """CC ignores a deniedMcpServers entry whose serverName is not a
+        string and runs on, so a home can carry one. The merge must keep it
+        and still append the profile's names: an exception here escapes
+        homes.provision and stops every `helm launch` on that home."""
+        home = self._plant_claude_home("bad-user-example", "bad@user.example")
+        odd = [{"serverName": ["alpha"]}, {"serverName": {"n": 1}}, "beta"]
+        self._write_settings(home, {"deniedMcpServers": odd})
+        from helm import localnames
+        with mock.patch.object(localnames, "words",
+                               return_value=("alpha", "beta")):
+            notes, err = homes.provision(home, at_launch=True)
+            self.assertIsNone(err, notes)
+            self.assertIsNone(homes._miss_lead_lean(home))
+        self.assertEqual(self._settings(home)["deniedMcpServers"], odd + [
+            {"serverName": "alpha"}, {"serverName": "beta"}])
+
+    def test_the_operator_record_is_honoured_and_a_hand_removed_deny_returns(self):
+        """The one recorded-deny writer: an entry helm.operator_denies names
+        is re-applied, and a trio entry removed by hand comes back on the next
+        pass (the profile is the owner's ruling about it)."""
+        home = self._plant_claude_home("rec-user-example", "rec@user.example")
+        self._write_settings(home, {"helm": {"operator_denies": ["WebFetch"]}})
+        homes._prov_lead_lean(home)
+        got = self._settings(home)
+        # nothing the file held was replaced, so no backup was written
+        self.assertEqual([n for n in os.listdir(home) if ".bak-lead-lean" in n], [])
+        self.assertEqual(got["permissions"]["deny"], self.TRIO + ["WebFetch"])
+        self.assertEqual(got["helm"]["operator_denies"], ["WebFetch"])
+        got["permissions"]["deny"].remove("ArtifactData")
+        self._write_settings(home, got)
+        self.assertIn("permissions", homes._miss_lead_lean(home))
+        homes._prov_lead_lean(home)
+        self.assertIn("ArtifactData", self._settings(home)["permissions"]["deny"])
+
+    def test_a_proxy_seat_dir_is_left_to_its_own_seeder(self):  # noqa: VACUOUS_ASSERTION — the native home beside it is changed in the same arm
+        from helm import seat, seat_catalog
+        fam = next(f for f, v in seat_catalog.FAMILIES.items()
+                   if v["mode"].startswith("proxy"))
+        cdir = os.path.join(seat.seat_dir(fam), self.PROVIDER)
+        os.makedirs(cdir)
+        seat._seed_seat_settings(cdir, fam)
+        before = self._settings(cdir)
+        self.assertEqual(homes._prov_lead_lean(cdir), ([], None))
+        self.assertIsNone(homes._miss_lead_lean(cdir))
+        self.assertEqual(self._settings(cdir), before)
+        native = self._plant_claude_home("native2-user-example", "n2@user.example")
+        homes._prov_lead_lean(native)
+        self.assertEqual(self._settings(native)["permissions"]["deny"], self.TRIO)
+
+    def test_the_benefit_runs_at_launch(self):
+        b = next(b for b in homes.BENEFITS if b.name == "lead lean")
+        self.assertTrue(b.launch)
+        self.assertIs(b.provision, homes._prov_lead_lean)
+
+
+class EffortDefaultsBenefitTest(HomesBase):
+    """OWNER RULING (supersedes the earlier xhigh + ultracode default):
+    every agent starts at HIGH effort, and ultracode is not special.
+    A claude credential home carries that as settings.json effort keys, and
+    it carries them because they are ONE ENTRY in homes.BENEFITS: the pass
+    that makes a home writes them, the drift report names a home without
+    them. Proxy seats for other families get none of them. The pass adds a
+    key the home lacks and never changes one the home already sets, except
+    the two halves of the retired default, which are drift: an Opus xhigh is
+    rewritten to high and an ultracode true is removed, by the same pass,
+    with a backup and a note. An owner-set value of either cannot be told
+    apart from helm's, so it is corrected too.
+
+    The expected values are LITERALS here and never read back from the
+    module's own table, so a wrong value in the table fails these arms."""
+
+    PROVIDER = "claude"  # noqa: SEAT_NAME — provider key, not a seat
+    NAME = "effort high"
+    CANON = {"effortLevel": "high", "modelSettings": {
+        "claude-opus-5-5": {"effortLevel": "high"},
+        "claude-sonnet-5": {"effortLevel": "high"},
+        "claude-fable-5-1": {"effortLevel": "high"}}}
+    CURE = ("`helm homes provision %s --apply` (the default home: a "
+            "`helm launch` with neither --home nor --no-install)")
+
+    @staticmethod
+    def _settings(home):
+        """The home's settings.json LESS what the "lead lean" benefit (its
+        sibling in the same pass, LeadLeanBenefitTest) writes, so these arms
+        stay about effort; the keys are literals, never the module's table."""
+        with open(os.path.join(home, "settings.json")) as fh:
+            body = json.load(fh)
+        for k in ("deniedMcpServers", "skillListingBudgetFraction"):
+            body.pop(k, None)
+        trio = ("Artifact", "ArtifactComments", "ArtifactData")
+        rec = body.get("helm", {})
+        if [t for t in rec.get("seeded_denies", ()) if t not in trio] == []:
+            rec.pop("seeded_denies", None)
+            if not rec:
+                body.pop("helm", None)
+        plugins = body.get("enabledPlugins", {})
+        plugins.pop("plugin-dev@claude-plugins-official", None)
+        if not plugins:
+            body.pop("enabledPlugins", None)
+        perms = body.get("permissions", {})
+        perms["deny"] = [t for t in perms.get("deny", []) if t not in trio]
+        if not perms["deny"]:
+            perms.pop("deny")
+        if not perms:
+            body.pop("permissions", None)
+        return body
+
+    @staticmethod
+    def _write_settings(home, body):
+        with open(os.path.join(home, "settings.json"), "w") as fh:
+            json.dump(body, fh)
+
     def _row(self, rows, path):
         real = os.path.realpath(path)
         return next(r for r in rows if os.path.realpath(r["path"]) == real)
 
-    def test_a_new_claude_home_is_born_with_ultracode_and_opus_xhigh(self):  # noqa: VACUOUS_ASSERTION — the absent settings file is the PRE-state, and the same file's keys are asserted present right after, unconditionally
+    def _mine(self, home):
+        row = self._row(homes.benefit_drift(), home)
+        return [m for m in row["missing"] if m[0] == self.NAME]
+
+    def test_a_new_claude_home_is_born_at_high_effort_without_ultracode(self):  # noqa: VACUOUS_ASSERTION — the absent settings file is the PRE-state, and the same file's keys are asserted equal to the canonical body right after, unconditionally
         """ARM (a): `helm homes prepare` (home_create) and `helm homes
-        provision` (home_provision) both give a Claude home the two keys."""
+        provision` (home_provision) both give a Claude home effort high for
+        every model, and neither writes ultracode."""
         res = homes.home_create(self.PROVIDER, "fresh@user.example")
         self.assertNotIn("error", res)
         got = self._settings(res["home"])
-        self.assertIs(got.get("ultracode"), True, got)
-        self.assertEqual(got["modelSettings"]["claude-opus-5-5"]["effortLevel"],
-                         "xhigh")
+        self.assertEqual({k: got[k] for k in self.CANON}, self.CANON)
+        self.assertNotIn("ultracode", got)
         self.assertIn("settings defaults set", res["note"] or "")
         bare = self._plant_claude_home("bare-user-example", "bare@user.example")
         self.assertFalse(os.path.exists(os.path.join(bare, "settings.json")))
         out = homes.home_provision("bare-user-example")
         self.assertNotIn("error", out)
         got = self._settings(bare)
-        self.assertIs(got.get("ultracode"), True, got)
-        self.assertEqual(got["modelSettings"]["claude-opus-5-5"]["effortLevel"],
-                         "xhigh")
+        self.assertEqual({k: got[k] for k in self.CANON}, self.CANON)
+        self.assertNotIn("ultracode", got)
+        self.assertEqual(self._mine(bare), [])
 
-    def test_a_proxy_family_seat_home_gets_neither_key(self):  # noqa: VACUOUS_ASSERTION — every absence is paired with an unconditional positive control in the same call: the native home gets ultracode and is reported missing
+    def test_a_proxy_family_seat_home_gets_none_of_the_keys(self):  # noqa: VACUOUS_ASSERTION — every absence is paired with an unconditional positive control in the same call: the native home gets effortLevel and is reported missing
         """ARM (b): a proxy family's seat config dir, seeded by the proxy
         seat's own settings writer, is walked by the list and comes out with
-        neither key, and the drift report does not ask for them there. Both
-        seat shapes the write gate knows: <family>/claude and
+        none of the keys, and the drift report does not ask for them there.
+        Both seat shapes the write gate knows: <family>/claude and
         <family>/instances/<seat>/claude. POSITIVE CONTROL in the same calls:
         a native home beside them gets the keys and is reported, so a list
         that did nothing would fail this arm."""
@@ -966,9 +1182,9 @@ class OpusDefaultsBenefitTest(HomesBase):
             homes.provision(native, at_launch=True)
             after = self._settings(cdir)
             self.assertEqual(after, before)
-            self.assertNotIn("ultracode", after)
+            self.assertNotIn("effortLevel", after)
             self.assertNotIn("modelSettings", after)
-            self.assertIs(self._settings(native).get("ultracode"), True)
+            self.assertEqual(self._settings(native).get("effortLevel"), "high")
         os.remove(os.path.join(native, "settings.json"))
         rows = homes.benefit_drift(
             dirs=[("seat-a", c) for c in cdirs] + [("native", native)])
@@ -979,42 +1195,54 @@ class OpusDefaultsBenefitTest(HomesBase):
         self.assertIn(self.NAME,
                       [m[0] for m in self._row(rows, native)["missing"]])
 
-    def test_an_existing_settings_file_keeps_every_other_key_and_its_own_values(self):
-        """ARM (c): the pass ADDS what is absent. Every other key survives
-        exactly, a different Opus effortLevel the home already sets is kept,
-        and an explicit ultracode false is kept. The rewritten file leaves its
-        backup beside it, named the way the hand cure named its backups."""
+    def test_an_explicit_effort_and_every_other_key_are_kept(self):
+        """ARM (c), the explicit override: the pass ADDS what is absent. Every
+        other key survives exactly, and an effort the home sets to another
+        value is kept, per model and at the top level (a top-level xhigh
+        included: helm never wrote that one, so it is the home's own choice).
+        An ultracode false is kept, and ultracode is not required. The
+        rewritten file leaves its backup beside it."""
         home = self._plant_claude_home("keep-user-example", "keep@user.example")
         mine = {"theme": "dark", "effortLevel": "low",
                 "hooks": {"Stop": [{"hooks": [{"type": "command",
                                                "command": "true"}]}]},
                 "permissions": {"allow": ["Bash(ls:*)"]},
-                "modelSettings": {"claude-opus-5-5": {"effortLevel": "high",
+                "modelSettings": {"claude-opus-5-5": {"effortLevel": "medium",
                                                       "other": 1},
-                                  "claude-fable-5-1": {"effortLevel": "high"}}}
+                                  "claude-fable-5-1": {"effortLevel": "low"}}}
         self._write_settings(home, mine)
         with open(os.path.join(home, "settings.json")) as fh:
             original = fh.read()
+        # POSITIVE CONTROL on the same reader: the one key it lacks is named
+        self.assertEqual([m[1] for m in self._mine(home)], [
+            "settings.json lacks modelSettings.claude-sonnet-5.effortLevel"])
         res = homes.home_provision("keep-user-example")
         self.assertNotIn("error", res)
-        self.assertEqual(self._settings(home), dict(mine, ultracode=True))
+        want = json.loads(original)
+        want["modelSettings"]["claude-sonnet-5"] = {"effortLevel": "high"}
+        self.assertEqual(self._settings(home), want)
+        self.assertEqual(self._mine(home), [])
         baks = [n for n in os.listdir(home)
-                if n.startswith("settings.json.bak-ultracode-")]
+                if n.startswith("settings.json.bak-effort-")]
         self.assertEqual(len(baks), 1, os.listdir(home))
         with open(os.path.join(home, baks[0])) as fh:
             self.assertEqual(fh.read(), original)
         off = self._plant_claude_home("off-user-example", "off@user.example")
-        self._write_settings(off, {"ultracode": False, "model": "opus"})
+        self._write_settings(off, {"ultracode": False, "model": "opus",
+                                   "effortLevel": "xhigh"})
         homes.home_provision("off-user-example")
-        self.assertEqual(self._settings(off), {
-            "ultracode": False, "model": "opus",
-            "modelSettings": {"claude-opus-5-5": {"effortLevel": "xhigh"}}})
+        self.assertEqual(self._settings(off), dict(
+            self.CANON, ultracode=False, model="opus", effortLevel="xhigh"))
+        self.assertEqual(self._mine(off), [])
         # a value where an object belongs is never replaced to make room
         odd = self._plant_claude_home("odd-user-example", "odd@user.example")
         self._write_settings(odd, {"modelSettings": "mine"})
-        homes.home_provision("odd-user-example")
+        res = homes.home_provision("odd-user-example")
         self.assertEqual(self._settings(odd),
-                         {"modelSettings": "mine", "ultracode": True})
+                         {"modelSettings": "mine", "effortLevel": "high"})
+        self.assertTrue(any("modelSettings.claude-opus-5-5.effortLevel is "
+                            "under a value that is not an object" in n
+                            for n in res["notes"]), res)
         # a symlinked file is left a symlink, its target unchanged: a replace
         # would cut the link
         linked = self._plant_claude_home("link-user-example", "link@user.example")
@@ -1040,42 +1268,72 @@ class OpusDefaultsBenefitTest(HomesBase):
         self.assertIn(self.NAME, [u[0] for u in row["unknown"]])
         self.assertNotIn(self.NAME, [m[0] for m in row["missing"]])
 
-    def test_doctor_names_a_claude_home_that_lacks_the_keys(self):
-        """ARM (d): the doctor rung over the list names each home without the
-        keys, says which key is absent and the command that closes it, and
-        does not name a home that sets them (even to another value)."""
+    def test_a_home_carrying_the_retired_opus_xhigh_is_drift_synced_to_high(self):
+        """ARM (d), THE EXISTING HOMES: a home stamped under the retired ruling
+        (ultracode true, Opus xhigh) is reported as drift by the list and the
+        doctor rung, with the command that closes it; that command (the
+        existing apply path) rewrites Opus to high, removes ultracode, says
+        both, leaves the original in a backup, and a second pass finds
+        nothing to do. A home whose only gap is ultracode true is drift too:
+        an owner-set one cannot be told apart from helm's old default."""
         from helm import doctor
-        bare = self._plant_claude_home("old-user-example", "old@user.example")
-        self._write_settings(bare, {"theme": "dark"})
-        half = self._plant_claude_home("half-user-example", "half@user.example")
-        self._write_settings(half, {"ultracode": True})
-        done = self._plant_claude_home("done-user-example", "done@user.example")
-        self._write_settings(done, {"ultracode": True, "modelSettings": {
-            "claude-opus-5-5": {"effortLevel": "high"}}})
-        rows = homes.benefit_drift()
-        mine = lambda r: [m for m in r["missing"] if m[0] == self.NAME]
-        self.assertEqual(mine(self._row(rows, bare)), [(
+        home = self._plant_claude_home("old-user-example", "old@user.example")
+        stamped = {"theme": "dark", "ultracode": True, "modelSettings": {
+            "claude-opus-5-5": {"effortLevel": "xhigh", "other": 1}}}
+        self._write_settings(home, stamped)
+        with open(os.path.join(home, "settings.json")) as fh:
+            original = fh.read()
+        self.assertEqual(self._mine(home), [(
             self.NAME,
-            "settings.json lacks ultracode, "
-            "modelSettings.claude-opus-5-5.effortLevel",
-            "`helm homes provision old-user-example --apply` (the default home: a "
-            "`helm launch` with neither --home nor --no-install)")])
-        self.assertEqual([m[1] for m in mine(self._row(rows, half))],
-                         ["settings.json lacks "
-                          "modelSettings.claude-opus-5-5.effortLevel"])
-        self.assertEqual(mine(self._row(rows, done)), [])
-        odd = self._plant_claude_home("odd-user-example", "odd@user.example")
-        self._write_settings(odd, {"ultracode": True, "modelSettings": "mine"})
-        self.assertEqual(
-            [m[1] for m in mine(self._row(homes.benefit_drift(), odd))],
-            ["settings.json lacks modelSettings.claude-opus-5-5.effortLevel "
-             "(its parent is not an object)"])
+            "settings.json lacks effortLevel, "
+            "modelSettings.claude-sonnet-5.effortLevel, "
+            "modelSettings.claude-fable-5-1.effortLevel; settings.json "
+            "carries the retired default modelSettings.claude-opus-5-5."
+            "effortLevel xhigh -> high, ultracode true -> removed",
+            self.CURE % "old-user-example")])
         said = [msg for _lvl, msg in doctor.check_home_benefits()]
         hit = [m for m in said if "old-user-example" in m and self.NAME in m]
         self.assertEqual(len(hit), 1, said)
         self.assertIn("helm homes provision old-user-example", hit[0])
-        self.assertFalse(any("done-user-example" in m and self.NAME in m
-                             for m in said), said)
+        self.assertIn("xhigh -> high", hit[0])
+        self.assertIn("ultracode true -> removed", hit[0])
+        res = homes.home_provision("old-user-example")
+        self.assertNotIn("error", res)
+        self.assertIn(
+            "settings drift corrected: modelSettings.claude-opus-5-5."
+            "effortLevel xhigh -> high, ultracode true -> removed (the "
+            "retired default)", res["notes"])
+        self.assertEqual(self._settings(home), {
+            "theme": "dark", "effortLevel": "high",
+            "modelSettings": {
+                "claude-opus-5-5": {"effortLevel": "high", "other": 1},
+                "claude-sonnet-5": {"effortLevel": "high"},
+                "claude-fable-5-1": {"effortLevel": "high"}}})
+        baks = [n for n in os.listdir(home)
+                if n.startswith("settings.json.bak-effort-")]
+        self.assertEqual(len(baks), 1, os.listdir(home))
+        with open(os.path.join(home, baks[0])) as fh:
+            self.assertEqual(fh.read(), original)
+        self.assertEqual(self._mine(home), [])
+        again = homes.home_provision("old-user-example")
+        self.assertFalse(any(n.startswith(("settings defaults",
+                                           "settings drift"))
+                             for n in again["notes"]), again)
+        self.assertEqual(len([n for n in os.listdir(home)
+                              if n.startswith("settings.json.bak-effort-")]),
+                         1)
+        # ultracode true alone, the other half of the old stamp, is drift
+        half = self._plant_claude_home("half-user-example", "half@user.example")
+        self._write_settings(half, dict(self.CANON, ultracode=True))
+        self.assertEqual([m[1] for m in self._mine(half)], [
+            "settings.json carries the retired default ultracode true -> "
+            "removed"])
+        self.assertTrue(any("half-user-example" in m and self.NAME in m
+                            for m in [msg for _l, msg in
+                                      doctor.check_home_benefits()]))
+        homes.home_provision("half-user-example")
+        self.assertEqual(self._settings(half), self.CANON)
+        self.assertEqual(self._mine(half), [])
 
 
 class SeatHomeBackfillTest(HomesBase):

@@ -28,14 +28,20 @@ import re
 import subprocess
 import sys
 
-from . import chat, home, pk, vcs
+from . import chat, home, needs_act, pk, vcs
 from .machine_senders import is_machine
 from .seats_address import (_mention_re, mentions, seat_names,  # noqa: F401
                             boundary_scope, seat_scope)  # re-exported
-from .seats_common import (MAX_BYTES, _BROADCAST, _canonical_recipient, _clip,
-                           live_alias, names_match, _scrub, _seat_key,
-                           canonical_keys, dm_lane, own_name,
-                           recipient_matches, roster, roster_path, seat_row)
+from .seats_common import (_BROADCAST, _canonical_recipient, live_alias,
+                           names_match, _seat_key, canonical_keys, dm_lane,
+                           own_name, roster, roster_path, seat_row)
+# A REACTION BURST'S WAKE BODY lives in seats_identity_reaction (this file
+# reached 1011 of its 1000-line budget); both names stay importable from here,
+# and `_OWNER_NAMES` declares the move so the retired-name rung reads it as one.
+from .seats_identity_reaction import (_reaction_wake_body,  # noqa: F401
+                                      _same_reaction_target)
+_OWNER_NAMES = (("seats_identity_reaction", (
+    "_reaction_wake_body", "_same_reaction_target")),)  # moved; bound here
 
 _FAMILIES = ("fable", "opus", "sonnet", "haiku", "kimi", "glm", "gpt",
              "gemini", "deepseek", "qwen", "grok", "mistral", "llama")
@@ -940,7 +946,18 @@ def deliverable(m, seat, room="main", scope=None, ambient=True, beacon=False):
     if beacon and room in sc["mute"]:
         return False
     home_r = sc.get("home")
-    if ambient and home_r and room == home_r and not is_machine(frm):
+    if ambient and home_r and room == home_r and not is_machine(frm) \
+            and not (beacon and needs_act.addressed_elsewhere(m, names)):
+        # task/4019 slice A cure 1b: on the WAKE tier, a row whose
+        # `addressees` stamp names only OTHER joined seats is not ambient
+        # chatter for this one. Measured: a one-shot wait runs ambient, and
+        # this tier woke every home-room member on rows stamped
+        # addressees:[seat-b] / [seat-c|seat-d]. Such a row FALLS THROUGH
+        # (a home-room @all still wakes below) and is never dropped: the
+        # boundary tier (beacon=False) still delivers it, and the beacon holds
+        # it for the hook (seats_delivery). No stamp, an unresolvable
+        # addressee, an owner row or a deadline/failure row keep this tier
+        # (helm/needs_act.py: unclassifiable is ACT).
         # The home-room full-surface tier is AMBIENT-scope only. The boundary
         # nudge and the pending gate keep it (a BUSY seat reads its team
         # channel for free between tool calls); the idle beacon drops it by
@@ -962,39 +979,3 @@ def deliverable(m, seat, room="main", scope=None, ambient=True, beacon=False):
     # IDENTITY (forgery defense) elsewhere; owner-posts are simply not a wake
     # class. bug-class superseded: beacon-owner-post-wake-is-noise.
     return bool(_BROADCAST.search(text))
-def _same_reaction_target(a, b):
-    """Same canonical target as chat's signed reaction + `_react_state`:
-    `(tts, tfrom)`. Reactions do not carry a room ordinal, rendered text, or a
-    target row id, so the beacon composes with their existing durable identity
-    rather than inventing a second grouping key."""
-    return a.get("tts") == b.get("tts") \
-        and recipient_matches(a.get("tfrom"), b.get("tfrom"))
-def _reaction_wake_body(rows, room="main"):
-    """One bounded, honest delivery body for a contiguous reaction burst.
-
-    The target comes FIRST, so clipping can never erase which row woke the seat.
-    Include as many reactor+emoji pairs as fit, then name the omitted count and
-    the exact pull surface — never silently truncate identities behind an
-    ellipsis or point a foreign-room wake at main."""
-    target = rows[0]
-    prefix = "%s@%s ← " % (
-        chat._dsan(target.get("tfrom") or "?"),
-        _scrub(str(target.get("tts") or "?")))
-    acts = ["%s %s %s" % (
-        chat._dsan(r.get("from") or "?"),
-        "un-reacted" if r.get("un") else "reacted",
-        _scrub(str(r.get("react") or "?"))) for r in rows]
-    pull = ("helm chat read --dm" if room.startswith(chat.DM_PREFIX)
-            else "helm chat read" if room == "main"
-            else "helm chat read --room %s" % _scrub(str(room)))
-    shown = []
-    for i, act in enumerate(acts):
-        rest = len(acts) - i - 1
-        suffix = " (+%d more reactions — %s)" % (rest, pull) if rest else ""
-        candidate = prefix + "; ".join(shown + [act]) + suffix
-        if len(candidate.encode("utf-8")) > MAX_BYTES:
-            break
-        shown.append(act)
-    rest = len(acts) - len(shown)
-    suffix = " (+%d more reactions — %s)" % (rest, pull) if rest else ""
-    return _clip(prefix + "; ".join(shown) + suffix)

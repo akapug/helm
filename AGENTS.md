@@ -88,6 +88,7 @@ Full text and rationale live in [CONTRIBUTING.md](CONTRIBUTING.md). In one breat
 | `tests/` | the `unittest` suite |
 | `docs/` | [VERBS.md](docs/VERBS.md) is the authoritative verb reference; plus ARCHITECTURE · CONCEPTS · ENVIRONMENT · HOOKS · WEB · ATTESTATION · EVOLUTION |
 | `agents/claudecode/skills/` | the shipped skill layer — how an agent *uses* helm |
+| `changes/` | one change note per lane, `changes/<lane>.md`, until a release folds them into `CHANGELOG.md` ([README](changes/README.md)) |
 
 ## Working style
 
@@ -114,6 +115,12 @@ Full text and rationale live in [CONTRIBUTING.md](CONTRIBUTING.md). In one breat
   that lands), the touched verb was actually run against real (or realistic
   temp) stores, and the docs that state the changed behaviour were updated in
   the *same* change. "Compiles" is not "done."
+- **A change note is its own file**: write `changes/<lane>.md` (markdown
+  bullets, written like a CHANGELOG bullet) and never edit `CHANGELOG.md` in
+  a lane. Lanes that each added a bullet under `## Unreleased` conflicted in
+  every train that carried two of them. `tests/test_change_notes.py` is red
+  on a line a lane writes there; the release's `--fold` is the one writer
+  ([A change note](CONTRIBUTING.md#a-change-note)).
 - **Maintained as-public**: no secrets, no machine-local absolute paths (use
   `~` or an env var), no personal data, and no data that is not source
   (exports, dumps, snapshots, archives, address lists). The repo is kept at
@@ -121,7 +128,8 @@ Full text and rationale live in [CONTRIBUTING.md](CONTRIBUTING.md). In one breat
   and the devops skill carries the scrub ladder for anything already in
   history.
 - **Releasing** is one command, a dry run unless you pass `--publish`:
-  `python3 scripts/release/release.py <version>`. It fast-forwards the public
+  `python3 scripts/release/release.py <version>`, after `--fold` has made the
+  version's CHANGELOG section from the change notes. It fast-forwards the public
   main by one commit (the trunk tree minus `scripts/release/omit.txt`), tags
   it and creates the GitHub release. Its reports under the work directory
   (`~/.helm/releases/<version>/` by default) are for the owner to read before
@@ -151,12 +159,19 @@ You additionally have the coordination physics, and they are not optional:
   neither is required. Every family is an equal counterpart here, including
   when a Claude seat holds the integrator chair.
 - **A reviewer of either family fixes what it finds in the row's REVIEW FIX
-  MODE.** For a MECHANICAL defect, PATCH commits off the exact reviewed tip in
-  their own room or a `git clone --shared` clone whose commit is fetched into
-  the repo (skill reviewer-implements-own-findings, step 3; never `git
-  worktree add` or a branch in the shared checkout), does not push, and names
-  that tip with `--fix --patch-tip <sha>`; the lane owner or integrator adopts
-  it. MELD-DIFF posts the exact fix as a diff in the pair meld and records
+  MODE.** For a MECHANICAL defect, PATCH commits off the exact reviewed tip —
+  in a room the reviewer holds, or, for a subagent with no room of its own (the
+  default), a `git clone --shared` clone whose commit is fetched into the repo
+  (skill reviewer-implements-own-findings, step 3; never a shared branch and
+  never `git worktree add`). For an explicit BUILD, a parent may instead assign
+  its sole delegate a REGISTERED lane room (`helm work claim`); the parent owns
+  the lease through completion or accepted handoff, then returns the room
+  (`helm work release`); unfinished work is not released. This narrower build
+  allocation is never general reviewer authority. Never an unregistered shared
+  worktree, unleased shared branch, protected or shared ref rewrite, permission
+  bypass, config/canon edit, test-home leak or publication. The reviewer does
+  not push, and names that tip with `--fix --patch-tip <sha>`; the lane owner
+  or integrator adopts it. MELD-DIFF posts the exact fix as a diff in the pair meld and records
   `--fix --diff-handoff ROOM/MSGID --no-patch-because <reason>` without a
   reviewer patch tip. The typed, validated message receipt (not the reason
   prose) and send/add proof that the first advancing direct child actually

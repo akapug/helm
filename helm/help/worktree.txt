@@ -1,0 +1,1 @@
+worktree gc [--apply] — prune orphan worktree-*/lane/* branches + landed worktrees (dry-run default; rescue-dirty-first, locked/occupied-immune, unmerged-blocked; composes `helm work gc` for lane rooms)

@@ -49,6 +49,14 @@ t("meld_cut_is_1h_channel_cut_is_24h", () => ({
   chan25h: chatRoomQuiet({room: "build", last: iso(25 * 3600)}, NOW, []),
 }));
 
+t("a_task_meld_is_a_meld", () => ({
+  task: roomType("helm-3742"), scoped: roomType("adopter-afd5094f-12"),
+  legacy: roomType("meld-0-pair-helm-task-3112"),
+  project: roomType("example-platform"), plain: roomType("helm"),
+  tooLong: roomType("abcdefghijklmnopq-12"), dm: roomType("dm-3742"),
+  task2h: chatRoomQuiet({room: "helm-3742", last: iso(2 * 3600)}, NOW, []),
+}));
+
 t("unread_outranks_any_age", () => ({
   meld: chatRoomQuiet({room: "meld-x", last: iso(9e6), owner_unread: 1}, NOW, []),
   chan: chatRoomQuiet({room: "old", last: iso(9e6), owner_unread: 3}, NOW, []),
@@ -133,6 +141,17 @@ class TestSidebarFold(unittest.TestCase):
         self.assertFalse(d["meld30m"], "a meld silent 30m must stay")
         self.assertFalse(d["chan2h"], "a channel silent 2h must stay")
         self.assertTrue(d["chan25h"], "a channel silent 25h must fold")
+
+    def test_a_task_meld_is_a_meld(self):
+        """A task's pair meld (`<scope>-<N>`) sits with the melds and folds
+        at a meld's hour, never among the project channels."""
+        d = self._detail("a_task_meld_is_a_meld")
+        self.assertEqual((d["task"], d["scoped"], d["legacy"]),
+                         ("meld", "meld", "meld"))
+        # CONTROL: a project, and names outside the task shape, are not melds
+        self.assertEqual((d["project"], d["plain"], d["tooLong"], d["dm"]),
+                         ("project", "project", "project", "dm"))
+        self.assertTrue(d["task2h"], "a task meld silent 2h must fold")
 
     def test_unread_outranks_any_age(self):
         d = self._detail("unread_outranks_any_age")

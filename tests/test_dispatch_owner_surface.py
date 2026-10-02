@@ -87,6 +87,8 @@ class OwnerSurfaceGuardTest(DispatchBase):
         # pass one that is deliberately proof-less so the door, not the
         # message gate, is the thing under test.
         body = message if message is not None else self._brief_no_proof()
+        if kind == "review":
+            kw.setdefault("task", self.review_task["id"])
         row, why, posted = dispatches.send(
             "seat-a", "lane-g", body, tip or self.a,
             repo=self.repo, kind=kind, new_work=True,
@@ -101,6 +103,8 @@ class OwnerSurfaceGuardTest(DispatchBase):
         ref lives in. This is the normal path — the guard must fire on it, not
         just on the repo-explicit arms. The guard was passed a bare None and
         read the diff as absent."""
+        if kind == "review":
+            kw.setdefault("task", self.review_task["id"])
         old_cwd = os.getcwd()
         os.chdir(self.repo)
         try:

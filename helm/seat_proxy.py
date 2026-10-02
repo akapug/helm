@@ -296,6 +296,17 @@ def _up(family, quiet=False, seat=None):
                   "failed (%s); existing bytes and listener were left intact"
                   % (seat, exc), file=sys.stderr)
             return 1
+        # THE BINARY IS JUDGED AGAINST THE CONFIG IT WILL LOAD, which is the
+        # plan's text: a config without session-header is given it here, and
+        # the preflight above read the file before that. Nothing is written,
+        # stopped or started yet.
+        from .seat_launch_assets import session_header_refusal
+        session = session_header_refusal(plan["text"])
+        if session:
+            print("helm seat: refusing %s proxy start — %s; existing bytes and "
+                  "listener were left intact" % (seat, session),
+                  file=sys.stderr)
+            return 1
         from . import offpeak
         closing = offpeak.closing_transition(
             plan["old"], plan["text"], family, fam)

@@ -17,7 +17,7 @@ from unittest import mock
 import os as _os, sys as _sys  # noqa: E402
 _sys.path.insert(0, _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))))
 
-from helm import chat, dispatches, meld, review_door as RD, seats  # noqa: E402
+from helm import burnflags, chat, dispatches, meld, review_door as RD, seats, tasks  # noqa: E402
 from tests._tmphome import pin_live_seats  # noqa: E402
 
 
@@ -48,6 +48,13 @@ class ParseOutcomeTest(unittest.TestCase):
         self.assertEqual(got["tip"], TIP)
         self.assertEqual(got["findings"], "F1=cured-in-patch; F2=note")
         self.assertEqual(got["next"], "record the verdict")
+
+    def test_task_disposition_requires_context_and_same_open_story(self):
+        self.assertIn("task/N", RD._finding_error("F1=task/not-an-id"))
+        parsed, why = RD.parse_outcome(
+            block().replace("F1=cured-in-patch", "F1=task/77"))
+        self.assertIsNone(why, why)
+        self.assertEqual(parsed["findings"], "F1=task/77; F2=note")
 
     def test_newline_separated_fields_parse_too(self):
         text = block().replace(" | ", "\n")
@@ -286,6 +293,51 @@ class RoomTest(unittest.TestCase):
                         "lane": self.LANE}, [TIP])
         self.assertIn("not this row's author and reader", why)
 
+    def test_task_disposition_binds_only_open_work_in_reviewed_story(self):
+        reviewed, err = tasks.add("reviewed work", "author",
+                                  project="helm-test", force_new=True)
+        self.assertIsNone(err, err)
+        self.assertEqual(reviewed["status"], "open")
+        same, err = tasks.add("first finding", "author",
+                              project="helm-test", continues=reviewed["id"],
+                              force_new=True)
+        self.assertIsNone(err, err)
+        self.assertEqual(same["continues"], reviewed["id"])
+        other, err = tasks.add("a different story", "author",
+                               project="helm-test", force_new=True)
+        self.assertIsNone(err, err)
+        self.assertEqual(other["status"], "open")
+        self.seed()
+        row = {"sender": "author", "recipient": "reader", "lane": self.LANE,
+               "task": reviewed["id"], "id": "a" * 32}
+        # This narrow citation unit supplies its root in the current dispatch
+        # projection; a caller-only dict cannot authorize the reviewed task.
+        snapshot = mock.patch.object(dispatches, "snapshot",
+                                     return_value=({row["id"]: row}, None))
+        snapshot.start()
+        self.addCleanup(snapshot.stop)
+        for tid, accepted in ((same["id"], True), (other["id"], False),
+                              ("task/999999", False)):
+            with self.subTest(tid=tid):
+                outcome = block().replace("F1=cured-in-patch",
+                                          "F1=%s" % tid)
+                self.post("author", "%s [DONE]" % outcome)
+                self.post("reader", "%s [DONE]" % outcome)
+                fields, why = RD.meld_citation(self.ROOM, row, [TIP])
+                self.assertEqual(fields is not None, accepted, why)
+                if not accepted:
+                    self.assertIn(tid, why)
+        closed, err = tasks.update(same["id"], status="closed",
+                                   closed_reason="verified in scratch fixture")
+        self.assertIsNone(err, err)
+        outcome = block().replace("F1=cured-in-patch",
+                                  "F1=%s" % same["id"])
+        self.post("author", "%s [DONE]" % outcome)
+        self.post("reader", "%s [DONE]" % outcome)
+        fields, why = RD.meld_citation(self.ROOM, row, [TIP])
+        self.assertIsNone(fields)
+        self.assertIn("open", why)
+
     def test_a_split_meld_is_recordable_as_split(self):
         self.seed()
         self.post("author", "%s [DONE]" % block())
@@ -493,6 +545,9 @@ class MeldOutcomeRidesTheRowTest(td.DispatchBase):
         the row's recipient (task/3053). Rows are still authored by the
         fixture's own seat, so none is a self-review."""
         super().setUp()
+        self.review_task, err = tasks.add("meld reviewed work", "author",
+                                          project="helm-test", force_new=True)
+        self.assertIsNone(err, err)
         real = dispatches._acting_author
 
         def acting(action="author this dispatch"):
@@ -502,6 +557,10 @@ class MeldOutcomeRidesTheRowTest(td.DispatchBase):
         patch = mock.patch.object(dispatches, "_acting_author", acting)
         patch.start()
         self.addCleanup(patch.stop)
+
+    def add(self, **kwargs):
+        kwargs.setdefault("task", self.review_task["id"])
+        return super().add(**kwargs)
 
     def meld(self, tip, word="AGREED", parties=("integrator", "seat-b"),
              about=None):
@@ -521,7 +580,7 @@ class MeldOutcomeRidesTheRowTest(td.DispatchBase):
         with self.verdict_author():
             return run(dispatches.cmd_dispatch, [
                 "verdict", row["id"], row["tip"], "--fix", "--measured",
-                "--finding-count", "1", "--prior-relation", "new",
+                "--finding", "the one harm inside the bar", "--prior-relation", "new",
                 "--worse-than-main", "helm/dispatches.py", *flags,
                 "the one harm inside the bar, cured"])
 
@@ -599,7 +658,7 @@ class MeldOutcomeRidesTheRowTest(td.DispatchBase):
         row = self.add(ref=self.b, recipient="seat-b")
         self.meld(self.b, about=row)
         rc, out, err = run(dispatches.cmd_dispatch, [
-            "hold", row["id"], "read clean inside the bar",
+            "hold", row["id"], "read clean inside the bar; fab Ran 5 tests OK",
             "--source-clean", self.b, "--meld", self.ROOM])
         self.assertEqual(rc, 0, err)
         self.assertIn("meld %s — AGREED" % self.ROOM, out)
@@ -618,10 +677,10 @@ class MeldOutcomeRidesTheRowTest(td.DispatchBase):
         row = self.add(ref=self.b, recipient="seat-b")
         self.meld(self.b, about=row)
         rc, _out, err = run(dispatches.cmd_dispatch, [
-            "hold", row["id"], "read clean", "--source-clean", self.b])
+            "hold", row["id"], "read clean; fab Ran 5 tests OK", "--source-clean", self.b])
         self.assertEqual(rc, 0, err)
         rc, _out, err = run(dispatches.cmd_dispatch, [
-            "hold", row["id"], "read clean", "--source-clean", self.b,
+            "hold", row["id"], "read clean; fab Ran 5 tests OK", "--source-clean", self.b,
             "--meld", self.ROOM])
         self.assertEqual(rc, 1, "the citation was dropped silently")
         self.assertIn("was NOT recorded", err)
@@ -634,7 +693,7 @@ class MeldOutcomeRidesTheRowTest(td.DispatchBase):
         row = self.add(ref=self.b, recipient="seat-b")
         self.meld(self.b, about=row)
         rc, _out, err = run(dispatches.cmd_dispatch, [
-            "hold", row["id"], "read clean", "--source-clean", self.b,
+            "hold", row["id"], "read clean; fab Ran 5 tests OK", "--source-clean", self.b,
             "--meld", self.ROOM])
         self.assertEqual(rc, 0, err)
         released, why = dispatches.mark_release(row["id"])
@@ -649,11 +708,11 @@ class MeldOutcomeRidesTheRowTest(td.DispatchBase):
         row = self.add(ref=self.b, recipient="seat-b")
         self.meld(self.b, about=row)
         rc, _out, err = run(dispatches.cmd_dispatch, [
-            "hold", row["id"], "waiting", "--meld", self.ROOM])
+            "hold", row["id"], "waiting; fab Ran 5 tests OK", "--meld", self.ROOM])
         self.assertEqual(rc, 1)
         self.assertIn("only with --source-clean", err)
         rc, _out, err = run(dispatches.cmd_dispatch, [
-            "hold", row["id"], "waiting", "--source-clean", self.b,
+            "hold", row["id"], "waiting; fab Ran 5 tests OK", "--source-clean", self.b,
             "--meld", self.ROOM])
         self.assertEqual(rc, 0, err)
 
@@ -685,18 +744,29 @@ class DoorBase(td.DispatchBase):
         patch.start()
         self.addCleanup(patch.stop)
         self._lane = 0
+        self.review_task, err = tasks.add("fixture review task", "author",
+                                          project="helm-test", force_new=True)
+        self.assertIsNone(err, err)
+
+    def add(self, **kwargs):
+        if kwargs.get("kind") == "review" and "supersedes" not in kwargs:
+            kwargs.setdefault("task", self.review_task["id"])
+        return super().add(**kwargs)
 
     def first(self, tip):
         type(self)._lane_n = getattr(type(self), "_lane_n", 0) + 1
         self.lane = "door-lane-%d" % type(self)._lane_n
         return self.add(ref=tip, recipient=self.READER, kind="review",
-                        lane=self.lane)
+                        lane=self.lane, task=self.review_task["id"])
 
     def fix(self, row, path="helm/a.py", **kw):
         kw.setdefault("finding_count", 1)
         kw.setdefault("prior_relation", "new")
         if "patch_tip" not in kw:
             kw.setdefault("no_patch_because", "a design finding")
+            kw.setdefault("findings", ["design finding %d in %s (%s)" %
+                                       (i + 1, path, row["id"][:12])
+                                       for i in range(kw["finding_count"])])
         out, why = dispatches.mark_verdict(
             row["id"], row["tip"], "one finding", "fix", basis="measured",
             worse_than_main_paths=[path], **kw)
@@ -706,7 +776,8 @@ class DoorBase(td.DispatchBase):
     def send(self, parent, tip, *flags, kind="review", body="read this tip"):
         args = ["send", self.READER, self.lane, body, "--ref", tip,
                 "--kind", kind, "--repo", self.repo]
-        args += ["--supersedes", parent["id"]] if parent else ["--new-work"]
+        args += ["--supersedes", parent["id"]] if parent else [
+            "--new-work", "--task", self.review_task["id"], "--part"]
         rc, out, err = run(dispatches.cmd_dispatch, args + list(flags))
         # THE ROW THE VERB SAYS IT WROTE: rows of one chain share a lane and
         # often a second, so "newest by timestamp" would pick the parent.
@@ -878,6 +949,8 @@ class ReviewDoorTest(DoorBase):
         two = self.two_answered()
         with mock.patch.object(dispatches, "_verified_family",
                                return_value="codex"), \
+                mock.patch.object(burnflags, "family_flag",
+                                  return_value={"colour": "GREEN"}), \
                 mock.patch.object(dispatches, "_review_mode_choice",
                                   return_value="MELD-DIFF"):
             rc, _out, err, three = self.send(two, self.c)
@@ -903,6 +976,8 @@ class ReviewDoorTest(DoorBase):
             delivered = []
             with mock.patch.object(dispatches, "_verified_family",
                                    return_value="codex"), \
+                    mock.patch.object(burnflags, "family_flag",
+                                      return_value={"colour": "GREEN"}), \
                     mock.patch.object(
                         seats, "dm",
                         side_effect=lambda _to, text, **_kw:
@@ -940,7 +1015,9 @@ class ReviewDoorTest(DoorBase):
                     {manual["id"]: manual}, self.READER, self.repo,
                     "second-chain"), "MELD-DIFF")
             with mock.patch.object(dispatches, "_verified_family",
-                                   return_value="codex"):
+                                   return_value="codex"), \
+                    mock.patch.object(burnflags, "family_flag",
+                                      return_value={"colour": "GREEN"}):
                 rc, retry_out, err, retry = self.send(root, tip)
             self.assertEqual(rc, 0, err)
             self.assertEqual(retry["review_mode"], mode)
@@ -955,11 +1032,265 @@ class ReviewDoorTest(DoorBase):
         self.assertNotIn("review_mode", row)
         self.assertNotIn("MELD-DIFF", out)
 
+    def test_orange_family_review_row_is_meld_diff_and_records_its_cause(self):
+        two = self.two_answered()
+        with mock.patch.object(dispatches, "_verified_family",
+                               return_value="codex"), \
+                mock.patch.object(burnflags, "family_flag",
+                                  return_value={"colour": "ORANGE"}):
+            rc, out, err, three = self.send(two, self.c)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(three["review_mode"], "MELD-DIFF")
+        self.assertEqual(three["review_mode_cause"],
+                         "burn flags ORANGE for this family")
+        self.assertIn("REVIEW FIX MODE: MELD-DIFF", out)
+
+    def test_red_family_review_row_is_review_only_and_records_its_cause(self):
+        two = self.two_answered()
+        with mock.patch.object(dispatches, "_verified_family",
+                               return_value="codex"), \
+                mock.patch.object(burnflags, "family_flag",
+                                  return_value={"colour": "RED"}):
+            rc, out, err, three = self.send(two, self.c)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(three["review_mode"], "RED")
+        self.assertEqual(three["review_mode_cause"],
+                         "burn flags RED for this family")
+        self.assertIn("REVIEW FIX MODE: REVIEW ONLY", out)
+        self.assertNotIn("--patch-tip", out)
+        # The READER's brief carries the line too, so the reader is told it
+        # reviews only, and the brief's suffix binds the recorded mode.
+        self.assertIn("REVIEW FIX MODE: REVIEW ONLY",
+                      dispatches.brief_of(three)[0])
+        from helm import compose_contract
+        _contract, why = compose_contract.parse(three, {three["id"]: three})
+        self.assertNotIn("generated review suffix does not bind", str(why))
+
+    def test_stale_family_flag_falls_to_meld_diff_not_patch(self):
+        two = self.two_answered()
+        with mock.patch.object(dispatches, "_verified_family",
+                               return_value="codex"), \
+                mock.patch.object(burnflags, "family_flag",
+                                  return_value=None):
+            rc, out, err, three = self.send(two, self.c)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(three["review_mode"], "MELD-DIFF")
+        self.assertEqual(three["review_mode_cause"],
+                         "a fresh burn flag is absent for this family")
+        self.assertNotIn("--patch-tip", out)
+
+    def test_green_family_review_row_keeps_the_alternation(self):  # noqa: VACUOUS_ASSERTION — the recorded mode is asserted to be one of the two A/B arms
+        two = self.two_answered()
+        with mock.patch.object(dispatches, "_verified_family",
+                               return_value="codex"), \
+                mock.patch.object(burnflags, "family_flag",
+                                  return_value={"colour": "GREEN"}):
+            rc, out, err, three = self.send(two, self.c)
+        self.assertEqual(rc, 0, err)
+        self.assertIn(three["review_mode"], ("PATCH", "MELD-DIFF"))
+        self.assertNotIn("review_mode_cause", three)
+
+    def test_stated_meld_diff_mode_wins_over_alternation_default(self):  # noqa: VACUOUS_ASSERTION — positive controls on MELD-DIFF review_mode and absence of PATCH
+        """task/4051: a stated MELD-DIFF in the brief or --review-mode flag stores
+        MELD-DIFF even when the alternation default would pick PATCH."""
+        self.lane = "stated-meld-diff"
+        # Control: fresh chain with no stated mode defaults to PATCH on GREEN
+        with mock.patch.object(dispatches, "_verified_family", return_value="codex"), \
+                mock.patch.object(burnflags, "family_flag", return_value={"colour": "GREEN"}):
+            rc, out, err, row = self.send(None, self.a, body="normal brief")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(row.get("review_mode"), "PATCH")
+
+        # 1. Stated in brief prose via 'REVIEW FIX MODE: MELD-DIFF'
+        self.lane = "stated-in-brief"
+        body = "Author instructions.\n\nREVIEW FIX MODE: MELD-DIFF\nProceed with diff."
+        with mock.patch.object(dispatches, "_verified_family", return_value="codex"), \
+                mock.patch.object(burnflags, "family_flag", return_value={"colour": "GREEN"}):
+            rc, out, err, stated_row = self.send(None, self.b, body=body)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(stated_row.get("review_mode"), "MELD-DIFF")
+        brief = dispatches.brief_of(stated_row)[0]
+        self.assertIn("REVIEW FIX MODE: MELD-DIFF", brief)
+        self.assertNotIn("REVIEW FIX MODE: PATCH", brief)
+
+        # 2. Stated via CLI flag --review-mode MELD-DIFF
+        self.lane = "stated-via-flag"
+        with mock.patch.object(dispatches, "_verified_family", return_value="codex"), \
+                mock.patch.object(burnflags, "family_flag", return_value={"colour": "GREEN"}):
+            rc, out, err, flag_row = self.send(None, self.c, "--review-mode", "MELD-DIFF", body="flag brief")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(flag_row.get("review_mode"), "MELD-DIFF")
+        brief_flag = dispatches.brief_of(flag_row)[0]
+        self.assertIn("REVIEW FIX MODE: MELD-DIFF", brief_flag)
+        self.assertNotIn("REVIEW FIX MODE: PATCH", brief_flag)
+
+    def test_conflicting_stated_review_modes_are_refused(self):  # noqa: VACUOUS_ASSERTION — positive control on non-zero exit and error text naming both modes
+        """task/4051: conflicting stated review modes are refused, naming both."""
+        self.lane = "conflicting-modes"
+        # 1. Conflicting lines in brief
+        conflict_body = "Instructions:\nREVIEW FIX MODE: PATCH\nREVIEW FIX MODE: MELD-DIFF"
+        with mock.patch.object(dispatches, "_verified_family", return_value="codex"), \
+                mock.patch.object(burnflags, "family_flag", return_value={"colour": "GREEN"}):
+            rc, out, err, _row = self.send(None, self.a, body=conflict_body)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("MELD-DIFF", out + err)
+        self.assertIn("PATCH", out + err)
+
+        # 2. Conflicting flag and brief
+        with mock.patch.object(dispatches, "_verified_family", return_value="codex"), \
+                mock.patch.object(burnflags, "family_flag", return_value={"colour": "GREEN"}):
+            rc, out, err, _row = self.send(None, self.a, "--review-mode", "PATCH",
+                                           body="REVIEW FIX MODE: MELD-DIFF")
+        self.assertNotEqual(rc, 0)
+        self.assertIn("MELD-DIFF", out + err)
+        self.assertIn("PATCH", out + err)
+
+    def test_burn_forced_mode_wins_over_stated_mode(self):  # noqa: VACUOUS_ASSERTION — positive controls on forced review_mode and cause override
+        """task/4051: a burn-forced mode (RED/ORANGE) still wins over a stated mode."""
+        self.lane = "burn-forced-orange"
+        body = "REVIEW FIX MODE: PATCH — please commit cure"
+        # On ORANGE, stated PATCH is overridden by burn-forced MELD-DIFF
+        with mock.patch.object(dispatches, "_verified_family", return_value="codex"), \
+                mock.patch.object(burnflags, "family_flag", return_value={"colour": "ORANGE"}):
+            rc, out, err, row_orange = self.send(None, self.a, body=body)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(row_orange.get("review_mode"), "MELD-DIFF")
+        self.assertIn("burn flags ORANGE", row_orange.get("review_mode_cause", ""))
+
+        # On RED, stated PATCH is overridden by burn-forced RED (review only)
+        self.lane = "burn-forced-red"
+        with mock.patch.object(dispatches, "_verified_family", return_value="codex"), \
+                mock.patch.object(burnflags, "family_flag", return_value={"colour": "RED"}):
+            rc, out, err, row_red = self.send(None, self.b, body=body)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(row_red.get("review_mode"), "RED")
+        self.assertIn("burn flags RED", row_red.get("review_mode_cause", ""))
+
+    def test_diff_handoff_passes_on_stated_meld_diff_row(self):  # noqa: VACUOUS_ASSERTION — positive control on rc 0 verdict and diff_handoff receipt
+        """task/4051: a row with stated MELD-DIFF accepts a --diff-handoff verdict."""
+        self.lane = "handoff-pass"
+        body = "Please review this.\n\nREVIEW FIX MODE: MELD-DIFF"
+        with mock.patch.object(dispatches, "_verified_family", return_value="codex"), \
+                mock.patch.object(burnflags, "family_flag", return_value={"colour": "GREEN"}):
+            rc, out, err, row = self.send(None, self.a, body=body)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(row["review_mode"], "MELD-DIFF")
+
+        # Now post a diff in the pair meld room and file a verdict with diff_handoff
+        room = self.pair_room(row)
+        epoch, _who, _seed = meld.latest_seed(chat.read(room)[0])
+        patch = self.git("diff", self.a, self.b, "--", "state") + "\n"
+        message = chat.post("[MELD e:%d] %s" % (epoch, patch), room=room,
+                            who=self.READER, sign=False)
+        self.fix(row, path="state",
+                 no_patch_because="author applies exact reviewer diff",
+                 diff_handoff=room + "/" + message["id"])
+        folded = dispatches.snapshot()[0][row["id"]]
+        self.assertEqual(folded["status"], "verdict")
+        self.assertTrue(dispatches._has_diff_handoff(folded))
+        self.assertEqual(folded["diff_handoff"]["msg_id"], message["id"])
+
+    def test_an_unknown_or_refusing_flag_never_stamps_patch(self):  # noqa: VACUOUS_ASSERTION — the loop is over a fixed three-flag table, and each pass asserts the MELD-DIFF mode and its cause
+        """GREY is unmeasured and a refusing reach axis cannot spend: both are
+        UNKNOWN for the fix mode, so both are MELD-DIFF, never PATCH, even where
+        the alternation would have chosen PATCH."""
+        for tip, flag, cause in (
+                (self.a, {"colour": "GREY"}, "burn flags GREY for this family"),
+                (self.b, {"colour": "GREEN", "axes": {"reach": "ORANGE"}},
+                 "burn flags reach ORANGE for this family"),
+                (self.c, {"colour": "YELLOW", "axes": {"reach": "RED"}},
+                 "burn flags reach RED for this family")):
+            self.lane = "unknown-flag-" + tip[:6]
+            with mock.patch.object(dispatches, "_verified_family",
+                                   return_value="codex"), \
+                    mock.patch.object(burnflags, "family_flag",
+                                      return_value=flag), \
+                    mock.patch.object(dispatches, "_review_mode_choice",
+                                      return_value="PATCH"):
+                rc, out, err, row = self.send(None, tip)
+            self.assertEqual(rc, 0, err)
+            self.assertEqual((row["review_mode"], row["review_mode_cause"]),
+                             ("MELD-DIFF", cause), flag)
+            self.assertIn("REVIEW FIX MODE: MELD-DIFF", out, flag)
+            self.assertNotIn("--patch-tip", dispatches.brief_of(row)[0], flag)
+
+    def test_an_orange_row_is_meld_diff_to_every_meld_diff_door(self):
+        """A burn-forced MELD-DIFF row is MELD-DIFF to the doors that read the
+        recorded mode: its reader can record the --diff-handoff receipt it was
+        told to produce. Only the task/3698 A/B count ignores it."""
+        self.lane = "orange-receipt"
+        with mock.patch.object(dispatches, "_verified_family",
+                               return_value="codex"), \
+                mock.patch.object(burnflags, "family_flag",
+                                  return_value={"colour": "ORANGE"}):
+            rc, _out, err, root = self.send(None, self.a)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(dispatches._review_mode_of(root), "MELD-DIFF")
+        self.assertIsNone(dispatches._ab_mode_of(root))
+        room = self.pair_room(root)
+        epoch, _who, _seed = meld.latest_seed(chat.read(room)[0])
+        patch = self.git("diff", self.a, self.b, "--", "state") + "\n"
+        message = chat.post("[MELD e:%d] %s" % (epoch, patch), room=room,
+                            who=self.READER, sign=False)
+        old = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                            time.gmtime(time.time() - 2))
+        with mock.patch.object(dispatches.pk, "now_ts", return_value=old):
+            self.fix(root, no_patch_because="exact diff posted in the pair "
+                     "room", diff_handoff=room + "/" + message["id"])
+        folded = dispatches.snapshot()[0][root["id"]]
+        self.assertEqual(folded["status"], "verdict")
+        self.assertTrue(dispatches._has_diff_handoff(folded))
+        self.assertEqual(folded["diff_handoff"]["msg_id"], message["id"])
+
+    def test_an_orange_add_moved_by_rebind_carries_one_mode_line(self):
+        two = self.two_answered()
+        with mock.patch.object(dispatches, "_verified_family",
+                               return_value="codex"), \
+                mock.patch.object(burnflags, "family_flag",
+                                  return_value={"colour": "ORANGE"}):
+            authored, why = dispatches.add(
+                self.READER, self.lane, ref=self.c, repo=self.repo,
+                kind="review", supersedes=two["id"], notify=False,
+                _reason=True)
+            self.assertIsNone(why, why)
+            self.assertEqual(authored["review_mode_cause"],
+                             "burn flags ORANGE for this family")
+            moved, why = dispatches.rebind(
+                authored["id"], "seat-c", reason="route to live seat",
+                force=True, notify=False)
+        self.assertIsNone(why, why)
+        brief = dispatches.brief_of(moved["new"])[0]
+        self.assertEqual(brief.count("REVIEW FIX MODE:"), 1, brief)
+        self.assertEqual(moved["new"]["review_mode"], "MELD-DIFF")
+
+    def test_a_burn_forced_row_does_not_move_the_alternation(self):
+        """The task/3698 parity counts only rows the alternation chose: a
+        forced row on another chain leaves this reader's next chain where it
+        was, and a forced row inside a chain never fixes that chain's mode."""
+        forced = {"id": "f" * 32, "chain_root": "f" * 32, "kind": "review",
+                  "recipient": self.READER, "repo_id": "prior-project",
+                  "review_mode": "MELD-DIFF",
+                  "review_mode_cause": "burn flags ORANGE for this family"}
+        self.assertEqual(dispatches._review_mode_of(forced), "MELD-DIFF")
+        current = {forced["id"]: forced}
+        self.assertEqual(dispatches._review_mode_choice(
+            current, self.READER, self.repo, "next-chain"), "PATCH")
+        self.assertEqual(dispatches._review_mode_choice(
+            current, self.READER, "prior-project", forced["id"]), "PATCH")
+        chosen = dict(forced, id="e" * 32, chain_root="e" * 32)
+        chosen.pop("review_mode_cause")
+        current[chosen["id"]] = chosen
+        self.assertEqual(dispatches._review_mode_choice(
+            current, self.READER, self.repo, "next-chain"), "MELD-DIFF")
+
+
     def test_add_and_rebind_record_guidance_from_the_ledger_and_keep_the_whole_brief(self):
         two = self.two_answered()
         original = "the review note: " + ("details " * 80).strip()
         with mock.patch.object(dispatches, "_verified_family",
-                               return_value="codex"):
+                               return_value="codex"), \
+                mock.patch.object(burnflags, "family_flag",
+                                  return_value={"colour": "GREEN"}):
             authored, why = dispatches.add(
                 self.READER, self.lane, ref=self.c, note=original,
                 repo=self.repo, kind="review", supersedes=two["id"],
@@ -976,7 +1307,9 @@ class ReviewDoorTest(DoorBase):
         self.assertIsNone(authored["message_hash"])
 
         with mock.patch.object(dispatches, "_verified_family",
-                               return_value="codex"):
+                               return_value="codex"), \
+                mock.patch.object(burnflags, "family_flag",
+                                  return_value={"colour": "GREEN"}):
             moved, why = dispatches.rebind(
                 authored["id"], "seat-c", reason="route to live seat",
                 force=True, notify=False)
@@ -993,7 +1326,9 @@ class ReviewDoorTest(DoorBase):
                   dispatches.REVIEW_MODE_LINES["PATCH"] +
                   "\nThe actual reviewer instructions follow.")
         with mock.patch.object(dispatches, "_verified_family",
-                               return_value="codex"):
+                               return_value="codex"), \
+                mock.patch.object(burnflags, "family_flag",
+                                  return_value={"colour": "GREEN"}):
             rc, _out, err, row = self.send(None, self.a, body=quoted)
         self.assertEqual(rc, 0, err)
         full = dispatches.brief_of(row)[0]
@@ -1007,6 +1342,8 @@ class ReviewDoorTest(DoorBase):
         original = "author's exact brief: " + "context " * 900
         with mock.patch.object(dispatches, "_verified_family",
                                return_value="codex"), \
+                mock.patch.object(burnflags, "family_flag",
+                                  return_value={"colour": "GREEN"}), \
                 mock.patch.object(dispatches, "_review_mode_choice",
                                   return_value="MELD-DIFF"):
             rc, _out, err, sent = self.send(two, self.c, body=original)
@@ -1031,10 +1368,13 @@ class ReviewDoorTest(DoorBase):
     def test_codex_guidance_only_rebind_to_claude_has_no_stale_brief(self):
         self.lane = "guidance-only"
         with mock.patch.object(dispatches, "_verified_family",
-                               return_value="codex"):
+                               return_value="codex"), \
+                mock.patch.object(burnflags, "family_flag",
+                                  return_value={"colour": "GREEN"}):
             authored, why = dispatches.add(
                 self.READER, self.lane, ref=self.a, repo=self.repo,
-                kind="review", new_work=True, notify=False, _reason=True)
+                kind="review", new_work=True, notify=False, _reason=True,
+                task=self.review_task["id"])
         self.assertIsNone(why, why)
         self.assertEqual(dispatches.brief_of(authored)[0],
                          dispatches.REVIEW_MODE_LINES["PATCH"])
@@ -1112,6 +1452,8 @@ class ReviewDoorTest(DoorBase):
         self.lane = "mode-diff-receipt"
         with mock.patch.object(dispatches, "_verified_family",
                                return_value="codex"), \
+                mock.patch.object(burnflags, "family_flag",
+                                  return_value={"colour": "GREEN"}), \
                 mock.patch.object(dispatches, "_review_mode_choice",
                                   return_value="MELD-DIFF"):
             rc, _out, err, root = self.send(None, self.a)
@@ -1137,6 +1479,8 @@ class ReviewDoorTest(DoorBase):
         self.lane = "mode-diff-unrelated"
         with mock.patch.object(dispatches, "_verified_family",
                                return_value="codex"), \
+                mock.patch.object(burnflags, "family_flag",
+                                  return_value={"colour": "GREEN"}), \
                 mock.patch.object(dispatches, "_review_mode_choice",
                                   return_value="MELD-DIFF"):
             rc, _out, err, root = self.send(None, self.a)
@@ -1292,7 +1636,8 @@ class ReviewDoorTest(DoorBase):
         self.assertIn("run the migration", err)
         self.assertIn("helm chat meld invite seat-b", err)
         self.assertIn(RD.PAIR_PLAN, err)
-        self.assertIn("--into meld-0-pair-", err)
+        self.assertIn("--into %s-3112" % RD.pair_scope(
+            {"repo_id": dispatches._repo_info(self.repo)["repo_id"]}), err)
         self.assertIsNone(row, "the build row was written before the meld")
         rc, _out, err, row = self.send(None, self.b, "--async-because",
                                        "staging-only", kind="build",
@@ -1373,7 +1718,7 @@ class ReviewDoorTest(DoorBase):
         self.assertIn("review spiral", block_text or "")
         with mock.patch.dict(os.environ, {"HELM_CHAT_NAME": self.READER}):
             rc, _out, err = run(dispatches.cmd_dispatch, [
-                "hold", three["id"], "read clean", "--source-clean", self.c])
+                "hold", three["id"], "read clean; fab Ran 5 tests OK", "--source-clean", self.c])
         self.assertEqual(rc, 0, err)
         self.assertEqual(dispatches.snapshot()[0][three["id"]]["hold_actor"],
                          self.READER)
@@ -1704,6 +2049,16 @@ class ModeMetricsCensusTest(unittest.TestCase):
             "were not measured")
         self.assertEqual(got["by_mode"]["UNKNOWN"]["cure_cycles"], "UNKNOWN")
         self.assertEqual(got["by_mode"]["PATCH"]["cure_cycles"], 1)
+
+    def test_a_burn_forced_row_is_not_a_second_mode_on_its_chain(self):
+        current, accepted = self.fixture()
+        current["6" * 32].update(review_mode="PATCH",
+                                 review_mode_cause="burn flags ORANGE for "
+                                                   "this family")
+        got = RD.mode_metrics(current, accepted, cutoff=0)
+        diff = {r["chain"]: r for r in got["chains"]}[self.DIFF]
+        self.assertEqual(diff["mode"], "MELD-DIFF")
+        self.assertNotIn("UNKNOWN", got["by_mode"])
 
     def test_a_strangers_accepted_hold_is_not_the_readers_answer(self):
         row = self.dispatch("e" * 32, self.PATCH, "2026-09-29T00:00:00Z",

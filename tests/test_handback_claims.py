@@ -31,7 +31,7 @@ import json
 import os
 import unittest
 
-from helm import dispatches, gate, gateauthority, landreq, pk
+from helm import dispatches, gate, gateauthority, handback_claims, landreq, pk
 from tests import test_dispatches as td
 from tests._tmphome import pin_live_seats
 
@@ -126,6 +126,57 @@ class ClaimBase(td.DispatchBase):
 
     def states(self, brief):
         return [(c["kind"], c["state"]) for c in self.check(brief)]
+
+
+class HoldReceiptTest(unittest.TestCase):
+    """The fab receipt a source-clean hold carries (task/4103), on the job
+    names fab writes: `<branch>-<git rev-parse --short>-<epoch>-<nonce>-<pid>`.
+    git sizes the short sha to the repository's object count, so a smaller
+    repository's run on exactly the held tip names fewer than 11 hex chars
+    of it, and that LOG is this tip's receipt, never another tip's."""
+
+    TIP = "148cd929b0e1f2a3b4c5d6e7f8091a2b3c4d5e6f"
+    OTHER = "9160a632aa0e1f2a3b4c5d6e7f8091a2b3c4d5e6"
+
+    def log(self, short):
+        return "LOG node-a:~/fab/logs/lane-x-%s-1790920203-44782e44-2454.log" \
+            % short
+
+    def test_a_short_sha_of_the_tip_is_its_receipt(self):
+        for n in (7, 9, 11, 12):
+            receipt, foreign = handback_claims.hold_receipt(
+                "read clean, " + self.log(self.TIP[:n]), self.TIP)
+            self.assertEqual((bool(receipt), foreign), (True, []), n)
+        # beside a Ran line, the same LOG is no longer read as a foreign run
+        receipt, foreign = handback_claims.hold_receipt(
+            "fab Ran 63 tests OK, " + self.log(self.TIP[:9]), self.TIP)
+        self.assertTrue(receipt)
+        self.assertEqual(foreign, [])
+
+    def test_a_short_sha_of_another_tip_is_foreign(self):  # noqa: VACUOUS_ASSERTION — the unconditional first assertion is the positive control: the same LOG shape on the held tip is its receipt
+        receipt, _foreign = handback_claims.hold_receipt(
+            "fab Ran 63 tests OK, " + self.log(self.TIP[:9]), self.TIP)
+        self.assertEqual(receipt, "LOG " + self.log(self.TIP[:9])[4:])
+        for n in (7, 9, 11):
+            receipt, foreign = handback_claims.hold_receipt(
+                "fab Ran 63 tests OK, " + self.log(self.OTHER[:n]), self.TIP)
+            self.assertIsNone(receipt, n)
+            self.assertEqual(len(foreign), 1, n)
+
+    def test_a_hex_part_shorter_than_a_short_sha_names_no_tip(self):
+        receipt, foreign = handback_claims.hold_receipt(
+            "read clean, " + self.log(self.TIP[:6]), self.TIP)
+        self.assertIsNone(receipt)
+        self.assertEqual(len(foreign), 1)
+
+    def test_a_zero_or_failed_count_is_no_receipt(self):
+        for text in ("fab Ran 0 tests in 0.0s OK",
+                     "fab Ran 63 tests in 4.2s FAILED (failures=1)",
+                     "fab Ran 63 tests in 4.2s\n\nFAILED (errors=2)"):
+            self.assertEqual(handback_claims.hold_receipt(text, self.TIP),
+                             (None, []), text)
+        self.assertEqual(handback_claims.hold_receipt(
+            "fab Ran 63 tests in 4.2s\n\nOK", self.TIP), ("Ran 63", []))
 
 
 class ClaimBindingTest(ClaimBase):
@@ -312,7 +363,8 @@ class ClaimSurfaceTest(ClaimBase):
         with dispatch_home(self.repo):
             row, why, _sent = dispatches.send(
                 "codex-3", "claims-lane-" + kind, brief, self.side,
-                repo=self.repo, sign=False, new_work=True, kind=kind)
+                repo=self.repo, sign=False, new_work=True, kind=kind,
+                task=self.review_task["id"] if kind == "review" else None)
         self.assertIsNone(why, why)
         return row
 
@@ -357,7 +409,7 @@ class ClaimSurfaceTest(ClaimBase):
         gone = self.send("hand-back, nothing claimed")["id"]
         with mock.patch.object(dispatches, "_acting_author",
                                return_value=("codex-3", None)):
-            _row, why = dispatches.mark_hold(gone, "read clean",
+            _row, why = dispatches.mark_hold(gone, "read clean; fab Ran 5 tests OK",
                                              source_clean_tip=self.side)
         self.assertIsNone(why, why)
         _row, why = dispatches.mark_cancel(gone, "moved to a new round")

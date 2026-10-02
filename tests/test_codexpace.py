@@ -718,10 +718,31 @@ class WallNoticeTest(unittest.TestCase):
 
     def test_a_new_wall_after_the_reset_is_a_new_event(self):  # noqa: VACUOUS_ASSERTION — the observable is what reached the room and the phone, counted exactly
         """The positive control on the latch key: the wall is (member,
-        reset instant), so the next week's wall speaks again."""
+        reset instant), so the next week's wall speaks again. The first
+        wall's reset is said once, before it, in the room only
+        (task/3876)."""
         self.announce(self.rows(reset_h=50), NOW)
         self.announce(self.rows(reset_h=50 + 168), NOW + 60 * HOUR)
-        self.assertEqual((len(self.posts), len(self.pushes)), (2, 2))
+        self.assertEqual((len(self.posts), len(self.pushes)), (3, 2))
+        self.assertTrue(self.posts[1].startswith("codex RESET: "),
+                        self.posts)
+        self.assertIn("walled@example.com", self.posts[1])
+        self.assertTrue(self.posts[2].startswith("codex WALL: "), self.posts)
+
+    def test_a_reset_closes_its_wall_once_in_the_room_only(self):  # noqa: VACUOUS_ASSERTION — the observable is what reached the room and the phone, counted exactly after each call
+        """task/3876: the wall's reset instant passing is its unblock. The
+        room hears it once, the phone (which heard the wall) hears nothing
+        new, and a later pass says nothing more."""
+        self.announce(self.rows(reset_h=2), NOW)
+        self.assertEqual((len(self.posts), len(self.pushes)), (1, 1))
+        self.announce([], NOW + HOUR)                 # before the reset
+        self.assertEqual(len(self.posts), 1)
+        self.announce([], NOW + 3 * HOUR)             # after it
+        self.assertEqual((len(self.posts), len(self.pushes)), (2, 1))
+        self.assertIn("codex RESET: walled@example.com", self.posts[1])
+        self.assertIn("window reset at", self.posts[1])
+        self.announce([], NOW + 4 * HOUR)
+        self.assertEqual((len(self.posts), len(self.pushes)), (2, 1))
 
     def test_an_open_account_announces_nothing(self):
         rows = [brow("open@example.com", 99.0, NOW + 90 * HOUR)]
@@ -768,7 +789,12 @@ class PassTest(unittest.TestCase):
             second = codexpace.watch_pass(rows, now=NOW + 900)
         self.assertEqual(post.call_count, 1)
         self.assertEqual(push.call_count, 1)
-        self.assertEqual(post.call_args.kwargs.get("room"), "helm")
+        # #seats, @mentioning the credentials steward (task/3876); no
+        # steward is declared in this temp home, so the row says where to
+        self.assertEqual(post.call_args.kwargs.get("room"), "seats")
+        self.assertEqual(post.call_args.kwargs.get("who"), "seat-events")
+        self.assertIn("no steward woken: local-names 'cred-steward-seat'",
+                      post.call_args.args[0])
         for got in (first, second):
             self.assertIn("verdict", got)
             self.assertNotIn("@", json.dumps(got))

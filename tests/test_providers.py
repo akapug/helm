@@ -502,6 +502,20 @@ class ProbeTest(NativeBase):
         (cred, _), _ = self.probe(self.acct(home), data)
         self.assertEqual((cred["cred_state"], cred["status"]), ("exhausted", "blocked"))
 
+    def test_the_history_row_names_the_plan(self):
+        """task/3871: the pace reader knows the watcher's switch pool (the
+        Max accounts) from the history alone, so each row names its plan,
+        the one the cred row carries, and None where that is unknown."""
+        home = self.claude_home("a", "u@x.example")
+        data = {"limits": [{"kind": "session", "percent": 30,
+                            "resets_at": "1970-01-01T00:01:00Z"}]}
+        (cred, hist), _fn = self.probe(dict(self.acct(home), tier="Max 20x"),
+                                       data)
+        self.assertEqual((hist["tier"], cred["tier"]), ("Max 20x", "Max 20x"))
+        (_cred, hist), _fn = self.probe(self.acct(home), data)
+        self.assertIn("tier", hist)
+        self.assertIsNone(hist["tier"])
+
     def test_exhausted_and_headroom_are_read_only_off_measured_gauges(self):  # noqa: VACUOUS_ASSERTION — the headroom absence has the measured 60.0 control first on the same probe, and the unread status is positively asserted equal on the history row
         """task/2935: a limit the vendor sent with no percent is an UNREAD
         gauge. It is never 0% (headroom), never 100% (exhausted); only the
@@ -1367,6 +1381,20 @@ class CodexBudgetReaderTest(unittest.TestCase):
                 junk["rate_limit_reset_credits"] = block
             self.assertIsNone(self.probe(junk)[0]["reset_credits"], block)
         self.assertIsNone(self.probe(error=OSError("down"))[0]["reset_credits"])
+
+    def test_invalid_snapshot_timestamp_is_unknown_not_fresh(self):  # noqa: VACUOUS_ASSERTION — the unconditional positive cached_budget/file assertion before the loop proves a valid snapshot is read from the same path
+        row, _ = self.probe(recorded("pro"))
+        self.mod.write_snapshot([row], now=self.now)
+        self.assertEqual(self.mod.cached_budget(now=self.now)[0][0]["file"],
+                         self.ACCT["file"])
+        path = self.mod.snapshot_path()
+        with open(path, encoding="utf-8") as f:
+            snapshot = json.load(f)
+        for ts in ("invalid", [], {}, "NaN", "Infinity", "-Infinity"):
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(dict(snapshot, ts=ts), f)
+            self.assertEqual(self.mod.cached_budget(now=self.now), (None, None),
+                             ts)
 
     def test_a_REJECTED_token_is_unknown_and_never_zero(self):
         row, _ = self.probe(error=self.http_error(401))

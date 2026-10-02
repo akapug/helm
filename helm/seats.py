@@ -296,9 +296,10 @@ from .seats_delegation import (  # noqa: F401
     _get_claim_lease, _enclosing_claude_holder, _AGENT_KEY_PREFIX, _activity_record_key,
     _activity_record_valid, _record_delegation_activity, _unlink_delegation_activity, _get_delegation_activity,
     _is_pid_alive, _record_posttool_delegation, _clear_posttool_delegation, _delegated_build,
-    _lane_stem, _gate_pending, release_hint, _claim_evidence_warning,
+    release_hint, _claim_evidence_warning,
     ProcScan, proc_scan,
 )
+from .seats_gate_exemption import _gate_pending, _lane_stem  # noqa: F401
 
 # CLAIMS — the advisory TTL lease and its liveness census.
 from .seats_claims import (  # noqa: F401
@@ -626,9 +627,17 @@ OWNER_RAILS = ("web", "tui", "telegram")
 # same rule: the siblings hold it, so a patch of it reaches them.
 _IMPL_MODULES = ("seats_common", "seats_common_lock", "seats_gate_queue",
                  "seats_identity",
+                 # the reaction burst's wake body, split out of seats_identity
+                 # (task/4019): a patch of seats._scrub or seats.MAX_BYTES must
+                 # reach the _reaction_wake_body that now resolves it here.
+                 "seats_identity_reaction",
                  "seats_roster", "seats_mute", "seats_incarnation",
                  "seats_lineage",
                  "seats_delivery",
+                 # the pair-meld YIELD retirement, split out of seats_delivery
+                 # (task/3743); it resolves every name on seats_delivery at
+                 # call time, so the fan-out reaches it through that module.
+                 "seats_delivery_yield",
                  # the hook's scope (`boundary_scope`, task/3382) resolves
                  # `seat_scope` here, so a patch of seats.seat_scope must
                  # reach it as it reached deliver_any before.
@@ -651,6 +660,9 @@ _IMPL_MODULES = ("seats_common", "seats_common_lock", "seats_gate_queue",
                  # reach the _spiral_gate that now resolves it here.
                  "seats_stop_spiral",
                  "seats_ack", "seats_receipts", "seats_delegation",
+                 # the gate exemption's proof, split out of seats_delegation
+                 # (task/2387)
+                 "seats_gate_exemption",
                  "seats_claims", "seats_report",
                  "seats_gc",
                  # THE GC's new home. gc_roster resolves `roster`,
@@ -662,7 +674,9 @@ _IMPL_MODULES = ("seats_common", "seats_common_lock", "seats_gate_queue",
                  "seats_work_offer", "seats_room_advice",
                  "seats_advice",
                  "seats_stop_guard", "seats_catchup",
-                 "seats_cli")
+                 "seats_cli",
+                 # split out of seats_cli and seats_join under the budget
+                 "seats_cli_council", "seats_join_banner")
 
 
 def _impl_modules(_stems=_IMPL_MODULES, _pkg=__name__.rsplit(".", 1)[0]):

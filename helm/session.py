@@ -52,7 +52,8 @@ import subprocess
 import sys
 import time
 
-from . import freetext, home, openflags, pk, runtime_config, seat_launch_owner
+from . import (cvcompat, freetext, home, openflags, pk, runtime_config,
+               seat_launch_owner)
 
 CV = "cv"
 FORCE_VAR = "CLAUDE_CODE_FORCE_SESSION_PERSISTENCE"
@@ -1834,8 +1835,10 @@ def cmd_doctor(args):
 
 def cmd_checkpoint(args):
     """session checkpoint <sid> [--window N] — mint a NEW resumable snapshot id
-    (original untouched) via cv prune (revive + --thinking default), so a
-    maxed/forked session becomes branchable. Memory-only sids route to rescue."""
+    (original untouched) via cv prune (revive by default plus
+    cvcompat.drop_thinking: --thinking on cv 0.10, --drop-thinking on cv 0.11+),
+    so a maxed/forked session becomes branchable. Memory-only sids route to
+    rescue."""
     if not args:
         print("usage: helm session checkpoint <sid-prefix> [--window N]",
               file=sys.stderr)
@@ -1869,8 +1872,8 @@ def cmd_checkpoint(args):
     cwd = _session_cwd(sid)  # fail closed before cv creates any artifact
     import uuid
     newid = str(uuid.uuid4())
-    rc, out, cerr = _cv("prune", sid, "--window", window, "--thinking",
-                        "--to", newid, "--json")
+    rc, out, cerr = _cv("prune", sid, "--window", window,
+                        cvcompat.drop_thinking(), "--to", newid, "--json")
     if rc != 0:
         print("helm session checkpoint: cv prune failed: " + (cerr or out),
               file=sys.stderr)
@@ -1879,7 +1882,7 @@ def cmd_checkpoint(args):
         report = json.loads(out)
     except ValueError:
         report = {}
-    if report.get("newId") != newid:
+    if not isinstance(report, dict) or cvcompat.field(report, "new_id") != newid:
         print("helm session checkpoint: cv prune returned success without the "
               "requested artifact id", file=sys.stderr)
         return 1

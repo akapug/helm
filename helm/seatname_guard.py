@@ -94,6 +94,10 @@ import sys
 import tokenize
 
 _CONVENTION = ("seat-a", "seat-b", "seat-c", "seat-under-test")
+#: The prefix of the line each refusal ends with, one per refused literal. This
+#: rung runs as a stdlib-only snapshot, so it holds its own copy of the prefix
+#: helm/review_done.py prints.
+CORRECTED = "corrected: "
 # The escape must be a REAL COMMENT token, never a substring: text that merely
 # CONTAINS the token inside ordinary string data disarmed the old check.
 _ESCAPE = re.compile(r"#\s*noqa:\s*SEAT_NAME\s+(?:—|-)\s*(\S.*)$")
@@ -1090,6 +1094,30 @@ def _entered_the_boundary(status, old, rel):
     return _under_tests(rel) and not _under_tests(was)
 
 
+def fixture_for(values):
+    """{casefolded value: fixture} in order of first appearance.
+
+    One real identity keeps one fixture across the refusal, so a test that
+    compared two rows for the same seat still compares two equal rows after
+    the rewrite, and two identities never collapse onto one fixture."""
+    out = {}
+    for value in values:
+        key = value.casefold()
+        if key not in out:
+            out[key] = "seat-" + _letters(len(out))
+    return out
+
+
+def _letters(n):
+    """a, b, ... z, aa, ab, ... for the n-th fixture."""
+    word = ""
+    n += 1
+    while n:
+        n, rem = divmod(n - 1, 26)
+        word = chr(ord("a") + rem) + word
+    return word
+
+
 def offenders(root, names):
     """(found, refusal_reason, missing_seam).
 
@@ -1272,9 +1300,12 @@ def main(argv):
         print("    %-44s %r" % (where, value), file=sys.stderr)
     if len(refusing) > 12:
         print("    ... and %d more" % (len(refusing) - 12), file=sys.stderr)
-    print("  FIX: use the house convention — %s. Build fixtures from those "
-          "DIRECTLY; never assemble one by splitting or concatenating real "
-          "names, which yields the same value past a weaker check.\n"
+    print("  FIX: use the house convention — %s. Each `corrected:` line below "
+          "names the fixture that replaces one literal; a role word such as "
+          "'reviewer' or 'builder' fits where the test is about a role. Build "
+          "fixtures from those DIRECTLY; never assemble one by splitting or "
+          "concatenating real names, which yields the same value past a "
+          "weaker check.\n"
           # THE REMEDY NAMES THE BOUNDARY THE CODE ACTUALLY HAS. `escape_lines`
           # groups by tokenize's LOGICAL line, so this may not say "the same
           # line": a physical line ending in a backslash cannot carry a
@@ -1291,6 +1322,14 @@ def main(argv):
           "indented body, which is a logical line of its own.\n"
           "  roster: %s | skip this commit: HELM_SEATNAME_SKIP=1"
           % (", ".join(_CONVENTION), path), file=sys.stderr)
+    # EVERY REFUSED LITERAL, NOT THE FIRST TWELVE: these lines are the cure,
+    # and a cure that stops partway leaves the next commit refused again.
+    fixtures = fixture_for(value for _rel, _line, value, _kind in refusing)
+    for rel, line, value, _kind in refusing:
+        where = "%s:%d" % (rel, line) if line else rel
+        print("%s%s: %r -> %r" % (CORRECTED, where, value,
+                                  fixtures[value.casefold()]),
+              file=sys.stderr)
     return 1
 
 

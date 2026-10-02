@@ -21,7 +21,7 @@ class TheDispatchDoorObeysTheProjectLightTest(td.DispatchBase):
     """A dispatch is where work is HANDED OUT, so it is the second door the
     owner's colour holds at (`helm work claim` is the first, and both ask
     `registry.admits`). The seat and budget rungs are about supply; this one is
-    about permission, and it is inside `_base` so every writer shares it."""
+    about permission, and it is inside `_base3` so every writer shares it."""
 
     def setUp(self):
         super().setUp()
@@ -42,6 +42,8 @@ class TheDispatchDoorObeysTheProjectLightTest(td.DispatchBase):
                 "repo": self.repo, "notify": False, "_reason": True}
         args.update(kwargs)
         args.setdefault("new_work", "supersedes" not in args)
+        if args.get("kind") == "review" and args["new_work"]:
+            args.setdefault("task", self.review_task["id"])
         with dispatch_home(self.repo):
             return dispatches.add(**args)
 
@@ -136,7 +138,9 @@ class TheShareNoteCountsTheRowItFiledOnceTest(td.DispatchBase):
             row, err = dispatches.add(recipient="grok", lane=lane,
                                       ref=self.a, repo=self.repo,
                                       notify=False, _reason=True, kind=kind,
-                                      new_work=True)
+                                      new_work=True,
+                                      task=self.review_task["id"]
+                                      if kind == "review" else None)
         self.assertIsNotNone(row, err)
         return [n for n in row.get(dispatches._ADMISSION_NOTES, ())
                 if "QUEUED" in n]

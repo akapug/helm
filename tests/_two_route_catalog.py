@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """The TWO-ROUTE pool entry the multi-route arms are written against.
 
-The catalog declares one token source per seat: ds4pro's only route is the
-DeepSeek direct key and the flat OpenCode Go subscription belongs to another
-family. No production family declares a multi-vendor pool today, but the
-machinery for one still ships (eligibility over every catalogued route, the
-canary-selected credential, the per-block cost rung), so the arms that pin it
-run against this entry: ds4pro as one alias served by two vendors, patched
-into FAMILIES under the same name for the life of one test.
+The catalog declares one token source per seat: ds4pro's pool lists the
+DeepSeek direct key and the OpenCode Go subscription, and a seat is minted
+with ONE of them. The machinery for a config carrying both still ships
+(eligibility over every catalogued route, the canary-selected credential, the
+per-block cost rung), so the arms that pin it run against this entry: ds4pro
+as one alias served by two vendors with the flat one default, patched into
+FAMILIES under the same name for the life of one test.
 
 NO BILLING WINDOW on either row, deliberately: the off-peak gate reads the
 wall clock, and these arms are about routes, not about the hour they run at.

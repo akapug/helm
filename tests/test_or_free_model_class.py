@@ -46,7 +46,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from helm import (dispatches, hostpath_guard, proxywatch,  # noqa: E402
                   repofacts, seat,
                   seat_catalog, seat_health, seat_launch_assets,
-                  seat_lifecycle)
+                  seat_lifecycle, tasks)
 # The module, never its TestCase: tests/test_suite_collection.py says why.
 from tests import test_landreq as _landreq  # noqa: E402
 from tests._tmphome import pin_live_seats, pin_suite_guard  # noqa: E402
@@ -459,9 +459,14 @@ class _HelmsOwnRemotes(object):
         # FORCE ON PURPOSE, as in TheDispatchDoorAsksTheRungTest: it clears
         # the roster and usability rungs for a synthetic recipient, and the
         # data-terms rung must not yield to it.
+        if kind == "review":
+            work, why = tasks.add("public-route review fixture", "integrator",
+                                  project="helm-test", force_new=True)
+            self.assertIsNone(why, why)
         return dispatches.add("seat-under-test", lane, ref=ref,
                               repo=self.repo, kind=kind, new_work=True,
-                              notify=False, force=True, _reason=True)
+                              notify=False, force=True, _reason=True,
+                              task=work["id"] if kind == "review" else None)
 
     def local_commit(self):
         """A commit on a local branch that no remote-tracking ref holds."""
@@ -1314,9 +1319,13 @@ class TheDispatchDoorAsksTheRungTest(_landreq.LandReqBase):
         # FORCE ON PURPOSE: it clears the roster and usability rungs for a
         # synthetic recipient, and the data-terms rung must NOT yield to it —
         # `force` says a seat is unreachable, never that its model may read.
+        work, why = tasks.add("public-route review fixture", "integrator",
+                              project="helm-test", force_new=True)
+        self.assertIsNone(why, why)
         return dispatches.add("seat-under-test", lane, ref=self.side,
                               repo=self.repo, kind="review", new_work=True,
-                              notify=False, force=True, _reason=True)
+                              notify=False, force=True, _reason=True,
+                              task=work["id"])
 
     def test_a_public_only_recipient_is_refused_this_remoteless_checkout(self):
         with mock.patch.object(dispatches, "_recipient_data_terms",

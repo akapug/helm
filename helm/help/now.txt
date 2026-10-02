@@ -1,0 +1,1 @@
+now capture [--hook-json]|show [--working-set|--hook-json] — session-continuity snapshot (_global/now.md, 40 lines newest-first, 48h freshness gate, captured at PreCompact) and the working set handed back after a compaction (SessionStart matcher compact: paths, verb spellings, ids, background tasks)

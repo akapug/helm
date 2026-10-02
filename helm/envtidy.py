@@ -1037,7 +1037,8 @@ def instructions_sync(dirs=None, apply=False):
 # 4. worktree gc — compose `helm work gc`, sweep orphan stubs + stray worktrees
 # ---------------------------------------------------------------------------
 
-def _worktree_rows(root, base, phantoms=None, registered=None, protected=()):
+def _worktree_rows(root, base, phantoms=None, registered=None, protected=(),
+                   memo=None):
     """Live remaining-estate worktrees, each classified.
 
     Lane/harness rooms belong to `helm work gc`, peeks belong to `work peek`,
@@ -1066,8 +1067,8 @@ def _worktree_rows(root, base, phantoms=None, registered=None, protected=()):
         # `helm work gc`'s OWN QUESTION, not `_merged`: ancestry alone reads a
         # room minted at the trunk a minute ago as merged (task/3428), and this
         # sweep removed it, branch and all, before its builder's first commit.
-        state, said = (work._sweep_state(root, w["path"], branch) if branch
-                       else (None, None))
+        state, said = (work._sweep_state(root, w["path"], branch, memo=memo)
+                       if branch else (None, None))
         merged = state in work.RETIRABLE
         occupied = work._occupants(w["path"])
         r = {"path": w["path"], "branch": branch, "locked": w["locked"],
@@ -1105,7 +1106,7 @@ def _worktree_rows(root, base, phantoms=None, registered=None, protected=()):
     return rows
 
 
-def _orphan_branches(root, base, pattern=None):
+def _orphan_branches(root, base, pattern=None, memo=None):
     """Cleanup-owned branches with NO registered worktree — the commit IS the
     work. Landed (by ancestry OR by patch identity) -> delete; anything else,
     including every unreadable case -> KEEP.
@@ -1145,7 +1146,7 @@ def _orphan_branches(root, base, pattern=None):
         # NO ROOM, SO NO GRACE — but the branch's reflog may be the only
         # place a commit it wrote and reset away still lives (task/3428), and
         # `_sweep_state` is the one reader that judges that commit.
-        state, said = work._sweep_state(root, None, b)
+        state, said = work._sweep_state(root, None, b, memo=memo)
         merged = state in work.RETIRABLE
         rows.append({"branch": b, "merged": merged, "state": state,
                      "verdict": "delete" if merged else "keep",
@@ -1175,7 +1176,8 @@ def _enact_worktree(root, r, apply):
             # looking for a broken git. The refusals are whole sentences; pass
             # them through rather than wrapping them in a diagnosis.
             return ["SKIPPED %s (%s) — kept" % (r["path"], err)]
-        lines.append("rescued dirty work -> %s" % (r["branch"] or "?"))
+        dest = _o if isinstance(_o, str) and _o.startswith("refs/") else (r["branch"] or "?")
+        lines.append("rescued dirty work -> %s" % dest)
     elif r["rescue"]:
         lines.append("would rescue-commit dirty work -> %s" % (r["branch"] or "?"))
     if r["remove"]:
@@ -1245,10 +1247,26 @@ def worktree_gc(root=None, apply=False):
     protected = {w["path"] for w in registered if requested and
                  (requested == os.path.realpath(w["path"]) or
                   requested.startswith(os.path.realpath(w["path"]) + os.sep))}
+    # FETCH BEFORE THE SCAN WHEN THIS RUN DELETES, as `helm work gc --apply`
+    # does: every "landed" below is asked of a remote-tracking ref, and an
+    # unrefreshed proof must not authorize a branch deletion. A failed fetch
+    # refuses the whole apply; the dry run never touches the network.
+    if apply:
+        ok, why = work.refresh_trunk(root)
+        if not ok:
+            return {"error": "REFUSING to apply — %s, so 'landed' is "
+                             "UNPROVEN; re-run when the remote is reachable, "
+                             "or use the dry run" % why}
     base = work._base(root)
+    # ONE MEMO FOR EVERY SCAN BELOW, saved once (task/4061): the keep verdicts
+    # of lanes, stray rooms and orphan branches whose tips and trunk did not
+    # change are not re-derived. Each scan runs in its own projection scope;
+    # every enact re-asks outside both.
+    from . import projscope
+    memo = work.LandedMemo(root)
     # (a) managed rooms — DELEGATE to work.gc (its lease-aware rescue logic,
     # plus lane/harness phantom ownership, reused exactly once).
-    lane_rows = work.gc_scan(root, registered=registered)
+    lane_rows = work.gc_scan(root, registered=registered, memo=memo)
     for row in lane_rows:
         if row["path"] in protected:
             row.update(verdict="keep", why="TARGET named by --repo — never remove")
@@ -1283,15 +1301,19 @@ def worktree_gc(root=None, apply=False):
         estate_removed, estate_error, estate_unknown = \
             work.prune_phantom_records(
                 root, estate_phantoms, excluded=estate_excluded, owner="estate")
-    wt_rows = _worktree_rows(root, base, estate_phantoms,
-                             registered=registered, protected=protected)
+    with projscope.scope():
+        wt_rows = _worktree_rows(root, base, estate_phantoms,
+                                 registered=registered, protected=protected,
+                                 memo=memo)
     wt_lines = {}
     for r in wt_rows:
         out = _enact_worktree(root, r, apply)
         if out:
             wt_lines[r["path"]] = out
     # (c) orphan branch stubs
-    orphans = _orphan_branches(root, base)
+    with projscope.scope():
+        orphans = _orphan_branches(root, base, memo=memo)
+    memo.save()
     orphan_lines = {}
     for o in orphans:
         if o["verdict"] == "delete":
@@ -1623,8 +1645,13 @@ def _post_worktree_summary(r):
         error = "worktree gc: phantom removal UNKNOWN — summary not posted"
         print(error, file=sys.stderr)
         return error
-    paths = [row["path"] for row in r["lane_rows"] + r["worktree_rows"]]
-    room_removed = sum(not os.path.exists(path) for path in paths)
+    rooms = r["lane_rows"] + r["worktree_rows"]
+    # A PARKED CHECKOUT IS GONE WITH ITS BRANCH KEPT (task/4061): its own
+    # count, still triage, never a removal.
+    parked = sum(row["verdict"] == "park" and not os.path.exists(row["path"])
+                 for row in r["lane_rows"])
+    room_removed = sum(not os.path.exists(row["path"]) for row in rooms
+                       if row["verdict"] != "park")
     branch_removed = sum(row["verdict"] == "delete" and
                          not work._has_branch(r["root"], row["branch"])
                          for row in r["orphans"])
@@ -1636,7 +1663,7 @@ def _post_worktree_summary(r):
     # ENACT-TIME TRUTH HERE TOO. A lane enact reclassified is triage NOW even
     # though the scan said remove; counting only the scan verdict is what made
     # this summary disagree with the detail it prints beside.
-    triage = (sum(row["verdict"] in ("triage", "rescue")
+    triage = (sum(row["verdict"] in ("triage", "rescue", "park")
                    or row["lane"] in r.get("reclassified_lanes", ())
                    for row in r["lane_rows"])
               # AN UNSTARTED ROOM IS NOT TRIAGE: it is not merged because it
@@ -1647,9 +1674,11 @@ def _post_worktree_summary(r):
                     for row in r["worktree_rows"])
               + sum(row["verdict"] == "keep" for row in r["orphans"])
               + phantom_kept)
-    total = (len(paths) + len(r["orphans"]) + len(r["managed_phantoms"])
+    total = (len(rooms) + len(r["orphans"]) + len(r["managed_phantoms"])
              + len(r["estate_phantoms"]))
-    line = work.format_gc_summary(r["root"], removed, total - removed, triage)
+    line = work.format_gc_summary(r["root"], removed,
+                                  total - removed - parked, triage,
+                                  parked=parked)
     print(line)
     error = work.post_gc_summary(line)
     if error:

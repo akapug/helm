@@ -620,10 +620,15 @@ class TriageVerbTest(unittest.TestCase):
         # the row speaks for, or the door refuses a ref that is perfectly
         # valid inside it.
         from tests._tmphome import dispatch_home
+        from helm import tasks
         with dispatch_home(repo):
+            task, why = tasks.add("triage the fixture review", "triage-fixture",
+                                  project="helm", force_new=True)
+            self.assertIsNone(why, why)
             row, why = dispatches.add("ds4pro", "probe-lane", ref=tip,
                                       repo=repo, kind="review", notify=False,
-                                      new_work=True, _reason=True)
+                                      new_work=True, task=task["id"],
+                                      _reason=True)
         self.assertIsNone(why)
         out = io.StringIO()
         with contextlib.redirect_stdout(out):

@@ -1990,5 +1990,100 @@ class VerbTest(Home):
         self.assertIn("team set", out)
 
 
+class WhoAudienceThroughTheRealReadTest(Home):
+    """task/4071 door read: the WHO audience, driven through the REAL
+    read_all/placements path rather than a mocked role. LONGTAIL is earned
+    only by a seat a whole read POSITIVELY names a non-lead member of a team
+    that has exactly one lead; every unsettled read gives the owner digest,
+    which is what every seat got before audiences existed."""
+
+    def setUp(self):
+        super().setUp()
+        from unittest import mock
+        from helm import inject
+        self.inject, self.mock = inject, mock
+        self.roster = {}
+        p = mock.patch.object(teams, "_roster",
+                              side_effect=lambda strict=False: self.roster)
+        p.start()
+        self.addCleanup(p.stop)
+        saved = {k: os.environ.get(k) for k in (
+            "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_SEAT_ROLE",
+            "HELM_INTEGRATOR_SEAT", "MELD_INTEGRATOR_SEAT")}
+        for k in saved:
+            os.environ.pop(k, None)
+
+        def restore():
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        self.addCleanup(restore)
+
+    def seat(self, name, family, project="alpha"):
+        import time
+        self.roster[name] = {"home_room": project, "last_seen": time.time(),
+                             "runtime": {"family": family},
+                             "runtime_verified": True,
+                             "cwd": self.paths[project]}
+
+    def audience(self, name):
+        os.environ["HELM_CHAT_NAME"] = name
+        return self.inject._who_audience()
+
+    def fleet(self):
+        """One settled team: an integrator leading alpha, a codex builder."""
+        self.seat("seat-a-integrator", "claude")
+        self.seat("seat-b", "codex")
+
+    def test_a_settled_builder_gets_longtail_and_its_lead_the_owner_digest(self):  # noqa: VACUOUS_ASSERTION — every case is assertEqual to a named audience, and a LONGTAIL control on the same _who_audience observable precedes each OWNER answer
+        self.fleet()
+        self.assertEqual(self.audience("seat-b"), self.inject.WHO_LONGTAIL)
+        self.assertEqual(self.audience("seat-a-integrator"),
+                         self.inject.WHO_OWNER)
+
+    def test_an_unreadable_roster_reads_owner_for_every_seat(self):  # noqa: VACUOUS_ASSERTION — every case is assertEqual to a named audience, and a LONGTAIL control on the same _who_audience observable precedes each OWNER answer
+        self.fleet()
+        self.assertEqual(self.audience("seat-b"),
+                         self.inject.WHO_LONGTAIL)               # control
+        teams._roster.side_effect = teams.RosterUnread("roster unreadable")
+        self.assertEqual(self.audience("seat-a-integrator"),
+                         self.inject.WHO_OWNER)
+        self.assertEqual(self.audience("seat-b"), self.inject.WHO_OWNER)
+
+    def test_a_second_native_on_a_lone_native_project_reads_owner(self):  # noqa: VACUOUS_ASSERTION — every case is assertEqual to a named audience, and a LONGTAIL control on the same _who_audience observable precedes each OWNER answer
+        self.seat("seat-a", "claude")
+        self.seat("seat-b", "codex")
+        self.seat("seat-x-integrator", "claude", project="beta")
+        self.assertEqual(self.audience("seat-b"),
+                         self.inject.WHO_LONGTAIL)               # control
+        self.seat("seat-c", "claude")       # the lone-native lead is gone
+        self.assertEqual(self.audience("seat-a"), self.inject.WHO_OWNER)
+        self.assertEqual(self.audience("seat-b"), self.inject.WHO_OWNER)
+
+    def test_an_unresolved_integrator_reads_owner(self):  # noqa: VACUOUS_ASSERTION — every case is assertEqual to a named audience, and a LONGTAIL control on the same _who_audience observable precedes each OWNER answer
+        self.seat("alpha-claude", "claude")
+        self.seat("seat-a-integrator", "claude")
+        self.assertEqual(self.audience("alpha-claude"),
+                         self.inject.WHO_LONGTAIL)               # control
+        os.environ["HELM_INTEGRATOR_SEAT"] = "seat-typo-integrator"
+        # alpha-claude now leads by name; the integrator must not be demoted
+        self.assertEqual(self.audience("seat-a-integrator"),
+                         self.inject.WHO_OWNER)
+
+    def test_a_seat_in_no_team_reads_owner(self):  # noqa: VACUOUS_ASSERTION — every case is assertEqual to a named audience, and a LONGTAIL control on the same _who_audience observable precedes each OWNER answer
+        self.fleet()
+        self.assertEqual(self.audience("seat-b"),
+                         self.inject.WHO_LONGTAIL)               # control
+        self.assertEqual(self.audience("seat-nowhere"), self.inject.WHO_OWNER)
+
+    def test_the_launch_lead_marker_reads_owner(self):  # noqa: VACUOUS_ASSERTION — every case is assertEqual to a named audience, and a LONGTAIL control on the same _who_audience observable precedes each OWNER answer
+        self.fleet()
+        self.assertEqual(self.audience("seat-b"),
+                         self.inject.WHO_LONGTAIL)               # control
+        os.environ["HELM_SEAT_ROLE"] = "lead"
+        self.assertEqual(self.audience("seat-b"), self.inject.WHO_OWNER)
+
 if __name__ == "__main__":
     unittest.main()

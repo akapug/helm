@@ -716,20 +716,38 @@ def reconcile_seat_home(home, cwd=None):
     return lines
 
 
-# OWNER RULING (premise opus-agents-xhigh-ultracode-subagents-for-same-
-# model): every Opus agent runs at xhigh effort with ultracode on. Two
-# settings.json keys carry it (measured on Claude Code 2.1.280): "ultracode"
-# true, and the per-model effort under modelSettings. Each row is (key path,
-# value).
+# OWNER RULING, superseding the earlier "xhigh + ultracode" default: "ultra
+# code isn't special. I think our ideal would actually be to have all agents
+# on high by default when they start". Every agent starts at HIGH effort,
+# and ultracode is no longer written or required. Each row is (key path,
+# canonical value, retired values); a canonical None means the key belongs
+# ABSENT, so a retired value there is removed rather than rewritten.
+#
+# WHICH KEYS, measured in the Claude Code 2.1.286 bundle: from USER settings
+# (a home's settings.json) a current model's effort is read ONLY from
+# modelSettings.<model>.effortLevel; the top-level effortLevel there applies
+# only to legacy and unrecognised model names. So each model the CLI's alias
+# table resolves (opus, sonnet, fable; seat_catalog cites that table) gets its
+# own row, and the top-level key covers the rest and is what physics.py and the
+# seat recipe read as the home's effort.
+#
+# ADDITIVE: a key the home sets to another value is its own explicit choice and
+# is kept. A RETIRED value is the one exception: helm wrote it under the ruling
+# this one supersedes (Opus xhigh, ultracode true), so it is drift, and the
+# pass rewrites or removes it and says so (never silently). The same bytes set
+# by the owner cannot be told apart from helm's (Claude Code's own /effort
+# saves under modelSettings too), so they are corrected as well.
 #
 # NOT hooks.ESTATE_DEFAULTS, for two reasons. That table is AUTHORITATIVE (it
-# rewrites a different value to its own), and these keys are ADDITIVE: a home
-# that sets another effort keeps it. And that table reaches the proxy seat
-# config dirs too, which must get neither key: automatic fan-out on a limited
-# family's credentials is the thing the ruling excludes.
+# rewrites every different value to its own), and these keys are additive. And
+# that table reaches the proxy seat config dirs too, which get none of these
+# keys: a proxy family's effort is its own harness's knob.
 SETTINGS_DEFAULTS = (
-    (("ultracode",), True),
-    (("modelSettings", "claude-opus-5-5", "effortLevel"), "xhigh"),
+    (("effortLevel",), "high", ()),
+    (("modelSettings", "claude-opus-5-5", "effortLevel"), "high", ("xhigh",)),
+    (("modelSettings", "claude-sonnet-5", "effortLevel"), "high", ()),
+    (("modelSettings", "claude-fable-5-1", "effortLevel"), "high", ()),
+    (("ultracode",), None, (True,)),
 )
 
 
@@ -742,12 +760,15 @@ def _proxy_home(home):
 
 
 def _settings_gaps(body):
-    """-> (absent, blocked). `absent` is [(key path, value)] for each
+    """-> (absent, blocked, drift). `absent` is [(key path, value)] for each
     SETTINGS_DEFAULTS row whose key the body does not set. `blocked` is [key
     path] for a row whose parent is present but is not an object, so adding
-    the key would replace a value the home set."""
-    absent, blocked = [], []
-    for keys, value in SETTINGS_DEFAULTS:
+    the key would replace a value the home set. `drift` is [(key path, held,
+    value)] for a row whose key holds one of its retired values (compared by
+    type as well, so a 1 is not a retired true). A row whose value is None
+    is never absent: absence is its canonical state."""
+    absent, blocked, drift = [], [], []
+    for keys, value, retired in SETTINGS_DEFAULTS:
         node = body
         for k in keys[:-1]:
             node = node.get(k, {})
@@ -755,9 +776,13 @@ def _settings_gaps(body):
                 blocked.append(keys)
                 break
         else:
+            held = node.get(keys[-1])
             if keys[-1] not in node:
-                absent.append((keys, value))
-    return absent, blocked
+                if value is not None:
+                    absent.append((keys, value))
+            elif any(type(held) is type(r) and held == r for r in retired):
+                drift.append((keys, held, value))
+    return absent, blocked, drift
 
 
 def _settings_body(home):
@@ -770,57 +795,155 @@ def _settings_body(home):
     return path, (body if isinstance(body, dict) else None)
 
 
+def _drift_text(drift):
+    return ", ".join("%s %s -> %s" % (
+        ".".join(k), held if isinstance(held, str) else json.dumps(held),
+        "removed" if value is None else value) for k, held, value in drift)
+
+
 def _prov_settings_defaults(home):
-    """Add each SETTINGS_DEFAULTS key the home's settings.json lacks. A key the
-    home sets, to any value, is kept, and every other key survives. A proxy
-    seat's config dir is left alone. An unreadable file and a symlinked one
-    are left untouched and named (a replace would cut the link). A rewrite
-    leaves its backup beside the file, named like the hand cure's backups."""
+    """Add each SETTINGS_DEFAULTS key the home's settings.json lacks, and
+    rewrite a key that holds a retired value to the canonical one (remove it
+    when the canonical state is absent), naming it.
+    A key the home sets to any other value is kept, and every other key
+    survives. A proxy seat's config dir is left alone. An unreadable file and
+    a symlinked one are left untouched and named (a replace would cut the
+    link). A rewrite leaves its backup beside the file."""
     if _proxy_home(home):
         return [], None
     path, body = _settings_body(home)
     if body is None:
         return ["settings defaults NOT written: %s is unreadable or not an "
                 "object — left untouched" % path], None
-    absent, blocked = _settings_gaps(body)
+    absent, blocked, drift = _settings_gaps(body)
     notes = ["settings defaults: %s is under a value that is not an object "
              "— left untouched" % ".".join(k) for k in blocked]
-    if not absent:
+    if not absent and not drift:
         return notes, None
     if os.path.islink(path):
         return notes + ["settings defaults NOT written: %s is a symlink — "
                         "left untouched" % path], None
-    for keys, value in absent:
+    for keys, value in absent + [(k, v) for k, _held, v in drift]:
         node = body
         for k in keys[:-1]:
             node = node.setdefault(k, {})
-        node[keys[-1]] = value
+        if value is None:
+            del node[keys[-1]]
+        else:
+            node[keys[-1]] = value
     try:
         mode = None
         if os.path.lexists(path):
             mode = os.stat(path).st_mode & 0o777
-            shutil.copy2(path, _beside(path, "bak-ultracode"))
+            shutil.copy2(path, _beside(path, "bak-effort"))
         pk.atomic_write(path, json.dumps(body, indent=2, ensure_ascii=False)
                         + "\n", mode=mode)
     except OSError as e:
         return notes + ["settings defaults NOT written (%s)" % e], None
-    return notes + ["settings defaults set: %s" % ", ".join(
-        ".".join(k) for k, _v in absent)], None
+    if absent:
+        notes.append("settings defaults set: %s" % ", ".join(
+            ".".join(k) for k, _v in absent))
+    if drift:
+        notes.append("settings drift corrected: %s (the retired default)"
+                     % _drift_text(drift))
+    return notes, None
 
 
 def _miss_settings_defaults(home):
-    """The SETTINGS_DEFAULTS keys the home does not set. A key set to another
-    value is present (the pass never changes it, so it is no gap). Nothing
-    for a proxy seat's config dir. An unreadable file raises (cannot tell)."""
+    """The SETTINGS_DEFAULTS keys the home does not set, and each one that
+    holds a retired value. A key set to another value is present (the pass
+    never changes it, so it is no gap). Nothing for a proxy seat's config
+    dir. An unreadable file raises (cannot tell)."""
     if _proxy_home(home):
         return None
     path, body = _settings_body(home)
     if body is None:
         raise ValueError("%s is unreadable or not an object" % path)
-    absent, blocked = _settings_gaps(body)
+    absent, blocked, drift = _settings_gaps(body)
     gone = [".".join(k) for k, _v in absent] + [
         "%s (its parent is not an object)" % ".".join(k) for k in blocked]
-    return ("settings.json lacks %s" % ", ".join(gone)) if gone else None
+    parts = (["settings.json lacks %s" % ", ".join(gone)] if gone else []) + (
+        ["settings.json carries the retired default %s" % _drift_text(drift)]
+        if drift else [])
+    return "; ".join(parts) or None
+
+
+def _lead_lean(body):
+    """-> (changed body, [top-level keys it changed]) — the lead-lean profile
+    applied to a COPY of a home's settings body, through the one applier
+    (seat_launch_assets._apply_lead_lean), so this pass and a seat's seeder
+    can never write two different profiles."""
+    from . import seat as _seat_facade  # noqa: F401 — the facade import the
+    # impl-import guard requires beside a direct impl import
+    from .seat_launch_assets import _apply_lead_lean
+    after = json.loads(json.dumps(body))
+    if not _apply_lead_lean(after):
+        return after, []
+    return after, sorted(k for k in after if after.get(k) != body.get(k))
+
+
+# THE LEAD-LEAN PROFILE ON EVERY NATIVE CLAUDE HOME (task/4056). The fleet's
+# Claude leads run on the default home and on credhomes, never on a spawned
+# seat's config dir, so this pass is the surface that reaches them; a proxy
+# seat's dir is left to its own seeder (it carries LOCAL_UNUSED_TOOLS or its
+# family's denies already). The profile is seat_catalog.lead_lean_settings
+# plus the Artifact trio's recorded deny, and it is ADDITIVE like every
+# benefit: it fills a key the home does not hold and never replaces one it
+# does (seat_launch_assets._apply_lead_lean), so an owner's own value
+# survives every launch. Every other key survives too.
+def _prov_lead_lean(home):
+    if _proxy_home(home):
+        return [], None
+    path, body = _settings_body(home)
+    if body is None:
+        return ["lead lean NOT written: %s is unreadable or not an object — "
+                "left untouched" % path], None
+    after, keys = _lead_lean(body)
+    if not keys:
+        return [], None
+    if os.path.islink(path):
+        return ["lead lean NOT written: %s is a symlink — left untouched"
+                % path], None
+    try:
+        mode = None
+        if os.path.lexists(path):
+            mode = os.stat(path).st_mode & 0o777
+            # A BACKUP WHEN A VALUE IS REPLACED, and only then: added keys and
+            # appended denies lose nothing, so a home born in this same pass
+            # gets no backup of a file helm itself wrote a moment earlier
+            if _replaces(body, after):
+                shutil.copy2(path, _beside(path, "bak-lead-lean"))
+        pk.atomic_write(path, json.dumps(after, indent=2, ensure_ascii=False)
+                        + "\n", mode=mode)
+    except OSError as e:
+        return ["lead lean NOT written (%s)" % e], None
+    return ["lead lean set: %s" % ", ".join(keys)], None
+
+
+def _replaces(before, after):
+    """True when `after` drops or changes anything `before` held: a key gone,
+    a list item gone, or a scalar changed. Additions are not replacements."""
+    if isinstance(before, dict):
+        return not isinstance(after, dict) or any(
+            k not in after or _replaces(v, after[k]) for k, v in before.items())
+    if isinstance(before, list):
+        return not isinstance(after, list) or any(v not in after for v in before)
+    return before != after
+
+
+def _miss_lead_lean(home):
+    """The settings keys the lead-lean profile would change in this home,
+    or None. It asks the applier itself, so a key the owner already set to
+    his own value counts as carried, not as a miss to repair. Nothing for a
+    proxy seat's config dir; an unreadable file raises (cannot tell)."""
+    if _proxy_home(home):
+        return None
+    path, body = _settings_body(home)
+    if body is None:
+        raise ValueError("%s is unreadable or not an object" % path)
+    keys = _lead_lean(body)[1]
+    return ("settings.json lacks the lead-lean %s" % ", ".join(keys)
+            if keys else None)
 
 
 def _hook_row(home):
@@ -916,9 +1039,14 @@ BENEFITS = (
             "skillsync.instructions_canonical() (the default home's CLAUDE.md)",
             _prov_instructions, _miss_instructions, False,
             "`helm homes provision {name} --apply`"),
-    Benefit("opus xhigh + ultracode",
-            "SETTINGS_DEFAULTS (the owner's Opus effort ruling)",
+    Benefit("effort high",
+            "SETTINGS_DEFAULTS (the owner's effort ruling)",
             _prov_settings_defaults, _miss_settings_defaults, True,
+            "`helm homes provision {name} --apply` (the default home: a "
+            "`helm launch` with neither --home nor --no-install)", True),
+    Benefit("lead lean",
+            "seat_catalog.lead_lean_settings + LEAD_DENIED_TOOLS (task/4056)",
+            _prov_lead_lean, _miss_lead_lean, True,
             "`helm homes provision {name} --apply` (the default home: a "
             "`helm launch` with neither --home nor --no-install)", True),
     Benefit("hook contract",
@@ -1057,7 +1185,7 @@ def home_create(provider, account_email):
         if err:
             return {"error": err}
     if existing:
-        notes.append("home already existed (idempotent — nothing was overwritten)")
+        notes.append("home already existed")
     return {"home": home, "name": name, "provider": provider, "existing": existing,
             "login_cmd": LOGIN_CMDS[provider](home),
             "next": "run the login command in YOUR terminal, approve in the browser, "

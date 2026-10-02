@@ -1,0 +1,23 @@
+{
+  "sourceId": "11111111-2222-4333-8444-555555555555",
+  "newId": "22222222-3333-4444-8555-666666666666",
+  "harness": "claude",
+  "beforeBytes": 16996446,
+  "afterBytes": 358318,
+  "snippedPayloads": 0,
+  "imageBlocks": 0,
+  "tokensFreed": 0,
+  "droppedTurns": 4786,
+  "windowRealTokens": 19912,
+  "revived": {
+    "recordedTokensBefore": 473757,
+    "recordedTokensAfter": 23097,
+    "usageRecordsRewritten": 68
+  },
+  "warnings": [],
+  "newPath": null,
+  "sidecarPath": null,
+  "copiedResources": null,
+  "dryRun": true,
+  "note": "dry run \u2014 nothing written"
+}

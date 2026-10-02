@@ -171,10 +171,10 @@ def _row_project(repo_id):
         p = os.path.dirname(p)
     return _git_project(p) if p else None
 def _offer_rows(seat, dispatch_snapshot=None):
-    """Ranked (oldest/highest-priority first) UNOWNED, unclaimed dispatch
-    backlog this idle `seat` could take:
+    """Ranked (board order: rank, a fast tax cut, then age) UNOWNED,
+    unclaimed dispatch and task backlog this idle `seat` could take:
     [(id8, line, claim_cmd, mine, kind, raw_row)].
-    open_rows() is already (ts, id)-sorted, so rows[0] is the head. The claim
+    tasks.offer_order merges both producers; rows[0] is the head. The claim
     resource is `dispatch:<id8>` — a stable key any idle seat computes
     identically, so two seats offered the same head collide on the claim and
     only one takes it. [] on any trouble, or when the live-claim set is
@@ -187,7 +187,7 @@ def _offer_rows(seat, dispatch_snapshot=None):
     that literal text. `kind` is the row's recorded kind VERBATIM (build /
     review / None-for-unrecorded / historical junk) — this function reports
     facts; whether a kind is safe to self-assign is the caller's policy."""
-    from . import dispatches
+    from . import dispatches, tasks
     if dispatch_snapshot is None:
         rows = dispatches.open_rows()
     elif dispatch_snapshot[1]:
@@ -267,8 +267,8 @@ def _offer_rows(seat, dispatch_snapshot=None):
         # seat could argue fit) — they stay offers, never auto-claims.
         out.append((rid[:8], line, "helm chat claim " + res,
                     bool(recip) and recip == me, r.get("kind"), r))
-    out.extend(_task_offers(seat, claimed, live, mine_proj))
-    return out
+    return tasks.offer_order(
+        out, _task_offers(seat, claimed, live, mine_proj))
 
 
 def _ledger_project():
@@ -520,7 +520,7 @@ def _work_offer_candidate(session, seat, ask, dsp, pending, inbox_blocked,
     if not rows:
         return None
     # OWN WORK FIRST, ANYWHERE IN THE BACKLOG — not just at its head. rows is
-    # (ts, id)-sorted, so a seat's OWN assigned row can sit behind an unowned
+    # in board order, so a seat's OWN assigned row can sit behind an unowned
     # pool row; reading only rows[0] meant that seat starved exactly like the
     # inbox gate starved it, one position over (cross-family review finding,
     # 2026-07-30). Auto-claimable own work is preferred wherever it sits; the
@@ -728,7 +728,7 @@ def _whisper_candidates(session, seat, pending, inbox_blocked, cwd=None,
                         dispatch_snapshot=None):
     """LIVE whisper candidate tuples, salience-ordered: owner-ask >
     verb-timeout > stuck > red-gate > stale-pending > unverified >
-    unbanked-green > dirty > solo-load > work-offer. The first two fields
+    unbanked-green > dirty > seen-working > work-offer. The first two fields
     are always (fp, line); autoclaim alone carries its selected raw offer as
     a third field for winner finalization.
     Signals are cheap local reads only (reflex law): the session's record.py
@@ -923,6 +923,12 @@ def _whisper_candidates(session, seat, pending, inbox_blocked, cwd=None,
     # own emission. Re-adding it here would give one predicate two mouths and
     # two latches, and the ladder seat is the one that STARVES: on the seat
     # the rung exists for, some higher rung is unlatched at almost every stop.
+    # THE SEEN-WORKING RUNG: checks owed on this seat's own landed tasks are
+    # its own work, so they outrank offered work (once per owed set).
+    from . import observed
+    seen = observed.stop_candidate(seat)
+    if seen:
+        out.append(seen)
     off = _work_offer_candidate(
         session, seat, ask, dsp, pending, inbox_blocked,
         dispatch_snapshot=dispatch_snapshot)

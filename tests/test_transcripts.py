@@ -227,8 +227,9 @@ class TranscriptsTest(unittest.TestCase):
         self.assertIn("error", res)
         # a legit sid builds argv with the sid after `--`
         done = mock.Mock(returncode=0, stdout='{"messages": []}', stderr="")
-        with mock.patch("subprocess.run", return_value=done) as run:
-            transcripts._cv_show("deadbeef-1234", rng="0-1", harness="hermes")
+        with mock.patch("subprocess.run", return_value=done) as run, \
+                mock.patch("helm.cvcompat.version", return_value=(0, 10, 0)):
+            transcripts._cv_show("deadbeef-1234", rng=(0, 1), harness="hermes")
         argv = run.call_args[0][0]
         self.assertEqual(argv, ["cv", "show", "--json", "--range", "0-1",
                                 "--harness", "hermes", "--", "deadbeef-1234"])
@@ -260,7 +261,7 @@ class TranscriptsTest(unittest.TestCase):
                          "timestamp": "2026-07-01T10:0%d:00Z" % (i % 10),
                          "content": [{"kind": "text", "text": text}]})
         def fake_cv_show(sid, rng=None, harness=None):
-            a, b = (int(x) for x in rng.split("-"))
+            a, b = rng
             return {"messages": msgs[a:b], "title": "stub title", "cwd": self.alpha}
         return msgs, fake_cv_show
 
@@ -354,7 +355,8 @@ class TranscriptsTest(unittest.TestCase):
         self._plant_claude(SID_A, self.alpha, "alpha work")
         self._plant_codex(SID_CX, self.beta)
         self._fresh_catalog()
-        with mock.patch.object(transcripts, "_cv_prune_help", lambda: "--thinking --window"):
+        with mock.patch.object(transcripts, "_cv_prune_help", lambda: "--thinking --window"), \
+                mock.patch("helm.cvcompat.version", return_value=(0, 10, 0)):
             res = transcripts.prune_session(SID_A[:12], preset="lean", dry=True)
             self.assertEqual(res["willRun"], f"cv prune {SID_A} --thinking")
             self.assertEqual(res["sid"], SID_A)
@@ -369,9 +371,26 @@ class TranscriptsTest(unittest.TestCase):
             res = transcripts.prune_session(SID_A, preset="window", tokens=999999, dry=True)
             self.assertIn("--window 180000", res["willRun"])
         # feature-detect: preset flag missing from installed cv
-        with mock.patch.object(transcripts, "_cv_prune_help", lambda: ""):
+        with mock.patch.object(transcripts, "_cv_prune_help", lambda: ""), \
+                mock.patch("helm.cvcompat.version", return_value=(0, 10, 0)):
             res = transcripts.prune_session(SID_A, preset="lean", dry=True)
             self.assertIn("--thinking", res["error"])
+
+    def test_prune_lean_speaks_the_installed_cv_grammar(self):
+        self._plant_claude(SID_A, self.alpha, "alpha work")
+        self._fresh_catalog()
+        help13 = "      --drop-thinking\n      --window <TOKENS>\n"
+        with mock.patch.object(transcripts, "_cv_prune_help", lambda: help13), \
+                mock.patch("helm.cvcompat.version", return_value=(0, 13, 0)):
+            res = transcripts.prune_session(SID_A, preset="lean", dry=True)
+        self.assertEqual(res["willRun"], f"cv prune {SID_A} --drop-thinking")
+        # a 0.10 flag is not found inside a 0.13 one: `--thinking` is a
+        # substring of `--drop-thinking`, and cv 0.13 refuses a bare --thinking
+        with mock.patch.object(transcripts, "_cv_prune_help", lambda: help13), \
+                mock.patch("helm.cvcompat.version", return_value=(0, 10, 0)):
+            res = transcripts.prune_session(SID_A, preset="lean", dry=True)
+        self.assertEqual(res["error"],
+                         "preset unavailable in installed cv (needs --thinking)")
 
     def test_prune_executes_and_reports_new_sid(self):
         self._plant_claude(SID_A, self.alpha, "alpha work")
@@ -382,7 +401,8 @@ class TranscriptsTest(unittest.TestCase):
                   f"resume with: claude --resume {new_sid}\n")
         done = mock.Mock(returncode=0, stdout="", stderr=report)
         with mock.patch.object(transcripts, "_cv_prune_help", lambda: "--thinking"), \
-             mock.patch("subprocess.run", return_value=done) as run:
+             mock.patch("subprocess.run", return_value=done) as run, \
+             mock.patch("helm.cvcompat.version", return_value=(0, 10, 0)):
             res = transcripts.prune_session(SID_A, preset="lean")
         self.assertTrue(res["ok"])
         self.assertEqual(res["newSid"], new_sid)
@@ -431,6 +451,7 @@ class TranscriptsTest(unittest.TestCase):
         self._fresh_catalog()
         out = io.StringIO()
         with mock.patch.object(transcripts, "_cv_prune_help", lambda: "--thinking"), \
+             mock.patch("helm.cvcompat.version", return_value=(0, 10, 0)), \
              contextlib.redirect_stdout(out):
             rc = transcripts.cmd_prune([SID_A[:12], "--dry"])
         self.assertEqual(rc, 0)

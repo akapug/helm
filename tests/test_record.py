@@ -572,6 +572,49 @@ class CommitShapesTest(RecordBase):
             "command": self.MUST_MISS[2]})), (3, 4))
 
 
+class FirstTurnOpenTest(RecordBase):
+    def test_prompt_hook_initializes_only_its_own_session(self):
+        hook = {"hook_event_name": "UserPromptSubmit", "session_id": "sess-1",
+                "prompt": "typed turn", "transcript_path":
+                os.path.join(self.tmp, "sess-1.jsonl")}
+        self.assertEqual(self.counters(), {})
+        for bad in (dict(hook, hook_event_name="SubagentStart"),
+                    dict(hook, session_id="other"),
+                    dict(hook, prompt="different"),
+                    dict(hook, agent_id="agent-1"),
+                    dict(hook, transcript_path=os.path.join(self.tmp,
+                                                              "other.jsonl"))):
+            record.turn_open("sess-1", "typed turn", hook=bad)
+            self.assertEqual(self.counters(), {}, bad)
+        record.turn_open("sess-1", "typed turn")
+        self.assertEqual(self.counters(), {}, "ordinary injection minted counters")
+        record.turn_open("sess-1", "typed turn", hook=hook)
+        c = self.counters()
+        self.assertIsInstance(c["turn-opened-at"], float)
+        self.assertEqual(c["stalled-turns"], 0)
+        self.assertNotIn("call-at", c)
+
+    def test_aliasing_session_id_does_not_mint_another_sessions_record(self):
+        hook = {"hook_event_name": "UserPromptSubmit", "session_id": "a/b",
+                "prompt": "typed turn"}
+        record.turn_open("a/b", "typed turn", hook=hook)
+        self.assertEqual(self.counters("a/b"), {})
+        self.assertEqual(self.counters("a_b"), {})
+        valid = dict(hook, session_id="a_b")
+        record.turn_open("a_b", "typed turn", hook=valid)
+        self.assertIsInstance(self.counters("a_b")["turn-opened-at"], float)
+
+    def test_corrupt_existing_counters_are_not_replaced_by_first_prompt(self):
+        path = os.path.join(record.session_dir("sess-1"), "counters.json")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("{corrupt")
+        hook = {"hook_event_name": "UserPromptSubmit", "session_id": "sess-1",
+                "prompt": "typed turn"}
+        record.turn_open("sess-1", "typed turn", hook=hook)
+        self.assertEqual(self.artifact("counters.json"), "{corrupt")
+
+
 class CounterRaceTest(RecordBase):
     """task/2970: turn_open (the per-turn hook) and
     _record (every tool call, a subagent's included) both read, change and

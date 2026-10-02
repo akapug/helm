@@ -539,24 +539,30 @@ class LawTest(SessionBase):
         self.assertIn("MEMORY-ONLY", err)
         self.assertIn("rescue", err)
 
-    def test_checkpoint_mints_new_id_original_untouched(self):
-        def prune(*argv, **_kwargs):
-            newid = argv[argv.index("--to") + 1]
-            return 0, json.dumps({"newId": newid}), ""
+    def test_checkpoint_mints_new_id_original_untouched(self):  # noqa: VACUOUS_ASSERTION — the loop is a literal pair, both arms always run
+        # each cv grammar: its prune flag, and its report's spelling of the id
+        # (cv 0.13 writes `new_id`; cv 0.10 wrote `newId`)
+        for version, flag, key in (((0, 10, 0), "--thinking", "newId"),
+                                   ((0, 13, 0), "--drop-thinking", "new_id")):
+            def prune(*argv, **_kwargs):
+                newid = argv[argv.index("--to") + 1]
+                return 0, json.dumps({key: newid}), ""
 
-        with self._sid("aaaa1111-integrator"), \
-             mock.patch.object(session, "_proc_claude_rows", return_value=[]), \
-             mock.patch.object(session, "_session_cwd", return_value="/source cwd"), \
-             mock.patch.object(session, "_cv", side_effect=prune) as cv:
-            rc, out, _ = run(session.cmd_checkpoint, ["aaaa1111"])
-        self.assertEqual(rc, 0)
-        self.assertIn("checkpoint minted:", out)
-        self.assertIn("cd '/source cwd'", out)
-        # cv prune got --thinking + --to <newid>, never mutating the original
-        argv = cv.call_args[0]
-        self.assertIn("prune", argv)
-        self.assertIn("--thinking", argv)
-        self.assertIn("--to", argv)
+            with self._sid("aaaa1111-integrator"), \
+                 mock.patch("helm.cvcompat.version", return_value=version), \
+                 mock.patch.object(session, "_proc_claude_rows", return_value=[]), \
+                 mock.patch.object(session, "_session_cwd", return_value="/source cwd"), \
+                 mock.patch.object(session, "_cv", side_effect=prune) as cv:
+                rc, out, _ = run(session.cmd_checkpoint, ["aaaa1111"])
+            self.assertEqual(rc, 0, version)
+            self.assertIn("checkpoint minted:", out)
+            self.assertIn("cd '/source cwd'", out)
+            # cv prune got the grammar's flag + --to <newid>, never mutating
+            # the original
+            argv = cv.call_args[0]
+            self.assertIn("prune", argv)
+            self.assertIn(flag, argv)
+            self.assertIn("--to", argv)
 
     def test_checkpoint_rejects_success_without_artifact_receipt(self):
         with self._sid("aaaa1111-integrator"), \

@@ -1,0 +1,1 @@
+cmd <sid> [--account A] [--model M] — account-aware pasteable resume command

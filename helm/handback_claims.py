@@ -62,6 +62,49 @@ _WHOLE = re.compile(r"(?:whole|full)[- ]suite", re.I)
 _FAILED = re.compile(r"\bFAILED\b")
 _OK = re.compile(r"\bOK\b")
 _CLAUSE = re.compile(r"[\n;]")
+# A fab job's log as fab prints it, `<host>:~/fab/logs/<job>.log`, with or
+# without a `LOG` word before it. The job name carries the tested tip's
+# `git rev-parse --short`, which is FAB_LOG_TIP_CHARS hex chars in this repo
+# and fewer in a smaller one (git sizes it to the object count), never fewer
+# than FAB_LOG_MIN_CHARS.
+_FAB_LOG = re.compile(r"(\S*fab/logs/([^\s/]+?)\.log)\b")
+_HEX = re.compile(r"[0-9a-f]+\Z")
+FAB_LOG_TIP_CHARS = 11
+FAB_LOG_MIN_CHARS = 7
+
+
+def _job_names_tip(job, tip):
+    """True when fab job name `job` carries a short sha of `tip`: the tip's
+    first FAB_LOG_TIP_CHARS hex chars anywhere in it, or a `-`-separated part
+    of at least FAB_LOG_MIN_CHARS hex chars that `tip` starts with."""
+    job = job.lower()
+    if tip[:FAB_LOG_TIP_CHARS] in job:
+        return True
+    return any(len(part) >= FAB_LOG_MIN_CHARS and _HEX.match(part)
+               and tip.startswith(part) for part in job.split("-"))
+
+
+def hold_receipt(text, tip):
+    """The fab receipt `text` carries for a source-clean hold at `tip`
+    (task/4103). -> (receipt, foreign): `receipt` labels the first one found,
+    or is None; `foreign` lists each fab LOG path in `text` whose job name
+    does not carry `tip`'s first FAB_LOG_TIP_CHARS hex chars.
+
+    A receipt is a fab LOG of a run on exactly `tip` (`_job_names_tip`), or
+    a `Ran N` claim with N > 0 that `parse` does not read as FAILED. A Ran
+    line names no tip, so it binds to the hold's own claim -- unless the
+    text names only LOGs of other tips: then the count is theirs, a run on
+    another tree cited as this one's (the laundered-gate shape), and proves
+    nothing."""
+    text = str(text or "")
+    tip = str(tip or "").strip().lower()
+    mine, foreign = [], []
+    for path, job in _FAB_LOG.findall(text):
+        (mine if tip and _job_names_tip(job, tip) else foreign).append(path)
+    if mine:
+        return "LOG " + mine[0], foreign
+    ran = [c["ran"] for c in parse(text) if c.get("ran") and not c["failed"]]
+    return ("Ran %d" % ran[0] if ran and not foreign else None), foreign
 
 
 def parse(text):

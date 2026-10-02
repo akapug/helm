@@ -21,13 +21,13 @@ from ._common import (
     COINAGE_CAP, COINAGE_STRIKES, COOLDOWN_ESCAPE,
     COUNCIL_OFFER_CAP, COUNCIL_ROUNDS, COUNCIL_TAIL, COUNCIL_WHISPER_ID,
     JIT_CAP, REPEAT_ALLOWANCE, REPEAT_WINDOW_TURNS, WHISPER_CAP, WHISPER_ID,
-    WHO_ID,
+    WHO_ID, WHO_AUDIENCES, WHO_OWNER,
 )
 from ._entries import (
     _entry_line, _gate_plan, _lane_entries, _lanes, lane_df, pinned_admission,
     pinned_lane,
     pinned_alarm, jit_alarm, lane_footer,
-    store_typed_id, _sa_whisper, _who_lines,
+    store_typed_id, _sa_whisper, _who_audience, _who_lines,
 )
 from ._ledger import _ledger_abort, _ledger_begin, _ledger_finish, _seen_save
 from ._compare import _active_compare, _compare_run
@@ -370,6 +370,9 @@ def _council_reach(session, cwd, persist=True):
     room = room or "main"
     if room.startswith("meld-") or room.startswith(chat.DM_PREFIX):
         return None
+    from .. import review_door
+    if review_door.is_pair_room(room):   # a task's `<scope>-<N>` pair meld
+        return None
     rows, _total = chat.read(room)
     kept = [m for m in rows
             if m.get("from") and (m.get("text") or "").strip()
@@ -459,7 +462,7 @@ def _council_reach(session, cwd, persist=True):
     return line, COUNCIL_WHISPER_ID
 
 
-def _unrepeated(lines, seen, turn):
+def _unrepeated(lines, seen, turn, exempt=()):
     """(lines to deliver, fingerprints delivered) — the same LINE, twice in a
     window, is not sent twice.
 
@@ -483,14 +486,18 @@ def _unrepeated(lines, seen, turn):
     saying twenty turns apart is worth saying again.
 
     Suppression state rides in the session's existing seen-file. There is no
-    second store.
+    second store. Exempt indices are steers already governed by a state-change
+    latch; their rendered bytes must not eat a second allowance.
 
     Fail-open: no session state -> everything delivers."""
     if seen is None:
         return list(lines), {}
     prior = seen.get("lines") or {}
     out, fps = [], {}
-    for line in lines:
+    for i, line in enumerate(lines):
+        if i in exempt:
+            out.append(line)  # the mood latch already governs this edge
+            continue
         fp = _pinned_fingerprint([line])
         if fp is None:
             out.append(line)
@@ -522,6 +529,25 @@ def _pinned_fingerprint(lines):
     identity for content that was never rendered)."""
     return hashlib.sha256(
         "\n".join(lines).encode("utf-8")).hexdigest() if lines else None
+
+
+def _who_for(seen):
+    """The WHO lines this context's seat is owed. A variant the context
+    already holds answers first (its fingerprint IS the seen marker), and
+    variants that render alike need no choice, so the role is read only on
+    the turn that would deliver something audience-specific: a worker's
+    every brief would otherwise pay a roster read to learn what it has."""
+    held = seen.get("who") if seen else None
+    variants = {a: _who_lines(a) for a in WHO_AUDIENCES}
+    for lines in variants.values():
+        if held and _pinned_fingerprint(lines) == held:
+            return lines
+    # NOTHING TO CHOOSE BETWEEN, NOTHING TO READ: a profile-less install
+    # renders the same (empty) lines for every audience and never sets
+    # seen['who'], so a role read here would be paid every typed turn.
+    if len({tuple(v) for v in variants.values()}) == 1:
+        return variants[WHO_OWNER]
+    return variants[_who_audience()]
 
 
 def _sample_context(session, cwd):
@@ -910,7 +936,7 @@ def _gather_admitted(text, project=None, session=None, compare=None, cwd=None,
     # WHO LEAVES THE CONTRACT (design section 3): the operator digest has a
     # reader only on a typed turn, so it rides the first typed turn of a
     # context under its own content identity, not every context's first turn.
-    who = _who_lines() if policy.who else []
+    who = _who_for(seen) if policy.who else []
     pinned_lines, pinned_ids = [], []
     # WHO NO LONGER CHARGES PINNED_BUDGET, AND NO LONGER WALKS FIRST.
     #
@@ -1151,6 +1177,23 @@ def _gather_admitted(text, project=None, session=None, compare=None, cwd=None,
         steers.append(reach[0])
         reflex_ids.append(reach[1])
         mutations["council"] = (session, cwd)
+    # THE SEAT'S MOOD (task/3899): its measured state fed back as ONE steer
+    # when it turns grinding or stuck (once per state change per seat), else
+    # the hourly ask for its word. A Stop hook reaches the model only by
+    # blocking the stop, so both ride this lane at the next turn's start;
+    # the latches are per seat and commit only once the turn is READY.
+    mood = None
+    if policy.state_reflex:
+        try:
+            from .. import seatmood_steer
+            mood = seatmood_steer.turn(session, now=now)
+        except Exception:
+            mood = None
+    if mood:
+        for line, rid in mood[0]:
+            steers.append(_cap_steer(line))
+            reflex_ids.append(rid)
+        mutations["mood"] = mood[1]
     # THE FIVE-HOUR PACE (pace5h): a Claude seat whose own account's 5h window
     # is WATCH or TIGHT hears it once per state change in this context. The
     # key it heard rides the seen-state, so a compaction or /clear re-arms it
@@ -1169,13 +1212,34 @@ def _gather_admitted(text, project=None, session=None, compare=None, cwd=None,
         reflex_ids.append(claudepace.STEER_ID)
         seen[claudepace.SEEN_KEY] = pace[1]
         mutations["seen"] = (session, seen)
+    # THE HANDOFF (pacecoach, task/3871): once per switch of the default
+    # home's account, a native Claude seat taking a turn hears the pool's
+    # pace and its project's advice. The switch it heard rides the
+    # seen-state like the 5h key above. Words only.
+    coach = None
+    if policy.state_reflex and seen is not None:
+        try:
+            from .. import claudepace
+            coach = claudepace.handoff(context, seen.get(
+                claudepace.HANDOFF_KEY), now=now)
+        except Exception:
+            coach = None
+    if coach:
+        from .. import claudepace
+        steers.append(_cap_steer(coach[0]))
+        reflex_ids.append(claudepace.HANDOFF_ID)
+        seen[claudepace.HANDOFF_KEY] = coach[1]
+        mutations["seen"] = (session, seen)
     # THE REFLEX LANE'S REPEAT FILTER, over the WHOLE lane and not per source:
     # a coinage nudge and a reflex steer are the same sentence to a reader, and
     # a filter applied per source cannot see that. It runs LAST because it
     # fingerprints the RENDERED line — the bytes the seat would receive, after
     # _cap_steer, which is the only identity that answers "did I already say
     # exactly this".
-    kept, line_fps = _unrepeated(steers, seen, turn)
+    from ..seatmood_steer import STEER_ID
+    kept, line_fps = _unrepeated(
+        steers, seen, turn, exempt={i for i, rid in enumerate(reflex_ids)
+                                   if rid == STEER_ID})
     repeated = [rid for line, rid in zip(steers, reflex_ids) if line not in kept]
     if repeated:
         steers = kept
@@ -1475,6 +1539,12 @@ def _apply_mutations(mutations):
             _council_reach(*council, persist=True)
         except Exception:
             pass
+    if mutations.get("mood"):
+        try:
+            from .. import seatmood_steer
+            seatmood_steer.commit(mutations["mood"])
+        except Exception:
+            pass
     if mutations.get("greet"):
         try:
             _mark_greeted()
@@ -1509,7 +1579,7 @@ def gather(text, project=None, session=None, compare=None, cwd=None,
         # this hook is the one place a turn begins, and the turn happened
         # whether or not this injection is admitted (record.turn_open).
         from .. import record
-        record.turn_open(session, text)
+        record.turn_open(session, text, hook=hook)
     _stage("admit")
     attempt = _ledger_begin()
     if attempt is None:
@@ -1669,7 +1739,7 @@ def _explain(text, project=None, session=None):
         print("posture: %s (nothing to say this turn)" % state)
     used = 0
     cut = False
-    who = _who_lines() if policy.who else []
+    who = _who_for(seen) if policy.who else []
     sa = _sa_whisper() if policy.contract else ()
     n_pin = bool(who) + len(pinned_entries) + len(sa)
     if n_pin:

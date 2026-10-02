@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Publish a helm release: ONE command, and a dry run unless you say --publish.
 
+    python3 scripts/release/release.py 0.3.2 --fold       # the cut's notes commit
     python3 scripts/release/release.py 0.3.2              # dry run (the default)
     python3 scripts/release/release.py 0.3.2 --publish    # the real thing
     python3 scripts/release/release.py --nightly          # the nightly's dry run
@@ -8,7 +9,7 @@
 WHAT A RELEASE IS. The public repository's main is a line of release commits,
 one per version. Each one is authored by the public repository's owner, its
 parent is the previous release, and its tree is the trunk tree minus the paths
-in `scripts/release/omit.txt`. The development history stays in the private
+in `scripts/release/omit.txt` and minus each change note (THE FOLD below). The development history stays in the private
 repository. So a release is one new commit and a fast-forward, never a
 history rewrite and never a force push.
 
@@ -65,9 +66,12 @@ writes. Three things differ, each so that the answer is about the tree:
     last released, whose tag is already public, so a dry run of that version
     refuses at the read and judges no gate. The nightly rehearses the next
     cut of it instead: version <__version__>-nightly (its tag, like every dry
-    run's, is made in the work repository only), with the CHANGELOG's newest
-    section as the notes. Bumping the version and writing its section stay
-    the owner's acts at the cut, and a real dry run checks them then.
+    run's, is made in the work repository only). Its notes are the ones the
+    next fold would make a section of (see THE FOLD below): the
+    '## Unreleased' notes and every change note in changes/; with none of
+    those, the CHANGELOG's newest section. Bumping the version and cutting
+    its section stay the owner's acts at the cut, and a real dry run checks
+    them then.
   - gitleaks is required, as --publish requires it. A dry run skips it when
     it is not installed, and a nightly that did would read green where the
     publish refuses.
@@ -79,6 +83,21 @@ candidate=<sha>`, or `NIGHTLY RED step=<step> trunk=<sha>` naming the first
 step that refused: read, backup, build, gate/candidate, gate/tree,
 gate/reports, gate/attribution, gate/sweep, gate/battery, gate/smoke,
 gate/gitleaks, gate/summary.
+
+THE FOLD (--fold). A lane writes its change note as its own file,
+changes/<lane>.md, and never edits CHANGELOG.md: when every lane added a
+bullet under '## Unreleased', any two lanes in one train conflicted there at
+compose and one of them dropped. The fold is the one writer of those notes
+into CHANGELOG.md, and it runs first at a cut. It makes ONE commit in the
+source checkout: the notes under '## Unreleased', then each changes/*.md
+note in path order (changes/README.md excepted), become a new
+'## <version> — <date>' section under '## Unreleased', dated like the
+commit it is made on; '## Unreleased' keeps only its pointer line (POINTER);
+and the folded note files are removed. It refuses a version CHANGELOG.md
+already has a section for, nothing to fold, and a checkout whose
+CHANGELOG.md, changes/ or index holds uncommitted changes. It pushes
+nothing. The owner then bumps `__version__` and edits the section, and the
+dry run reads it as the notes.
 
 THIS FILE IS STANDALONE. It runs from the checkout that holds it and imports
 nothing from the helm package. It loads two sibling files that are themselves
@@ -105,6 +124,18 @@ import traceback
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 OMIT = "scripts/release/omit.txt"
 NOREPLY = "users.noreply.github.com"
+
+# THE CHANGE NOTES (see THE FOLD above). A note is `changes/<name>.md`
+# directly under CHANGES; the README there says how to write one and is never
+# folded. POINTER is the one line under '## Unreleased' that is not a change:
+# the fold writes it back and never folds it, and the guard in
+# tests/test_change_notes.py exempts exactly this text.
+CHANGELOG = "CHANGELOG.md"
+CHANGES = "changes/"
+CHANGES_README = CHANGES + "README.md"
+UNRELEASED = "Unreleased"
+POINTER = ("Lanes add change notes as `changes/<lane>.md`, never here; a "
+           "release folds them.")
 
 # THE PUBLISH MARKER. The managed pre-push hook's shared-history rung
 # (helm/hostpath_guard.py) refuses a push whose commits share no history with
@@ -172,8 +203,10 @@ PATTERN_KEYS = ("seat", "private_token", "owner")
 # A seat-attribution line: in helm/ production code, a line that names a seat
 # (the private `seat` pattern) and carries a verb of finding. Who found,
 # caught, measured or reviewed something is the private engineering record,
-# not a property of the code.
-ATTR_SUFFIXES = (".py", ".part", ".html", ".js", ".css", ".md")
+# not a property of the code. `.txt` is a help fragment: a verb's help text
+# lives in helm/help/<verb>.txt (one file per verb), so a line moved out of a
+# .py file stays under this same scan.
+ATTR_SUFFIXES = (".py", ".part", ".html", ".js", ".css", ".md", ".txt")
 ATTR_VERB = re.compile(
     r"(?i)\b(found|finds|caught|catch|measured|flagged|raised|review(ed|er)?|"
     r"named|noticed|asked|ruled|reported|proposed|refuted|witnessed|spotted|"
@@ -455,6 +488,85 @@ def attribution(files, seat):
     return scanned, named, found
 
 
+def _unquote(text):
+    """The value a quoted source line names: its padding and outer quotes gone.
+    A keep entry names a line as it stood in source, quotes and all; the value
+    is what a help fragment holds once the line has moved out of the .py."""
+    s = text.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        s = s[1:-1]
+    return s.strip()
+
+
+def _covers(entry, line):
+    """Whether a keep entry covers a found line. An entry covers the line it
+    names exactly, in the file it stands in. It also covers a line that moved
+    out of that file into a help fragment (one file per verb, 3918): the entry
+    named the line's value in its source file, and the fragment holds that
+    value, so the approval follows the text, not the file it once stood in."""
+    (ep, et), (lp, lt) = entry, line
+    if ep == lp:
+        return et == lt
+    return (not ep.startswith("helm/help/") and lp.startswith("helm/help/")
+            and _unquote(et) in lt)
+
+
+def _value_spans(needle, hay):
+    """Every (start, end) of `needle` in `hay`, left to right: a value held
+    as one long fragment line may stand more than once in it, and a hit is
+    covered when it falls inside any of those spans."""
+    out, i = [], hay.find(needle)
+    while i >= 0:
+        out.append((i, i + len(needle)))
+        i = hay.find(needle, i + 1)
+    return out
+
+
+def kept_reason(path, text, keep, seat):
+    """The reason the KEEP list gives for covering this found line, or None:
+    one definition of the match for the gate and the owner's report. A found
+    line in the file an entry stands in needs only to be named exactly; a
+    found line in a help fragment needs a keep entry whose value holds it, and
+    the approval is span-aware — a private-name hit is kept only when it falls
+    inside the kept value's span, so the kept name on a long fragment line does
+    not carry a second name planted elsewhere on that same line. The gate and
+    the owner's report both call this one predicate, `seat` being the pattern
+    the line was found by."""
+    if (path, text) in keep:
+        return keep[(path, text)]
+    if not path.startswith("helm/help/"):
+        return None
+    # A help fragment holds one moved value as a single long line. The
+    # approval is span-aware, per occurrence: every seat hit on the line must
+    # fall inside a kept entry's value span. That is what keeps the one kept
+    # value from carrying a second private name planted elsewhere on the same
+    # line — the finding the old substring match opened. The gate and the
+    # owner's report both call this one predicate.
+    # The reason given is the one of the entry whose span holds the hit, not
+    # of whichever entry's value happens to stand first on the line: the
+    # owner reads that reason to judge the hit. A line with no hit has no
+    # kept span to name and is not covered.
+    spans = [(s, e, keep[(p, t)]) for p, t in keep
+             if not p.startswith("helm/help/")
+             for s, e in _value_spans(_unquote(t), text)]
+    reason = None
+    for m in seat.finditer(text):
+        held = next((r for s, e, r in spans
+                     if s <= m.start() and m.end() <= e), None)
+        if held is None:
+            return None
+        reason = reason or held
+    return reason
+
+
+def entry_is_live(entry, found):
+    """Whether a keep entry still matches a line at the candidate: exactly, or
+    by having moved into a help fragment, where the entry's value is text of
+    the moved line. A match is a match, in either direction of the move."""
+    return any(_covers(entry, line)
+               for line in {(p, t) for p, _n, t in found})
+
+
 def _top(counter, n=6):
     return ", ".join("%s(%d)" % kv for kv in counter.most_common(n))
 
@@ -579,15 +691,72 @@ def changelog_section(text, version):
 
 
 def newest_section(text):
-    """(its heading, its body) of the first `## ` section with text under
-    it, or (None, None). The nightly's notes: the section a cut made now
-    would publish nearest to."""
+    """(its heading, its body) of the first version's `## ` section with
+    text under it, or (None, None). The nightly's notes when nothing is
+    pending (see `pending`): the section a cut made now would publish
+    nearest to. '## Unreleased' is not a version: `pending` reads it."""
     for line in text.splitlines():
         words = line[3:].split() if line.startswith("## ") else []
-        body = changelog_section(text, words[0]) if words else None
+        body = changelog_section(text, words[0]) \
+            if words and words[0] != UNRELEASED else None
         if body:
             return line[3:].strip(), body
     return None, None
+
+
+def note_paths(paths):
+    """The change notes among tree `paths`: each `changes/<name>.md` directly
+    under CHANGES, the README excepted, in path order (the fold's order)."""
+    return sorted(p for p in paths
+                  if p.startswith(CHANGES) and p.endswith(".md")
+                  and "/" not in p[len(CHANGES):] and p != CHANGES_README)
+
+
+def unreleased(text):
+    """The notes under '## Unreleased' without the POINTER line, or ""."""
+    body = changelog_section(text, UNRELEASED) or ""
+    return "\n".join(line for line in body.splitlines()
+                     if line.strip() != POINTER).strip()
+
+
+def pending(text, notes):
+    """The notes the next fold makes a section of, or None: the notes under
+    '## Unreleased', then the text of each change note in `notes` ({path:
+    text}) in path order."""
+    parts = [unreleased(text)] + [notes[p].strip() for p in sorted(notes)]
+    return "\n".join(p for p in parts if p) or None
+
+
+def fold(text, version, date, notes):
+    """CHANGELOG.md's `text` with the pending notes (`pending`) made the
+    section '## <version> — <date>', placed under '## Unreleased', which
+    keeps only POINTER. The section opens with "Changes since <the version
+    below it>." when there is one. A text with no '## Unreleased' gains one
+    above its first `## ` heading. Refuses a version the text already has a
+    heading for, and nothing to fold."""
+    lines = text.splitlines()
+    heads = [i for i, line in enumerate(lines) if line.startswith("## ")]
+    first = {i: (lines[i][3:].split() or [""])[0] for i in heads}
+    if version in first.values():
+        raise Refusal("%s already has a section for %s; the fold makes a "
+                      "new one" % (CHANGELOG, version))
+    body = pending(text, notes)
+    if not body:
+        raise Refusal("nothing to fold: no note under '## %s' in %s and no "
+                      "change note in %s" % (UNRELEASED, CHANGELOG, CHANGES))
+    at = next((i for i in heads if first[i] == UNRELEASED), None)
+    start = at if at is not None else (heads[0] if heads else len(lines))
+    end = next((i for i in heads if i > start), len(lines)) \
+        if at is not None else start
+    since = next((first[i] for i in heads if i >= end and first[i]), None)
+    head = lines[:start]
+    if head and head[-1].strip():
+        head.append("")
+    block = (["## " + UNRELEASED, POINTER, "",
+              "## %s — %s" % (version, date), ""]
+             + (["Changes since %s." % since, ""] if since else [])
+             + body.splitlines() + [""])
+    return "\n".join(head + block + lines[end:]).rstrip("\n") + "\n"
 
 
 def default_message(version, notes):
@@ -607,6 +776,14 @@ def omit_entries(text):
 def omitted(path, entries):
     return any(path.startswith(e) if e.endswith("/") else path == e
                for e in entries)
+
+
+def left_out(path, entries):
+    """Whether the candidate leaves `path` out: the omit list names it, or it
+    is a change note, whose public form is its CHANGELOG section, so a note
+    that lands after the fold never ships raw. CHANGES_README is not a note
+    and ships."""
+    return omitted(path, entries) or bool(note_paths([path]))
 
 
 def tree_map(repo, rev):
@@ -690,18 +867,31 @@ class Release:
             p = git(self.source, "show", "%s:%s" % (self.trunk, path), check=False)
             return p.stdout if p.returncode == 0 else None
 
-        changelog = show("CHANGELOG.md") or ""
+        changelog = show(CHANGELOG) or ""
+        listed = git(self.source, "ls-tree", "-r", "-z", "--name-only",
+                     self.trunk, "--", CHANGES)
+        notes = {p: show(p) or "" for p in note_paths(listed.split("\0"))}
         init = show("helm/__init__.py") or ""
         m = re.search(r"^__version__\s*=\s*[\"']([^\"']+)[\"']", init, re.M)
         if a.nightly:
-            self.rehearse(changelog, m.group(1) if m else None)
+            self.rehearse(changelog, m.group(1) if m else None, notes)
         else:
             self.notes = changelog_section(changelog, self.version)
             if not self.notes:
+                headed = re.search(r"^## %s(\s|$)" % re.escape(self.version),
+                                   changelog, re.M)
                 raise Refusal("CHANGELOG.md at %s has no section for %s (a '## "
                               "%s' heading with text under it); the release "
-                              "notes are that section" % (
-                                  self.trunk[:12], self.version, self.version))
+                              "notes are that section%s" % (
+                                  self.trunk[:12], self.version, self.version,
+                                  "; `--fold` makes it from the notes under "
+                                  "'## %s' and in %s" % (UNRELEASED, CHANGES)
+                                  if pending(changelog, notes) and not headed
+                                  else ""))
+            if notes:
+                self.say("read", "%d change notes in %s are not in these "
+                         "notes; the next fold takes them"
+                         % (len(notes), CHANGES))
             if not m or m.group(1) != self.version:
                 raise Refusal("helm/__init__.py at %s declares __version__ %s, "
                               "not %s" % (self.trunk[:12],
@@ -741,15 +931,22 @@ class Release:
             raise Refusal("the public repository already has tag %s" % self.tag)
         self.say("ok", "tag %s is not on the public repository" % self.tag)
 
-    def rehearse(self, changelog, declared):
+    def rehearse(self, changelog, declared, notes):
         """The nightly's version and notes: the next cut of the version trunk
-        declares, as <declared>-nightly, with the CHANGELOG's newest section
-        as the notes (see THE NIGHTLY above)."""
+        declares, as <declared>-nightly, with the notes the next fold would
+        make a section of, else the CHANGELOG's newest section (see THE
+        NIGHTLY above). `notes` is {path: text} of trunk's change notes."""
         if not declared:
             raise Refusal("helm/__init__.py at %s declares no __version__; a "
                           "nightly rehearses the next cut of the version "
                           "trunk declares" % self.trunk[:12])
-        heading, self.notes = newest_section(changelog)
+        self.notes = pending(changelog, notes)
+        if self.notes:
+            said = ("the notes the next fold takes: '## %s' and %d change "
+                    "notes in %s" % (UNRELEASED, len(notes), CHANGES))
+        else:
+            heading, self.notes = newest_section(changelog)
+            said = "the newest CHANGELOG section, '## %s'" % heading
         if not self.notes:
             raise Refusal("CHANGELOG.md at %s has no section with text under "
                           "it; the release notes are a CHANGELOG section"
@@ -757,8 +954,49 @@ class Release:
         self.version = declared + NIGHTLY_SUFFIX
         self.tag = "v" + self.version
         self.say("read", "NIGHTLY: rehearsing the next cut as %s (trunk declares "
-                 "%s); notes: the newest CHANGELOG section, '## %s'"
-                 % (self.version, declared, heading))
+                 "%s); notes: %s" % (self.version, declared, said))
+
+    def fold_commit(self):
+        """--fold: the cut's notes commit in the source checkout (see THE
+        FOLD above). Reads CHANGELOG.md and the change notes at HEAD, which
+        must match the working tree and leave the index empty, so the commit
+        holds the fold and nothing else."""
+        src = git(os.path.abspath(self.a.source), "rev-parse", "--show-toplevel")
+        dirty = git(src, "status", "--porcelain", "--", CHANGELOG, CHANGES)
+        if dirty:
+            raise Refusal("%s or %s has uncommitted changes in %s; commit or "
+                          "discard them before the fold" % (CHANGELOG, CHANGES, src))
+        if git(src, "diff", "--cached", "--name-only"):
+            raise Refusal("the index of %s holds staged changes; the fold's "
+                          "commit holds the fold alone" % src)
+        head = git(src, "rev-parse", "--verify", "HEAD^{commit}")
+        listed = git(src, "ls-tree", "-r", "-z", "--name-only", head, "--", CHANGES)
+        paths = note_paths(listed.split("\0"))
+        notes = {p: git(src, "show", "%s:%s" % (head, p)) for p in paths}
+        date = git(src, "log", "-1", "--format=%cd", "--date=short", head)
+        text = fold(git(src, "show", "%s:%s" % (head, CHANGELOG)), self.version,
+                    date, notes)
+        with open(os.path.join(src, CHANGELOG), "w", encoding="utf-8") as f:
+            f.write(text)
+        message = ("release %s: fold the change notes into %s\n\nThe notes "
+                   "under '## %s' and %d change notes in %s become the '## %s "
+                   "— %s' section.%s\n" % (
+                       self.version, CHANGELOG, UNRELEASED, len(paths), CHANGES,
+                       self.version, date, "".join("\n  " + p for p in paths)))
+        try:
+            if paths:
+                git(src, "rm", "-q", "--", *paths)
+            git(src, "add", "--", CHANGELOG)
+            git(src, "commit", "-q", "-F", "-", input=message)
+        except Refusal as e:
+            raise Refusal("the fold is written in %s but not committed: %s"
+                          % (src, e))
+        self.say("FOLDED", "'## %s — %s' from the notes under '## %s' and %d "
+                 "change notes; commit %s in %s. Next: bump __version__ to %s, "
+                 "edit the section, then the dry run"
+                 % (self.version, date, UNRELEASED, len(paths),
+                    git(src, "rev-parse", "HEAD"), src, self.version))
+        return 0
 
     def read_private(self):
         """The KEEP list and the private patterns, from outside the tree. A
@@ -919,7 +1157,7 @@ class Release:
             self.say("given", "candidate %s (%s)" % (self.cand, self.a.candidate))
         else:
             keep = [(p, meta) for p, meta in entries.items()
-                    if not omitted(p, self.omit + [OMIT])]
+                    if not left_out(p, self.omit + [OMIT])]
             with tempfile.TemporaryDirectory() as d:
                 env = _env(GIT_INDEX_FILE=os.path.join(d, "index"))
                 # Through git(): what update-index says on stderr names index
@@ -1030,8 +1268,8 @@ class Release:
         """{seat_attribution.txt, arm_attr.txt} for the lines in `self.attr`."""
         found = self.attr
         keep = self.keep or {}
+        seat = self.patterns["seat"]
         per_file = lambda rows: collections.Counter(p for p, _n, _t in rows)
-        seen = {(p, t) for p, _n, t in found}
         rows = [
             OWNER_READ, "",
             "seat attribution in helm/ production code at candidate %s" % self.cand,
@@ -1042,11 +1280,14 @@ class Release:
             % (len(found), len(per_file(found))),
             "top files by B: " + _top(per_file(found), 12),
             "", "B lines (KEEP with the list's reason, else OFFENDING):"]
-        rows += ["  %s:%d: %s  %s" % (p, n, "KEEP (%s)" % keep[(p, t)]
-                                         if (p, t) in keep else "OFFENDING",
+        rows += ["  %s:%d: %s  %s" % (p, n,
+                                         "KEEP (%s)" % kept_reason(p, t, keep, seat)
+                                         if kept_reason(p, t, keep, seat) is not None
+                                         else "OFFENDING",
                                          self.hide(t)[:150])
                     for p, n, t in found]
-        bad = [(p, n, t) for p, n, t in found if (p, t) not in keep]
+        bad = [(p, n, t) for p, n, t in found
+               if kept_reason(p, t, keep, seat) is None]
         gate = [OWNER_READ, "",
                 "candidate %s: definition-B lines=%d  (KEEP-listed %d, offending %d)"
                 % (self.cand, len(found), len(found) - len(bad), len(bad)),
@@ -1055,7 +1296,7 @@ class Release:
         gate += ["  OFFENDING %s:%d: %s" % (p, n, self.hide(t)[:150])
                  for p, n, t in bad]
         gate += ["  STALE KEEP entry (no longer present): %s: %s" % k
-                 for k in sorted(keep) if k not in seen]
+                 for k in sorted(keep) if not entry_is_live(k, found)]
         return {"seat_attribution.txt": "\n".join(rows) + "\n",
                 "arm_attr.txt": "\n".join(gate) + "\n"}
 
@@ -1071,9 +1312,11 @@ class Release:
                 "they live outside the tree, readable by their owner only "
                 "(chmod 600); --keep-file and --audit-file name other paths"
                 % "; ".join(unusable))
-        seen = {(p, t) for p, _n, t in self.attr}
-        bad = ["%s:%d" % (p, n) for p, n, t in self.attr if (p, t) not in self.keep]
-        stale = [k for k in self.keep if k not in seen]
+        seat = self.patterns["seat"]
+        bad = ["%s:%d" % (p, n)
+               for p, n, t in self.attr
+               if kept_reason(p, t, self.keep, seat) is None]
+        stale = [k for k in self.keep if not entry_is_live(k, self.attr)]
         why = []
         if bad:
             why.append("%d line(s) in helm/ production code name a seat as the "
@@ -1100,7 +1343,7 @@ class Release:
     def tree_is_trunk_minus_omissions(self):
         trunk = tree_map(self.repo, self.trunk)
         cand = tree_map(self.repo, self.cand)
-        kept = {p: m for p, m in trunk.items() if not omitted(p, self.omit + [OMIT])}
+        kept = {p: m for p, m in trunk.items() if not left_out(p, self.omit + [OMIT])}
         extra = sorted(set(cand) - set(kept))
         missing = sorted(set(kept) - set(cand))
         changed = sorted(p for p in set(kept) & set(cand) if kept[p] != cand[p])
@@ -1154,6 +1397,7 @@ class Release:
                                % (i, self.needles_path)
                                for i, n in enumerate(self.needles, 1) if n in path), None)
             why = why or ("the omit list names it" if omitted(path, self.omit) else None)
+            why = why or ("an unfolded change note" if note_paths([path]) else None)
             if why:
                 raise Refusal("%s: forbidden filename %s (%s)"
                               % (label, self.hide(path), why))
@@ -1332,12 +1576,20 @@ def parse(argv):
     mode.add_argument("--nightly", action="store_true",
                       help="the nightly job's dry run of trunk as it stands: "
                            "no version (it rehearses the next cut of the "
-                           "version trunk declares, the CHANGELOG's newest "
-                           "section as the notes), gitleaks required, its "
+                           "version trunk declares, with the notes the next "
+                           "--fold takes as the notes, else the CHANGELOG's "
+                           "newest section), gitleaks required, its "
                            "default work directory under ~/.helm/releases/"
                            "nightly keeping the newest %d runs, and a "
                            "closing NIGHTLY GREEN|RED line naming the first "
                            "step that refused" % NIGHTLY_KEEP)
+    mode.add_argument("--fold", action="store_true",
+                      help="the cut's notes commit, before the dry run: fold "
+                           "the notes under '## Unreleased' and every "
+                           "changes/*.md note into a new '## <version>' "
+                           "section, remove the folded note files, and "
+                           "commit that in the source checkout; nothing is "
+                           "pushed")
     p.add_argument("--source", default=ROOT,
                    help="the development checkout (default: this one)")
     p.add_argument("--trunk", default="main",
@@ -1389,6 +1641,9 @@ def parse(argv):
     if args.nightly and args.candidate:
         p.error("--nightly builds its candidate from trunk; --candidate names "
                 "a staged one for a publish")
+    if args.fold and args.candidate:
+        p.error("--fold commits the notes in the source checkout; --candidate "
+                "names a staged commit for a publish")
     return args
 
 
@@ -1424,6 +1679,15 @@ def main(argv=None):
 
 
 def run(rel, args):
+    if args.fold:
+        rel.say("helm", "release %s: FOLD (one commit in the source checkout; "
+                "nothing is pushed or released)" % args.version)
+        try:
+            return rel.fold_commit()
+        except Refusal as e:
+            rel.say("REFUSED", str(e))
+            rel.output("nothing was pushed, tagged on a remote or released")
+            return 1
     if args.nightly:
         rel.say("helm", "release: NIGHTLY (a dry run of trunk as it stands, as "
                 "if cut now; nothing is pushed, tagged on a remote or released)")

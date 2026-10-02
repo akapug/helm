@@ -698,7 +698,8 @@ def _rung_budget(seat, family, flags, budget_why):
     if colour == burnflags.ORANGE:
         return "pass", ("%s is ORANGE%s — %s; %s"
                         % (family, when, cause,
-                           burnflags.BEHAVIOUR[burnflags.ORANGE]["say"]))
+                           (flag.get("behaviour") or
+                            burnflags.BEHAVIOUR[burnflags.ORANGE])["say"]))
     if colour == burnflags.GREY:
         return "unknown", "%s is NOT MEASURED — %s" % (family, cause)
     return "pass", None

@@ -50,9 +50,13 @@ you reload before large work.
 - **Author != reviewer, and every family is an equal counterpart.** A non-trivial change gets a
   cross-family refutation before it lands; the refuter looks for the substrate rule the change
   violates. A bare "looks good" is not review. The refuter follows the row's REVIEW FIX MODE
-  for mechanical findings: PATCH commits off the exact reviewed tip in its own room or a
-  `git clone --shared` clone whose commit it fetches into the repo and returns `--patch-tip`;
-  MELD-DIFF posts the exact fix in the pair meld for the author to apply, and records a FIX with
+  for mechanical findings: PATCH commits off the exact reviewed tip — in a
+  room it holds, or, for a subagent with no room of its own, a
+  `git clone --shared` clone whose commit it fetches into the repo — and returns `--patch-tip`;
+  only an explicit BUILD can assign a sole delegate a registered lane room, with its
+  parent owning the lease through completion or accepted handoff and returning it
+  (`helm work release`) then, never while work is unfinished. MELD-DIFF posts
+  the exact fix in the pair meld for the author to apply, and records a FIX with
   the validated `--diff-handoff ROOM/MSGID` receipt and `--no-patch-because`.
   Only a child whose send/add proves it applies the receipted diff confirms the cure;
   an unrelated child is an ordinary round. Prose without a receipt, including
@@ -80,10 +84,9 @@ you reload before large work.
   always free (qwen27 is prefill-bound): `helm reviewers <row>` names who can take it now, then
   `helm dispatch send <seat> <lane> --ref <tip> --kind review --supersedes <row>`. When none can
   take it, the door read **PARKS until a tier reader can take it**, with gemini reading
-  meanwhile as input only. **Fable is for max QC only**, never a default and never automatic: the
-  most important work (an owner P0, a release, a public push, or a money or creds door with no
-  other reader), at about 3 Opus tokens per Fable token, and not while `helm burn` reads anthropic
-  ORANGE or worse (owner ruling, task/3202). A max-QC read is a one-agent Workflow
+  meanwhile as input only. **Fable is for max QC only**, never a default and never automatic: it
+  reads only when the owner asks for it, at about 3 Opus tokens per Fable token, and not while
+  `helm burn` reads anthropic ORANGE or worse (owner rulings, task/3202 and task/3855). A max-QC read is a one-agent Workflow
   (opts.model `fable`, the alias; never the Agent tool, which runs your own model). On
   "You have reached your Fable limit": that limit is one credential's, not a wall and never a
   reason to step down a model — get **Fable through another credential or seat**. A model run's

@@ -526,6 +526,70 @@ class UpstreamWallCompositionTest(unittest.TestCase):
         self.assertIn("liveness WALLED (upstream RATE-LIMITED", out.getvalue())
         self.assertNotIn("liveness IDLE", out.getvalue())
 
+    def test_a_family_miss_prints_the_liveness_wall_not_an_adopted_LIVE(self):  # noqa: VACUOUS_ASSERTION — the printed WALLED line and its evidence are the positive control
+        """task/3996. A case-only rename fails the family grammar. The
+        liveness row is WALLED. where prints that wall, not an adopted LIVE."""
+        walled = {"seat": "Codex", "state": "WALLED", "blocked_on":
+                  "upstream RATE-LIMITED since 2026-09-14T02:59:16Z",
+                  "evidence": "pane-tail+proxywatch",
+                  "detail": "storage codex"}
+        out = io.StringIO()
+        with mock.patch.object(seat_lifecycle, "_seat_family",
+                               return_value=(None, "not a family")), \
+             mock.patch.object(seat_lifecycle, "seat_liveness",
+                               return_value=walled) as live, \
+             mock.patch.object(seat_lifecycle, "_where_adopted",
+                               side_effect=AssertionError("adopted")), \
+             mock.patch("helm.seat_rest.display", return_value=None), \
+             contextlib.redirect_stdout(out):
+            rc = seat_lifecycle._where("Codex", [])
+        self.assertEqual(rc, 0)
+        live.assert_called_once_with("Codex")
+        text = out.getvalue()
+        self.assertIn("Codex: liveness WALLED (upstream RATE-LIMITED "
+                      "since 2026-09-14T02:59:16Z)", text)
+        self.assertIn("evidence: pane-tail+proxywatch", text)
+        self.assertNotIn("orca-adopted", text)
+        self.assertNotIn("LIVE", text)
+
+    def test_a_family_miss_prints_an_identity_refusal_not_an_adopted_LIVE(self):  # noqa: VACUOUS_ASSERTION — the printed UNKNOWN line and identity-refused evidence are the positive control
+        """task/3996. A partial census is UNKNOWN. where prints that
+        refusal, not an adopted LIVE."""
+        refused = {"seat": "Codex", "state": "UNKNOWN", "blocked_on": None,
+                   "evidence": "identity-refused",
+                   "detail": "the seat tree is only partly readable"}
+        out = io.StringIO()
+        with mock.patch.object(seat_lifecycle, "_seat_family",
+                               return_value=(None, "not a family")), \
+             mock.patch.object(seat_lifecycle, "seat_liveness",
+                               return_value=refused), \
+             mock.patch.object(seat_lifecycle, "_where_adopted",
+                               side_effect=AssertionError("adopted")), \
+             mock.patch("helm.seat_rest.display", return_value=None), \
+             contextlib.redirect_stdout(out):
+            rc = seat_lifecycle._where("Codex", ["--json"])
+        self.assertEqual(rc, 0)
+        got = json.loads(out.getvalue())
+        self.assertEqual(got["state"], "UNKNOWN")
+        self.assertEqual(got["evidence"], "identity-refused")
+        self.assertIn("partly readable", got["detail"])
+        self.assertNotIn("provenance", got)
+
+    def test_a_family_miss_with_no_register_still_adopts(self):
+        """task/3996. No register, and liveness's own answer is the adopted
+        pane. where keeps that printer."""
+        adopted_row = {"seat": "Codex", "state": "LIVE",
+                       "evidence": "orca-adopted", "blocked_on": None}
+        adopted = mock.Mock(return_value=0)
+        with mock.patch.object(seat_lifecycle, "_seat_family",
+                               return_value=(None, "not a family")), \
+             mock.patch.object(seat_lifecycle, "seat_liveness",
+                               return_value=adopted_row), \
+             mock.patch.object(seat_lifecycle, "_where_adopted", adopted):
+            rc = seat_lifecycle._where("Codex", [])
+        self.assertEqual(rc, 0)
+        adopted.assert_called_once_with("Codex", [], "not a family")
+
 
     def test_a_WALLED_row_carries_its_since_and_its_detail(self):
         """A production record always carries the canary's detail. The row
@@ -594,6 +658,294 @@ class UpstreamWallCompositionTest(unittest.TestCase):
         self.assertEqual(idle_dispatch._live_pane("codex", row), "")
         self.assertIn("stranded on auth",
                       idle_dispatch._provider_wall("codex", row))
+
+
+    def test_a_direct_record_does_not_walk_the_identity_register(self):
+        """The storage walk is the miss path. A seat whose own directory
+        answers — the whole un-renamed fleet — never pays it."""
+        with mock.patch(
+                "helm.seat_lifecycle_runtime._identity_register") as reg:
+            row, _ = self.liveness(({
+                "codex": {"state": "HEALTHY", "dark": False, "seats": {
+                    "codex": {"state": "HEALTHY", "dark": False}}}}, None))
+        self.assertEqual(row["state"], "IDLE")
+        reg.assert_not_called()
+
+    def test_a_renamed_roster_name_reads_the_storage_keyed_wall(self):
+        """task/2476. A renamed roster name's proxy still lives under the
+        original storage key. Asking liveness by the roster name missed that
+        directory, the family grammar refused the new name, and the adopted
+        pane read LIVE while the family was RATE-LIMITED. The wall is the
+        storage key's wall; the row stays the name that was asked."""
+        roster, storage = "seat-a", "seat-b"
+        rec = {"seat": storage, "identity": roster, "harness": "orca",
+               "handle": "term_x", "family": "codex"}
+        ad = mock.Mock()
+        ad.read.return_value = "❯\n  ⏵⏵ bypass permissions on"
+        since = "2026-09-14T02:59:16Z"
+        seat_rec = {"state": "RATE-LIMITED", "dark": True, "since": since,
+                    "detail": "HTTP 429"}
+        snapshot = ({"codex": {"state": "RATE-LIMITED", "dark": True,
+                               "since": since, "seats": {storage: seat_rec}}},
+                    None)
+
+        def family(name):
+            if name == storage:
+                return "codex", None
+            return None, "unknown seat %s" % name
+
+        def spawn(d):
+            return rec if d == "storage-dir" else None
+
+        def instance(_family, name):
+            return "storage-dir" if name == storage else "missing"
+
+        def resolve(name, d=None, repair=True):
+            if name == storage and d == "storage-dir":
+                return ad, "term_x", ""
+            return None, None, "no pane for %s" % name
+
+        with mock.patch.object(seat, "_seat_family", side_effect=family), \
+             mock.patch.object(seat, "_instance_dir", side_effect=instance), \
+             mock.patch.object(seat, "_spawn_record", side_effect=spawn), \
+             mock.patch.object(seat, "_resolve_registered_pane",
+                               side_effect=resolve), \
+             mock.patch("helm.seat_lifecycle_runtime._identity_register",
+                        return_value=(storage, "storage-dir", rec, None)), \
+             mock.patch("helm.proxywatch.upstream_snapshot",
+                        return_value=snapshot), \
+             mock.patch("helm.poolwall.seat_wall",
+                        return_value=(None, "no pool refusal")) as wall, \
+             mock.patch("helm.poolwall.pane_anchor",
+                        return_value=lambda _line: None):
+            row = seat.seat_liveness(roster)
+        self.assertEqual(row["state"], "WALLED")
+        self.assertEqual(row["seat"], roster)
+        self.assertEqual(row["evidence"], "pane-tail+proxywatch")
+        self.assertIn("RATE-LIMITED", row["blocked_on"])
+        self.assertIn(since, row["blocked_on"])
+        self.assertNotIn("upstream_seat", row)
+        wall.assert_called_with(storage, family="codex")
+
+    def test_a_case_only_rename_keeps_the_storage_keyed_wall(self):
+        """task/3989. A permitted self-case rename codex -> Codex leaves the
+        register keyed `codex`. Casefold equality called that the same key,
+        the family grammar refused Codex, and the adopted pane read LIVE
+        while the storage proxy was RATE-LIMITED. The wall is that storage
+        key's wall. The row stays the spelling that was asked. The
+        different-spelling wall above is the control that a real rename
+        still reads its wall."""
+        roster, storage = "Codex", "codex"
+        rec = {"seat": storage, "identity": roster, "harness": "orca",
+               "handle": "term_x", "family": "codex"}
+        ad = mock.Mock()
+        ad.read.return_value = "❯\n  ⏵⏵ bypass permissions on"
+        since = "2026-09-14T02:59:16Z"
+        seat_rec = {"state": "RATE-LIMITED", "dark": True, "since": since,
+                    "detail": "HTTP 429"}
+        snapshot = ({"codex": {"state": "RATE-LIMITED", "dark": True,
+                               "since": since, "seats": {storage: seat_rec}}},
+                    None)
+
+        def family(name):
+            if name == storage:
+                return "codex", None
+            return None, "unknown seat %s" % name
+
+        with mock.patch.object(seat, "_seat_family", side_effect=family), \
+             mock.patch.object(seat, "_instance_dir",
+                               side_effect=lambda _f, name:
+                               "storage-dir" if name == storage else "missing"), \
+             mock.patch.object(seat, "_spawn_record",
+                               side_effect=lambda d:
+                               rec if d == "storage-dir" else None), \
+             mock.patch.object(seat, "_resolve_registered_pane",
+                               side_effect=lambda name, d=None, repair=True:
+                               (ad, "term_x", "") if name == storage
+                               else (None, None, "no pane")), \
+             mock.patch("helm.seat_lifecycle_runtime._identity_register",
+                        return_value=(storage, "storage-dir", rec, None)), \
+             mock.patch("helm.proxywatch.upstream_snapshot",
+                        return_value=snapshot), \
+             mock.patch("helm.poolwall.seat_wall",
+                        return_value=(None, "no pool refusal")) as wall, \
+             mock.patch("helm.poolwall.pane_anchor",
+                        return_value=lambda _line: None), \
+             mock.patch("helm.orcaadopt.resolve",
+                        return_value={"state": "LIVE", "evidence": "pid"}):
+            row = seat.seat_liveness(roster)
+        self.assertEqual(row["state"], "WALLED")
+        self.assertEqual(row["seat"], roster)
+        self.assertNotEqual(row["seat"], storage)
+        self.assertEqual(row["evidence"], "pane-tail+proxywatch")
+        self.assertIn("RATE-LIMITED", row["blocked_on"])
+        self.assertIn(since, row["blocked_on"])
+        self.assertNotIn("upstream_seat", row)
+        wall.assert_called_with(storage, family="codex")
+
+    def test_a_renamed_cooldown_prescribes_the_storage_proxy(self):
+        """The restart clock is stamped with the storage key. Remediation
+        asked by the roster name misses it and says UNKNOWN; the wall lookup
+        has to hand the storage key through."""
+        roster, storage = "seat-a", "seat-b"
+        rec = {"seat": storage, "identity": roster, "harness": "orca",
+               "handle": "term_x", "family": "codex"}
+        ad = mock.Mock()
+        ad.read.return_value = "❯\n  ⏵⏵ bypass permissions on"
+        cooled = {"state": proxywatch._PROXY_COOLDOWN, "dark": True,
+                  "since": "2026-09-14T02:59:16Z",
+                  "falsification_due": True, "falsification_age_s": 3600,
+                  "falsification_seat": storage}
+        snapshot = ({"codex": {
+            "state": proxywatch._PROXY_COOLDOWN, "dark": True,
+            "falsification_bar_s": 1800, "seats": {storage: cooled}}}, None)
+
+        def family(name):
+            return ("codex", None) if name == storage else (None, "unknown")
+
+        with mock.patch.object(seat, "_seat_family", side_effect=family), \
+             mock.patch.object(seat, "_instance_dir",
+                               side_effect=lambda _f, name:
+                               "storage-dir" if name == storage else "missing"), \
+             mock.patch.object(seat, "_spawn_record",
+                               side_effect=lambda d:
+                               rec if d == "storage-dir" else None), \
+             mock.patch.object(seat, "_resolve_registered_pane",
+                               return_value=(ad, "term_x", "")), \
+             mock.patch("helm.seat_lifecycle_runtime._identity_register",
+                        return_value=(storage, "storage-dir", rec, None)), \
+             mock.patch("helm.proxywatch.upstream_snapshot",
+                        return_value=snapshot), \
+             mock.patch("helm.poolwall.seat_wall",
+                        return_value=(None, "no pool refusal")), \
+             mock.patch("helm.poolwall.pane_anchor",
+                        return_value=lambda _line: None):
+            row = seat.seat_liveness(roster)
+        self.assertEqual(row["state"], "WALLED")
+        self.assertEqual(row["remediation"]["restart"], seat.RESTART_HELPFUL)
+        self.assertEqual(row["remediation"]["target"], "proxy")
+        self.assertIn(storage, row["remediation"]["evidence"])
+        self.assertNotIn(roster, row["remediation"]["evidence"])
+
+    def test_no_storage_register_leaves_the_adopted_pane_unwalled(self):
+        """THE CONTROL. The same roster name, with no register declaring it,
+        is still the adopted pane — LIVE, not a wall invented from a family
+        the name never resolved. A refusal is not this control (task/3990): blindness is UNKNOWN."""
+        def family(name):
+            return None, "unknown seat %s" % name
+
+        def ask(register):
+            with mock.patch.object(seat, "_seat_family", side_effect=family), \
+                 mock.patch.object(seat, "_spawn_record", return_value=None), \
+                 mock.patch("helm.seat_lifecycle_runtime._identity_register",
+                            return_value=register), \
+                 mock.patch("helm.orcaadopt.resolve",
+                            return_value={"state": "LIVE",
+                                          "evidence": "pid"}):
+                return seat.seat_liveness("seat-a")
+
+        bare = ask((None, None, None, None))
+        self.assertEqual(bare["state"], "LIVE")
+        self.assertEqual(bare["evidence"], "orca-adopted")
+        refused = ask((None, None, None, "the seat tree is only partly readable"))
+        self.assertEqual(refused["state"], "UNKNOWN")
+        self.assertEqual(refused["seat"], "seat-a")
+        self.assertEqual(refused["evidence"], "identity-refused")
+        self.assertIn("partly readable", refused["detail"])
+
+    def test_a_partial_census_does_not_adopt_or_own_a_renamed_seat(self):
+        """task/3990. One readable register beside an unreadable one is not
+        exclusive ownership. The runtime refuses; liveness says UNKNOWN
+        rather than adopting the pane as LIVE or reading that register's
+        wall. The no-register arm above stays the adopted LIVE control."""
+        roster, storage = "Codex", "codex"
+        rec = {"seat": storage, "identity": roster, "harness": "orca",
+               "handle": "term_x", "family": "codex"}
+        ad = mock.Mock()
+        ad.read.return_value = "❯\n  ⏵⏵ bypass permissions on"
+        since = "2026-09-14T02:59:16Z"
+        seat_rec = {"state": "RATE-LIMITED", "dark": True, "since": since,
+                    "detail": "HTTP 429"}
+        snapshot = ({"codex": {"state": "RATE-LIMITED", "dark": True,
+                               "since": since, "seats": {storage: seat_rec}}},
+                    None)
+        refusal = ("the seat tree is only partly readable, so whether a "
+                   "spawn register still declares Codex is UNKNOWN")
+
+        def family(name):
+            if name == storage:
+                return "codex", None
+            return None, "unknown seat %s" % name
+
+        with mock.patch.object(seat, "_seat_family", side_effect=family), \
+             mock.patch.object(seat, "_instance_dir",
+                               side_effect=lambda _f, name:
+                               "storage-dir" if name == storage else "missing"), \
+             mock.patch.object(seat, "_spawn_record",
+                               side_effect=lambda d:
+                               rec if d == "storage-dir" else None), \
+             mock.patch.object(seat, "_resolve_registered_pane",
+                               side_effect=lambda name, d=None, repair=True:
+                               (ad, "term_x", "") if name == storage
+                               else (None, None, "no pane")), \
+             mock.patch("helm.seat_lifecycle_runtime._identity_register",
+                        return_value=(storage, "storage-dir", rec, refusal)), \
+             mock.patch("helm.proxywatch.upstream_snapshot",
+                        return_value=snapshot), \
+             mock.patch("helm.poolwall.seat_wall",
+                        return_value=(None, "no pool refusal")), \
+             mock.patch("helm.poolwall.pane_anchor",
+                        return_value=lambda _line: None), \
+             mock.patch("helm.orcaadopt.resolve",
+                        return_value={"state": "LIVE", "evidence": "pid"}):
+            row = seat.seat_liveness(roster)
+        self.assertEqual(row["state"], "UNKNOWN")
+        self.assertEqual(row["seat"], roster)
+        self.assertEqual(row["evidence"], "identity-refused")
+        self.assertIn("partly readable", row["detail"])
+        self.assertIn("UNKNOWN", row["detail"])
+
+    def test_case_only_rename_identity_walk_error_refuses_adoption(self):
+        """A failed identity walk is blindness, not proof of no register.
+
+        Orca would call this pane LIVE if adopted, but neither the raw row nor
+        either `seat where` rendering may adopt it or leak the failed path.
+        """
+        secret = "/private/credentials/personal.env"
+        refusal = OSError("permission denied: " + secret)
+        with mock.patch.object(seat, "_seat_family",
+                               return_value=(None, "unknown seat Codex")), \
+             mock.patch("helm.seat_lifecycle_runtime._identity_register",
+                        side_effect=refusal) as register, \
+             mock.patch("helm.orcaadopt.resolve",
+                        return_value={"state": "LIVE",
+                                      "evidence": "orca-adopted"}) as adopt, \
+             mock.patch.object(seat_lifecycle, "_where_adopted",
+                               side_effect=AssertionError("adopted")), \
+             mock.patch("helm.seat_rest.display", return_value=None):
+            row = seat_lifecycle._seat_liveness_row("Codex")
+            self.assertEqual(row["state"], "UNKNOWN")
+            self.assertEqual(row["evidence"], "identity-refused")
+            self.assertTrue(row["detail"])
+            self.assertNotIn(secret, row["detail"])
+            self.assertNotIn("handle", row)
+            for args in ([], ["--json"]):
+                with self.subTest(args=args), contextlib.redirect_stdout(
+                        io.StringIO()) as out:
+                    self.assertEqual(seat_lifecycle._where("Codex", args), 0)
+                text = out.getvalue()
+                if args:
+                    printed = json.loads(text)
+                    self.assertEqual(printed["state"], "UNKNOWN")
+                    self.assertEqual(printed["evidence"], "identity-refused")
+                else:
+                    self.assertIn("liveness UNKNOWN", text)
+                    self.assertIn("evidence: identity-refused", text)
+                self.assertNotIn(secret, text)
+                self.assertNotIn("LIVE", text)
+            self.assertEqual(register.call_count, 3)
+            adopt.assert_not_called()
+
 
 class LivenessLifecycleTest(unittest.TestCase):
     """Every non-answer is an HONEST UNKNOWN, not a guess — the lifecycle walk

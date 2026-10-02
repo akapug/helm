@@ -136,6 +136,10 @@ HOLD_MARKER = "fleet-hold"
 RESUMING = "RESUMING"          # the one ACTION value the sweep acts on
 HELD = "HELD"
 DOWN = "DOWN (desired)"        # an operator's `seat down`; never relaunched
+# the sweep's name as an UNATTENDED caller of `seat._resume` (task/3695): no
+# operator is there to choose --defaults, so a recipe missing only fields a
+# defaults resume never carried resumes on the defaults, never left down
+SWEEP = "the reboot sweep"
 
 LIVE_SET_DIR = "resume-live-set"
 BOOT_ID_PATH = "/proc/sys/kernel/random/boot_id"
@@ -323,11 +327,17 @@ def admit(row, pre):
     return True
 
 
-def record_live_set(table, apply, partial, boot, btime):
+def record_live_set(table, apply, partial, boot, btime, recipes=None):
     """(line, failed): write THIS boot's live set, the next boot's
     population. It holds every row found LIVE and every row resumed with rc 0
     — a crash before the next pass must not forget a seat this pass brought
     back. Written only under --apply, and never from a partial table.
+
+    `recipes` rides beside the population, never inside it (task/3695): each
+    seat's LAUNCH RECIPE as its live process was last captured, carried
+    forward from record to record (helm/seat_recipe.py `carried`), so a seat
+    that parks or dies still has the settings a resume restores exactly.
+    `seats` alone decides who is relaunched; `recipes` decides nothing here.
 
     A DESIRED-DOWN SEAT IS NEVER LIVE HERE. `seat down` stops a proxy seat's
     proxy, not its pane, so a stood-down seat can still read LIVE; recorded,
@@ -360,7 +370,22 @@ def record_live_set(table, apply, partial, boot, btime):
     doc = {"v": 1, "boot_id": boot, "btime": btime, "written": pk.now_ts(),
            "seats": seats}
     try:
-        pk.atomic_write(path, json.dumps(doc, indent=1, sort_keys=True) + "\n")
+        if recipes is None:
+            pk.atomic_write(path, json.dumps(doc, indent=1, sort_keys=True)
+                            + "\n")
+        else:
+            # TWO PASSES CAN WRITE AT ONCE (the timer and a hand pass): the
+            # recipes merge with the map on disk UNDER ONE LOCK, the later
+            # capture of each seat winning (task/3695), so a pass that read
+            # the map before another wrote it never writes an older capture
+            # over a newer one
+            from . import seat_recipe
+            from .seats_common import _flocked
+            with _flocked(os.path.join(live_set_dir(), ".recipes.lock")):
+                doc["recipes"] = seat_recipe.keep_newest(
+                    recipes, seat_recipe.newest_recipes())
+                pk.atomic_write(path, json.dumps(doc, indent=1,
+                                                 sort_keys=True) + "\n")
     except OSError as e:
         return _LEAD + ("could not record this boot's live set at %s: %s"
                         % (path, e)), True
@@ -381,13 +406,16 @@ def _memo(fn):
 class Row(object):
     # `down` is the seat's READABLE desired-down record, set by `gate`: a row
     # carrying one is never relaunched and never recorded in the live set
+    # `pids` is an adopted LIVE row's resolved processes, kept so the recipe
+    # capture needs no second /proc walk (task/3695)
     __slots__ = ("seat", "kind", "state", "session", "action", "reason",
-                 "down")
+                 "down", "pids")
 
     def __init__(self, seat, kind, state, session=None, action="-", reason=""):
         self.seat, self.kind, self.state = seat, kind, state
         self.session, self.action, self.reason = session, action, reason
         self.down = None
+        self.pids = None
 
     def line(self):
         # the seat column is the table's first and widest, and for an adopted
@@ -656,8 +684,10 @@ def classify_adopted(name, ad, boot, roster_row=None, rows=(), apply=False):
     if state == orcaadopt.LIVE:
         stamp = orcatitle.restamp_one(
             ad, name, _inventory_row(rows, info.get("handle")), apply=apply)
-        return Row(name, kind, LIVE, sid, "none: no register to stamp",
-                   (info.get("evidence") or "") + orcatitle.note(stamp)), False
+        row = Row(name, kind, LIVE, sid, "none: no register to stamp",
+                  (info.get("evidence") or "") + orcatitle.note(stamp))
+        row.pids = list(info.get("pids") or ())
+        return row, False
     if state != orcaadopt.DEAD:
         return Row(name, kind, UNKNOWN, sid,
                    reason=info.get("evidence") or "state %r" % state), False
@@ -797,7 +827,7 @@ def act(name, ad, sid):
     with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
         try:
             rc = seat._resume(name, [], adapter=ad, reboot_dead=True,
-                              reboot_sid=sid)
+                              reboot_sid=sid, unattended=SWEEP)
         except Exception as e:              # noqa: BLE001 — the row must say FAILED, not die mid-table
             print("helm seat: resume raised %s: %s" % (type(e).__name__, e))
             rc = 1
@@ -889,6 +919,14 @@ def cmd_resume_all(rest):
     from . import vendorescape
     for line in vendorescape.sweep(sorted(registered) + adopted, apply=apply):
         print(line)
+    # THE CUBICLE MOVER RIDES THIS WAKE TOO (task/3900): each fleet seat's
+    # tab moved to the owner's Orca pane its state names. It reuses this
+    # adapter and this write flag, reads no /proc, and is silent until
+    # local-names names a floor. Like a title, a move types nothing and
+    # starts nothing, so the fleet hold does not withhold it.
+    from . import cubicles
+    for line in cubicles.tick(ad, apply=apply):
+        print(line)
     counts = {}
     for row in table:
         counts[row.state] = counts.get(row.state, 0) + 1
@@ -902,8 +940,19 @@ def cmd_resume_all(rest):
         "; %d desired-down, not relaunched" % stood_down if stood_down
         else ""))
     print(pre[2])
+    # EVERY LIVE SEAT'S RECIPE, captured while it runs (task/3695): its argv
+    # and allow-listed environ never change for the life of the process, so
+    # the last capture before it parks or dies is exact. Only under --apply,
+    # the one pass that writes, and never from a partial table. The pid comes
+    # from the row's own proof (a spawned seat's register pin, an adopted
+    # seat's resolved pids), so a healthy fleet still costs no /proc walk.
+    recipes = None
+    if apply and not roster_failed:
+        from . import seat_recipe
+        recipes = seat_recipe.carried(seat_recipe.capture_seats(
+            [(r.seat, r.session, r.pids) for r in table if r.state == LIVE]))
     line, unrecorded = record_live_set(table, apply, roster_failed, this_boot,
-                                       boot)
+                                       boot, recipes=recipes)
     print(line)
     if held:
         print("helm seat resume --all: FLEET HOLD in effect — no resume and no "

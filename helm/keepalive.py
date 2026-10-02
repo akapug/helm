@@ -39,8 +39,10 @@ appear anywhere.
 the predecessor's log history carries over; new writes are helm-only.)
 """
 import contextlib
+import datetime
 import fcntl
 import glob
+import hashlib
 import json
 import mmap
 import os
@@ -290,6 +292,14 @@ def cli_identity():
     return _identity_cache[key]
 
 
+def refresh_family(token):
+    """The digest prefix naming one refresh token, never the token: the same
+    sha256 prefix cred.orca's _token_facts records as a copy's `family`, so a
+    keepalive row and a freshness measurement name one token one way."""
+    return hashlib.sha256(token.encode()).hexdigest()[:10] \
+        if isinstance(token, str) and token else None
+
+
 def _read_oauth(cred_path):
     blob, _ = cred._read_regular(cred_path)
     val = json.loads(blob.decode("utf-8"))
@@ -421,7 +431,21 @@ def refresh_home(home_path, early_horizon_s=60, force=False, apply=False):
             j = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         e.close()
-        return rec({"action": "needs_reauth",
+        if e.code == 429 or e.code >= 500:
+            # A THROTTLE OR A SERVER FAULT SAYS NOTHING ABOUT THE CHAIN. It
+            # was logged needs_reauth, "one-time re-login needed", which sent
+            # the owner to a login for an outage. Nothing was written; the
+            # next pass asks again, and its answer (a grant, or a 400 on this
+            # same token) is the one that decides.
+            return rec({"action": "error", "http": e.code,
+                        "reason": "refresh HTTP %s — the token endpoint failed, "
+                                  "not the chain; nothing written, the next "
+                                  "pass retries" % e.code})
+        # THE REFUSAL CARRIES WHICH REFRESH TOKEN IT REFUSED (its family
+        # digest, never a byte of it), so `refusal_of` can prove a later
+        # reader is looking at those same bytes and not at a re-login.
+        return rec({"action": "needs_reauth", "http": e.code,
+                    "family": refresh_family(refresh_token),
                     "reason": "refresh HTTP %s — one-time re-login needed" % e.code})
     except Exception as e:
         return rec({"action": "error",
@@ -495,6 +519,12 @@ def last_outcome(home_name, tail_bytes=262144):
             continue
         if not isinstance(row, dict) or row.get("home") not in wanted:
             continue
+        # A CODEX HOME CAN CARRY THE CLAUDE HOME'S NAME, and the sweep logs it
+        # after the claude one, so its "stale-risk" row was read as this
+        # home's newest decision: a home keepalive had seen refused every hour
+        # for a day was reported as one keepalive would refresh.
+        if row.get("provider") == "codex":
+            continue
         action = str(row.get("action") or "")
         if action in ("would-refresh", ""):
             continue          # a dry run decided nothing about the home
@@ -504,6 +534,74 @@ def last_outcome(home_name, tail_bytes=262144):
                 "orca": action == "skip" and reason.startswith("home ")
                 and "orca" in reason.lower()}
     return None
+
+
+#: The token endpoint's answer to a refresh token that is no longer valid
+#: (invalid_grant). A 401 or 403 can be about the client, not the chain, and a
+#: 5xx or 429 is about the endpoint, so only this code proves a chain spent.
+REFUSED_HTTP = 400
+
+
+def _row_epoch(ts):
+    try:
+        return datetime.datetime.strptime(str(ts), "%Y-%m-%dT%H:%M:%S%z").timestamp()
+    except ValueError:
+        return None
+
+
+def refusal_of(home_name, family, since, tail_bytes=262144):
+    """The token endpoint's refusal of the refresh token this home holds NOW,
+    from keepalive's own log -> {"ts", "count", "by"} or None.
+
+    It is the proof `cred sync-orca` lacked: a home whose refresh token the
+    endpoint answers HTTP 400 is on a spent chain, whatever its refresh
+    lifetime says. A row counts only when it is about the CURRENT bytes: it
+    names the refused token's family and that equals `family` (the home's
+    refresh-token digest now), or, for a row written before families were
+    recorded, it was written after the credentials file last changed (`since`,
+    epoch seconds). Codex rows of the same home name never count. `count` is
+    how many such refusals the log tail holds."""
+    if not family:
+        return None
+    path = _log_path()
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            if size > tail_bytes:
+                fh.seek(size - tail_bytes)
+                fh.readline()
+            lines = fh.read().decode("utf-8", "replace").splitlines()
+    except OSError:
+        return None
+    wanted = {home_name, cred._display_path(home_name)}
+    hits = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if (not isinstance(row, dict) or row.get("home") not in wanted
+                or row.get("provider") == "codex"
+                or row.get("action") != "needs_reauth"):
+            continue
+        code = row.get("http")
+        if code is None:
+            m = re.match(r"refresh HTTP (\d+)\b", str(row.get("reason") or ""))
+            code = int(m.group(1)) if m else None
+        if code != REFUSED_HTTP:
+            continue
+        if row.get("family") is not None:
+            if row["family"] != family:
+                continue
+        else:
+            at = _row_epoch(row.get("ts"))
+            if at is None or since is None or at <= since:
+                continue
+        hits.append(row)
+    if not hits:
+        return None
+    return {"ts": hits[-1].get("ts"), "count": len(hits),
+            "by": hits[-1].get("by") or "hand"}
 
 
 def last_refresh(home_name=None, tail_bytes=262144):

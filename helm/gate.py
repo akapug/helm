@@ -3080,7 +3080,8 @@ def _agent_pane_pids(proc_dir=None):
     if index is None:
         return None                  # unlistable process table: UNKNOWN
     return sorted(pid for pid in index.get("by_pid") or ()
-                  if not _print_mode_agent(pid, proc_dir))
+                  if not _print_mode_agent(pid, proc_dir)
+                  and not _container_agent(pid, proc_dir))
 
 
 def _print_mode_agent(pid, proc_dir=None):
@@ -3108,6 +3109,33 @@ def _print_mode_agent(pid, proc_dir=None):
     except OSError:
         return False
     return session._is_headless(argv)
+
+
+def _namespace_ino(proc_dir, pid, kind):
+    """Inode of /proc/<pid>/ns/<kind>, or None when it cannot be read."""
+    try:
+        return os.stat(os.path.join(
+            _census_proc_dir(proc_dir), str(pid), "ns", kind)).st_ino
+    except OSError:
+        return None
+
+
+def _container_agent(pid, proc_dir=None):
+    """True when this agent's pid or cgroup namespace is not the host's.
+
+    The host is pid 1 (task/3094). A container's namespace inode differs
+    from that, so a claude running inside one is a job, not a seat, and
+    does not hold the pane cap. An unreadable namespace proves nothing,
+    and this returns False: the agent stays a pane, which is the side the
+    cap fails toward.
+    """
+    proc_dir = _census_proc_dir(proc_dir)
+    for kind in ("pid", "cgroup"):
+        host = _namespace_ino(proc_dir, 1, kind)
+        agent = _namespace_ino(proc_dir, pid, kind)
+        if host is not None and agent is not None and host != agent:
+            return True
+    return False
 
 
 def _online_cpu_count():
@@ -11095,7 +11123,8 @@ def _opt(rest, name, default=None):
 # tree that becomes trunk, and the train's receipt is that suite
 # (`landgate.py`, `foldcheck.py` and the APPROVE `NEED_SUITE` binding, none of
 # which this touches). A lane-tip whole suite answers nothing the land gate
-# asks, because the integrator rebases the lane before it lands: 142 of them
+# asks, because the integrator merges the lane at its exact sha before it
+# lands: 142 of them
 # in the week, 68.6 h. 38 train gates ran stacked under a later green train
 # (13.7 h), and 4 runs gated a tree that was already green (1.7 h).
 #

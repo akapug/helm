@@ -56,6 +56,7 @@ import contextlib
 import hashlib
 import json
 import os
+import time
 
 from . import home, pk
 
@@ -96,7 +97,11 @@ SURFACES = ("leases", "dispatch_in", "dispatch_out", "tasks")
 # the one moment it is needed — the morning after a reboot, when nothing can
 # be measured about a process that no longer exists. Owner canon for this row:
 # "refuse only on measured contradiction, never on absence."
+# WALLED proceeds too (task/3881): its pane process runs, but its own
+# liveness reading says its provider refuses its turns and the reset is past
+# the dark-seat mover's RESET_WAIT_S, so it is not live FOR WORK.
 SOURCE_DEAD, SOURCE_LIVE, SOURCE_UNKNOWN = "dead", "live", "unknown"
+SOURCE_WALLED = "walled"
 
 
 def ledger_path():
@@ -475,7 +480,7 @@ def source_disposition(seat):
     if state in (seat_resume_all.DEAD_PANE, seat_resume_all.PANE_GONE):
         return SOURCE_DEAD, "%s — %s" % (state, why)
     if state == seat_resume_all.LIVE:
-        return SOURCE_LIVE, why
+        return _live_or_walled(seat, why)
     # THE SECOND ARM EXISTS BECAUSE THE FIRST IS BLIND TO NATIVE SEATS, and
     # the blindness pointed the DANGEROUS way. `prove_reboot_dead` resolves a
     # seat through its FAMILY REGISTER (codex, gemini, grok, kimi and their -N
@@ -516,10 +521,71 @@ def source_disposition(seat):
     except Exception:                        # noqa: BLE001 — a second opinion
         alive = False                        # that cannot be READ is not one
     if alive:
-        return SOURCE_LIVE, ("the reboot classifier could not place %s (%s), "
-                             "but its roster session is in the LIVE set — a "
-                             "second surface measured it working" % (seat, why))
+        return _live_or_walled(seat, (
+            "the reboot classifier could not place %s (%s), but its roster "
+            "session is in the LIVE set — a second surface measured it "
+            "working" % (seat, why)))
     return SOURCE_UNKNOWN, "%s — %s" % (state, why)
+
+
+def _live_or_walled(seat, why):
+    """(SOURCE_LIVE, why), or (SOURCE_WALLED, why) for a running process
+    whose seat cannot take a turn (`walled_for_work`)."""
+    walled, _not = walled_for_work(seat)
+    if walled:
+        return SOURCE_WALLED, ("its pane process runs (%s), but it reads %s, "
+                               "so it cannot take a turn and is not live for "
+                               "work" % (why, walled))
+    return SOURCE_LIVE, why
+
+
+def _wall_reset(seat, row):
+    """When the seat's wall is known to end, as an epoch, else None: its own
+    proxy pool's refusal (`poolwall.seat_wall`), else its family's burn flag
+    (`expires_at`, the instant the dark-seat mover waits for)."""
+    from . import burnflags, poolwall
+    try:
+        wall, _why = poolwall.seat_wall(seat)
+        if wall and isinstance(wall.get("expires_at"), (int, float)):
+            return float(wall["expires_at"])
+    except Exception:                        # noqa: BLE001 — the flag stands
+        pass
+    family = row.get("upstream_family")
+    if not family:
+        from . import darkmove
+        family = darkmove._family_of(seat)
+    try:
+        flags, _age = burnflags.cached_flags()
+    except Exception:                        # noqa: BLE001 — no known reset
+        return None
+    got = ((flags or {}).get(family) or {}).get("expires_at")
+    return float(got) if isinstance(got, (int, float)) else None
+
+
+def walled_for_work(seat, now=None):
+    """(the classification, None) when the seat's own liveness reading
+    (`seat.seat_liveness`, the reader the cubicle mover and idle-dispatch
+    ask) is WALLED or BLOCKED_ON_QUOTA and its wall does not reset within
+    the dark-seat mover's RESET_WAIT_S; else (None, why not). An unknown
+    reset is no evidence the wall ends soon. Never raises."""
+    from . import cubicles, darkmove, seat as _seat
+    try:
+        row = _seat.seat_liveness(seat, repair=False) or {}
+    except Exception as exc:                 # noqa: BLE001 — not a wall
+        return None, "its liveness did not read (%s)" % exc.__class__.__name__
+    state = row.get("state") or "UNKNOWN"
+    if state not in cubicles.WALLED_STATES:
+        return None, "its liveness reads %s" % state
+    now = time.time() if now is None else now
+    reset = _wall_reset(seat, row)
+    at = None if reset is None else time.strftime(
+        "%Y-%m-%dT%H:%M:%SZ", time.gmtime(reset))
+    if reset is not None and reset - now <= darkmove.reset_wait_s():
+        return None, ("it reads %s, but its wall resets at %s, within %ds"
+                      % (state, at, darkmove.reset_wait_s()))
+    return ("%s (%s), reset %s" % (
+        state, row.get("blocked_on") or "no cause recorded",
+        at or "not known")), None
 
 
 # Reading the dispatch store fails for BOTH halves at once — there is one read

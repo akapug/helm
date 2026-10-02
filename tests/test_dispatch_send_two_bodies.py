@@ -49,7 +49,7 @@ class SendRefusesTwoBodiesTest(DispatchBase):
             return run(dispatches.cmd_dispatch, [
                 "send", "reviewer", lane, *message,
                 "--ref", self.a, "--repo", self.repo, "--kind", "review",
-                "--new-work"])
+                "--new-work", "--task", self.review_task["id"], "--part"])
 
     def _lanes(self):
         current, unavailable = dispatches.snapshot()
@@ -75,7 +75,7 @@ class SendRefusesTwoBodiesTest(DispatchBase):
                 rc, out, err = run(dispatches.cmd_dispatch, [
                     "send", "reviewer", "null-lane", "the message",
                     "--ref", self.a, "--repo", self.repo, "--kind", "review",
-                    "--new-work"])
+                    "--new-work", "--task", self.review_task["id"], "--part"])
         self.assertEqual(rc, 0, out + err)
         self.assertEqual(self._lanes(), ["null-lane"])
 

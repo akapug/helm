@@ -74,7 +74,7 @@ def _fake_cv_show(alpha, n=9, target_at=3):
                      "content": [{"kind": "text", "text": text}]})
 
     def fake(sid, rng=None, harness=None):
-        a, b = (int(x) for x in rng.split("-"))
+        a, b = rng
         return {"messages": msgs[a:b], "title": "stub title", "cwd": alpha}
     return fake
 
@@ -346,7 +346,8 @@ class TestWebSessions(unittest.TestCase):
     # -- POST /api/prune ---------------------------------------------------
     def test_prune_post_dry_run(self):
         with mock.patch.object(transcripts, "_cv_prune_help",
-                               lambda: "--thinking --window"):
+                               lambda: "--thinking --window"), \
+                mock.patch("helm.cvcompat.version", return_value=(0, 10, 0)):
             status, d = self.req("/api/prune", {"sid": SID_A[:12], "preset": "lean",
                                                 "dry": True})
             self.assertEqual(status, 200, d)

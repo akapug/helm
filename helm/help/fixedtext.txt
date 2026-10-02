@@ -1,0 +1,1 @@
+fixedtext [--json] — the instruction files and project memory index each CHECKOUT loads before a seat's first turn, heaviest first, with every seat that shares it. Read-only: it caps and prunes nothing, because shared text is the business of every seat that loads it

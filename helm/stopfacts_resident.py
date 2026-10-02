@@ -8,7 +8,7 @@ eight to twelve questions per held lane and reading the room census, against a
 wall-clock budget on a box whose load decides the wall clock. The facts are the
 same for every stop until an input moves, so they are computed HERE, once per
 change, by the
-guard's own functions — `seats_delegation._gate_pending`,
+guard's own functions — `seats_gate_exemption._gate_pending`,
 `seats_room_advice._room_unfinished`, `_dispatch_advice`,
 `dispatches.review_spiral` and `dispatches.owed` — and written behind this
 process for `helm/stopfacts.py` to read. There is no second oracle: the
@@ -117,7 +117,8 @@ def _eager_imports():
     process runs is the code LOADED_POLICY names — a lazy import after a
     deploy would mix trees under one policy."""
     from . import (dispatches, gate, landreq, seats_delegation,  # noqa: F401
-                   seats_room_advice, seats_roster, seats_stop_signals, vcs)
+                   seats_gate_exemption, seats_room_advice, seats_roster,
+                   seats_stop_signals, vcs)
     from .work import _gc, _lanes  # noqa: F401
 
 
@@ -211,7 +212,7 @@ def lease_facts(resource, row, snap, note, seats_for=(), now=None):
     """The facts one stop needs about one held lease, computed with the
     guard's own functions. Never raises; an input that cannot be read is an
     UNKNOWN in the facts, exactly as the guard would have printed it."""
-    from . import seats_delegation, seats_room_advice
+    from . import seats_delegation, seats_gate_exemption, seats_room_advice
     now = time.time() if now is None else now
     usable = snap if isinstance(snap, dict) and not note else None
     parts = str(resource).split(":", 2)
@@ -237,14 +238,14 @@ def lease_facts(resource, row, snap, note, seats_for=(), now=None):
     out["room"] = room
     out["room_exists"] = bool(room) and os.path.isdir(room)
     sha0, wit0 = head(room) if room else (None, None)
-    family = seats_delegation._lane_stem(parts[2])
+    family = seats_gate_exemption._lane_stem(parts[2])
     out["stem"] = family
     out["ids"] = sorted(str(rid) for rid, r in (usable or {}).items()
                         if isinstance(r, dict)
-                        and seats_delegation._lane_stem(r.get("lane"))
+                        and seats_gate_exemption._lane_stem(r.get("lane"))
                         == family)
     try:
-        gate = seats_delegation._gate_pending(
+        gate = seats_gate_exemption._gate_pending(
             resource, snap=usable if usable is not None else {}, cwd=anchor)
     except Exception:                        # noqa: BLE001 — UNKNOWN blocks
         gate = None
@@ -685,9 +686,16 @@ def _resident(replaying=None):
             "code_root": stopfacts.code_root()}
 
 
-def _preflight():
+#: The modules `helm web` imports before it serves (see `_preflight`).
+WEB_MODULES = ("helm.cli", "helm.trunkroute", "helm.selfrepo", "helm.web",
+               "helm.web_server", "helm.webserve", "helm.stopfacts_resident",
+               "helm.tickalarm")
+
+
+def _preflight(modules=WEB_MODULES):
     """None when the tree on disk imports the modules a re-exec starts, else
-    why not. Run in a child interpreter, so a tree that does not import costs
+    why not. `modules` defaults to the web family; the hook resident
+    (helm/hookres.py) passes the modules it serves from. Run in a child interpreter, so a tree that does not import costs
     a line in this process's log and never the console.
 
     THOSE ARE THE MODULES `helm web` IMPORTS BEFORE IT SERVES: the verb
@@ -700,10 +708,8 @@ def _preflight():
     integrator's board is; neither import is guarded, so both are checked.
     `helm.hooks` is not: `_main` imports it under `except Exception`."""
     parent = os.path.dirname(stopfacts.code_root())
-    probe = ("import sys; sys.path.insert(0, %r); "
-             "import helm.cli, helm.trunkroute, helm.selfrepo, helm.web, "
-             "helm.web_server, helm.webserve, helm.stopfacts_resident"
-             % parent)
+    probe = ("import sys; sys.path.insert(0, %r); import %s"
+             % (parent, ", ".join(modules)))
     try:
         r = subprocess.run([sys.executable, "-c", probe], cwd=parent,
                            stdin=subprocess.DEVNULL, capture_output=True,
@@ -751,6 +757,10 @@ class Follower(object):
     are waited out and released before the exec; any other server follows
     through one of these, which holds neither."""
 
+    #: The modules the import check loads before an exec; None is the web
+    #: family (`WEB_MODULES`). The hook resident sets its own.
+    PREFLIGHT = None
+
     def __init__(self):
         # THE RE-EXEC'S STATE: the tree digest first seen off LOADED_POLICY
         # and when, and every digest a re-exec was refused on, with why.
@@ -790,7 +800,8 @@ class Follower(object):
         the exec. The interpreter, argv (and with it the port) and the
         environment are this process's own — less `--open`, so a land never
         opens another browser tab."""
-        why = _preflight()
+        why = _preflight() if self.PREFLIGHT is None \
+            else _preflight(self.PREFLIGHT)
         if why:
             self.no_exec[digest] = why
             _say("not re-exec'ing onto the changed tree: %s" % why)

@@ -400,11 +400,11 @@ def _clean(backend, repo, tip):
 def _landed_by_content(backend, repo, tip, ref):
     """True / False / None — did this CHANGE ever reach `ref`, by any sha.
 
-    THE RUNGS ABOVE ASK ANCESTRY, WHICH IS SHA IDENTITY, AND OUR PROTOCOL LANDS
-    WORK REBASED: the integrator rebases the chain onto current trunk and gates
-    the rebased tree, so the landed commit carries a different object id.
-    Ancestry then answers "no" TRUTHFULLY about a lane whose every line is on
-    trunk, and the author is told not to announce a land that already happened.
+    THE RUNGS ABOVE ASK ANCESTRY, WHICH IS SHA IDENTITY. An exact-sha train
+    merge preserves the reviewed tip as an ancestor; ancestry answers YES.
+    Historical rebases and cherry-picks did not preserve that object, even
+    when every line reached trunk. For those lanes ancestry answers "no"
+    truthfully, so content identity is needed before refusing their land.
     Measured specimen, 2026-08-11: lane spiral-guard-sees-an-open-meld was
     REFUSED by three rungs while `git cherry` marked both of its commits as
     already upstream. It is on trunk as 9b3ed7640. THAT SHA IS THE LANDED ONE

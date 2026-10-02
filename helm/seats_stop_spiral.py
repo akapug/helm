@@ -275,9 +275,9 @@ def _pair_turn_gate(session, room, seat):
     """(block | None, warn | None) — a pair-meld round whose floor is THIS
     seat's (review_door.pair_turns_owed).
 
-    A pair meld's chunks carry no @mention by design (both sides are meant to
-    sit in recv), so the inbox rung cannot see a turn owed there, and a seat
-    that stops over one leaves its partner waiting on a room nobody reads.
+    The inbox rung sees a pair-meld row only until it is delivered (a YIELD
+    there @mentions the peer, task/3743), and a turn stays owed after that,
+    so a seat that stops over one leaves its partner waiting on a room.
     This names the room and the two commands that answer it. BLOCKS ONCE PER
     SET of owed turns, like the inbox rung: a re-stop over the same set
     passes, a new turn re-arms, and an unwritable latch degrades to a warn.

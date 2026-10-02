@@ -16,6 +16,7 @@ import unittest
 from unittest import mock
 
 from helm import autocompact, harness, pk, seat, seat_catalog, seats
+from tests import _launchrecipe
 
 # DERIVED, never typed. Every plant below means "N% of the codex window", and
 # this file used to say so by retyping the window itself forty-odd times — the
@@ -445,14 +446,16 @@ class AutocompactTest(AutocompactBase):
         and helm read 474.9% of the 192,000 window it was taught then, the
         reading the seat compacted on; the first response of a fresh
         conversation said 16,310 in and 50,900 out. The window is 225,000
-        max_context since task/3616 (405.2% and 7.2% on those records), and
-        the 110,000 context_budget since task/3652 narrows what the seat is
-        taught to (828.9% and 14.8% on the same records). helm carries no
-        defect of its own here: it reads exactly the input, so the cure is the
-        bridge's (its usage-is-the-request patch)."""
+        max_context since task/3616 (405.2% and 7.2% on those records). The
+        110,000 context_budget task/3652 narrowed it to is gone (task/3816):
+        it guarded Cursor's run-start replay count, which the bridge's kept
+        conversation removes (task/3817), and it made the seat compact near
+        73k by the estimate. helm carries no defect of its own here: it reads
+        exactly the input, so the cure is the bridge's (its
+        usage-is-the-request patch)."""
         fam = seat.FAMILIES["cursor"]
         self.assertEqual(fam["max_context"], 225000)
-        self.assertEqual(fam["context_budget"], 110000)
+        self.assertIsNone(fam.get("context_budget"))
         proj = os.path.join(seat.seat_dir("cursor"), "claude", "projects", "-p")  # noqa: SEAT_NAME — the catalog FAMILY key whose window IS the subject of this arm (and "claude" is the config dir name)
         os.makedirs(proj, exist_ok=True)
         path = os.path.join(proj, SID + ".jsonl")
@@ -465,13 +468,13 @@ class AutocompactTest(AutocompactBase):
             return autocompact.read("cursor")  # noqa: SEAT_NAME — the catalog FAMILY key whose window IS the subject of this arm
 
         row = reads(911810, 299)
-        self.assertEqual(row["window"], 110000)
-        self.assertEqual(row["window_src"], "FAMILIES.context_budget")
+        self.assertEqual(row["window"], 225000)
+        self.assertEqual(row["window_src"], "FAMILIES.max_context")
         self.assertEqual(row["ctx_tokens"], 911810)
-        self.assertEqual(row["pct"], 828.9)
+        self.assertEqual(row["pct"], 405.2)
         row = reads(16310, 50900)
         self.assertEqual(row["ctx_tokens"], 16310)
-        self.assertEqual(row["pct"], 14.8)
+        self.assertEqual(row["pct"], 7.2)
 
     # -- the trigger -------------------------------------------------------
 
@@ -498,9 +501,11 @@ class AutocompactTest(AutocompactBase):
         self.assertEqual(first["fired"][0]["mode"], "pruned-resumed")
         self.assertEqual(ad.sent, [], "/clear must not discard a resumable session")
         prune.assert_called_once()
+        # the recovery names itself as the UNATTENDED caller (task/3695)
         resume.assert_called_once_with(
             "codex", [], _locked=True, target_sid=new,
-            expected_session=SID, adapter=ad)
+            expected_session=SID, adapter=ad,
+            unattended=autocompact.RECOVERY)
         self.assertEqual(again["fired"], [])
         self.assertTrue(again["rows"][0].get("latched"))
 
@@ -526,6 +531,23 @@ class AutocompactTest(AutocompactBase):
         self.assertEqual(got["fired"][0]["mode"], "recovery-manual")
         self.assertIn("current composer is held", got["fired"][0]["detail"])
         self.assertIn("unfinished draft", got["fired"][0]["detail"])
+        self.assertEqual(ad.sent, [])
+
+    def test_clear_refusal_names_helms_own_injection(self):  # noqa: VACUOUS_ASSERTION — refusal mode and the Helm-named sentence are the positive controls; zero sends is that refusal
+        text = "Continue with the OPEN Codex dispatch."
+        current = "❯ " + text
+        ad = FakeAdapter(tail=current)
+        inj = {"text": text, "handle": "h1", "held_at": 0, "expired": True}
+        with mock.patch("helm.resumeturn.recorded_injections",
+                        return_value={"h1": inj}) as recorded:
+            mode, detail = autocompact._fire_clear(
+                "codex", ad, "h1", "identity proven", current)
+        recorded.assert_called_with(include_expired=True)
+        self.assertEqual(mode, "recovery-manual")
+        self.assertIn("helm-stranded", detail)
+        self.assertIn("PAST ITS FRESHNESS HORIZON", detail)
+        self.assertIn("Helm's text", detail)
+        self.assertNotIn("unfinished draft", detail)
         self.assertEqual(ad.sent, [])
 
     def test_repeated_400_with_empty_composer_sends_one_clear(self):
@@ -593,7 +615,7 @@ class AutocompactTest(AutocompactBase):
         def run(cmd, **kwargs):
             self.assertEqual(cmd[:3], ["cv", "prune", SID])
             self.assertIn("--json", cmd)
-            self.assertIn("--thinking", cmd)
+            self.assertIn("--drop-thinking", cmd)
             self.assertEqual(cmd[cmd.index("--to") + 1], new)
             self.assertEqual(cmd[cmd.index("--window") + 1], "180000")
             self.assertNotIn("--no-revive", cmd,
@@ -602,16 +624,18 @@ class AutocompactTest(AutocompactBase):
                              os.path.join(self.d, "claude"))
             with open(new_path, "w") as f:
                 f.write(usage_line(167000) + "\n")
+            # the report as cv 0.13 writes it (snake_case keys)
             return mock.Mock(returncode=0, stdout=json.dumps({
-                "sourceId": SID, "newId": new, "newPath": new_path,
-                "beforeBytes": 21100000, "afterBytes": 1600000,
-                "windowRealTokens": 167000, "tokensFreed": 54000,
-                "revived": {"recordedTokensBefore": 221000,
-                            "recordedTokensAfter": 167000,
-                            "usageRecordsRewritten": 208},
+                "source_id": SID, "new_id": new, "new_path": new_path,
+                "before_bytes": 21100000, "after_bytes": 1600000,
+                "window_real_tokens": 167000, "tokens_freed": 54000,
+                "revived": {"recorded_tokens_before": 221000,
+                            "recorded_tokens_after": 167000,
+                            "usage_records_rewritten": 208},
             }), stderr="")
 
         with mock.patch("uuid.uuid4", return_value=new), \
+                mock.patch("helm.cvcompat.version", return_value=(0, 13, 0)), \
                 mock.patch("subprocess.run", side_effect=run):
             got, detail, clear_allowed = autocompact._prune_context(row)
         self.assertEqual(got, new)
@@ -647,13 +671,17 @@ class AutocompactTest(AutocompactBase):
         new = "22222222-2222-2222-2222-222222222222"
         new_path = os.path.join(self.proj, new + ".jsonl")
 
-        def run(_cmd, **_kwargs):
+        def run(cmd, **_kwargs):
+            self.assertIn("--thinking", cmd)
             with open(new_path, "w") as f:
                 f.write(usage_line(180001) + "\n")
+            # the report as cv 0.10 wrote it (camelCase keys): read, so the
+            # budget check below is reached
             return mock.Mock(returncode=0, stdout=json.dumps({
                 "sourceId": SID, "newId": new, "newPath": new_path}), stderr="")
 
         with mock.patch("uuid.uuid4", return_value=new), \
+                mock.patch("helm.cvcompat.version", return_value=(0, 10, 0)), \
                 mock.patch("subprocess.run", side_effect=run):
             sid, detail, clear_allowed = autocompact._prune_context(row)
         self.assertIsNone(sid)
@@ -686,7 +714,7 @@ class AutocompactTest(AutocompactBase):
         self.plant(1000, sid=distractor)  # newer mtime must NOT outrank target_sid
         launch = os.path.join(self.d, "launch.sh")
         with open(launch, "w") as f:
-            f.write("#!/bin/sh\nexec claude \"$@\"\n")
+            f.write(_launchrecipe.launch_sh("codex", "codex"))
         os.chmod(launch, 0o700)
         resource = "worktree:helm:fixture-" + os.path.basename(self.tmp)
         ok, message, lease = seats.claim(resource, "codex", session=SID)
@@ -702,7 +730,8 @@ class AutocompactTest(AutocompactBase):
                 contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
             rc = seat._resume("codex", [], target_sid=new,
-                              expected_session=SID, adapter=ad)
+                              expected_session=SID, adapter=ad,
+                              unattended=autocompact.RECOVERY)
         self.assertEqual(rc, 0)
         self.assertIn("--resume " + new, ad.spawned[0][0])
         self.assertEqual(ad.spawned[0][2], self.tmp,
@@ -722,7 +751,7 @@ class AutocompactTest(AutocompactBase):
         self.plant(167000, sid=new)
         launch = os.path.join(self.d, "launch.sh")
         with open(launch, "w") as f:
-            f.write("#!/bin/sh\nexec claude \"$@\"\n")
+            f.write(_launchrecipe.launch_sh("codex", "codex"))
         os.chmod(launch, 0o700)
         with open(os.path.join(self.d, "spawn.json")) as f:
             rec = json.load(f)
@@ -732,7 +761,8 @@ class AutocompactTest(AutocompactBase):
         with mock.patch.object(seat, "_reap_stale") as reap, \
                 contextlib.redirect_stderr(io.StringIO()):
             rc = seat._resume("codex", [], target_sid=new,
-                              expected_session=SID, adapter=FakeAdapter())
+                              expected_session=SID, adapter=FakeAdapter(),
+                              unattended=autocompact.RECOVERY)
         self.assertEqual(rc, 1)
         self.assertFalse(reap.called)
 
@@ -742,7 +772,7 @@ class AutocompactTest(AutocompactBase):
         self.plant(167000, sid=new)
         launch = os.path.join(self.d, "launch.sh")
         with open(launch, "w") as f:
-            f.write("#!/bin/sh\nexec claude \"$@\"\n")
+            f.write(_launchrecipe.launch_sh("codex", "codex"))
         os.chmod(launch, 0o700)
 
         class DeadSpawnAdapter(FakeAdapter):
@@ -757,7 +787,8 @@ class AutocompactTest(AutocompactBase):
                 contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
             rc = seat._resume("codex", [], target_sid=new,
-                              expected_session=SID, adapter=ad)
+                              expected_session=SID, adapter=ad,
+                              unattended=autocompact.RECOVERY)
         self.assertEqual(rc, 1)
         self.assertEqual(ad.stopped, ["h2"])
         self.assertFalse(rebind.called)
@@ -770,7 +801,7 @@ class AutocompactTest(AutocompactBase):
         self.plant(167000, sid=new)
         launch = os.path.join(self.d, "launch.sh")
         with open(launch, "w") as f:
-            f.write("#!/bin/sh\nexec claude \"$@\"\n")
+            f.write(_launchrecipe.launch_sh("codex", "codex"))
         os.chmod(launch, 0o700)
         resource = "worktree:helm:rebind-failure-" + os.path.basename(self.tmp)
         ok, _, _ = seats.claim(resource, "codex", session=SID)
@@ -785,7 +816,8 @@ class AutocompactTest(AutocompactBase):
                 contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
             rc = seat._resume("codex", [], target_sid=new,
-                              expected_session=SID, adapter=ad)
+                              expected_session=SID, adapter=ad,
+                              unattended=autocompact.RECOVERY)
         self.assertEqual(rc, 1)
         self.assertEqual(ad.stopped, ["h2"])
         with open(os.path.join(self.d, "spawn.json")) as f:
@@ -801,7 +833,7 @@ class AutocompactTest(AutocompactBase):
         self.plant(167000, sid=new)
         launch = os.path.join(self.d, "launch.sh")
         with open(launch, "w") as f:
-            f.write("#!/bin/sh\nexec claude \"$@\"\n")
+            f.write(_launchrecipe.launch_sh("codex", "codex"))
         os.chmod(launch, 0o700)
         resource = "worktree:helm:register-failure-" + os.path.basename(self.tmp)
         ok, _, _ = seats.claim(resource, "codex", session=SID)
@@ -815,7 +847,8 @@ class AutocompactTest(AutocompactBase):
                 contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
             rc = seat._resume("codex", [], target_sid=new,
-                              expected_session=SID, adapter=ad)
+                              expected_session=SID, adapter=ad,
+                              unattended=autocompact.RECOVERY)
         self.assertEqual(rc, 1)
         self.assertEqual(ad.stopped, ["h2"])
         with open(os.path.join(self.d, "spawn.json")) as f:
@@ -1047,6 +1080,36 @@ class AutocompactTest(AutocompactBase):
         self.assertEqual(row["actuation_state"], "UNKNOWN")
         self.assertIn("composer contains unsent input",
                       row["actuation_reason"])
+
+    def test_compact_refusal_names_helms_injection_and_the_sweep(self):  # noqa: VACUOUS_ASSERTION — the Helm-named refusal and the sweep pointer are the positive controls; zero sends is that refusal
+        self.plant(int(CODEX_WINDOW * 0.91))
+        self.unbind_session()
+        text = "Continue with the OPEN Codex dispatch."
+        ad = FakeAdapter(tail="❯ " + text)
+        inj = {"text": text, "handle": "h1", "held_at": 0, "expired": True}
+        with mock.patch("helm.resumeturn.recorded_injections",
+                        return_value={"h1": inj}):
+            res = autocompact.check(seats=["codex"], post=False, adapter=ad)
+        reason = res["rows"][0]["actuation_reason"]
+        self.assertEqual(res["fired"], [])
+        self.assertEqual(ad.sent, [])
+        self.assertIn("composer contains unsent input", reason)
+        self.assertIn("helm-stranded", reason)
+        self.assertIn("PAST ITS FRESHNESS HORIZON", reason)
+        self.assertIn("Helm's text", reason)
+        self.assertIn("resumeturn.sweep_stranded", reason)
+        self.assertIn("helm beacons --post", reason)
+
+    def test_compact_refusal_of_a_human_draft_does_not_name_the_sweep(self):
+        self.plant(int(CODEX_WINDOW * 0.91))
+        self.unbind_session()
+        ad = FakeAdapter(tail="❯ keep this draft")
+        res = autocompact.check(seats=["codex"], post=False, adapter=ad)
+        reason = res["rows"][0]["actuation_reason"]
+        self.assertEqual(res["fired"], [])
+        self.assertIn("composer contains unsent input", reason)
+        self.assertIn("unfinished draft", reason)
+        self.assertNotIn("sweep_stranded", reason)
 
     def test_same_handle_new_session_invalidates_unbound_scan(self):  # noqa: VACUOUS_ASSERTION — exact UNKNOWN refusal and absence of sends are positive controls
         self.plant(int(CODEX_WINDOW * 0.91))
@@ -1874,6 +1937,215 @@ class AutocompactTest(AutocompactBase):
             ["--interval", "0", "--apply"]), 2)
 
 
+class PrunedCopyRecipeTest(AutocompactBase):
+    """The context-wall recovery resumes a cv-PRUNED COPY: the same
+    conversation under a new session id. A capture binds by session id, and
+    the copy's own lineage stamp names the session it was pruned from
+    (`seat._prune_source`), so the capture of the process that held the
+    source binds the copy: a captured seat's automatic recovery comes back
+    EXACTLY as it ran (task/3695)."""
+
+    NEW = "22222222-2222-2222-2222-222222222222"
+
+    def _pruned(self, lineage=True, source=SID, own=None, model=CODEX_MODEL):
+        """The source session and its pruned copy; `lineage` stamps the
+        copy's head the way cv prune --revive does (its session_id is the
+        source's, `source`, and its sessionId its own)."""
+        self.plant(221000)
+        path = os.path.join(self.proj, self.NEW + ".jsonl")
+        with open(path, "w") as f:
+            if lineage:
+                f.write(json.dumps({"type": "user", "session_id": source,
+                                    "sessionId": own or self.NEW,
+                                    "message": {"role": "user"}}) + "\n")
+            f.write(usage_line(167000, model=model) + "\n")
+        text = _launchrecipe.launch_sh("codex", "codex")
+        launch = os.path.join(self.d, "launch.sh")
+        with open(launch, "w") as f:
+            f.write(text)
+        os.chmod(launch, 0o700)
+        return path, text
+
+    def _capture_source(self, text, session=SID):
+        """What the reboot sweep kept of the seat's process while it held
+        `session`, the SOURCE by default."""
+        from helm import seat_recipe, seat_resume_all
+        ran = seat_recipe.launch_capture(text)
+        line, failed = seat_resume_all.record_live_set(
+            [], True, False, "boot-a", 1, recipes={
+                "codex": seat_recipe.capture_record(
+                    ran["argv"], ran["env"], pid=4242, start="100",
+                    sessions=[session], captured="2026-09-29T00:00:00Z")})
+        self.assertFalse(failed, line)
+
+    def _recover(self):
+        """The recovery's own call, `_fire_prune_resume`, with cv prune
+        having minted the copy."""
+        ad = FakeAdapter()
+        out = io.StringIO()
+        with mock.patch.object(autocompact, "_prune_context", return_value=(
+                self.NEW, "cv prune --revive minted session", False)), \
+                mock.patch.object(seat, "_reap_stale", return_value=([], [])), \
+                mock.patch.object(seat, "_write_launch_assets") as wla, \
+                mock.patch.object(seat, "_ensure_autocompact_timer"), \
+                mock.patch.object(seats, "write_roster"), \
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(out):
+            mode, detail = autocompact._fire_prune_resume(
+                {"seat": "codex", "registered_session": SID}, ad, "h1",
+                "context wall", "")
+        return mode, detail, out.getvalue(), wla, ad
+
+    def test_a_captured_sources_pruned_copy_recovers_exactly(self):
+        """MUTATION: bind a capture by the copy's own id alone — the copy
+        has none, so launch.sh and the copy's model are two launches and the
+        automatic recovery never resumes exactly."""
+        _path, text = self._pruned()
+        self._capture_source(text)
+        mode, detail, out, wla, ad = self._recover()
+        self.assertEqual(mode, "pruned-resumed", detail + out)
+        self.assertIn("resuming EXACTLY as it ran", out)
+        self.assertNotIn("WARNING", out)
+        self.assertEqual(wla.call_args.kwargs["recipe"]["model"], CODEX_MODEL)
+        self.assertIn("--resume " + self.NEW, ad.spawned[0][0])
+
+    def test_a_copy_stamped_with_another_source_binds_nothing(self):
+        """The recovery asks for a copy of ITS source, the session the
+        seat's register holds. A copy whose stamp names another session
+        binds nothing, even where that session has a capture: the recovery
+        takes today's defaults with its loud line. MUTATION: bind whatever
+        session the stamp names — the copy resumes EXACTLY on another
+        session's launch."""
+        other = "33333333-3333-3333-3333-333333333333"
+        _path, text = self._pruned(source=other)
+        self._capture_source(text, session=other)
+        mode, detail, out, wla, ad = self._recover()
+        self.assertEqual(mode, "pruned-resumed", detail + out)
+        self.assertNotIn("resuming EXACTLY", out)
+        self.assertIn("WARNING: the context-wall recovery resumes it on "
+                      "TODAY'S defaults", out)
+
+    def test_a_copy_whose_stamp_names_another_own_id_binds_nothing(self):
+        """codex's stamp-vs-target check: the stamp names the requested
+        source, but its own sessionId is not the copy being resumed, so it
+        is not this copy's lineage. MUTATION: check only the source half of
+        the stamp — the copy binds the source's capture and says EXACTLY."""
+        _path, text = self._pruned(own="44444444-4444-4444-4444-444444444444")
+        self._capture_source(text)
+        mode, detail, out, wla, ad = self._recover()
+        self.assertEqual(mode, "pruned-resumed", detail + out)
+        self.assertNotIn("resuming EXACTLY", out)
+
+    def test_the_owners_record_carries_the_recoverys_loud_line(self):
+        """The recovery's detail is what reaches the owner's record (the
+        chat post), and stdout does not: a resume on today's defaults says
+        so there, in the same loud line. MUTATION: report 'resumed exact
+        session' whatever the resume did."""
+        self._pruned()
+        mode, detail, out, wla, ad = self._recover()
+        self.assertEqual(mode, "pruned-resumed", detail + out)
+        self.assertIn("WARNING: the context-wall recovery resumes it on "
+                      "TODAY'S defaults", detail)
+        self.assertNotIn("resumed exact session", detail)
+
+    def test_the_owners_record_carries_why_the_recovery_left_it_down(self):
+        """A recovery that leaves the seat down (the copy ran another model
+        than today's) says why in the owner's record too."""
+        from helm import seat_catalog
+        fam = seat.FAMILIES["codex"]
+        other = next(m for m in seat_catalog.family_catalogued_models(fam)
+                     if m != fam["model"])
+        self._pruned(model=other)
+        mode, detail, out, wla, ad = self._recover()
+        self.assertEqual(mode, "resume-manual", detail + out)
+        self.assertIn("the context-wall recovery leaves it down", detail)
+
+    def test_an_exact_recovery_reports_exact(self):
+        """The control: a captured source's copy reports the exact resume."""
+        _path, text = self._pruned()
+        self._capture_source(text)
+        mode, detail, out, wla, ad = self._recover()
+        self.assertEqual(mode, "pruned-resumed", detail + out)
+        self.assertIn("resumed exact session", detail)
+
+    def test_a_resume_that_raises_still_prints_what_it_said(self):
+        """The recovery holds the resume's output to read its loud line; a
+        resume that raises must still leave every line it printed on the
+        pass's own output. MUTATION: write the held output only after a
+        clean return — the lines before the failure are lost with it."""
+        def said_then_raised(*_args, **_kw):
+            print("helm seat: a line before the failure")
+            raise RuntimeError("the resume failed")
+        out = io.StringIO()
+        with mock.patch.object(autocompact, "_prune_context", return_value=(
+                self.NEW, "cv prune --revive minted session", False)), \
+                mock.patch.object(seat, "_resume",
+                                  side_effect=said_then_raised), \
+                contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(out):
+            with self.assertRaises(RuntimeError):
+                autocompact._fire_prune_resume(
+                    {"seat": "codex", "registered_session": SID},
+                    FakeAdapter(), "h1", "context wall", "")
+        self.assertIn("a line before the failure", out.getvalue())
+
+    def test_the_copys_lineage_stamp_is_what_binds_the_capture(self):
+        """The control on the reader: the same capture binds the stamped
+        copy, each launch field read from the capture of its source, and
+        binds nothing to a copy whose lineage is unrecorded."""
+        from helm import seat_recipe
+        for lineage in (True, False):
+            with self.subTest(lineage=lineage):
+                path, text = self._pruned(lineage=lineage)
+                self._capture_source(text)
+                r = seat_recipe.read(
+                    "proxy", "codex", self.NEW, transcript=path, cwd=self.tmp,
+                    launch=os.path.join(self.d, "launch.sh"), role="worker",
+                    source=SID)
+                if lineage:
+                    self.assertEqual(r.missing, [])
+                    self.assertIn("of its source session %s" % SID[:8],
+                                  r.sources["window"])
+                else:
+                    self.assertIn("window", r.unbound)
+                    self.assertIn("window", r.missing)
+
+    def test_an_uncaptured_sources_pruned_copy_recovers_on_todays_defaults(self):
+        """No capture binds the copy (its source was never captured), and
+        each field it lacks is one a defaults resume never took from the
+        seat's past run, so the recovery, an UNATTENDED caller like the
+        reboot sweep, resumes on today's defaults in one loud line naming
+        them. MUTATION: pass no caller name from `_fire_prune_resume` — the
+        resume refuses and the automatic recovery becomes manual."""
+        self._pruned()
+        mode, detail, out, wla, ad = self._recover()
+        self.assertEqual(mode, "pruned-resumed", detail + out)
+        loud = [l for l in out.splitlines() if "WARNING: the context-wall "
+                "recovery resumes it on TODAY'S defaults" in l]
+        self.assertEqual(len(loud), 1, out)
+        for field in ("window", "subagent", "identity_env"):
+            self.assertIn(field, loud[0])
+        self.assertIsNone(wla.call_args.kwargs["recipe"])
+        self.assertIn("--resume " + self.NEW, ad.spawned[0][0])
+
+    def test_a_caller_that_is_not_unattended_still_refuses_that_copy(self):  # noqa: VACUOUS_ASSERTION — rc 1 and the named refusal are the positive controls; the empty spawn log is the refusal's contract, and the recovery arm on the same fixture spawns
+        """The control: the same resume of the same copy with no unattended
+        caller named (the operator's resume) refuses, naming the fields."""
+        self._pruned()
+        ad = FakeAdapter()
+        err = io.StringIO()
+        with mock.patch.object(seat, "_reap_stale", return_value=([], [])), \
+                mock.patch.object(seat, "_write_launch_assets"), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(err):
+            rc = seat._resume("codex", [], target_sid=self.NEW,
+                              expected_session=SID, adapter=ad)
+        self.assertEqual(rc, 1)
+        self.assertIn("refusing to resume codex", err.getvalue())
+        self.assertIn("window [last launch (launch.sh)]", err.getvalue())
+        self.assertEqual(ad.spawned, [])
+
+
 class CmdAutocompactCliSeam(unittest.TestCase):
     """The CLI guard accepts the verb's WHOLE documented+consumed surface.
     The fable composition review (2026-07-22) caught the guard refusing
@@ -2563,8 +2835,8 @@ class Ds4proWindowIsProbeBackedTest(unittest.TestCase):
 
     THE CONTROL THIS CLASS EXISTS TO KEEP is not "ds4pro is unpinned"; it is
     that `_window()` does not answer ONE NUMBER FOR EVERYBODY. That control now
-    runs off ds4flash, the last unpinned family (its route publishes no
-    window), plus pinned families that disagree with it."""
+    runs off a planted unpinned family (every live family pins), plus pinned
+    families that disagree with it."""
 
     def test_ds4pro_pins_the_window_its_endpoint_publishes(self):
         # UNCONDITIONAL POSITIVE CONTROL on the same observable, kept from the
@@ -2586,18 +2858,26 @@ class Ds4proWindowIsProbeBackedTest(unittest.TestCase):
     def test_window_does_not_answer_one_number_for_everybody(self):
         """THE CONTROL THAT SURVIVED THE RENAME. Three families must resolve
         three different ways or `_window()` has stopped resolving anything:
-        ds4flash falls through _assume_window() to CC's 200k, ds4pro pins its
-        published 1M, and codex pins its own smaller ceiling-checked number."""
-        win, why = autocompact._window("ds4flash")  # noqa: SEAT_NAME — the catalog FAMILY key whose window IS the subject of this arm
+        an unpinned family falls through _assume_window() to CC's 200k, ds4pro
+        pins its published 1M, and codex pins its own smaller ceiling-checked
+        number. EVERY LIVE FAMILY PINS NOW (ds4flash took its Go route's
+        published window, task/3824), so the unpinned side is a family planted
+        for this arm alone."""
+        with mock.patch.dict(seat.FAMILIES, {"unpinned-probe": {
+                "port": 8999, "model": "unpinned-probe-model",
+                "mode": "proxy-key"}}):
+            win, why = autocompact._window("unpinned-probe")
         self.assertEqual(win, autocompact.CC_ASSUMED_WINDOW)
         self.assertEqual(why, "cc-assumed-default")
+        self.assertNotEqual(autocompact._window("ds4flash"), (win, why),  # noqa: SEAT_NAME — the catalog FAMILY key that changed sides
+                            "ds4flash's pinned window vanished")
         # GROK CHANGED SIDES: it pinned its xai route's published 256000
-        # (seat_catalog.PUBLISHED_ROUTE_WINDOWS) as a 204000 input ceiling,
+        # (seat_catalog.PUBLISHED_ROUTE_WINDOWS) as a 237000 window,
         # so it is no longer the unpinned control and must not read as one
         self.assertNotEqual(autocompact._window("grok"), (win, why),
                             "grok's pinned window vanished — if that was "
                             "deliberate, it is an unpinned control again")
-        # DS4FLASH CARRIES THE UNPINNED POSTURE ALONE NOW. This arm read
+        # A PLANTED FAMILY CARRIES THE UNPINNED POSTURE NOW. This arm read
         # `for fam in ("gemini", "grok")`, then ds4pro's own assertion, until
         # 2026-08-03 pinned gemini (owner-stated) and ds4pro (probed). Neither
         # was allowed to simply LEAVE — keeping them as same-answer controls

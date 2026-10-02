@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # helm-session — safe session RSH (move/copy/convert agent sessions) over clustervision (cv).
 #
-# cv OWNS the mechanism (`cv port` = rehome to a new cwd, copy w/ a NEW id; `cv convert` = cross-harness;
-# `cv export` = read). This wrapper adds the SAFETY RAILS cv doesn't force:
+# cv OWNS the mechanism (`cv port` = rehome to a new cwd and/or cross-harness, copy w/ a NEW id — cv 0.10
+# split the cross-harness half out as `cv convert`; `cv export` = read). This wrapper adds the SAFETY RAILS cv doesn't force:
 #   - DRY-RUN by default: cv runs with `--out <scratch>` so nothing touches real storage; you SEE the new
 #     id + resume command + carried context before committing. Pass --apply to write for real.
 #   - original-untouched: cv port/convert are COPIES (new id), never mutating the source. After --apply the
@@ -34,13 +34,37 @@ Env: HELM_SESSION_SCRATCH (default $TMPDIR/helm-session-dryrun), HELM_SESSION_CV
 EOF
 }
 
-session_cwd() { "$CVBIN" show "$1" --json --range 0-0 2>/dev/null | python3 -c 'import sys,json
+# cv 0.11 changed the grammar this wrapper speaks, with no aliases: `port --to/--to-dir` became
+# `port --harness/--cwd`, `convert` folded into `port --harness`, and a message window `A-B` became `A..B`.
+# Probed once (cv_grammar, before dispatch); a version it cannot read is the current grammar.
+# helm/cvcompat.py is the same seam for helm's Python callers.
+CV_V2=1
+cv_grammar() {
+  local out; out="$("$CVBIN" --version 2>/dev/null || true)"
+  if [[ $out =~ ([0-9]+)\.([0-9]+)\.[0-9]+ ]] && [ "${BASH_REMATCH[1]}" -eq 0 ] && [ "${BASH_REMATCH[2]}" -lt 11 ]; then
+    CV_V2=0
+  fi
+}
+empty_window() { if [ "$CV_V2" = 1 ]; then echo 0..0; else echo 0-0; fi; }
+
+session_cwd() { "$CVBIN" show "$1" --json --range "$(empty_window)" 2>/dev/null | python3 -c 'import sys,json
 try: print(json.load(sys.stdin).get("cwd",""))
 except Exception: print("")' 2>/dev/null || true; }
 
-session_exists() { [ -n "$("$CVBIN" show "$1" --json --range 0-0 2>/dev/null | head -c1)" ]; }
+session_exists() { [ -n "$("$CVBIN" show "$1" --json --range "$(empty_window)" 2>/dev/null | head -c1)" ]; }
 
-# run cv (port|convert) either as a dry-run (--out scratch) or for real, then verify.
+# the cv port flags for a new cwd and/or target harness, in the installed cv's grammar -> PORT_ARGS
+port_args() { # <to_dir> <harness>
+  PORT_ARGS=()
+  if [ "$CV_V2" = 1 ]; then
+    [ -n "$1" ] && PORT_ARGS+=(--cwd "$1"); [ -n "$2" ] && PORT_ARGS+=(--harness "$2")
+  else
+    [ -n "$1" ] && PORT_ARGS+=(--to-dir "$1"); [ -n "$2" ] && PORT_ARGS+=(--to "$2")
+  fi
+  return 0
+}
+
+# run cv (port, or convert on cv 0.10) either as a dry-run (--out scratch) or for real, then verify.
 run_copy() { # <verb> <id> <apply> <cv-args...>
   local verb="$1" id="$2" apply="$3"; shift 3
   if ! session_exists "$id"; then echo "helm-session: source session '$id' not found" >&2; exit 4; fi
@@ -116,7 +140,7 @@ channel_has_shared_buffer() { # <project_dir> ; 0 = the shared main-checkout buf
 }
 
 # native-memory re-key verify: Claude Code keys native memory off the SLUG DIR the transcript lives in
-# (<projects-root>/<slug>/, slug = the cwd path with '/' and '.' -> '-'). `cv port --to-dir <wt>` writes the
+# (<projects-root>/<slug>/, slug = the cwd path with '/' and '.' -> '-'). `cv port --cwd <wt>` writes the
 # ported transcript into the WORKTREE's slug dir, so native memory follows the worktree BY CONSTRUCTION.
 # This ASSERTS that actually happened (verify the pipe, not the person) instead of assuming it — the same
 # discipline as the .remember channel check, made standing for native memory. Distinct exit code (10).
@@ -143,7 +167,7 @@ resurrect() { # <id> <project_dir> <apply> <harness> <noctx>
     echo "helm-session: DRY-RUN — would pre-create $inject (mv-steal defuse) and reject only if it carries the SHARED main-checkout buffer (channel-verify) before resume." >&2
   fi
   # rehome the session into the isolated worktree cwd (reuses the copy rails: dry-run/apply, untouched, verify)
-  local cargs=(--to-dir "$pd"); [ -n "$harness" ] && cargs+=(--to "$harness"); [ -n "$noctx" ] && cargs+=("$noctx")
+  port_args "$pd" "$harness"; local cargs=("${PORT_ARGS[@]}"); [ -n "$noctx" ] && cargs+=("$noctx")
   run_copy port "$id" "$apply" "${cargs[@]}"
   # native-memory re-key verify: the ported transcript must land in the WORKTREE slug dir, else native
   # memory would NOT isolate per-worktree. Runs in BOTH paths: dry-run checks the scratch slug dir cv
@@ -186,14 +210,21 @@ done
 case "$CMD" in
   rehome|clone)
     [ -n "$TO_DIR" ] || { echo "helm-session: $CMD needs --to-dir <cwd>" >&2; exit 2; }
-    args=(--to-dir "$TO_DIR"); [ -n "$TO" ] && args+=(--to "$TO"); [ -n "$NOCTX" ] && args+=("$NOCTX")
+    cv_grammar
+    port_args "$TO_DIR" "$TO"; args=("${PORT_ARGS[@]}"); [ -n "$NOCTX" ] && args+=("$NOCTX")
     run_copy port "$ID" "$APPLY" "${args[@]}";;
   port-harness)
     [ -n "$TO" ] || { echo "helm-session: port-harness needs --to <harness>" >&2; exit 2; }
-    args=(--to "$TO"); [ -n "$CWD" ] && args+=(--cwd "$CWD")
-    run_copy convert "$ID" "$APPLY" "${args[@]}";;
+    cv_grammar
+    if [ "$CV_V2" = 1 ]; then
+      port_args "$CWD" "$TO"; run_copy port "$ID" "$APPLY" "${PORT_ARGS[@]}"
+    else
+      args=(--to "$TO"); [ -n "$CWD" ] && args+=(--cwd "$CWD")
+      run_copy convert "$ID" "$APPLY" "${args[@]}"
+    fi;;
   resurrect)
     [ -n "$PROJECT_DIR" ] || { echo "helm-session: resurrect needs --project-dir <expert-worktree> (its own git worktree = the isolated channel)" >&2; exit 2; }
+    cv_grammar
     resurrect "$ID" "$PROJECT_DIR" "$APPLY" "$TO" "$NOCTX";;
   export)
     case "$FORMAT" in md|json|html) ;; *) echo "helm-session: --format must be md|json|html" >&2; exit 2;; esac

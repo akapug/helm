@@ -1,0 +1,23 @@
+{
+  "source_id": "11111111-2222-4333-8444-555555555555",
+  "new_id": "22222222-3333-4444-8555-666666666666",
+  "harness": "claude",
+  "before_bytes": 16996446,
+  "after_bytes": 353593,
+  "snipped_payloads": 9,
+  "image_blocks": 0,
+  "tokens_freed": 1417,
+  "dropped_turns": 4780,
+  "window_real_tokens": 19912,
+  "revived": {
+    "recorded_tokens_before": 473757,
+    "recorded_tokens_after": 22252,
+    "usage_records_rewritten": 68
+  },
+  "warnings": [],
+  "new_path": null,
+  "sidecar_path": null,
+  "copied_resources": null,
+  "dry_run": true,
+  "note": "dry run \u2014 nothing written"
+}

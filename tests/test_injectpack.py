@@ -245,8 +245,18 @@ class InjectPackActionsTest(unittest.TestCase):
                      "load_class": "jit"}
         acts = injectpack._actions(heuristic)
         self.assertEqual([a for a in acts if a in ("demote", "undemote")], [])
-        # a heuristic still has the two doors that work on it
-        self.assertEqual(acts, ["rescope", "retire"])
+        # a heuristic still has the doors that work on it: scope, retire, and
+        # the two text edits (regloss and retag admit heuristics)
+        self.assertEqual(acts, ["rescope", "retire", "reword", "keywords"])
+
+    def test_the_text_edits_are_offered_on_exactly_the_writers_types(self):
+        from helm.store import write
+        self.assertEqual(injectpack._EDIT_TYPES, write._KEYWORD_TYPES)
+        self.assertIn("reword", injectpack._actions(_prior("p", "s")))
+        # control: a type the writers refuse gets neither button
+        cap = injectpack._actions({"type": "capability", "id": "c"})
+        self.assertNotIn("reword", cap)
+        self.assertNotIn("keywords", cap)
 
     def test_every_offered_verb_is_one_the_module_will_accept(self):  # noqa: VACUOUS_ASSERTION — the unconditional cardinality assertion proves `offered` has more members than there are entries, so the loop below cannot be empty when it runs
         entries = (_prior("a", "s", load_class="always"), _prior("b", "s"),
@@ -462,6 +472,90 @@ class InjectPackActTest(unittest.TestCase):
         self.assertEqual(_get("a-reasonless-thing")["load_class"],
                          "always")
 
+    def test_reword_sets_the_line_it_fires_as_and_says_before_and_after(self):
+        self._seed("a-wordy-thing")
+        out, err = injectpack.act("reword", "a-wordy-thing",
+                                  text="  the short line   it fires as ")
+        self.assertIsNone(err)
+        # the fired line is the injector's own rendering, prefix and all
+        self.assertTrue(out["before"]["line"].endswith(
+            "a durable thing about the tree"))
+        self.assertTrue(out["after"]["line"].endswith(
+            ": the short line it fires as"))
+        self.assertEqual(out["after"]["bytes"],
+                         len(out["after"]["line"].encode("utf-8")))
+        self.assertLess(out["after"]["bytes"], out["before"]["bytes"])
+        self.assertTrue(out["changed"])
+        self.assertEqual(_get("a-wordy-thing")["gloss"],
+                         "the short line it fires as")   # it LANDED
+
+    def test_a_line_over_the_cap_is_the_writers_refusal_and_writes_nothing(self):
+        self._seed("a-long-thing")
+        out, err = injectpack.act("reword", "a-long-thing", text="x " * 400)
+        self.assertIsNone(out)
+        self.assertTrue(err)
+        self.assertFalse(_get("a-long-thing").get("gloss"))
+        # control: the same door on the same entry lands a line under the cap
+        injectpack.act("reword", "a-long-thing", text="short enough")
+        self.assertEqual(_get("a-long-thing")["gloss"], "short enough")
+
+    def test_an_empty_line_is_refused(self):
+        self._seed("an-empty-thing")
+        out, err = injectpack.act("reword", "an-empty-thing", text="   ")
+        self.assertIsNone(out)
+        self.assertIn("empty", err)
+
+    def test_keywords_replace_what_makes_it_fire(self):
+        self._seed("a-findable-thing")
+        out, err = injectpack.act("keywords", "a-findable-thing",
+                                  keywords="seat freezes, plan prompt")
+        self.assertIsNone(err)
+        self.assertEqual(out["before"]["keywords"], ["durable thing", "tree fact"])
+        self.assertEqual(out["after"]["keywords"], ["seat freezes", "plan prompt"])
+        self.assertEqual(_get("a-findable-thing")["keywords"],
+                         "seat freezes,plan prompt")
+
+    def test_the_keyword_lint_refuses_what_retag_alone_would_save(self):  # noqa: VACUOUS_ASSERTION — each refusal's text is matched and the bare retag control below SAVES the same salad on the same entry, so the refusal is the lint's and not a no-op
+        self._seed("a-salad-thing")
+        salad = "seat freezes on the plan prompt"
+        out, err = injectpack.act("keywords", "a-salad-thing", keywords=salad)
+        self.assertIsNone(out)
+        self.assertIn("comma-less", err)
+        self.assertEqual(_get("a-salad-thing")["keywords"],
+                         "durable thing, tree fact")     # untouched
+        out, err = injectpack.act("keywords", "a-salad-thing", keywords="work")
+        self.assertIsNone(out)
+        self.assertIn("generic", err)
+        # THE CONTROL: the bare writer accepts the same salad, so the refusal
+        # above is the lint this door adds, not retag's own
+        from helm.store import write
+        e, werr = write.retag("a-salad-thing", pk.now_ts(), replace=salad)
+        self.assertIsNone(werr)
+        self.assertEqual(e["keywords"], salad)
+
+    def test_the_reword_form_opens_on_the_statement_until_there_is_a_gloss(self):
+        win = injectpack.fold([_row(1, jit=["e"])])
+        from helm import inject
+        e = _prior("e", "the  whole statement")
+        with mock.patch.object(inject, "load_entries", return_value=[e]), \
+                mock.patch.object(inject, "_who_lines", return_value=[]):
+            rows, _d, _m = injectpack.entries(win)
+            self.assertEqual(rows[0]["draft"], "the whole statement")
+            e["gloss"] = "the short line"
+            rows, _d, _m = injectpack.entries(win)
+        self.assertEqual(rows[0]["draft"], "the short line")
+        self.assertEqual(rows[0]["gloss"], "the short line")
+
+    def test_an_unchanged_edit_says_nothing_changed(self):
+        self._seed("a-steady-thing")
+        out, err = injectpack.act("keywords", "a-steady-thing",
+                                  keywords="durable thing, tree fact")
+        self.assertIsNone(err)
+        self.assertFalse(out["changed"])
+        # control: the answer is a real reading, not an empty one
+        self.assertEqual(out["after"]["keywords"], ["durable thing", "tree fact"])
+        self.assertGreater(out["after"]["bytes"], 0)
+
     def test_the_writers_own_refusal_reaches_the_caller_unchanged(self):
         self._seed("a-jit-thing")
         out, err = injectpack.act("demote", "a-jit-thing", reason="try it")
@@ -555,6 +649,15 @@ class InjectPackWebTest(unittest.TestCase):
         self.assertEqual(obj["code"], "refused")
         self.assertIn("sideways", obj["error"])
 
+    def test_the_edit_text_and_keywords_reach_the_door(self):
+        from helm import web
+        with mock.patch.object(injectpack, "act",
+                               return_value=({"id": "e"}, None)) as a:
+            web._api_inject_act({"action": "reword", "id": "e",
+                                 "text": "new line", "keywords": "a, b"})
+        self.assertEqual(a.call_args.kwargs["text"], "new line")
+        self.assertEqual(a.call_args.kwargs["keywords"], "a, b")
+
     def test_an_accepted_edit_answers_200_and_says_what_changed(self):
         from helm import web
         with mock.patch.object(injectpack, "act",
@@ -595,6 +698,17 @@ class InjectPackFragmentTest(unittest.TestCase):
         self.assertIn("/api/inject/act", body)      # the slice is the sender
         self.assertIn("IPK_PACK.project", body)
         self.assertIn("project:", body)
+        # the two text edits send what the writers read
+        self.assertIn("body.text", body)
+        self.assertIn("body.keywords", body)
+        self.assertIn("IPK_DONE[id]", body)
+
+    def test_the_edit_buttons_say_what_they_change(self):
+        from helm import web_ui_loader
+        page = web_ui_loader.read_text()
+        self.assertIn("change the line it fires as", page)
+        self.assertIn("change what makes it fire", page)
+        self.assertIn("function ipkDone(", page)
 
     def test_the_page_carries_no_cost_or_credential_wording(self):
         # The standing constraint on this surface: nobody has measured whether
@@ -643,7 +757,7 @@ class InjectPackFragmentTest(unittest.TestCase):
         self.assertEqual(set(model["entries"][0]), {
             "id", "lane", "fires", "last_turn", "line_bytes", "bytes",
             "present", "type", "load_class", "text", "project", "scope_how",
-            "actions"})
+            "actions", "gloss", "draft", "keywords"})
 
 
 class AnEntryPreviewSaysWhenItIsShortTest(unittest.TestCase):

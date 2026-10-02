@@ -35,6 +35,15 @@ def _localnames():
     return localnames
 
 
+def _cvcompat():
+    """`cvcompat`, the same two ways in as `_pk()`."""
+    try:
+        from . import cvcompat
+    except ImportError:               # run by pathname: no package parent
+        import cvcompat
+    return cvcompat
+
+
 def _home():
     """`home`, the same two ways in as `_pk()`."""
     try:
@@ -260,15 +269,17 @@ def _epoch(iso):
 
 
 def _row_from_cv(o):
-    """One `cv ls --json` object -> a catalog row (same schema the scanner emits)."""
+    """One `cv ls --json` object -> a catalog row (same schema the scanner emits).
+    Either key spelling: snake_case since cv 0.11, camelCase before."""
+    f = _cvcompat().field
     cwd = o.get("cwd") or ""
-    updated, created = str(o.get("updatedAt") or ""), str(o.get("createdAt") or "")
+    updated, created = str(f(o, "updated_at") or ""), str(f(o, "created_at") or "")
     mt = _epoch(updated)
     git = o.get("git") if isinstance(o.get("git"), dict) else {}
     return _classify({
         "h": o.get("harness") or "?", "i": o.get("id") or "", "c": _short(cwd),
         "b": git.get("branch", "") or "", "t": o.get("title") or "(untitled)",
-        "z": o.get("sizeBytes") or 0, "m": o.get("messageCount") or 0,
+        "z": f(o, "size_bytes") or 0, "m": f(o, "message_count") or 0,
         "cr": created[:10],
         "u": updated[:10] or (time.strftime("%Y-%m-%d", time.localtime(mt)) if mt else ""),
         "mt": mt, "p": o.get("path") or "", "cwd": cwd,
@@ -333,8 +344,8 @@ def _backfill_syn(rows):
 
 
 def _build_from_cv():
-    """Primary path: `cv ls --json` IS the catalog (cv 0.10+ carries sizeBytes +
-    synthesized titles + true messageCount — the fields that let the predecessor's transitional
+    """Primary path: `cv ls --json` IS the catalog (cv 0.10+ carries the byte size +
+    synthesized titles + the true message count — the fields that let the predecessor's transitional
     scanner retire). Returns (rows, stats) or None if cv can't answer (→ scanner
     fallback). The one remaining gap vs the scanner is git branch, which cv doesn't
     emit yet (emberian/cv#15) — non-load-bearing, blank until it lands."""

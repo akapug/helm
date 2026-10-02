@@ -514,9 +514,10 @@ def _landed(row, world, tip):
        net-zero branch can only ever match at or behind its own base.
     3. CONTENT IDENTITY — every commit the branch carries past the merge-base
        has its patch-id on trunk. Ancestry is the WRONG question for rebased
-       work (`vcs.py:565`): the integrator rebases, so the landed commit is
-       patch-identical and object-different, and ancestry truthfully answers
-       "no". A single unmatched commit is decisive AGAINST landing — landing
+       work: historical rebases and cherry-picks carried patch-identical
+       content under different shas, so ancestry truthfully answers "no".
+       Today's exact-sha train merges preserve the reviewed commit as an
+       ancestor. A single unmatched commit is decisive AGAINST landing — landing
        part of a stack is exactly the state that must keep its branch.
     4. ID BINDING — a trunk commit message names this row's dispatch id. This
        is the only proof that survives the branch being reaped, and it is

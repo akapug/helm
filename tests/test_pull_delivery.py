@@ -857,19 +857,28 @@ class RestartedBeaconTest(PullBase):
         self.assertEqual(self.restarted(), [])
         self.assertIn("piped to another program", piped)
 
-    def test_an_unread_row_rings_a_restarted_waiter_once(self):
-        """The control: a row the seat never read whole (its one read was
-        piped) rings the waiter re-armed past the backstop on its first
-        pass, once, and that waiter stays silent until its own backstop."""
+    def test_an_unread_row_the_ring_showed_stays_owed_and_is_not_replayed(self):  # noqa: VACUOUS_ASSERTION — the counts (1, 1) before and after are the positive observables; the control below rings a counted-only row on the same restarted waiter
+        """A row the seat never read (its one read was piped) stays owed and
+        counted. Its ring carried it whole, so a waiter re-armed past the
+        backstop does not ring it again (task/4019: one row is delivered once
+        per seat); the hook and the stop guard still owe it."""
         _rid, k = self.rung_row()
         self.into_pipe(k, ["head", "-40"])
         self.assertEqual(self.counts(), (1, 1))
+        self.assertEqual(self.restarted(passes=6), [])
+        self.assertEqual(self.counts(), (1, 1))
+
+    def test_an_unread_row_the_ring_only_counted_rings_a_restarted_waiter_once(self):
+        """The control: a row the ring only counted was never shown, so the
+        waiter re-armed past the backstop rings it on its first pass, once,
+        and stays silent until its own backstop."""
+        self.rung(["@gemini an older ask", self.TEXT])
         self.clock[0] = self.t0 + 1800.0
         lines, seen = self.follow(passes=6, clock=True)
         self.assertEqual(len(lines), 1, lines)
         self.assertEqual(seen[0], 1, "the re-armed waiter rings at once")
-        self.assertIn(self.TEXT, lines[0])
-        self.assertIn("doorbell: 1 unread = 1 addressed", lines[0])
+        self.assertIn("] bob: @gemini an older ask (+1 waiting", lines[0])
+        self.assertIn("doorbell: 2 unread = 2 addressed", lines[0])
 
     def test_an_ack_inside_a_delegates_mark_ends_the_ring(self):  # noqa: VACUOUS_ASSERTION — the restarted waiter's silence is paired with the unread-row arm above, whose restarted waiter rings the same row on the same schedule
         """An ack clears the ring per seat, from any session and inside a

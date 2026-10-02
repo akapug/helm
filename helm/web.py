@@ -86,6 +86,8 @@ API = {
 QUERY_API = {  # GET endpoints that take query params; fn(qs) -> (obj, status)
     "/api/config/injection": _api_config_injection,
     "/api/inject/pack": _api_inject_pack,
+    "/api/inject/turntext": _api_inject_turntext,
+    "/api/seat/contextloop": _api_seat_contextloop,
     "/api/configs/cascade": _api_configs_cascade,
     "/api/configs/tree": _api_configs_tree,
     "/api/configs/resolve": _api_configs_resolve,
@@ -107,6 +109,7 @@ QUERY_API = {  # GET endpoints that take query params; fn(qs) -> (obj, status)
     "/api/todos": _api_todos,
     "/api/lr": _api_lr,
     "/api/roster/git": _api_roster_git,
+    "/api/roster/mood": _api_roster_mood,
     "/api/ledger": _api_ledger,
     "/api/ledger/turn": _api_ledger_turn,
     "/api/ledger/native": _api_ledger_native,

@@ -27,7 +27,8 @@ from ._guard import install_guard
 # ---------------------------------------------------------------------------
 
 USAGE = """usage: helm work <verb> [--repo PATH] [--seat S]
-  claim <lane> [--ttl N] [--lease ID] [--task task/N]
+  claim <lane> [--ttl N] [--lease ID] [--task task/N --whole|--part
+               [--because "<one line>"] [--start-anyway "<one line>"]]
                                         check in: lease + private room —
                                         prints path<TAB>branch<TAB>lease<TAB>ttl.
                                         --ttl is seconds, bare or with one
@@ -36,7 +37,31 @@ USAGE = """usage: helm work <verb> [--repo PATH] [--seat S]
                                         serves on its branch (the one join's
                                         stored key); an unknown or closed task,
                                         or a lane that records another, is
-                                        refused before anything is claimed
+                                        refused before anything is claimed.
+                                        A task that goes ahead of a bigger
+                                        lever with no lane (a story sub-task
+                                        its --order puts first or that ranks
+                                        higher, or an owner-asked P0/P1
+                                        two ranks higher) is told LEVER
+                                        INVERSION, and started work of yours
+                                        sitting unlanded (a lane you hold, idle
+                                        4h; for the integrator any lane, and a
+                                        row held source-clean 1h) FINISH FIRST;
+                                        LEVER INVERSION once per session, task
+                                        and lever, FINISH FIRST once per session
+                                        and item; the
+                                        claim goes ahead. Adopting an
+                                        unlanded lane is not weighed.
+                                        The skip is recorded on the lane with
+                                        the reason from --because /
+                                        --start-anyway, else "went ahead
+                                        without a reason"; a reason given is
+                                        also a task comment.
+                                        --whole records that the lane carries
+                                        the task's WHOLE ask, so its land
+                                        closes the task; without it the land
+                                        asks the task's room whether the whole
+                                        ask is done
   release [<lane>] --lease ID [--park] [--stale]  check out: dirty refuses (--park
                                         WIP-commits); landed room retires,
                                         unlanded room + branch stay for triage.
@@ -239,7 +264,8 @@ def _tree_word(row):
 # A shared guard that refuses a documented form is not the same guard.
 _SHARED_FLAGS = ("--repo", "--seat")
 _VERB_FLAGS = {
-    "claim": ("--ttl", "--lease", "--task"),
+    "claim": ("--ttl", "--lease", "--task", "--because", "--start-anyway",
+              "--whole", "--part"),
     "release": ("--lease", "--superseded", "--stale", "--park"),
     "peek": ("--drop", "--json"),
     "stash": (),
@@ -433,6 +459,100 @@ def _claim_task(root, lane, token):
     return tid, None
 
 
+def _lever_gate(root, lane, task, rest, seat):
+    """(gate or None, rc or None) — the two checks for one new pick.
+
+    THE BIGGEST LEVER FIRST (`tasks.leverage_inversion`, answered with
+    --because) and FINISH FIRST (`taskkey.in_flight`: `seat`'s started work
+    sitting unlanded, answered with --start-anyway). A claim with no --task
+    runs neither, and either flag without one is refused. A lane that
+    already records `task` is its renewal, not a new pick, and ADOPTING an
+    existing lane whose work is not on trunk (`lanes_landed` UNLANDED) takes
+    up started work, which is what FINISH FIRST asks for: neither is
+    weighed. NEITHER CHECK
+    REFUSES: one that finds something STEERS, printing its line once per
+    session, task and named lever (`taskkey.steer_once`) unless its flag
+    already says why, and the claim goes ahead; `_record_lever` records the reason, or
+    `tasks.NO_REASON`. A check that cannot run says UNKNOWN. `gate` is
+    (lever, finish) for `_record_lever`, each None when it found nothing."""
+    from .. import taskkey, tasks
+    given = {}
+    for flag in (tasks.LEVER_FLAG, taskkey.START_FLAG):
+        if flag not in rest:
+            continue
+        given[flag] = seats._flag(rest, flag)
+        bad = ("%s answers a check only a --task claim runs" % flag
+               if not task else tasks.lever_because_error(given[flag], flag))
+        if bad:
+            print("helm work claim: %s; nothing was claimed" % bad,
+                  file=sys.stderr)
+            return None, 2
+    if not task:
+        return None, None
+    from . import _gc
+    records, _why = taskkey.lane_records(root)
+    name = taskkey.lane_name(lane)
+    if task in (records.get(name) or ()) or (_gc.lanes_landed(
+            root, [name]).get(name) or {}).get("state") == _gc.LANE_UNLANDED:
+        return None, None
+    # ONE READ OF EACH LEDGER FOR THE PICK: both checks and the FINISH FIRST
+    # line share this dispatch snapshot and this task snapshot.
+    current, known, why = taskkey.pick_ledgers()
+    lever = (tasks.Lever(task, (), why) if why else tasks.leverage_inversion(
+        task, known=known, repo=root, current=current))
+    finish = (taskkey.Finish(seat, False, (), why) if why else
+              taskkey.in_flight(root, seat, lane=lane, task=task,
+                                current=current, known=known))
+    for result, found, flag, check in (
+            (lever, lever.skipped, tasks.LEVER_FLAG, "lever"),
+            (finish, finish.items, taskkey.START_FLAG, "finish")):
+        if result.unknown or (found and flag not in given
+                              and taskkey.steer_once(seat, check, task,
+                                                     result)):
+            print("helm work claim: " + (
+                tasks.lever_line(result) if check == "lever"
+                else taskkey.finish_line(result, known)),
+                file=sys.stderr)
+    return (lever if lever.skipped else None,
+            finish if finish.items else None), None
+
+
+def _record_lever(root, lane, gate, rest, task, seat):
+    """rc after recording on `lane` what its task went ahead of, and why: on
+    the lane's branch, and, for a reason the seat gave, as one comment on
+    `task`, which outlives it (`taskkey.choice_comment`)."""
+    from .. import taskkey, tasks
+    lever, finish = gate or (None, None)
+    said = {}
+    for what, ids, flag, write in (
+            (lever, lever and tasks.lever_skipped(lever), tasks.LEVER_FLAG,
+             taskkey.record_lever),
+            (finish, finish and taskkey.finish_over(finish),
+             taskkey.START_FLAG, taskkey.record_start)):
+        if what is None:
+            continue
+        given = flag in rest
+        reason = seats._flag(rest, flag).strip() if given else tasks.NO_REASON
+        _written, why = write(root, lane, ids, reason)
+        if why:
+            print("helm work claim: the lane holds its task, but what it went "
+                  "ahead of was NOT recorded: %s" % why, file=sys.stderr)
+            return 1
+        if given:
+            print('helm work: lane %s went ahead of %s: "%s" (%s, recorded '
+                  'on branch %s)' % (lane, tasks.named(ids), reason, flag,
+                                     lane_branch(lane)), file=sys.stderr)
+        said[flag] = (ids, reason)
+    _written, why = taskkey.choice_comment(
+        task, "lane " + lane, lever=said.get(tasks.LEVER_FLAG),
+        start=said.get(taskkey.START_FLAG), by=seat)
+    if why:
+        print("helm work claim: the lane records the reason, but it was NOT "
+              "added to %s as a comment: %s" % (task, why), file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_work(args):
     """work claim|release|gc|list|install-guard|checkout-watch — worktree
     lifecycle on the claims lane: private room per lane, the shared checkout
@@ -556,11 +676,45 @@ def cmd_work(args):
         # branch already records another task, is refused by name and
         # nothing is claimed. It is RECORDED only after the claim holds.
         task = None
+        whole = "--whole" in rest
+        part = "--part" in rest
+        if whole and "--task" not in rest:
+            print("helm work claim: REFUSED — --whole records that the lane "
+                  "carries the WHOLE ask of the task --task names; give "
+                  "--task task/N with it (nothing was claimed)",
+                  file=sys.stderr)
+            return 1
+        if part and "--task" not in rest:
+            print("helm work claim: REFUSED — --part records that the lane "
+                  "carries a PIECE of the task --task names; give "
+                  "--task task/N with it (nothing was claimed)",
+                  file=sys.stderr)
+            return 1
         if "--task" in rest:
+            # THE ASK'S PATH (task/3938): a lane that names a task picks
+            # EXACTLY ONE of --whole / --part — the whole ask (its land closes
+            # the task) or a piece of it. Neither names the path; both do.
+            if not (whole ^ part):
+                state = ("both --whole and --part were given"
+                         if (whole and part)
+                         else "neither --whole nor --part was given")
+                print("helm work claim: REFUSED — --task names a task's ask, "
+                      "and it must pick one path to it. %s. add --whole if "
+                      "this lane finishes the task, or --part if it does a "
+                      "piece of it; give exactly one of --whole or --part "
+                      "(nothing was claimed)"
+                      % state, file=sys.stderr)
+                return 1
             task, why = _claim_task(root, pos[0], seats._flag(rest, "--task"))
             if why:
                 print("helm work claim: REFUSED — %s" % why, file=sys.stderr)
                 return 1
+        # THE BIGGEST LEVER FIRST (task/3821), judged beside the task and
+        # before anything is claimed: a task that skips a bigger lever with
+        # no lane stops here unless --because says why.
+        lever, rc = _lever_gate(root, pos[0], task, rest, seat)
+        if rc is not None:
+            return rc
         # THE PROJECT'S LIGHT, BEFORE ANYTHING IS CHECKED OUT. A new lane IS
         # new work starting here, so this is the door the owner's colour has to
         # hold at. A RENEWAL is never refused: a lease is a lock on a room, not
@@ -597,6 +751,21 @@ def cmd_work(args):
                       % (pos[0], task, "recorded" if written
                          else "already recorded", lane_branch(pos[0])),
                       file=sys.stderr)
+                rc = _record_lever(root, pos[0], lever, rest, task, seat)
+            # THE WHOLE ASK (task/3746): its land closes the task, where a
+            # lane without it asks the task's room whether the ask is done.
+            if rc == 0 and whole:
+                written, why = taskkey.record_whole(root, pos[0], task)
+                if why:
+                    print("helm work claim: the lease, room and task hold, "
+                          "but --whole was NOT recorded: %s" % why,
+                          file=sys.stderr)
+                    rc = 1
+                else:
+                    print("helm work: lane %s carries the whole ask of %s "
+                          "(%s): its land closes the task"
+                          % (pos[0], task, "recorded" if written
+                             else "already recorded"), file=sys.stderr)
         if rc == 0:
             # WHO ELSE IS LIVE, AND IN WHAT. A lease answers "is anyone in this
             # ROOM", never "is anyone already fixing this DEFECT" — and the
@@ -976,9 +1145,10 @@ def cmd_work(args):
             len(rows), "s"[:len(rows) != 1], root,
             "APPLYING" if enforcing else "dry-run; --apply enforces — only "
             "clean LANDED rooms and empty claims idle past 24h retire; "
+            "clean unlanded checkouts idle past 3d PARK (branch kept); "
             "dirty/unlanded work stays for triage, never discarded"))
         w = max(len(r["lane"]) for r in rows)
-        removed = 0
+        removed = parked = 0
         # PLANNED-VS-DONE, because "removed=0" is literally true and reads as
         # "nothing needed removing". Measured 2026-08-04: a run PLANNED two
         # removals, completed ZERO (both blocked on a bound pane), and said
@@ -993,6 +1163,11 @@ def cmd_work(args):
                 for ln in out:
                     print("        " + ln)
                 gone = not os.path.exists(r["path"])
+                # A PARKED ROOM IS GONE AND ITS BRANCH IS NOT: its own count,
+                # never `removed`, which says a lane retired (task/4061).
+                if r["verdict"] == "park":
+                    parked += gone
+                    continue
                 removed += gone
                 if r["verdict"] == "remove" and not gone:
                     blocked_why.append(_blocked_reason(out))
@@ -1019,7 +1194,8 @@ def cmd_work(args):
             # gc_enact reclassified is triage NOW even though the scan said
             # remove. (A cross-family read, finding 2 + cleanup.)
             eligible = [r for r in rows
-                        if r["verdict"] in ("triage", "rescue")] + reclassified
+                        if r["verdict"] in ("triage", "rescue", "park")] \
+                + reclassified
             triage = len(eligible) + phantom_kept
             # COUNTED OVER THE SAME POPULATION THE TRIAGE NUMBER IS TAKEN FROM
             # — the triage/rescue rows — and never over every room, or the
@@ -1047,8 +1223,9 @@ def cmd_work(args):
                            sum(r["lane"] not in rowed for r in eligible))
             line = format_gc_summary(
                 root, removed + peek_dropped + phantom_removed,
-                len(rows) - removed + peek_kept + phantom_kept, triage,
-                planned=planned, blocked=blocked_why, unrowed=unrowed)
+                len(rows) - removed - parked + peek_kept + phantom_kept,
+                triage, planned=planned, blocked=blocked_why,
+                unrowed=unrowed, parked=parked)
             print(line)
             error = post_gc_summary(line)
             if error:

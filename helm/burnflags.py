@@ -138,6 +138,8 @@ BEHAVIOUR = {
     GREY: {"say": "not measured; treated as yellow and said out loud",
            "capacity": 2, "delegate_factor": 0.5},
 }
+_SPEND_DOWN_SAY = ("keep working at a steady pace until the vendor refuses; "
+                   "do not route critical-path work here")
 
 SNAPSHOT_NAME = "burn-flags.json"
 DECLARATIONS_NAME = "burn-declarations.json"
@@ -579,6 +581,40 @@ def _runway_step(axis, runway):
     return stepped
 
 
+def _pool_pace_step(axis, pool):
+    """The money axis after the pool's weekly pace joins it -> an axis record
+    (task/3880).
+
+    The pool is a WEEKLY reading, so it folds into the family colour here,
+    the ONE place every consumer of the colour reads it: the axis becomes the
+    WORSE of the 5h reading and the pool's pace. An EASE (ORANGE) pool holds a
+    GREEN 5h at ORANGE; the pace NEVER lifts a reading, so a FASTER (GREEN)
+    pool leaves a measured wall alone. An UNREADABLE (GREY) pace touches
+    nothing: GREY is off the ordering, so the module's first law holds for a
+    pace exactly as it holds for a reading. The stepped axis names the pool
+    pace first and keeps the reading it stepped from."""
+    if not isinstance(axis, dict) or not isinstance(pool, dict):
+        return axis
+    colour = axis.get("colour")
+    pace = pool.get("colour")
+    if colour not in _RANK or pace not in _RANK:
+        return axis
+    to = _worse(colour, pace)
+    if to == colour:
+        return axis
+    stepped = dict(axis, colour=to, cause_id="money:pool-pace-%s" % to,
+                   stepped_from=colour,
+                   cause="%s — the money axis steps %s to %s; the reading it "
+                         "steps from: %s"
+                         % (pool.get("advice") or "the pool's weekly pace",
+                            colour, to, axis.get("cause")))
+    if to == pace and pool.get("runout_at"):
+        stepped.update(expires_at=pool["runout_at"],
+                       expires_kind="weekly-reset",
+                       expires_source="the pool's weekly pace: the run-out")
+    return stepped
+
+
 def _account_binding(windows, threshold):
     """Latest reset needed for one account to fall below ``threshold``."""
     blockers = [window for window in windows
@@ -672,6 +708,12 @@ def _family_binding(accounts):
     if not bindings or any(binding is None for binding in bindings):
         return None
     return min(bindings, key=lambda window: window["reset_at"])
+
+
+def _on_demand_off_family(family):
+    from . import moneyread, seat
+    return family in moneyread.catalog_families() and \
+        moneyread._on_demand_is_off(seat.FAMILIES.get(family))
 
 
 def derive_money(family, rows, ceiling=None, abundance=None, measured_at=None,
@@ -768,6 +810,21 @@ def derive_money(family, rows, ceiling=None, abundance=None, measured_at=None,
                      coverage=coverage, capped_by_coverage=True,
                      coverage_why=why, provenance=provenance)
     if family_state == "blocked":
+        # A family whose catalog claims on-demand off WITH a basis cannot be
+        # billed past the included dollars: a high pool reading is not a money
+        # wall at the dispatch door, but a down-spend family the vendor itself
+        # will still refuse — so the money axis says ORANGE, not RED, and the
+        # family stays dispatchable until the vendor refuses on the reach axis.
+        if _on_demand_off_family(family):
+            return _axis("money", ORANGE,
+                         "%s is at or past the %.0f%% ceiling on its measured "
+                         "budget, but its catalog claims on-demand off with a "
+                         "basis, so this is spending down, not a wall — keep a "
+                         "steady pace until the vendor refuses" % (
+                             family, ceiling),
+                         "money:ondemand-off-spend-down", measured_at=measured_at,
+                         coverage=coverage, capped_by_coverage=coverage_gap,
+                         coverage_why=coverage_why, provenance="measured")
         binding = _family_binding(pressure)
         reset = _wall_reset_fields(
             binding, credits=reset_credits, measured_at=measured_at)
@@ -1015,12 +1072,12 @@ def derive_reach(family, record, now=None):
         return None
     from . import proxywatch
     if proxywatch.quota_wall(record) and state != "AUTH-UNAVAILABLE":
-        # The family answered, and the answer was "no budget": that is the
-        # MONEY axis's reading (`derive_quota_wall`), and a proxy bounce is not
-        # its repair — including for the local cooldown that mirrors it. A local
-        # AUTH-UNAVAILABLE remains a reach failure while the prior wall stands
-        # independently on money.
-        return None
+        # With on-demand spend disabled, a vendor refusal is a REACH wall,
+        # not an assertion that spending past the included dollars is possible.
+        # Other families keep the quota refusal on MONEY. The proxy's cooldown
+        # inherits the vendor refusal rather than becoming an OURS repair.
+        return (derive_quota_wall(family, record)
+                if _on_demand_off_family(family) else None)
     since = pk.parse_ts_epoch(record.get("since"))
     bar = record.get("falsification_bar_s") or 0
     if since and (now - since) < bar:
@@ -1059,8 +1116,8 @@ def derive_reach(family, record, now=None):
 
 
 def derive_quota_wall(family, record):
-    """The MONEY axis a vendor's own quota refusal sets -> an axis record, or
-    None when the family's upstream record is not a quota wall.
+    """A vendor quota refusal -> MONEY, or REACH for a based on-demand-off
+    family, or None when the upstream record has no quota wall.
 
     The instant is the record's vendor reset: the one the refusal carried, or
     else the owner-entered page value (`helm proxywatch vendor-reset`). With
@@ -1074,10 +1131,18 @@ def derive_quota_wall(family, record):
         and not isinstance(ms, bool) else None
     mirror = "" if wall == record.get("state") else (
         ", held across the proxy's %s that mirrors it" % record["state"])
-    return _axis("money", RED,
-                 "the vendor refused on its usage quota (%s%s); the repair is "
-                 "a wait for its reset, not a proxy bounce or a new key"
-                 % (wall, mirror), "money:vendor-quota-wall",
+    axis = "reach" if _on_demand_off_family(family) else "money"
+    # THE REPAIR FOLLOWS THE REFUSAL'S KIND: an empty balance has no reset to
+    # wait for. A window, or a kind nobody recorded, keeps the reset wording.
+    if proxywatch.quota_wall_kind(record) == "balance":
+        text = ("the vendor refused on an empty balance (%s%s); the repair "
+                "is a top-up or a plan change by the account owner, with no "
+                "reset to wait for; not a proxy bounce or a new key")
+    else:
+        text = ("the vendor refused on its usage quota (%s%s); the repair is "
+                "a wait for its reset, not a proxy bounce or a new key")
+    return _axis(axis, RED, text % (wall, mirror),
+                 "%s:vendor-quota-wall" % axis,
                  measured_at=pk.parse_ts_epoch(record.get("since")),
                  expires_at=at,
                  expires_kind="vendor-reset" if at else "none",
@@ -1104,6 +1169,15 @@ def derive_turn_wall(family, walls):
             ("reach", "reach:turn-wall", "a person clearing the account "
                                          "check")):
         w = (walls or {}).get(axis) if isinstance(walls, dict) else None
+        based_off = _on_demand_off_family(family)
+        if axis == "money" and based_off:
+            out.append(None)
+            continue
+        if axis == "reach" and based_off and not isinstance(w, dict):
+            w = (walls or {}).get("money") if isinstance(walls, dict) else None
+            if isinstance(w, dict):
+                cause_id = "reach:turn-quota-wall"
+                repair = "the vendor serving the family again"
         if not isinstance(w, dict):
             out.append(None)
             continue
@@ -1525,6 +1599,9 @@ def compose(family, axes, now=None, credits=None):
     at, kind, source = expiry([axes[n] for n in
                                ("money", "reach", "policy", "declared")],
                               headline=headline)
+    behaviour = dict(BEHAVIOUR[colour])
+    if cause_id == "money:ondemand-off-spend-down" and colour == ORANGE:
+        behaviour["say"] = _SPEND_DOWN_SAY
     return {"family": family, "colour": colour, "axis": axis_name,
             "declared_unmeasured": declared_unmeasured,
             "axes": {n: (axes[n]["colour"] if axes[n] else None)
@@ -1545,8 +1622,11 @@ def compose(family, axes, now=None, credits=None):
             "expires_at": at, "expires_kind": kind, "expires_source": source,
             "provenance": provenance,
             "declared_ignored": declared_ignored,
+            # WHICH DECLARATION THIS FOLD READ, by its own instant: the key
+            # `pending_declarations` matches a saved record against (task/4027).
+            "declared_at": (declared or {}).get("measured_at"),
             "credits": credits,
-            "behaviour": dict(BEHAVIOUR[colour])}
+            "behaviour": behaviour}
 
 
 def overall(flags, critical=None):
@@ -1596,6 +1676,11 @@ def fold(inputs, now=None):
     before_all = inputs.get("upstream_before") or {}
     # THE RUNWAY IS AN INPUT, and `_RUNWAY_STEP_TABLE` is its only effect.
     runway = inputs.get("runway") or {}
+    # THE POOL'S WEEKLY PACE IS AN INPUT TOO (task/3880), and
+    # `_pool_pace_step` is its only effect: the native family reads its pool
+    # as a weekly burn against a horizon, not a 5h headroom, so the pace folds
+    # into the family colour here and never again.
+    pool_pace = inputs.get("pool_pace") or {}
     turn_walls = inputs.get("turn_walls") or {}
     certifications = inputs.get("local_certifications")
     local = local_families()
@@ -1622,10 +1707,11 @@ def fold(inputs, now=None):
             # pool of accounts that each carry a seat of their own.
             rotated=(family != NATIVE_FAMILY),
             reset_credits=credits.get(family))
-        # A measured quota refusal outranks every money reading short of RED:
-        # budget rows that still show headroom are older than the refusal.
+        # A vendor refusal outranks older pool headroom. With on-demand off,
+        # the vendor's actual refusal is REACH; other families retain MONEY.
         wall = derive_quota_wall(family, record)
-        base = wall if wall and money["colour"] != RED else money
+        base = (wall if wall and wall["axis"] == "money"
+                and money["colour"] != RED else money)
         # A REFUSAL ON A SEAT'S OWN TURN IS A MEASURED WALL TOO (task/3587),
         # read where the proxy's record cannot see it: the proxy answered,
         # the vendor said no.
@@ -1634,10 +1720,14 @@ def fold(inputs, now=None):
         if turn_money and base["colour"] != RED:
             base = turn_money
         reach = derive_reach(family, record, now=now)
+        if wall and wall["axis"] == "reach" and \
+                (reach is None or reach["colour"] != RED):
+            reach = wall
         if turn_reach and (reach is None or reach["colour"] != RED):
             reach = turn_reach
         axes = {
-            "money": _runway_step(base, runway.get(family)),
+            "money": _pool_pace_step(_runway_step(base, runway.get(family)),
+                                     pool_pace.get(family)),
             "reach": reach,
             "policy": (derive_policy(history, now=now)
                        if family == NATIVE_FAMILY else None),
@@ -1656,6 +1746,8 @@ def fold(inputs, now=None):
                         "turn_walls": sorted(turn_walls),
                         "runway": sorted(f for f, r in runway.items()
                                          if isinstance(r, dict)),
+                        "pool_pace": sorted(f for f, p in pool_pace.items()
+                                            if isinstance(p, dict)),
                         "declared": sorted(
                             ((declarations or {}).get("families") or {})),
                         "certified_local": sorted(
@@ -1701,6 +1793,48 @@ def declare(family, colour, until, why=None, now=None, path=None):
     except OSError as exc:
         return False, str(exc)
     return True, None
+
+
+def pending_declarations(declarations, flags=None, ts=None, now=None):
+    """The owner's live declarations that the snapshot has NOT folded yet ->
+    {family: {colour, until, declared_at, why, folds_by}} (task/4027).
+
+    `flags` and `ts` are the snapshot's families and its instant, or None
+    when no fresh snapshot exists. `folds_by` is the watchdog's next pass
+    after `ts`, or None when that is not known.
+
+    THE SNAPSHOT SAYS WHICH RECORD IT FOLDED. The watchdog stamps `ts` at the
+    START of its pass and reads the declarations near the end, so a record
+    younger than `ts` can already be folded, and the instant cannot decide.
+    A record is folded when the flag's `declared_at` and declared colour are
+    the record's own. A snapshot written before the flag carried
+    `declared_at` reads PENDING for one pass at most, never FOLDED on a
+    guess.
+
+    PENDING IS NOT A COLOUR. Nothing here changes a flag: the reading stays
+    the fold's, and worse-only and `declared_ignored` stay the fold's rules.
+    A reader shows the record BESIDE the reading, as declared and pending.
+    The families and the expiry are the fold's own (`derive_declared`), so a
+    record the fold would never read is never pending."""
+    now = time.time() if now is None else now
+    from . import proxywatch
+    said = (declarations or {}).get("families") or {}
+    folds_by = ts + proxywatch.INTERVAL_S if _finite(ts) else None
+    out = {}
+    for family in families():
+        axis = derive_declared(family, declarations, now=now) \
+            if family in said else None
+        if axis is None:
+            continue
+        flag = (flags or {}).get(family)
+        flag = flag if isinstance(flag, dict) else {}
+        if (flag.get("axes") or {}).get("declared") == axis["colour"] \
+                and flag.get("declared_at") == axis["measured_at"]:
+            continue
+        out[family] = {"colour": axis["colour"], "until": axis["expires_at"],
+                       "declared_at": axis["measured_at"],
+                       "why": axis["cause"], "folds_by": folds_by}
+    return out
 
 
 def improving_declaration(colour, flag):
@@ -2083,7 +2217,7 @@ def watch_notice(flags, prior):
         body.append("  %-11s %s -> %s (%s) %s"
                     % (family, was or "unknown", is_, fl["axis"] or "unmeasured",
                        fl["cause"]))
-        body.append("      %s" % BEHAVIOUR[is_]["say"])
+        body.append("      %s" % fl["behaviour"]["say"])
     return "\n".join(body) + "\n", colours
 
 
@@ -2227,6 +2361,18 @@ def read_inputs(now=None):
         runway = codexpace.cached_fold_input(now=now)
         if runway:
             inputs["runway"] = {codexpace.FAMILY: runway}
+    except Exception:                       # noqa: BLE001
+        pass
+    try:
+        # THE POOL'S WEEKLY PACE, read the same way the runway is: the
+        # watchdog's own snapshot, best-effort. `fold` consumes it as
+        # `pool_pace` and never reaches for it itself (claudepace imports
+        # this module, so the fold stays pure).
+        from . import claudepace
+        snap = claudepace.cached(now=now)
+        pool = (snap or {}).get("pool")
+        if pool:
+            inputs["pool_pace"] = {claudepace.FAMILY: pool}
     except Exception:                       # noqa: BLE001
         pass
     return inputs
@@ -2467,21 +2613,31 @@ _USAGE = ("helm burn [--json] | helm burn why <family> [--json] | "
           "helm burn calibrate [--json] | "
           "helm burn declare <family> <colour> --until <iso> [reason...] | "
           "helm burn certify-local <family> --until <iso|duration> [note...] "
-          "| helm burn certify-local <family> --revoke [note...]")
+          "| helm burn certify-local <family> --revoke [note...] | "
+          "helm burn horizon [anthropic <utc-iso> [reason...] | "
+          "anthropic --clear] | "
+          "helm burn spend [--json] [--session <id>...]")
 
 
 def cmd_burn(args):
-    """burn [--json]|why <family>|calibrate|declare <family> <colour>
-    --until <iso>|certify-local <family> --until <iso|duration>|--revoke —
-    the fire-danger reading per model family."""
+    """burn [--json]|why <family>|calibrate|horizon [anthropic <utc-iso>
+    [reason...]|anthropic --clear]|declare <family> <colour> --until
+    <iso>|certify-local <family> --until <iso|duration>|--revoke — the
+    fire-danger reading per model family."""
     import sys
     args = list(args or ())
     sub = args[0] if args and not args[0].startswith("-") else None
     if sub is not None and sub not in ("why", "declare", "burst", "runway",
-                                       "certify-local", "calibrate"):
+                                       "certify-local", "calibrate",
+                                       "horizon", "spend"):
         print("helm burn: unknown subcommand %r\nusage: %s"
               % (sub, _USAGE), file=sys.stderr)
         return 2
+    if sub == "horizon":
+        from . import claudepace
+        return claudepace.cmd_horizon(args[1:])
+    if sub == "spend":
+        return _cmd_spend(args[1:])
     if sub == "declare":
         return _cmd_declare(args[1:])
     if sub == "certify-local":
@@ -2523,8 +2679,10 @@ def cmd_burn(args):
         # watchdog pass's own snapshot, never a live probe.
         from . import codexpace
         print(codexpace.burn_line(now=now))
-        # AND THE CLAUDE 5H PACE (pace5h): one line per account, from its own
-        # snapshot. Neither pace moves a colour.
+        # AND THE CLAUDE PACE (pace5h, task/3871): one line per account, the
+        # switch pool's weekly pace against its horizon, and one line per
+        # project with an authored light, from its own snapshot. Neither
+        # pace moves a colour.
         from . import claudepace
         for text in claudepace.burn_lines(now=now):
             print(text)
@@ -2591,6 +2749,47 @@ def _cmd_runway(args):
         for text in codexpace.render(reading):
             print(text)
     return 0 if reading["accounts"] else 3
+
+
+def _cmd_spend(args):
+    """spend [--json] [--session <id>...] — this seat's own spend over its
+    account's weekly window: the calls its sessions made and the context they
+    re-read versus output, priced per model, beside the weekly percent of the
+    account its own home holds. EXTENDS `helm burn` per the owner's scope line
+    (Orca feeds helm's existing surfaces, not a replacement meter).
+
+    The sessions are the running session by default; `--session` names others
+    (a seat's earlier sessions, or a terminal with no session of its own).
+    Unknown is UNKNOWN, never zero. The verb prints NO Max savings % — it
+    states the confounds (shared account, rounding, resets)."""
+    import sys
+    from . import burnspend
+    args = list(args or ())
+    as_json, sessions, rest = False, [], args
+    while rest:
+        head, rest = rest[0], rest[1:]
+        if head == "--json":
+            as_json = True
+        elif head == "--session" and rest and not rest[0].startswith("-"):
+            sessions.append(rest[0])
+            rest = rest[1:]
+        else:
+            print("helm burn spend: unknown argument %r\nusage: %s"
+                  % (head, _USAGE), file=sys.stderr)
+            return 2
+    reading = burnspend.spend_reading(sessions or None)
+    if as_json:
+        print(json.dumps(reading, indent=1, sort_keys=True))
+    elif not reading.get("source_ok"):
+        # No readable log is an ANSWER, not an error: exit 0 with the why, so
+        # the verb never claims the seat spent nothing.
+        print("helm burn spend: %s" % reading.get("why", "no source"))
+    else:
+        for text in burnspend.render(
+                reading, weekly_pct=reading.get("weekly_pct"),
+                weekly_reset_at=reading.get("weekly_reset_at")):
+            print(text)
+    return 0
 
 
 def _cmd_declare(args):

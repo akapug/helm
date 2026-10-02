@@ -2994,7 +2994,14 @@ class SeatCoverageTest(HooksBase):
                           hooks._hook_cmds(got, s["event"]), s["name"])
         self.assertEqual(got["hooks"]["PostToolUse"][-1]["matcher"], "*")
         self.assertEqual(got["hooks"]["SubagentStop"][-1]["matcher"], "*")
-        self.assertEqual(got["hooks"]["SessionStart"][-1]["matcher"], "*")
+        # SessionStart carries two groups: the wildcard one (join and
+        # resume-turn) and the working set's, which fires on a compaction
+        # only (task/4054).
+        ss = got["hooks"]["SessionStart"]
+        self.assertEqual({g.get("matcher") for g in ss}, {"*", "compact"})
+        compact = next(g for g in ss if g.get("matcher") == "compact")
+        self.assertEqual([h["command"] for h in compact["hooks"]],
+                         [hooks.spec_command(by_name["working-set"])])
         for name in ("inject", "stop-guard", "handoff-precompact",
                      "handoff-sessionend"):
             event = by_name[name]["event"]
@@ -5436,10 +5443,11 @@ class SidechainBeaconGuardInstallTest(HooksBase):
         # task/2566: a workflow file lands through Write/Edit too
         self.assertTrue(self.covers(matchers[0], "Write"), matchers)
         self.assertTrue(self.covers(matchers[0], "Edit"), matchers)
-        # the agent-model rung: an Agent call reaches the guard, and the
-        # Workflow tool, which spawns without an Agent call, does not
+        # the agent-model rung: an Agent call reaches the guard; and the
+        # narrow-goal rung: a Workflow, which spawns without an Agent call,
+        # reaches it too, as the turn's build act
         self.assertTrue(self.covers(matchers[0], "Agent"), matchers)
-        self.assertFalse(self.covers(matchers[0], "Workflow"), matchers)
+        self.assertTrue(self.covers(matchers[0], "Workflow"), matchers)
         self.assertFalse(self.covers(matchers[0], "Read"), matchers)
 
     def test_hooks_install_writes_a_guard_that_fires_on_monitor(self):  # noqa: VACUOUS_ASSERTION — assert_guards_monitor requires exactly one produced guard group and a matcher that covers Bash and Monitor

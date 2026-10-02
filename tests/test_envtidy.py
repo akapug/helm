@@ -1127,9 +1127,12 @@ class WorktreeBase(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="helm-envtidy-wt-")
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         self.env_prior = {k: os.environ.get(k)
-                          for k in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM")}
+                          for k in ("GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM",
+                                    "HELM_CACHE_DIR")}
         os.environ["GIT_CONFIG_GLOBAL"] = "/dev/null"
         os.environ["GIT_CONFIG_SYSTEM"] = "/dev/null"
+        # the sweep's keep-verdict memo lives in the cache root (task/4061)
+        os.environ["HELM_CACHE_DIR"] = os.path.join(self.tmp, "cache")
         self.addCleanup(self._restore_env)
         self.root = os.path.join(self.tmp, "proj")
         os.makedirs(self.root)

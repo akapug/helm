@@ -1,0 +1,1 @@
+record [--hook-json]|status|install|swallows — session-keyed tool-outcome recorder (PostToolUse leg); its counters drive the counter/latch reflexes, and `swallows` lists the exceptions broad handlers ate

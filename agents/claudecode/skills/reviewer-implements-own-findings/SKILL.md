@@ -145,7 +145,14 @@ All must be true:
    `git worktree add` or a new branch in the shared checkout (the rail guard
    refuses both for anyone but the integrator), never a commit in a
    `helm work peek` room (every reader of that sha shares it), and never an
-   amend or rebase of the reviewed SHA.
+   amend or rebase of the reviewed SHA. For an explicit BUILD, a parent may
+   instead assign its sole delegate a REGISTERED lane room (`helm work claim`);
+   the parent owns the lease through completion or accepted handoff and then
+   returns the room (`helm work release`); unfinished work is not released.
+   This narrower build allocation is never general reviewer authority. Never
+   an unregistered shared worktree or unleased shared-branch creation, a
+   protected or shared ref write, a permission bypass, a config/canon edit, a
+   test-home leak or a publication.
 5. **MELD-DIFF: do not commit the mechanical cure.** Post the exact unified
    diff with a hunk and changed line against the reviewed tip in the row's
    pair meld with one `[MELD e:N]` marker for this row's round, not a file:line
@@ -228,10 +235,9 @@ order:
    it**, with gemini reading meanwhile as input only.
 
 **Fable is for max QC only**, never a default and never automatic, and no
-rung of this ladder (owner ruling, task/3202): the most important work (an
-owner P0, a release, a public push, or a money or creds door with no other
-reader), at about 3 Opus tokens per Fable token, and not while `helm burn`
-reads anthropic ORANGE or worse. A max-QC read is a one-agent Workflow,
+rung of this ladder (owner rulings, task/3202 and task/3855): it reads only
+when the owner asks for it, at about 3 Opus tokens per Fable token, and not
+while `helm burn` reads anthropic ORANGE or worse. A max-QC read is a one-agent Workflow,
 opts.model `fable` (the alias), never the Agent tool (it ignores its model
 flag and runs your own model). On "You have reached your Fable limit": that
 limit belongs to one credential. It is not a wall and never a reason to step
@@ -275,10 +281,11 @@ owed, and the integrator reads it for itself.
   ladder above.
 - Counting a gemini or local-seat read as a door's approval: it is input
   until the owner admits that reader on its record.
-- Reaching for Fable when no approval-tier reader can take a door read: the
-  door read parks until one can, with gemini as input meanwhile. Fable is for max QC on the most important work only, at about 3
-  Opus tokens per Fable token, and never while `helm burn` reads anthropic
-  ORANGE or worse.
+- Reaching for Fable when no approval-tier reader can take a door read: take
+  a fresh-context Opus read, or the door read parks until a reader can, with
+  gemini as input meanwhile. Fable is for max QC only: it reads only when the
+  owner asks for it, at about 3 Opus tokens per Fable token, and never while
+  `helm burn` reads anthropic ORANGE or worse.
 - Stepping down to Sonnet or Haiku because Fable hit a limit on one credential.
 - Sending a vague fix recipe instead of a committed PATCH cure or the exact
   MELD-DIFF diff in the pair meld with its validated `--diff-handoff` receipt.

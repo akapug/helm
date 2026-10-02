@@ -242,7 +242,9 @@ def doctor_rows():
         if row["state"] == DRIFT:
             out.append((True, "launch drift: %-9s DRIFT — %s — %s (no process "
                         "is started or stopped; a running pane keeps its "
-                        "model until it is resumed)"
+                        "model, and a resume restores the recipe it ran with "
+                        "only from its own process or a capture of it, since "
+                        "a re-mint binds launch.sh to no launch)"
                         % (s, _field_text(row), _cure_text(row))))
         elif row["state"] == UNKNOWN:
             out.append((False, "launch drift: %-9s UNKNOWN — %s"
@@ -369,8 +371,14 @@ def _remint_one(family, s, apply, decide):
         print("helm seat remint: %s still DRIFT after the re-mint — %s"
               % (s, _field_text(after)), file=sys.stderr)
         return 1
-    print("  done — a running pane keeps its model until `helm seat resume "
-          "%s`" % s)
+    # nothing was launched, so launch.sh is no longer the launch the pane
+    # ran: a resume reads the recipe from the pane's process or a capture of
+    # it, refuses a recipe no launch binds, and takes this re-mint only under
+    # --defaults (task/3695)
+    print("  done — nothing was launched: a running pane keeps its model, "
+          "and launch.sh no longer states the launch it ran, so %s resumes "
+          "exactly only from its process or a capture of it (--defaults "
+          "resumes it on this re-mint)" % s)
     return 0
 
 

@@ -26,8 +26,9 @@ it is read here only so `--force` past it is recorded like the other three.
 AN OPERATOR HOLD LIFTS ONLY ON ITS OWN TERMS: `--clear`, or the `--until` it
 was set with, either a task whose row closes as landed (a close reason
 starting "landed", which the task sweep's confirm-close and quiet-window
-close write; auto-land closes no task since task/3643, so the task's owner
-closes it after re-reading the whole ask) or a deadline the operator wrote. It NEVER lifts on the seat's activity or on a
+close write, and so does auto-land's land step for a lane that carried the
+whole ask, "landed whole in LAND N" (task/3746); any other land only asks the
+task's owner whether the whole ask is done) or a deadline the operator wrote. It NEVER lifts on the seat's activity or on a
 healthy reading: an operator holds a seat for a defect helm does not measure,
 and a seat still working its old rows reads healthy on every rung helm has
 while that defect is still there. A MEASURED refusal lifts on its own signal:

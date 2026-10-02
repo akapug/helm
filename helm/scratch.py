@@ -72,6 +72,11 @@ so none of this is advice:
         thing.
       - LOUD: every applied pass writes a one-line pk.event, and doctor surfaces
         the last one — a silent data-eater is not allowed.
+      - EVICT, NEVER DELETE (scratch_evict): a unit leaves RAM for a disk
+        archive, is verified there and gets an index row before its RAM copy
+        goes, and a unit that cannot be archived stays in RAM and is said.
+        `helm scratch evicted` lists the archive; `helm scratch restore`
+        brings a unit back.
       - Kill-switches: HELM_SCRATCH_GC=0 (the reaper), HELM_SCRATCH_GC_TIER2=0
         (the second tier alone), HELM_SCRATCH_TMPDIR=0 (the launch-env routing;
         HELM_SCRATCH_TMPDIR=<path> pins it instead).
@@ -113,7 +118,7 @@ import stat
 import sys
 import time
 
-from . import home, openflags, pk, projscope
+from . import home, openflags, pk, projscope, scratch_evict
 
 MB = 1024 * 1024
 
@@ -433,6 +438,7 @@ class Reading(object):
                 "aged-candidate window": "candidate",
                 "deep-probe window": "unit",
                 "per-pass reap window": "unit",
+                "per-pass eviction copy": "byte",
                 "journal scan": "row",
                 "audited-line listing": "item",
                 "doctor-row listing": "row",
@@ -1773,9 +1779,17 @@ def tier2_units(tree, reading=None):
                 kept.append((entry.path, "a symlink is never a unit — helm "
                                          "never follows one out of the estate"))
                 return
-            kind = "dir" if entry.is_dir(follow_symlinks=False) else "file"
-            out.append((entry.path, entry.name,
-                        entry.stat(follow_symlinks=False).st_mtime, kind))
+            st = entry.stat(follow_symlinks=False)
+            special = scratch_evict.special_kind(st.st_mode)
+            if special:
+                # A FIFO, SOCKET OR DEVICE HOLDS NO DATA, so there is nothing
+                # to evict, and a copy would open it (a FIFO blocks, a
+                # character device reads without end).
+                kept.append((entry.path, "a %s holds no data, so it is never "
+                                         "a unit" % special))
+                return
+            kind = "dir" if stat.S_ISDIR(st.st_mode) else "file"
+            out.append((entry.path, entry.name, st.st_mtime, kind))
         except OSError:
             return
 
@@ -2567,7 +2581,9 @@ def gc(apply=False, now=None, specs=None, proc_dir=None, ttl=None, rows=None,
            "tier2_files": 0, "reap_capped": False, "probed": 0,
            "unknown": {"transcript": 0, "worktree": 0}, "sampled": 0,
            "handle_window_s": 0.0, "seat_pressure": {}, "seats": seats,
-           "worktrees": [], "unattributable": [], "errors": []}
+           "worktrees": [], "unattributable": [], "errors": [],
+           "archive": None, "evicted_bytes": 0, "evict_kept": [],
+           "archive_blocked": None}
     if list_unattributable:
         try:
             rep["unattributable"] = unattributable(now=now)
@@ -2720,9 +2736,24 @@ def gc(apply=False, now=None, specs=None, proc_dir=None, ttl=None, rows=None,
     #     by a count would make it wider exactly on the passes that delete the
     #     most. The report carries the widest window the pass actually ran with
     #     (`handle_window_s`) so nothing here is a silent bound.
+    #
+    # EVERY UNIT LEAVES RAM FOR THE DISK ARCHIVE, NEVER FOR NOWHERE
+    # (scratch_evict). It is copied and verified, its index row is written,
+    # and only then does the RAM copy go. A copy costs I/O exactly when memory
+    # is short, so the pass copies a bounded number of bytes, biggest-by-
+    # inodes first (a pressured seat's units, already ranked by bytes, lead),
+    # and a unit that cannot be archived STAYS IN RAM and is said: there is
+    # no delete fallback, and the pass never prunes the archive to make room
+    # (an archive under its free floor, or on a RAM mount, keeps every unit
+    # in RAM and the summary says so first).
     both = ([("reaped", v) for v in rep["victims"]] +
             [("tier2_reaped", v) for v in rep["tier2"]])
+    both.sort(key=lambda row: (row[1].get("pressure") is None,
+                               0 if row[1].get("pressure")
+                               else -row[1]["files"]))
     handles = _fresh_handles(rep, proc_dir) if both else None
+    root = rep["archive"] = scratch_evict.archive_root()
+    copied = Reading("per-pass eviction copy", cap=scratch_evict.pass_bytes())
     try:
         for counter, v in both:
             projscope.spend_or_raise("deleting scratch victim")
@@ -2731,14 +2762,67 @@ def gc(apply=False, now=None, specs=None, proc_dir=None, ttl=None, rows=None,
                 handles = _fresh_handles(rep, proc_dir)
             age = time.time() - handles["at"]
             rep["handle_window_s"] = max(rep["handle_window_s"], round(age, 3))
-            stop = _recheck_victim(v, now, handles, proc_dir,
-                                   tier2=counter == "tier2_reaped")
+            tier2 = counter == "tier2_reaped"
+            stop = _recheck_victim(v, now, handles, proc_dir, tier2=tier2)
             if stop:
                 v["skipped"] = stop
                 rep["errors"].append((v["path"], stop))
                 continue
+            # ONLY A COPY SPENDS THE ALLOWANCE. A unit on the archive's own
+            # filesystem is one rename and costs no copy, so a spent cap
+            # defers only the units archive() would have to copy.
+            no_copy = copied.why("what this pass could copy past it") + \
+                "; it goes on the next pass" if copied.spent_out() else None
+            session = os.path.basename(v["tree"].rstrip("/")) if tier2 \
+                else v["tag"]
+            got = scratch_evict.archive(v["path"], session, root,
+                                        no_copy=no_copy)
+            if not got["why"] and not got["moved"]:
+                # THE COPY TOOK TIME, so the gates are taken again before the
+                # RAM copy goes: an agent may have opened or entered it.
+                if handles["fresh"].spent_out():
+                    handles = _fresh_handles(rep, proc_dir)
+                late = _recheck_victim(v, now, handles, proc_dir, tier2=tier2)
+                if late:
+                    scratch_evict.discard(got["archive_path"])
+                    got["why"] = late + " (during its copy to the archive)"
+            if got.get("blocked") and not rep["archive_blocked"]:
+                rep["archive_blocked"] = got["why"]
+            if got["why"]:
+                v["skipped"] = "KEPT in RAM: " + got["why"]
+                rep["evict_kept"].append((v["path"], v["skipped"]))
+                continue
+            if not got["moved"]:
+                copied.take(got["bytes"])
+            why = ("%s of a live session, untouched %s (ttl %s)%s"
+                   % (v.get("kind") or "dir", _dur(v["age"]), _dur(v["ttl"]),
+                      "; seat memory pressure on %s" % v["pressure"]
+                      if v.get("pressure") else "")) if tier2 else \
+                ("dead session, untouched past ttl %s, %s%% pressure (%s)"
+                 % (_dur(v["ttl"]), rep["pressure"], rep["level"]))
             try:
-                if v.get("kind") == "file":
+                scratch_evict.record(root, {
+                    "event": "evicted", "path": v["path"], "session": session,
+                    "tier": 2 if tier2 else 1, "reason": why,
+                    "bytes": got["bytes"], "files": got["files"],
+                    "dirs": got["dirs"], "special": got["special"],
+                    "moved": got["moved"],
+                    "archive_path": got["archive_path"]})
+            except OSError as exc:
+                # NO ROW, NO EVICTION: a unit nobody can find again is a unit
+                # lost, whatever the archive holds.
+                if not got["moved"]:
+                    scratch_evict.discard(got["archive_path"])
+                v["skipped"] = ("KEPT in RAM: the archive index could not be "
+                                "written (%s)" % exc)
+                rep["evict_kept"].append((v["path"], v["skipped"]))
+                continue
+            v["archive"], v["bytes"] = got["archive_path"], got["bytes"]
+            try:
+                if got["moved"]:
+                    scratch_evict.move(v["path"], got["archive_path"])
+                    removed[0] += 1
+                elif v.get("kind") == "file":
                     os.unlink(v["path"])  # never follows a link
                     removed[0] += 1
                 elif projscope.deadline() is None:
@@ -2746,6 +2830,7 @@ def gc(apply=False, now=None, specs=None, proc_dir=None, ttl=None, rows=None,
                 else:
                     _remove_tree(v["path"], removed)
                 rep[counter] += 1
+                rep["evicted_bytes"] += got["bytes"]
                 v["done"] = True
                 # EACH TIER COUNTS ITS OWN FILES. One accumulator rendered
                 # inside the tier-one sentence made the audit line say
@@ -2759,13 +2844,23 @@ def gc(apply=False, now=None, specs=None, proc_dir=None, ttl=None, rows=None,
                 rep["errors"].append((v["path"], str(exc)))
                 if removed[0] != before:
                     v["partial"] = removed[0] - before
+                try:
+                    scratch_evict.record(root, {
+                        "event": "remove_failed", "path": v["path"],
+                        "archive_path": got["archive_path"],
+                        "reason": str(exc), "partial": removed[0] - before})
+                except OSError as late:
+                    rep["errors"].append((v["path"], "its remove_failed index "
+                                          "row could not be written (%s)"
+                                          % late))
     except projscope.Expired:
-        if rep["reaped"] or rep["tier2_reaped"] or removed[0]:
+        if rep["reaped"] or rep["tier2_reaped"] or removed[0] or \
+                rep["evict_kept"]:
             pk.event("scratch", "gc", summary(rep) +
                      ("; %d tree entries removed before expiry" % removed[0]
                       if removed[0] else ""))
         raise
-    if rep["reaped"] or rep["tier2_reaped"]:
+    if rep["reaped"] or rep["tier2_reaped"] or rep["evict_kept"]:
         pk.event("scratch", "gc", summary(rep))
     return rep
 
@@ -2832,6 +2927,7 @@ def summary(rep):
                   % (len(pressed), ", ".join(sorted({
                       os.path.basename(v["pressure"]) for v in pressed})),
                      _human(sum(v.get("bytes") or 0 for v in pressed))))
+    extra += _evict_note(rep)
     if rep.get("sampled"):
         # THE SAMPLE REACHES THE SURFACE OR IT IS NOT RECORDED. The docstring
         # promised "the report never passes it off as a full reading", and the
@@ -2895,6 +2991,40 @@ def summary(rep):
                ">=" if any(v.get("at_least") for v in rep["victims"]) else "",
                rep["files"], rep["pressure"], rep["level"],
                _dur(rep["ttl"]), len(rep["kept"]), rep["candidates"], extra))
+
+
+def _evict_note(rep):
+    """Where every unit went and what stayed in RAM and why: the owner reads
+    this line to find his work again. A blocked archive leads, because no
+    unit leaves RAM until someone cures it."""
+    out = ""
+    if rep.get("archive_blocked"):
+        out += ("; ARCHIVE BLOCKED, NOTHING MORE LEAVES RAM UNTIL IT IS CURED: "
+                "%s" % rep["archive_blocked"])
+    went = [v for v in (rep.get("victims") or []) + (rep.get("tier2") or [])
+            if v.get("done") and v.get("archive")]
+    if went:
+        listing = Reading("audited-line listing", cap=SUMMARY_LIST_CAP)
+        named, all_named = listing.head(went)
+        out += ("; each went to the disk archive first, %s (%s%s; `helm "
+                "scratch evicted` lists them, `helm scratch restore <path>` "
+                "brings one back)"
+                % (_human(sum(v.get("bytes") or 0 for v in went)),
+                   ", ".join("%s -> %s" % (v["path"], v["archive"])
+                             for v in named),
+                   "" if all_named else
+                   ", and %d more" % (len(went) - len(named))))
+    kept = rep.get("evict_kept") or []
+    if kept:
+        listing = Reading("audited-line listing", cap=SUMMARY_LIST_CAP)
+        named, all_named = listing.head(kept)
+        out += ("; %d unit%s KEPT in RAM, not archived (%s%s)"
+                % (len(kept), "s"[:len(kept) != 1],
+                   "; ".join("%s: %s" % (path, why.replace(
+                       "KEPT in RAM: ", "", 1)) for path, why in named),
+                   "" if all_named else
+                   "; and %d more" % (len(kept) - len(named))))
+    return out
 
 
 def _dur(s):
@@ -3041,8 +3171,8 @@ def _auto_pass(now, due, pressing, plane):
                            "the hourly throttle was not stamped"), None
     projscope.spend_or_raise("stamping completed scratch gc pass")
     _touch_stamp()                    # only a completed pass earns the throttle
-    return (summary(rep) if rep["reaped"] or rep["tier2_reaped"] else None,
-            rep)
+    return (summary(rep) if rep["reaped"] or rep["tier2_reaped"]
+            or rep.get("evict_kept") else None, rep)
 
 
 def _pressing(plane):
@@ -3314,6 +3444,15 @@ def _deliver(post, text, room):
     return isinstance(written, dict) and bool(written.get("id"))
 
 
+def _lead(mentions, text):
+    """`text` led by the seats it wakes. A wake line is clipped to its first
+    200 bytes (seats_common.MAX_BYTES), so mentions at the END of a long
+    alarm were cut off its reader's line, and a backup woken to act read a
+    line addressed to nobody. WHO comes first; the body that follows is WHY."""
+    named = " ".join("@" + m for m in mentions or ())
+    return "%s: %s" % (named, text) if named else text
+
+
 def _who(seat, sl):
     """How a post names the pressed seat: `@seat` when it is inert, else the
     slice's basename."""
@@ -3355,9 +3494,7 @@ def _rescue_pass(sl, r, plane, spell, now, post, kill=None, sleep=None):
         spell.pop("held", None)
         text = seatrescue.ended_line(done, sl, _who(spell.get("seat"), sl))
     pk.event("scratch", "seat-rescue", text)
-    mentions = spell.get("mentions") or []
-    _deliver(post, text + ("\n" + " ".join("@" + m for m in mentions)
-                           if mentions else ""),
+    _deliver(post, _lead(spell.get("mentions"), text),
              spell.get("room") or "main")
 
 
@@ -3398,11 +3535,10 @@ def _escalate(due, now, post, phone=None):
                 spell["escalated"] = now
         return
     for (sl, r, spell), line in zip(due, lines):
-        mentions = spell.get("mentions") or []
-        text = ("[helm scratch] still open: %s. No phone is configured "
-                "(HELM_NTFY_TOPIC or Telegram), so this alarm reaches only "
-                "this room.%s" % (line, "\n" + " ".join(
-                    "@" + m for m in mentions) if mentions else ""))
+        text = _lead(spell.get("mentions"), (
+            "[helm scratch] still open: %s. No phone is configured "
+            "(HELM_NTFY_TOPIC or Telegram), so this alarm reaches only "
+            "this room." % line))
         if _deliver(post, text, spell.get("room") or "main"):
             spell["escalated"] = now
 
@@ -3467,8 +3603,7 @@ def _wake(sl, r, plane, rep, post=None, roster=None, audience=None):
                      "pass could size, so reaping cannot relieve it — the "
                      "memory is elsewhere in the slice.")
     lines.append(seatrescue.cure_line(r, (plane.get("loads") or {}).get(sl)))
-    if mentions:
-        lines.append(" ".join("@" + m for m in mentions))
+    lines[0] = _lead(mentions, lines[0])
     if able is False:
         lines.append("No seat able to act resolved, so this goes to the "
                      "owner's phone now.")
@@ -3861,13 +3996,22 @@ def _victim_state(v, applying):
         return "FAILED (%s)" % v["error"]
     if v.get("skipped"):
         return "KEPT-LATE (%s)" % v["skipped"]
-    return "reaped" if applying else "would reap"
+    if not applying:
+        return "would evict"
+    return "evicted -> %s" % v["archive"] if v.get("archive") else "reaped"
 
 
 def _print_gc(rep, applying):
     print("helm scratch gc — dead-session scratch (%s)"
           % ("APPLYING" if applying
              else "dry-run; `helm scratch gc --apply` reaps"))
+    root = rep.get("archive") or scratch_evict.archive_root()
+    print("  archive %s — a unit leaves RAM only after its copy there "
+          "verifies (`helm scratch evicted` lists, `helm scratch restore "
+          "<path>` brings one back)" % root)
+    bad = scratch_evict.unavailable(root)
+    if bad:
+        print("  ARCHIVE UNAVAILABLE: %s; every unit stays in RAM" % bad)
     print("  pressure %d%% (%s) -> ttl %s; %d candidate%s, %d aged%s"
           % (rep["pressure"], rep["level"], _dur(rep["ttl"]),
              rep["candidates"], "s"[:rep["candidates"] != 1], rep["aged"],
@@ -4000,7 +4144,9 @@ def _print_proposal(rep, applying):
                 total_bytes += v["bytes"]
             else:
                 priced = False
-    print("  %s:" % ("REAPED" if applying else "WOULD REAP"))
+    print("  %s:" % ("EVICTED TO THE DISK ARCHIVE" if applying else
+                     "WOULD REAP (each unit is copied to the disk archive "
+                     "first)"))
     for label, picks in tiers:
         if not picks:
             continue
@@ -4050,10 +4196,13 @@ def _print_unattributable(rows, reading=None):
 
 def cmd_scratch(args):
     """scratch [small|big|durable [--name N]] | gc [--apply] | unattributable
-    [--json] | status — the mount plane. A bare `helm scratch` surveys bytes AND
+    [--json] | evicted [--session S] [--json] | restore <path> [--force] |
+    status — the mount plane. A bare `helm scratch` surveys bytes AND
     inodes and prints the routing table; a class prints the routed dir (created)
     so a caller can `cd $(helm scratch big)`; `gc` reaps dead-session scratch
-    (dry-run default) and, inside a live session, its aged unheld children;
+    (dry-run default) and, inside a live session, its aged unheld children,
+    each one copied to the disk archive and verified before its RAM copy goes;
+    `evicted` lists that archive's index and `restore` brings a unit back;
     `unattributable` lists what helm can never reap, biggest first, so the cost
     of that refusal is visible instead of silent."""
     args = list(args)
@@ -4093,6 +4242,10 @@ def cmd_scratch(args):
                       % (" ".join("@" + m for m in mentions) or "nobody",
                          room, os.path.basename(sl)))
         return 0
+    if verb == "evicted":
+        return scratch_evict.cmd_evicted(args[1:])
+    if verb == "restore":
+        return scratch_evict.cmd_restore(args[1:])
     if verb == "unattributable":
         rest = args[1:]
         if [a for a in rest if a != "--json"]:
@@ -4134,6 +4287,7 @@ def cmd_scratch(args):
         print("# %s" % why, file=sys.stderr)
         return 0
     print("usage: helm scratch [small|big|durable [--name N]] | gc [--dry | "
-          "--apply] | unattributable [--json] | status [--json]   (unknown "
+          "--apply] | evicted [--session S] [--json] | restore <path> "
+          "[--force] | unattributable [--json] | status [--json]   (unknown "
           "verb '%s')" % verb, file=sys.stderr)
     return 2

@@ -49,7 +49,7 @@ const WK_RANKS = ["P0", "P1", "P2", "P3"];
 const WK_ENTRY = {flow: {stage: "", lens: "river"}, pipeline: {stage: "pipeline"},
                   backlog: {stage: "todo", lens: "list"}};
 const WK_OMIT = {flow: [], pipeline: ["stage"], backlog: ["stage", "lens"]};
-const WK_GROUPS = [["stage", "stage"], ["move", "who has it"], ["project", "project"], ["one", "one list"]];
+const WK_GROUPS = [["stage", "stage"], ["move", "who has it"], ["project", "project"], ["story", "story"], ["one", "one list"]];
 const WK_SORTS = [["", "stage order"], ["recent", "most recent move"], ["longest", "longest in its stage"]];
 const WK_PER = 50;
 const WK_POLL_MS = 45000;
@@ -395,10 +395,12 @@ function wkHomeTile(d, ageS) {
   // LANDED NAMES ITS SCOPE (walk 3, finding 1): only the train's project's
   // lands are measured, so over every project it is "at least", said as whose
   const lm = d.counts.landed || {}, only = lm.others && wkMeasured(d).length ? "landed: " + wkMeasured(d).join(", ") + " only" : "";
+  const so = d.counts.stories_open,
+    storiesWord = (typeof so === "number" ? " · " + so + " open " + (so === 1 ? "story" : "stories") : "");
   return homeTile(n("todo") + " to do › " + n("building") + " building › " + n("review") + " in review › "
       + n("landing") + " landing › " + n("landed") + " landed",
     (b.n === "?" ? "stuck unknown" : b.n ? '<span class="dwarn">' + wkNum(b.n, b.bound, true) + " stuck</span>" : "0 stuck")
-      + " · all projects" + (only ? " · " + esc(only) : "") + (miss ? " · " + wkPlural(miss, "project") + " not read" : "")
+      + " · all projects" + storiesWord + (only ? " · " + esc(only) : "") + (miss ? " · " + wkPlural(miss, "project") + " not read" : "")
       + (stale ? " · " + stale : ""));
 }
 /* A PROJECT'S ROW on Work › projects: its to-do and under-way counts off
@@ -665,6 +667,8 @@ function wkCardHTML(c, v, lock, d, nowS) {
     + (c.asked ? '<span class="otqasked" title="you asked for this">★</span>' : "")
     + (c.paused ? '<span class="wkpause" title="paused on purpose">‖</span>' : "") + wkBackHTML(c) + "</div>"
     + '<div class="wktitle">' + esc(c.title) + "</div>"
+    + (c.story && c.story.total > 0 ? '<div class="wkstory" title="the story this is part of: done of total tasks, all depths">'
+      + esc(c.story.done + " of " + c.story.total + " done") + "</div>" : "")
     + '<div class="wkline3">' + wkTrackHTML(c) + '<span class="wkball ' + who.cls + '" title="' + esc(who.title) + '">' + esc(who.text) + "</span>"
     + '<span class="wkage" title="' + (c.stage === "landed" ? "when it landed" : "time in this stage") + '">' + esc(wkAgeWord(c, nowS, true)) + "</span></div>"
     + wkWhys(c, d, nowS).slice(0, 2).map(w => '<div class="wkwhy ' + w[0] + '">' + esc(w[1]) + "</div>").join("")
@@ -822,10 +826,13 @@ function wkListHTML(inst, d, cards, nowS) {
     return cls + head + note + (s.length ? s.slice((v.page - 1) * WK_PER, v.page * WK_PER).map(row).join("") + wkPagerHTML(v, s.length, WK_PER)
       : empty) + "</div>";
   }
-  const groups = new Map(), gkey = c => v.group === "move" ? c.move : v.group === "project" ? (c.project || "none") : c.stage;
+  const groups = new Map(), gkey = c => v.group === "move" ? c.move : v.group === "project" ? (c.project || "none")
+    : v.group === "story" ? (c.story ? c.story.root : c.stage) : c.stage;
   inStages.forEach(c => { const k = gkey(c); if (!groups.has(k)) groups.set(k, []); groups.get(k).push(c); });
   const ks = v.group === "stage" ? keys.filter(k => groups.has(k))
-    : [...groups.keys()].sort((a, b) => (b === "nobody") - (a === "nobody") || groups.get(b).length - groups.get(a).length || String(a).localeCompare(String(b)));
+    : v.group === "story"
+      ? [...groups.keys()].sort((a, b) => ((groups.get(b)[0].story || {}).root_total || 0) - ((groups.get(a)[0].story || {}).root_total || 0) || String(a).localeCompare(String(b)))
+      : [...groups.keys()].sort((a, b) => (b === "nobody") - (a === "nobody") || groups.get(b).length - groups.get(a).length || String(a).localeCompare(String(b)));
   const label = k => v.group === "stage" ? WK_STAGES[WK_SI[k]].label : v.group === "move" ? wkMoveLabel(k) : k === "none" ? "no project" : k;
   // a group's count carries its bound: a project's own, or the view's; a
   // seat's group holds no landed card ("done" does), as in the menu
@@ -835,9 +842,15 @@ function wkListHTML(inst, d, cards, nowS) {
   return cls + head + (ks.map(k => {
     const xs = groups.get(k).sort(wkSort(v.group === "stage" ? k : "", v.sort)), sel = xs.some(c => c.key === v.card);
     const shown = sel ? xs : xs.slice(0, open.has(k) ? xs.length : 5);
-    const door = v.group === "stage" ? "more" : v.group === "move" ? "movef" : "projf";
+    const door = v.group === "stage" ? "more" : v.group === "move" ? "movef" : v.group === "story" ? "storyf" : "projf";
+    // a story's head is the root's OWN roll-up — the number the story owns
+    // ("3 of 5 done") — not the group's row count, which a root's members do
+    // not share. A card with no story of its own rides its stage here.
+    const st = v.group === "story" ? (xs[0].story || {root_total: 0}) : null;
     return '<details class="blgroup" data-g="' + esc(k) + '" open><summary class="blghead">' + esc(label(k))
-      + (v.group === "stage" ? ' <span class="cfgmut">' + esc(WK_STAGES[WK_SI[k]].say) + "</span>" : ' <span class="blcnt">' + wkNum(xs.length, gb(k), false) + "</span>")
+      + (v.group === "stage" ? ' <span class="cfgmut">' + esc(WK_STAGES[WK_SI[k]].say) + "</span>"
+        : v.group === "story" && st.root_total > 0 ? ' <span class="cfgmut">' + esc(st.root_done + " of " + st.root_total + " done") + "</span>"
+        : ' <span class="blcnt">' + wkNum(xs.length, gb(k), false) + "</span>")
       + "</summary>" + shown.map(row).join("")
       + (xs.length > shown.length ? '<button type="button" class="chip blgmore" data-' + door + '="' + esc(k) + '">all ' + blN(xs.length) + " "
         + esc(v.group === "stage" ? label(k).toLowerCase() : "here") + " →</button>" : "") + "</details>";
@@ -911,6 +924,9 @@ function wkDrawerHTML(inst, d, c, nowS) {
     + (others.length ? '<div class="wkfacts">Also owed on this work: ' + others.map(o => "<b>" + esc(o.stage) + "</b> · " + esc(o.who.text)
       + (o.lane ? " (" + esc(o.lane) + ")" : "")).join("; ") + "</div>" : "")
     + ((c.lanes || []).length ? '<div class="wkfacts">Work room' + (c.lanes.length > 1 ? "s" : "") + ": " + c.lanes.map(x => "<b>" + esc(x) + "</b>").join(", ") + "</div>" : "")
+    + (c.story && c.story.total > 0 ? '<div class="wkfacts"><b>' + esc(c.story.done + " of " + c.story.total + " done") + '</b>'
+      + (c.story.children || []).map(ch => '<div class="wkchild"><span class="wkcheck' + (ch.status === "closed" ? " on" : "") + '">' + (ch.status === "closed" ? "✓" : "·") + "</span> "
+        + '<span class="wkchildid">' + esc(ch.id) + '</span> ' + esc(ch.title) + (ch.status === "closed" ? "" : " · " + esc(ch.status.replace("_", " "))) + "</div>").join("") + "</div>" : "")
     + (link ? '<div class="wkprov">' + esc(link) + "</div>" : "")
     + (c.task ? '<details class="otqnotes wknotes" data-id="' + esc(c.task) + '"><summary>the task’s note and comments</summary>'
       + '<div class="otqnotebody">…</div></details><div class="odqacts"><input class="odqcomment wkcomment" data-id="' + esc(c.task)
@@ -1435,7 +1451,7 @@ document.addEventListener("click", ev => {
   document.querySelectorAll(".wk .blmenu[open]").forEach(m => { if (!m.contains(t)) m.open = false; });
   const root = t.closest && t.closest(".wk[data-wk]"), inst = root && WK[root.dataset.wk];
   if (!inst) return;
-  const hit = t.closest("[data-stage],[data-lens],[data-chip],[data-clear],[data-more],[data-movef],[data-projf],[data-page],[data-card],[data-close],[data-expand],[data-today],.blopt,.wksay");
+  const hit = t.closest("[data-stage],[data-lens],[data-chip],[data-clear],[data-more],[data-movef],[data-projf],[data-storyf],[data-page],[data-card],[data-close],[data-expand],[data-today],.blopt,.wksay");
   if (!hit || (hit.dataset.card && t.closest(".wkdrawer"))) return;
   if (hit.matches(".wksay")) { wkComment(hit); return; }
   if (hit.matches(".blopt")) {
@@ -1458,6 +1474,7 @@ document.addEventListener("click", ev => {
   if (hit.dataset.page) { if (!hit.disabled) wkSet(inst, {page: Number(hit.dataset.page)}); return; }
   if (hit.dataset.movef) { wkSet(inst, {move: hit.dataset.movef}); return; }
   if (hit.dataset.projf) { if (inst.lock.project) { inst.open = inst.open.concat([hit.dataset.projf]); wkPaint(inst); } else wkSet(inst, {project: hit.dataset.projf}); return; }
+  if (hit.dataset.storyf) { inst.open = inst.open.concat([hit.dataset.storyf]); wkPaint(inst); return; }
   if (hit.dataset.clear) {
     const f = hit.dataset.clear, d = wkDefault();
     wkSet(inst, f === "all" ? Object.assign(d, {lens: inst.view.lens, project: inst.view.project, group: inst.view.group})

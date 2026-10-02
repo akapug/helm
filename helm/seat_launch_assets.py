@@ -212,7 +212,7 @@ def _frontmatter_models_yaml(upstream):
 
 
 def _provider_block_yaml(provider, base_url, key_rows, upstream, alias,
-                         frontmatter=True):
+                         frontmatter=True, session_header=None):
     """One openai-compatibility provider block, credential entries and all.
 
     EXTRACTED SO A FAMILY MAY HAVE MORE THAN ONE OF THEM. A per-model family
@@ -227,9 +227,15 @@ def _provider_block_yaml(provider, base_url, key_rows, upstream, alias,
     five credentials in front of `claude-opus-5` and pools them — which is the
     shared-cooldown failure the per-model split exists to end, re-created one
     alias over.
+
+    `session_header` names a header the provider needs on every request with a
+    per-conversation value (OpenCode Go: GO_SESSION_HEADER). The block then
+    carries `session-header`, and the proxy fork stamps the value; absent, the
+    block is byte-identical to the one written before the field existed.
     """
     return ("  - name: %s\n"
             "    base-url: %s\n"
+            "%s"
             "    api-key-entries:\n"
             "%s"
             "    models:\n"
@@ -237,14 +243,16 @@ def _provider_block_yaml(provider, base_url, key_rows, upstream, alias,
             "        alias: %s\n"
             # built-in subagent frontmatter ids -> this provider's model,
             # beside the family's own row (task/1952 — measured 502s on kimi)
-            "%s" % (_yaml_quote(provider), _yaml_quote(base_url), key_rows,
+            "%s" % (_yaml_quote(provider), _yaml_quote(base_url),
+                    "    session-header: %s\n" % _yaml_quote(session_header)
+                    if session_header else "", key_rows,
                     _yaml_quote(upstream), _yaml_quote(alias),
                     _frontmatter_models_yaml(upstream) if frontmatter else ""))
 
 
 def _config_yaml_key(port, token, provider, base_url, model, api_key,
                      upstream=None, api_keys=None, frontmatter=True,
-                     providers=None):
+                     providers=None, session_header=None):
     """The proxy-key config: same inbound head (the per-seat token claude
     presents), no auth-dir (no OAuth cred), plus the openai-compatibility
     provider block carrying the outbound API key (0600 via _write_private —
@@ -267,10 +275,12 @@ def _config_yaml_key(port, token, provider, base_url, model, api_key,
     body = "".join(
         _provider_block_yaml(row["provider"], row["base_url"], key_rows,
                              row["upstream"], row["alias"],
-                             row.get("frontmatter", True))
+                             row.get("frontmatter", True),
+                             row.get("session_header"))
         for row in providers) if providers else \
         _provider_block_yaml(provider, base_url, key_rows,
-                             upstream or model, model, frontmatter)
+                             upstream or model, model, frontmatter,
+                             session_header)
     return ('host: "127.0.0.1"\n'
             "port: %d\n"
             "api-keys:\n"
@@ -686,7 +696,7 @@ def _eligible_providers(block, family, fam):
     rather than invent a provider.
     """
     from .seat_catalog import family_block_alias, family_default_provider, \
-        proxy_routes, unconfigured_endpoint
+        provider_session_header, proxy_routes, unconfigured_endpoint
     _prefix, items = _provider_sections(block)
     candidates = []
     unreadable = None
@@ -788,6 +798,9 @@ def _eligible_providers(block, family, fam):
         selected["alias"] = expected_alias
         selected["frontmatter"] = default_block is None \
             or info["provider"] == default_block
+        # the per-conversation header is the catalog row's, like the rung
+        selected["session_header"] = provider_session_header(
+            family, info["provider"])
         # THE INDEX IS THE IDENTITY. A name identifies a KIND of provider, and
         # a config may carry two blocks sharing one name with different
         # endpoints and different credentials; it may also carry a retained
@@ -1377,7 +1390,54 @@ def vendor_model_listing(fam, timeout=VENDOR_LISTING_TIMEOUT):
             if isinstance(row, dict) and isinstance(row.get("id"), str)}
 
 
-def family_start_refusal(family, fam, config_text, listing=_UNPROBED):
+#: The fork's struct tag for a provider's session-header. A binary without it
+#: parses the key as unknown YAML and drops it, so no session is sent and
+#: OpenCode Go refuses every request (HTTP 400 MissingSessionID).
+SESSION_HEADER_TAG = b'yaml:"session-header'
+_SESSION_HEADER_LINE = re.compile(r"^    session-header:", re.M)
+
+
+def _binary_carries(path, needle, chunk=1 << 22):
+    """True when the file at `path` holds `needle`; None when it cannot be
+    read. Chunked with an overlap, so a needle across a boundary is found."""
+    try:
+        with open(path, "rb") as f:
+            tail = b""
+            while True:
+                block = f.read(chunk)
+                if not block:
+                    return False
+                if needle in tail + block:
+                    return True
+                tail = block[-(len(needle) - 1):]
+    except (OSError, TypeError):
+        return None
+
+
+def session_header_refusal(config_text, binary=None):
+    """Why the proxy binary cannot serve a config that asks for a
+    per-conversation session-header, else None. A config that asks for none
+    needs nothing of the binary."""
+    if not _SESSION_HEADER_LINE.search(config_text or ""):
+        return None
+    if binary is None:
+        from . import seat        # THROUGH THE SEAT FACADE, as buildskew reads it
+        binary = seat._proxy_bin()
+    carries = _binary_carries(binary, SESSION_HEADER_TAG) if binary else None
+    if carries:
+        return None
+    return ("this config asks the proxy for a per-conversation session-header, "
+            "and the cli-proxy-api at %s %s: every OpenCode Go request would be "
+            "refused 400 MissingSessionID. Install a fork build carrying "
+            "session-header (CLIProxyAPI lane/opencode-go-session-3824 or "
+            "later) and retry"
+            % (binary or "(not found)",
+               "predates that field" if carries is False
+               else "could not be read"))
+
+
+def family_start_refusal(family, fam, config_text, listing=_UNPROBED,
+                         binary=None):
     """Why this family must not be started, plus what to announce — as
     ``(refusal_or_None, notes)``.
 
@@ -1400,6 +1460,9 @@ def family_start_refusal(family, fam, config_text, listing=_UNPROBED):
     from .seat_catalog import zero_cost_refusal
     if fam.get("activation_refusal"):
         return fam["activation_refusal"], ()
+    session = session_header_refusal(config_text, binary)
+    if session:
+        return "%s: %s" % (family, session), ()
     if not fam.get("model_providers"):
         return None, ()
     _prefix, blocks = _top_blocks(config_text)
@@ -1479,7 +1542,8 @@ def proxy_config_plan(path, family, seat=None):
                 info.get("alias") or fam["model"],
                 info["api_keys"][0], info["upstream"],
                 api_keys=info["api_keys"],
-                frontmatter=info.get("frontmatter", True))
+                frontmatter=info.get("frontmatter", True),
+                session_header=info.get("session_header"))
             merged = _merge_generated(
                 merged, generated, mode, provider=info["provider"],
                 channel=fam.get("auth_type"),
@@ -1685,7 +1749,7 @@ def _launch_identity(seat):
 
 
 def launch_line(family, model=None, room=None, seat=None, room_source=None,
-                multi=False, identity=None):
+                multi=False, identity=None, recipe=None):
     """The exact seat launch command. env -u ANTHROPIC_API_KEY is part of the
     line: an inherited key must never ride into a proxied seat either. The
     child-stamp trio (CHILD_STAMP_VARS) is unset right beside it: a spawning
@@ -1723,7 +1787,13 @@ def launch_line(family, model=None, room=None, seat=None, room_source=None,
     DROP CLAUDE_CODE_SUBAGENT_MODEL entirely — that env var blunt-pins EVERY
     subagent to one model, overriding the per-agent `model:` frontmatter that
     IS the mixed-fleet mechanism; the probe agents minted beside this line
-    carry the per-model pins instead."""
+    carry the per-model pins instead.
+
+    `recipe` is an EXACT RESUME (task/3695, helm/seat_recipe.py): the model,
+    subagent pin, window, denied tools and appended system prompt the seat
+    RAN with, each outranking what the catalog says today, so a parked seat
+    comes back on its own launch rather than on a newer default. Every key
+    it does not carry is today's, as before."""
     from .seat_catalog import (denied_tools, feedback_env_words,
                                instance_launch_model, launch_window,
                                workflow_cap_env_words)
@@ -1736,7 +1806,8 @@ def launch_line(family, model=None, room=None, seat=None, room_source=None,
     # instance with no row) mints the same line as before. An explicit `model`
     # — the operator's `--model`, or the persisted choice seat.py re-derives —
     # still outranks the declaration for this pane.
-    model = model or instance_launch_model(fam, seat)
+    recipe = recipe or {}
+    model = recipe.get("model") or model or instance_launch_model(fam, seat)
     identity = identity or seat
     port = _launch_endpoint(family, seat)   # never None into `127.0.0.1:%d`
     # The eval-arm seam (§C pilot FINDING 5): CLAUDE_CONFIG_DIR is emitted as
@@ -1803,7 +1874,7 @@ def launch_line(family, model=None, room=None, seat=None, room_source=None,
     # task/2944), through the one helper the autocompact gauge reads too.
     # launch_window is that reading, shared with the lite profile's
     # settings.json pin (seat_catalog.profile_env).
-    _ctx = launch_window(fam, model)
+    _ctx = recipe["window"] if "window" in recipe else launch_window(fam, model)
     if _ctx:
         ctxenv += " CLAUDE_CODE_MAX_CONTEXT_TOKENS=%d" % _ctx
         ctxenv += " CLAUDE_CODE_AUTO_COMPACT_WINDOW=%d" % _ctx
@@ -1855,10 +1926,17 @@ def launch_line(family, model=None, room=None, seat=None, room_source=None,
     # positional prompt still arrives after a COMPLETE option pair.
     # Empty for every family that declares none, so every other launch line in
     # this tree stays byte-identical.
-    sysline = fam.get("system_line")
+    sysline = (recipe["append_system_prompt"] if "append_system_prompt" in recipe
+               else fam.get("system_line"))
     sysline = (" --append-system-prompt %s" % shlex.quote(sysline)) if sysline else ""
     # --multi: no pin (frontmatter routes per-subagent); default: today's line.
-    pin = "" if multi else " CLAUDE_CODE_SUBAGENT_MODEL=%s" % model
+    pin = "" if multi else " CLAUDE_CODE_SUBAGENT_MODEL=%s" % (
+        recipe.get("subagent") or model)
+    denied = (recipe["disallowed_tools"] if "disallowed_tools" in recipe
+              else denied_tools(family))
+    # a flag with no words would swallow the next option, so none rides at all
+    deny = (" --disallowedTools %s" % " ".join(shlex.quote(t) for t in denied)
+            if denied else "")
     # NO-keys-in-argv (a second read): the bearer is NEVER a NAME=value arg
     # to the EXTERNAL `env` binary — `env TOKEN=$(cat f)` would put the
     # resolved secret in env's OWN argv (/proc/pid/cmdline). Instead the token
@@ -1894,16 +1972,14 @@ def launch_line(family, model=None, room=None, seat=None, room_source=None,
             " HELM_CELL_BIN=%s"
             " HELM_CELL_PROFILE=%s"
             " DREGG_PROFILE=%s%s"
-            " claude --disallowedTools %s"
+            " claude%s"
             " --dangerously-skip-permissions --model %s%s"
             % (child_stamp_unsets(),
                port,
                pin, cfgdir, shlex.quote(identity), shlex.quote(seat), homing,
                shlex.quote(family), shlex.quote(DREGG_SIGNER_DEFAULT),
                shlex.quote(identity),
-               shlex.quote(identity), ctxenv,
-               " ".join(shlex.quote(t) for t in denied_tools(family)),
-               model, sysline))
+               shlex.quote(identity), ctxenv, deny, model, sysline))
 
 
 def _seat_token(family, d):
@@ -2233,7 +2309,88 @@ def _deny_record(value):
     return None, "not a list of strings (%s)" % type(value).__name__
 
 
-def _seed_seat_settings(cdir, family=None, workdir=None, model=None):
+def _seed_recorded_denies(s, tools, retire=(), family=None, path=None):
+    """Append each of `tools` to the parsed settings `s`'s permissions.deny
+    and keep helm's two records under the `helm` key true (seat_catalog
+    RETIRED_SPAWN_DENIES states the three legs): every entry helm appends is
+    named in helm.seeded_denies, helm.operator_denies is re-applied and never
+    edited, and a `retire` name leaves only when helm's own record names it.
+    -> True when it changed `s`.
+
+    ONE WRITER OF A RECORDED DENY, wherever helm writes one: a seat's config
+    dir (_seed_seat_settings) and a lead's lean profile (_apply_lead_lean,
+    which homes.py also runs on every native claude home), so a deny helm
+    wrote anywhere is one its record names and `helm seat retire-deny` can
+    find. `family` and `path` only name the file in the unrecorded-retire
+    line."""
+    from .seat_catalog import (OPERATOR_RECORD_DENIES, SEED_RECORD_DENIES,
+                               SEED_RECORD_KEY)
+    changed = False
+    perms = s.get("permissions")
+    if not isinstance(perms, dict):
+        perms = s["permissions"] = {}
+        changed = True
+    deny = perms.get("deny")
+    if not isinstance(deny, list):
+        deny = perms["deny"] = []
+        changed = True
+    # THE TWO RECORDS under the key helm owns (seat_catalog
+    # RETIRED_SPAWN_DENIES): what helm wrote here, and what the operator asks
+    # helm to keep. Either is None when absent or not a list.
+    rec = s.get(SEED_RECORD_KEY)
+    rec = rec if isinstance(rec, dict) else {}
+    # ONE VALIDATOR for both keys, here and in the retire-deny verb: a
+    # record is a list of strings or it is nothing. The seeder REWRITES a
+    # malformed helm record (it is helm's own) and does not honour a
+    # malformed operator one (it names nothing), so neither can remove.
+    record, _why = _deny_record(rec.get(SEED_RECORD_DENIES))
+    operator, _why = _deny_record(rec.get(OPERATOR_RECORD_DENIES))
+    operator = operator or []
+    seeded = list(record or [])
+    for tool in tools:
+        if tool not in deny:
+            deny.append(tool)
+            changed = True   # only an actual append dirties the file
+            if tool not in seeded:
+                seeded.append(tool)
+    # THE OPERATOR'S RECORD IS ALWAYS RE-APPLIED and never edited: an entry
+    # it names is in the deny list after every refresh, whatever else moves.
+    for tool in operator:
+        if tool not in deny:
+            deny.append(tool)
+            changed = True
+    # A RETIRED NAME LEAVES BY ONE OF THREE LEGS, and only a record decides:
+    # the operator recorded it (kept, re-applied above); helm recorded it
+    # (retired, record updated); nobody recorded it (LEFT, and said so —
+    # `helm seat retire-deny` is the deliberate door). Neither the list's
+    # shape nor the file's location is read as proof of who wrote it.
+    for tool in retire:
+        if tool not in deny or tool in operator:
+            continue
+        if tool in seeded:
+            deny[:] = [t for t in deny if t != tool]
+            seeded.remove(tool)
+            changed = True
+        else:
+            print("helm seat: %s keeps the unrecorded deny %r in %s — no %s.%s "
+                  "record names it, so a refresh never removes it; `helm seat "
+                  "retire-deny %s` lists it and `--apply` retires it "
+                  "deliberately, or record it under %s.%s to keep it"
+                  % (family, tool, path, SEED_RECORD_KEY, SEED_RECORD_DENIES, tool,
+                     SEED_RECORD_KEY, OPERATOR_RECORD_DENIES), file=sys.stderr)
+    # THE RECORD NEVER NAMES AN ENTRY THE LIST DOES NOT CARRY: a name the
+    # operator removed by hand, or a retirement removed, leaves the record.
+    seeded = [t for t in seeded if t in deny]
+    if record != seeded:
+        if not isinstance(s.get(SEED_RECORD_KEY), dict):
+            s[SEED_RECORD_KEY] = rec
+        s[SEED_RECORD_KEY][SEED_RECORD_DENIES] = seeded
+        changed = True
+    return changed
+
+
+def _seed_seat_settings(cdir, family=None, workdir=None, model=None,
+                        window=None, role=None):
     """CC 2.1.216 records bypass-permissions acceptance in settings.json
     (skipDangerousModePermissionPrompt), NOT .claude.json — so a launched
     --dangerously-skip-permissions seat stalls at the bypass warning without it
@@ -2254,7 +2411,8 @@ def _seed_seat_settings(cdir, family=None, workdir=None, model=None):
     A family with a launch profile (seat_catalog PROFILES) also gets that
     profile's env pins and claudeMdExcludes here (_seed_profile): `model` is
     the model the launch line stamps, and `workdir` the cwd the pane will run
-    in, when the caller knows it."""
+    in, when the caller knows it. `window` is an exact resume's (the recipe
+    it ran with): the pin names it, since a pin outranks the launch stamp."""
     from . import pk
     from .seat_catalog import FEEDBACK_DRAFTS_SETTING
     p = os.path.join(cdir, "settings.json")
@@ -2269,78 +2427,20 @@ def _seed_seat_settings(cdir, family=None, workdir=None, model=None):
         if s.get(k) != v:
             s[k] = v
             changed = True
-    perms = s.get("permissions")
-    if not isinstance(perms, dict):
-        perms = s["permissions"] = {}
-        changed = True
-    deny = perms.get("deny")
-    if not isinstance(deny, list):
-        deny = perms["deny"] = []
-        changed = True
     # THE SCHEMA-UNSAFE SET RIDES THE SAME DENY (task/1941): on a proxy family
     # the Artifact tool's \p{} pattern 400s the whole tool list at OpenAI, and
     # this surface is what a resume or an orca relaunch inherits, so denying it
     # only on the launch line would come back on the first restart. The spawn
     # deny (task/2287 Skill + Agent(fork)) rides here for the same reason, and
     # reaches a minted subagent definition through _frontmatter_deny_yaml.
-    from .seat_catalog import (OPERATOR_RECORD_DENIES, SEED_RECORD_DENIES,
-                               SEED_RECORD_KEY, denied_tools, retired_denies,
-                               workflow_cap_env)
-    # THE TWO RECORDS under the key helm owns (seat_catalog
-    # RETIRED_SPAWN_DENIES): what helm wrote here, and what the operator asks
-    # helm to keep. Either is None when absent or not a list.
-    rec = s.get(SEED_RECORD_KEY)
-    rec = rec if isinstance(rec, dict) else {}
-    # ONE VALIDATOR for both keys, here and in the retire-deny verb: a
-    # record is a list of strings or it is nothing. The seeder REWRITES a
-    # malformed helm record (it is helm's own) and does not honour a
-    # malformed operator one (it names nothing), so neither can remove.
-    record, _why = _deny_record(rec.get(SEED_RECORD_DENIES))
-    operator, _why = _deny_record(rec.get(OPERATOR_RECORD_DENIES))
-    operator = operator or []
     # denied_tools(None) is plan entry alone, so the native door reads the
     # same one door as every family: this module binds no deny name of its
     # own, and a name resolved only through the facade's shared globals is
     # unbound when the implementation is called directly.
-    seeded = list(record or [])
-    for tool in denied_tools(family):
-        if tool not in deny:
-            deny.append(tool)
-            changed = True   # only an actual append dirties the file
-            if tool not in seeded:
-                seeded.append(tool)
-    # THE OPERATOR'S RECORD IS ALWAYS RE-APPLIED and never edited: an entry
-    # it names is in the deny list after every refresh, whatever else moves.
-    for tool in operator:
-        if tool not in deny:
-            deny.append(tool)
-            changed = True
-    # A RETIRED NAME LEAVES BY ONE OF THREE LEGS, and only a record decides:
-    # the operator recorded it (kept, re-applied above); helm recorded it
-    # (retired, record updated); nobody recorded it (LEFT, and said so —
-    # `helm seat retire-deny` is the deliberate door). Neither the list's
-    # shape nor the file's location is read as proof of who wrote it.
-    for tool in retired_denies(family) if family else ():
-        if tool not in deny or tool in operator:
-            continue
-        if tool in seeded:
-            deny[:] = [t for t in deny if t != tool]
-            seeded.remove(tool)
-            changed = True
-        else:
-            print("helm seat: %s keeps the unrecorded deny %r in %s — no %s.%s "
-                  "record names it, so a refresh never removes it; `helm seat "
-                  "retire-deny %s` lists it and `--apply` retires it "
-                  "deliberately, or record it under %s.%s to keep it"
-                  % (family, tool, p, SEED_RECORD_KEY, SEED_RECORD_DENIES, tool,
-                     SEED_RECORD_KEY, OPERATOR_RECORD_DENIES), file=sys.stderr)
-    # THE RECORD NEVER NAMES AN ENTRY THE LIST DOES NOT CARRY: a name the
-    # operator removed by hand, or a retirement removed, leaves the record.
-    seeded = [t for t in seeded if t in deny]
-    if record != seeded:
-        if not isinstance(s.get(SEED_RECORD_KEY), dict):
-            s[SEED_RECORD_KEY] = rec
-        s[SEED_RECORD_KEY][SEED_RECORD_DENIES] = seeded
+    from .seat_catalog import denied_tools, retired_denies, workflow_cap_env
+    if _seed_recorded_denies(s, denied_tools(family),
+                             retired_denies(family) if family else (),
+                             family=family, path=p):
         changed = True
     # THE WORKFLOW CAP RIDES THE SETTINGS `env` MAP (task/2559) for the deny
     # set's reason: the launch line carries the same variable, and this file
@@ -2359,7 +2459,10 @@ def _seed_seat_settings(cdir, family=None, workdir=None, model=None):
         if env.get(k) != v:
             env[k] = v
             changed = True
-    if family and _seed_profile(s, family, model=model, workdir=workdir):
+    if family and _seed_profile(s, family, model=model, workdir=workdir,
+                                window=window):
+        changed = True
+    if _seed_lead_lean(s, role=role):
         changed = True
     if not changed:
         return
@@ -2372,7 +2475,74 @@ def _seed_seat_settings(cdir, family=None, workdir=None, model=None):
               "helm feedback into Claude Code's own queue" % (p, e), file=sys.stderr)
 
 
-def _seed_profile(s, family, model=None, workdir=None):
+def _seed_lead_lean(s, role=None):
+    """The LEAD-LEAN half of _seed_seat_settings (task/4056): the profile on
+    a seat whose spawn register says lead, nothing (False) for anyone else, so
+    a worker's file stays byte-identical. _apply_lead_lean says what it
+    writes."""
+    return role == "lead" and _apply_lead_lean(s)
+
+
+def _apply_lead_lean(s):
+    """Write the lead-lean profile into the parsed settings `s`; True when it
+    changed `s`. ONE APPLIER for every place a lead's settings live: a seat
+    config dir whose register says lead (_seed_lead_lean) and every native
+    claude home (homes.py, the "lead lean" benefit), which is where the
+    fleet's Claude leads actually run — none of them is a spawned seat with a
+    register, so a role-keyed path alone reached no live lead.
+
+    WHAT IT WRITES, and each is a measured part of a lead's fixed floor
+    (seat_catalog.lead_lean_settings is the one table):
+      deniedMcpServers        servers a lead calls 0-1 times in a lifetime
+      skillListingBudgetFraction  the skill list is re-sent every request
+      enabledPlugins          plugin-dev, which a lead is not doing
+      permissions.deny        the Artifact trio, the owner's ruling
+                              (seat_catalog.LEAD_DENIED_TOOLS), through the
+                              one recorded-deny writer, so helm.seeded_denies
+                              names it and helm.operator_denies is honoured.
+
+    ADDITIVE ONLY, the homes.BENEFITS contract: this runs on every native
+    home at every `helm launch`, the owner's own default home included, so a
+    value the file already holds is never replaced. Each key is written only
+    where the home holds nothing for it:
+      skillListingBudgetFraction  only when the key is absent;
+      enabledPlugins          merged into the map, and the plugin entry only
+                              when the map lacks it (an operator's true stays);
+      deniedMcpServers        merged by serverName: a name the list lacks is
+                              appended, an existing entry is never removed or
+                              replaced.
+    A key whose value is not the shape the profile writes into (a map, a
+    list) is the operator's and is left as it is. Only the recorded deny
+    re-applies a trio entry removed by hand, because that entry IS the
+    owner's ruling. A home that already holds every key is a pure read."""
+    from .seat_catalog import LEAD_DENIED_TOOLS, lead_lean_settings
+    changed = False
+    for key, value in lead_lean_settings():
+        if key not in s:
+            s[key] = value  # lead_lean_settings builds a fresh value per call
+            changed = True
+            continue
+        cur = s[key]
+        if key == "enabledPlugins" and isinstance(cur, dict):
+            for name, off in value.items():
+                if name not in cur:
+                    cur[name] = off
+                    changed = True
+        elif key == "deniedMcpServers" and isinstance(cur, list):
+            # a name CC would honour is a string; any other serverName (CC
+            # ignores that entry) is kept but cannot be hashed into the set
+            held = {e["serverName"] for e in cur if isinstance(e, dict)
+                    and isinstance(e.get("serverName"), str)}
+            for entry in value:
+                if entry["serverName"] not in held:
+                    cur.append(dict(entry))
+                    changed = True
+    if _seed_recorded_denies(s, LEAD_DENIED_TOOLS):
+        changed = True
+    return changed
+
+
+def _seed_profile(s, family, model=None, workdir=None, window=None):
     """The launch profile's half of _seed_seat_settings (task/3253,
     seat_catalog PROFILES): True when it changed the parsed settings `s`.
     Nothing at all for a family whose profile pins no env and excludes no
@@ -2408,7 +2578,7 @@ def _seed_profile(s, family, model=None, workdir=None):
         rec = s[SEED_RECORD_KEY] = {}
         changed = True
     env = s.get("env")
-    pins = profile_env(family, model)
+    pins = profile_env(family, model, window)
     if pins and not isinstance(env, dict):
         env = s["env"] = {}
         changed = True
@@ -2652,13 +2822,15 @@ def cmd_retire_deny(rest):
     the named entry, from exactly those files, appending nothing to
     helm.seeded_denies, never touching an entry helm.operator_denies names,
     never a non-proxy seat. A tool the current table still denies is refused
-    (a refresh would re-seed it); a tool only a launch profile denies leaves
-    that profile's families out of the sweep and refuses a --seat of one.
+    (a refresh would re-seed it); a tool only a launch profile denies, and a
+    retired name a family's entry denies again, leave those families out of
+    the sweep and refuse a --seat of one.
     Exit 1 whenever a candidate could not be judged, so a fleet run never
     reports clean over a file it did not read."""
     from . import pk
     from .cli import guard_tail
-    from .seat_catalog import (PROXY_MODES, SPAWN_DENIED_TOOLS, denied_tools,
+    from .seat_catalog import (PROXY_MODES, RETIRED_SPAWN_DENIES,
+                               SPAWN_DENIED_TOOLS, denied_tools,
                                profile_denied_tools)
     rest = list(rest)
     tool = rest.pop(0) if rest and not rest[0].startswith("-") else None
@@ -2678,10 +2850,13 @@ def cmd_retire_deny(rest):
     # (task/3253): Workflow is denied again on a lite family and retirable on
     # every other proxy family, so a family whose CURRENT set carries the
     # tool is simply not a candidate (its refresh would seed it straight
-    # back), and every other deny keeps the refusal it always had.
-    if tool in SPAWN_DENIED_TOOLS or any(
+    # back), and every other deny keeps the refusal it always had. A RETIRED
+    # NAME is this verb's subject, so it scopes the sweep the same way
+    # whatever entry denies it again: cursor denies Workflow by its own
+    # context_denied_tools (task/3803), not by a profile.
+    if tool in SPAWN_DENIED_TOOLS or (tool not in RETIRED_SPAWN_DENIES and any(
             tool in denied_tools(f) and tool not in profile_denied_tools(f)
-            for f in FAMILIES):
+            for f in FAMILIES)):
         print("helm seat retire-deny: %r is in the current deny set, so a "
               "refresh would seed it straight back; retire it from "
               "seat_catalog first" % tool, file=sys.stderr)
@@ -2699,10 +2874,12 @@ def cmd_retire_deny(rest):
                   "here touches a native seat" % name, file=sys.stderr)
             return 2
         if tool in denied_tools(family):
-            print("helm seat retire-deny: %r is in %s's current deny set (its "
-                  "%s launch profile), so a refresh would seed it straight "
-                  "back" % (tool, family, FAMILIES[family].get("profile")),
-                  file=sys.stderr)
+            why = ("its %s launch profile" % FAMILIES[family].get("profile")
+                   if tool in profile_denied_tools(family)
+                   else "its catalog entry")
+            print("helm seat retire-deny: %r is in %s's current deny set "
+                  "(%s), so a refresh would seed it straight back"
+                  % (tool, family, why), file=sys.stderr)
             return 2
         rows = [(name, family, os.path.join(_instance_dir(family, name),
                                             "claude", "settings.json"))]
@@ -3033,7 +3210,7 @@ def _launch_surface_refusal(family, seat, d, fatal_shortened=True):
 
 def _write_launch_assets(family, d, room=None, seat=None, workdir=None,
                          room_source=None, multi=False, model=None,
-                         fatal_shortened=True, identity=None):
+                         fatal_shortened=True, identity=None, recipe=None):
     """The seat's isolated CLAUDE_CONFIG_DIR + the executable launch preset —
     identical for every mode, and refreshed by BOTH `add` and `launch` (a
     stale launch.sh minted before HELM_CHAT_NAME existed is why the live
@@ -3052,8 +3229,11 @@ def _write_launch_assets(family, d, room=None, seat=None, workdir=None,
     INSTANCE's assets (instances/<seat>/{claude,launch.sh}). The instance's
     PROXY assets
     (config.yaml/token) are minted separately by `_mint_instance_proxy` at
-    launch — this function stays proxy-agnostic."""
+    launch — this function stays proxy-agnostic. `recipe` is an exact
+    resume's launch (see `launch_line`); its model is the one the seat's
+    settings pin too."""
     seat = seat or family
+    model = (recipe or {}).get("model") or model
     if identity is None:
         identity, identity_error = (seat, None) if not fatal_shortened \
             else _launch_identity(seat)
@@ -3115,8 +3295,14 @@ def _write_launch_assets(family, d, room=None, seat=None, workdir=None,
     # pins name the model launch_line resolves below, and its excludes the
     # cwd the pane will run in, when this caller knows it
     from .seat_catalog import instance_launch_model
+    # A LEAD'S OWN POSTURE, off the register its spawn wrote (the same
+    # reader seat_role exposes), so the lean profile follows the seat
+    # through a resume or a relaunch and never a name-shaped guess.
+    from .seat_role import recorded_role
     _seed_seat_settings(cdir, family, workdir=workdir,
-                        model=model or instance_launch_model(FAMILIES[family], seat))
+                        model=model or instance_launch_model(FAMILIES[family], seat),
+                        window=(recipe or {}).get("window"),
+                        role=recorded_role(seat))
     _seed_seat_rules(cdir)              # feedback goes to helm rows, never CC /feedback (CLAUDE.md)
     if multi:
         _mint_probe_agents(cdir, family)   # per-model frontmatter pins ride here
@@ -3143,7 +3329,7 @@ def _write_launch_assets(family, d, room=None, seat=None, workdir=None,
                         _launch_owner(launch_line(
                             family, room=room, seat=seat, identity=identity,
                             room_source=room_source, multi=multi,
-                            model=model), cdir=cdir)))
+                            model=model, recipe=recipe), cdir=cdir)))
     # AFTER launch.sh: the MCP plan budgets servers by the window this script
     # stamps, so planning first read no stamp on a first mint and the OLD
     # stamp on a re-mint.

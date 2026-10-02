@@ -280,6 +280,7 @@ _SEQ_WRITER_ARMS = {
                          "successor race"),
     "_mark_delivered": ("delivered",),
     "record_findings_note": ("findings-note",),
+    "attach_task": ("chain-task",),
     "mark_verdict": ("verdict", "advisory-read"),
     "mark_cancel": ("cancel",),
     "mark_custody": ("custody",),
@@ -296,6 +297,7 @@ _SEQ_WRITER_ARMS = {
     "_record_close_proven": ("close",),
     "record_delivered_report_correction": ("close-correction",),
     "_record_retract": ("retract",),
+    "mark_applied": ("diff-applied",),
 }
 
 
@@ -358,6 +360,11 @@ _WRITERS = (
     ("findings-note", None,
      lambda test, rid: dispatches.record_findings_note(
          rid, test.side, dict(lr_retire._FINDINGS_NOTE_FIELDS))),
+    # THE CHAIN-TASK ATTACH (task/4000): the matrix needs no task ledger row —
+    # the vocabulary rung in `_resolve_row` fires before the task checks, and
+    # the clean twin only has to get PAST it (any other refusal is proof).
+    ("chain-task", None,
+     lambda test, rid: dispatches.attach_task(rid, "task/1")),
     ("custody", None, _custody),
     ("add --supersedes", None, lambda test, rid: _successor(test, rid, "add")),
     ("send --supersedes", None,
@@ -395,6 +402,12 @@ _WRITERS = (
                                                polarity="fix"),
      lambda test, rid: dispatches.retract(rid, "matrix probe", "unknown",
                                           "inferred")),
+    # THE AUTHOR'S UNCHANGED-CURE RECORD (task/3937): its own refusals need a
+    # verdicted MELD-DIFF FIX row, so the clean twin only has to get PAST
+    # this rung.
+    ("diff-applied", None,
+     lambda test, rid: dispatches.mark_applied(rid, test.side,
+                                               fab_receipt="matrix")),
     ("findings pass", None,
      lambda test, rid: findingspass._run_locked(rid, 1)),
     ("stale-cure redispatch", None,
@@ -416,7 +429,7 @@ class EveryWriterRefusesARowItCannotReadTest(_Base):
     NOTHING. And only that row: a clean row beside one carrying an unknown
     kind is written exactly as before."""
 
-    def test_every_seq_writer_is_in_the_matrix(self):  # noqa: VACUOUS_ASSERTION — the census must hit mark_verdict unconditionally before it is compared to a seventeen-entry map
+    def test_every_seq_writer_is_in_the_matrix(self):  # noqa: VACUOUS_ASSERTION — the census must hit mark_verdict unconditionally before it is compared to the writer map
         found = _seq_writers(ledger_sources(dispatches))
         self.assertIn("mark_verdict", found, "the census reads nothing")
         self.assertEqual(sorted(found), sorted(_SEQ_WRITER_ARMS),

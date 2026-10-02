@@ -109,6 +109,11 @@ class StopGuardRoomUnfinishedTest(SeatsBase):
         # otherwise refuse every row here as FOREIGN.
         from tests._tmphome import pin_dispatch_home
         self._real_home_repo_id = pin_dispatch_home(self, self.root)
+        from helm import tasks
+        self.review_task, why = tasks.add(
+            "check the fixture room's unfinished work", "room-fixture",
+            project="helm", force_new=True)
+        self.assertIsNone(why, why)
         self.commit("tip", self.root)
         self.head = self.rev(self.root)
         self.wt = self.root + "-wt/lane-u"
@@ -152,7 +157,8 @@ class StopGuardRoomUnfinishedTest(SeatsBase):
                 dispatch_home(target):
             row = dispatches.add(recipient, lane, ref=ref or self.head,
                                  kind="review", notify=False,
-                                 repo=target, new_work=True)
+                                 repo=target, new_work=True,
+                                 task=self.review_task["id"])
         self.assertIsNotNone(row, "plant: the real writer refused")
         dispatches._mark_delivered(row["id"], ref or self.head)
         return row

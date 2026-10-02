@@ -10,7 +10,10 @@ Two legs on one PreCompact trigger (the handoff-now card):
   (a journal entry carrying the session id, or a repo HANDOFF_NEXT_SESSION.md)
   newer than a FLOOR? Hook-wired on PreCompact + SessionEnd it NAGS in a
   few lines when unmet — a nag, never a capture: the agent authors audited
-  prose, helm never invents a summary. `recover <sid>` re-reads the span a
+  prose, helm never invents a summary. At PreCompact the nag never goes to
+  stdout, which Claude Code hands the summarizer as custom instructions: it
+  goes to the session's nag file, and the SessionStart working-set hook
+  gives it to the seat after the compaction (helm/workingset.py, task/4054). `recover <sid>` re-reads the span a
   compaction discarded by wrapping the ONE recall index (`cv show <sid>
   --pre-compaction`, architecture law 4 — record how to query, never a
   second index).
@@ -971,6 +974,26 @@ def _hollow_text(text):
     return tuple(k for k in ("done", "remaining", "next") if not s.get(k))
 
 
+#: The most chars one journal handoff may carry and still be read whole
+#: (task/4132). A shorter read classifies from a prefix: a handoff whose NEXT
+#: section starts past that prefix reads as hollow and an older entry silently
+#: wins. 4 MiB is far above any authored handoff; past it the scan says
+#: UNKNOWN, naming the file and size, never truncating silently.
+JOURNAL_READ_CAP = 4 * 1024 * 1024
+
+
+def _over_cap(path, text, size=None):
+    """The UNKNOWN reason for a snapshot read past JOURNAL_READ_CAP, or None.
+
+    Callers read JOURNAL_READ_CAP + 1 chars, so a longer snapshot proves the
+    entry did not fit: it is UNKNOWN, named with the cap and its byte size,
+    never classified from the prefix (task/4132)."""
+    if len(text) <= JOURNAL_READ_CAP:
+        return None
+    return "%s is over the %d-char handoff read cap%s — UNKNOWN, not absent" % (
+        path, JOURNAL_READ_CAP, "" if size is None else " (%d bytes)" % size)
+
+
 def hollow_checked(path, text=None):
     """((missing sections), err) — the same answer, plus whether we could LOOK.
 
@@ -989,12 +1012,17 @@ def hollow_checked(path, text=None):
     hand back (value, err) so an unreadable source cannot pass as an empty
     one. Gate dcf603c8b0bef585 — the third rung of one class, after the
     unreadable ENTRY and the unreadable SHELF."""
+    size = None
     if text is None:
         try:
             with open(path, encoding="utf-8", errors="replace") as f:
-                text = f.read(65536)
+                text = f.read(JOURNAL_READ_CAP + 1)
+                size = os.fstat(f.fileno()).st_size
         except OSError as exc:
             return (), "%s could not be read (%s)" % (path, type(exc).__name__)
+    over = _over_cap(path, text, size)
+    if over:
+        return (), over
     return _hollow_text(text), None
 
 
@@ -1117,7 +1145,7 @@ def check_checked(sid, cwd, start):
             try:
                 with f:
                     before = os.fstat(f.fileno())
-                    content = f.read(65536)
+                    content = f.read(JOURNAL_READ_CAP + 1)
                     snapshot = os.fstat(f.fileno())
                 before_stamp = _journal_stamp(before)
                 snapshot_stamp = _journal_stamp(snapshot)
@@ -1132,6 +1160,15 @@ def check_checked(sid, cwd, start):
                 by_seat = (own and not by_sid and not foreign
                            and _matches_own_seat(p, own, content))
                 if not by_sid and not by_seat:
+                    continue
+                # Type, window and owner came from the stamp and the
+                # frontmatter at the top, so a capped snapshot decides them
+                # soundly; only the SECTIONS need the whole body. An entry
+                # past the cap that is stale, foreign or not a handoff hides
+                # nothing, and must not turn every seat's check UNKNOWN.
+                over = _over_cap(p, content, snapshot.st_size)
+                if over:
+                    unread.append(over)
                     continue
                 missing, err = hollow_checked(p, content)
                 if err:
@@ -1236,7 +1273,7 @@ _USAGE = """usage: helm handoff check [--hook-json] [--session S]
        helm handoff recover <sid>"""
 
 _NOW_USAGE = """usage: helm now capture [--hook-json] [--session S]
-       helm now show"""
+       helm now show [--working-set [--session S] | --hook-json]"""
 
 
 def _opt(rest, flag):
@@ -1299,6 +1336,7 @@ def cmd_handoff(args):
                     resumeturn.note_precompact(
                         str(d.get("session_id") or ""), d.get("trigger"),
                         actors.sidechain_agent(d), tp)
+                said = []
                 captured = capture(sid, cwd)  # leg 2 rides the same trigger
                 start = _session_start(tp)
                 # A COMPACTION IS AN EVENT, and gets the event floor. SessionEnd
@@ -1314,11 +1352,11 @@ def cmd_handoff(args):
                     # in the one direction that trains an author to ignore the
                     # guard: they wrote the handoff, and the guard says they
                     # did not. Say what actually happened instead.
-                    print("helm handoff: whether a handoff exists is UNKNOWN — "
-                          "%s. This is NOT 'no handoff was written'; fix the "
-                          "read (permissions, a broken mount) and re-check, and "
-                          "do not author a second handoff on the strength of "
-                          "this line." % unread)
+                    said.append("helm handoff: whether a handoff exists is UNKNOWN — "
+                                "%s. This is NOT 'no handoff was written'; fix the "
+                                "read (permissions, a broken mount) and re-check, and "
+                                "do not author a second handoff on the strength of "
+                                "this line." % unread)
                 elif found is None:
                     # HOLLOW AND ABSENT ASK FOR DIFFERENT THINGS, and the hook
                     # path collapsed them: it only ever asked the strict
@@ -1329,11 +1367,11 @@ def cmd_handoff(args):
                     # accept. Telling an author to write a file they already
                     # wrote is how a guard trains people to ignore it.
                     if loose:
-                        print("helm handoff: %s exists but carries no %s — "
-                              "REWRITE it (helm handoff write); a handoff with "
-                              "no sections is as useful to the next window as "
-                              "none" % (os.path.basename(loose),
-                                        "/".join(missing).upper()))
+                        said.append("helm handoff: %s exists but carries no %s — "
+                                    "REWRITE it (helm handoff write); a handoff with "
+                                    "no sections is as useful to the next window as "
+                                    "none" % (os.path.basename(loose),
+                                              "/".join(missing).upper()))
                     elif str(d.get("hook_event_name") or "") == "PreCompact":
                         # THE THIRD LOOK, and the closure audit caught it on
                         # its first run — it was still calling the checked seam
@@ -1344,25 +1382,57 @@ def cmd_handoff(args):
                         # the enumeration instead of the instances.
                         stale, _sl, _sm, stale_unread = contract_state(
                             sid, cwd, start)
-                        print(_nag(sid, captured, stale=stale))
+                        said.append(_nag(sid, captured, stale=stale))
                         if stale_unread:
-                            print("helm handoff: (and the STANDING-question "
-                                  "scan could not read %s — the nag above may "
-                                  "be missing a stale artifact it would "
-                                  "otherwise name)" % stale_unread)
+                            said.append("helm handoff: (and the STANDING-question "
+                                        "scan could not read %s — the nag above may "
+                                        "be missing a stale artifact it would "
+                                        "otherwise name)" % stale_unread)
                     else:
-                        print(_nag(sid, captured))
+                        said.append(_nag(sid, captured))
+                # THE NAG'S CHANNEL (task/4054). Claude Code hands PreCompact
+                # stdout to the summarizer as custom instructions, so a nag
+                # printed there became a "next step" in 27 of 43 measured
+                # summaries. At PreCompact it goes only to the session's nag
+                # file, which the SessionStart working-set hook hands to the
+                # main thread after the compaction (helm/workingset.py).
+                # Not stderr either: at exit 0 that is the debug log, and
+                # this hook's stderr is reserved for the record lines above.
+                # A subagent's PreCompact keeps no nag: its seat lost
+                # nothing. SessionEnd keeps stdout, where no summarizer reads.
+                if said:
+                    text = "\n".join(said)
+                    if str(d.get("hook_event_name") or "") == "PreCompact":
+                        from . import actors, workingset
+                        if not actors.sidechain_agent(d):
+                            workingset.put_nag(str(d.get("session_id") or ""),
+                                               text)
+                    else:
+                        print(text)
             except Exception:
                 pass
             return 0
         sid = canonical_sid(session or home.session_id())
         from . import seats
         # deleted cwd: check runs project-less instead of tracebacking
-        # (eager-getcwd class)
-        path, loose, missing, unread = contract_state(sid, seats.safe_cwd(), None)
+        # (eager-getcwd class). ONE scan (the second-look defect is named in
+        # contract_state's docstring): the hollow candidate rides the same
+        # walk, so a newer hollow beside the winner costs no second read.
+        path, _fm, hollow, unread = check_checked(sid, seats.safe_cwd(), None)
+        loose, missing = (hollow if hollow and not path else (None, ()))
         if path:
             print("helm handoff: contract satisfied — %s (%s old)"
                   % (path, _age(time.time() - os.stat(path).st_mtime)))
+            if hollow:
+                # task/4132: a NEWER matching entry that reads hollow does not
+                # unsatisfy the contract, but hiding it reads as if the newest
+                # handoff were the winner. Name it beside the winner.
+                print("helm handoff: a NEWER entry %s carries no %s — the "
+                      "older %s satisfied the check; REWRITE the newer one "
+                      "(helm handoff write)"
+                      % (os.path.basename(hollow[0]),
+                         "/".join(hollow[1]).upper() or "sections",
+                         os.path.basename(path)), file=sys.stderr)
             return 0
         if unread:
             # rc 2, not 1: "you have no handoff" and "I could not find out"
@@ -1484,6 +1554,21 @@ def cmd_now(args):
         return 0
 
     if verb == "show":
+        if "--hook-json" in rest:
+            # SessionStart(compact): the working set (task/4054). Fail-open
+            # TOTAL, rc 0, nothing printed on any fault.
+            from . import workingset
+            return workingset.cmd_hook()
+        if "--working-set" in rest:
+            from . import workingset
+            sid = session or home.session_id()
+            text = workingset.build(workingset.ring(sid)) if sid else ""
+            if not text:
+                print("helm now: no working set recorded for session %s"
+                      % ((sid or "?")[:8]), file=sys.stderr)
+                return 1
+            print(text)
+            return 0
         text = show()
         if text:
             print(text)

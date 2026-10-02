@@ -4,6 +4,7 @@ Arg split, env build, seat derivation, roster pre-write, and exact child handoff
 are pure and pinned here. Hermetic per the seats pattern."""
 import contextlib
 import io
+import json
 import os
 import shutil
 import sys
@@ -14,6 +15,9 @@ from unittest import mock
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from helm import launch, seats  # noqa: E402
+# the facade import the impl-import guard requires beside a direct
+# seat_catalog import in this module's own arms (helm/seat.py)
+from helm import seat  # noqa: E402,F401
 
 ENV_KEYS = ("HELM_HOME", "MELD_HOME", "HELM_CHAT_DIR", "MELD_CHAT_DIR",
             "HELM_CHAT_NAME", "MELD_CHAT_NAME", "HELM_CHAT_ROOM",
@@ -67,6 +71,72 @@ class LaunchTest(unittest.TestCase):
         opts, rest = launch.parse_args(["--no-install"])
         self.assertFalse(opts["install"])
         self.assertEqual(rest, [])
+
+    def test_an_own_option_accepts_the_equals_form(self):
+        """helm launch's OWN options take `--k=v` as well as `--k v`
+        (integrator ruling): split on the FIRST '=', so a value that itself
+        contains '=' survives whole."""
+        opts, rest = launch.parse_args(["--role=lead", "--seat=bob"])
+        self.assertEqual((opts["role"], opts["seat"]), ("lead", "bob"))
+        self.assertEqual(rest, [])
+        opts, _rest = launch.parse_args(["--room=a=b"])
+        self.assertEqual(opts["room"], "a=b")
+
+    def test_a_valueless_own_option_is_refused_by_name(self):
+        """Every gap the space form opens: the flag last, or followed by
+        another flag. Each must REFUSE and name the option — today they fall
+        through to claude silently, so `helm launch --seat` launches a seat
+        nobody named."""
+        for argv, want in ((["--seat"], "--seat"),
+                           (["--home"], "--home"),
+                           (["--room"], "--room"),
+                           (["--model"], "--model"),
+                           (["--role"], "--role"),
+                           (["--seat", "--room", "r"], "--seat"),
+                           (["--role", "--model", "m"], "--role")):
+            with self.assertRaises(launch.OwnArgumentError, msg=argv) as ctx:
+                launch.parse_args(argv)
+            self.assertIn(want, str(ctx.exception), argv)
+
+    def test_an_empty_own_value_is_refused_like_a_missing_one(self):
+        """`--seat=` and `--seat ""` carry no value either. Accepting the empty
+        string hands the launch an option that reads as unset, so the seat
+        is inherited or derived from the cwd: a seat nobody named, the same
+        gap the bare form opened."""
+        self.assertEqual(launch.parse_args(["--seat=a", "--room", "-r"])[0]
+                         ["room"], "-r")
+        for argv, want in ((["--seat="], "--seat"),
+                           (["--home="], "--home"),
+                           (["--room="], "--room"),
+                           (["--model="], "--model"),
+                           (["--role="], "--role"),
+                           (["--seat", ""], "--seat"),
+                           (["--room", "", "-p", "hi"], "--room")):
+            with self.assertRaises(launch.OwnArgumentError, msg=argv) as ctx:
+                launch.parse_args(argv)
+            self.assertIn(want, str(ctx.exception), argv)
+
+    def test_the_door_reports_a_valueless_option_and_launches_nothing(self):
+        """THE HALF THE PARSER ARM CANNOT SEE: the refusal must reach the
+        caller as a usage line, not a traceback, and NOTHING may be launched.
+        A parser that raises correctly but crashes the door has moved the bug."""
+        with mock.patch.object(launch.seats, "join") as join, \
+                mock.patch.object(launch.seat_launch_owner, "exec_attached") \
+                as execvpe, \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            rc = launch.cmd_launch(["--seat"])
+        self.assertEqual(rc, 2)
+        self.assertIn("--seat wants a value", err.getvalue())
+        join.assert_not_called()
+        execvpe.assert_not_called()
+
+    def test_an_unknown_equals_token_still_reaches_claude(self):
+        """THE CONTROL: `--k=v` is helm's ONLY for its own options. Anything
+        else is claude's argument and must arrive byte-identical, or this
+        change would swallow a real harness flag."""
+        opts, rest = launch.parse_args(["--seat=a", "--foo=bar", "-p", "hi"])
+        self.assertEqual(opts["seat"], "a")
+        self.assertEqual(rest, ["--foo=bar", "-p", "hi"])
 
     def test_build_env_sets_room_and_truthful_provenance(self):
         env = launch.build_env({"PATH": "/bin"}, "alice")
@@ -277,6 +347,39 @@ class LaunchTest(unittest.TestCase):
             rc = launch.cmd_launch(["--no-install", "--seat", "s1", "--home", name])
         return rc, err.getvalue(), ex
 
+    def _launch_rows(self):
+        """The launch record's rows, read through the checked reader."""
+        from helm import eventledger, home
+        rows, unread = eventledger.checked_events(
+            os.path.join(home.global_dir(), "seat-launches.jsonl"))
+        self.assertIsNone(unread)
+        return rows
+
+    def _launch_words(self, words):
+        err = io.StringIO()
+        with mock.patch.object(launch.seats, "join"), \
+                mock.patch.object(launch.seat_launch_owner, "exec_attached",
+                                  return_value=0), \
+                contextlib.redirect_stderr(err):
+            rc = launch.cmd_launch(["--no-install", "--seat", "s1", "--home",
+                                    "rec-home", "--"] + list(words))
+        self.assertEqual(rc, 0, err.getvalue())
+
+    def test_a_launch_writes_no_launch_row_before_claude_starts(self):  # noqa: VACUOUS_ASSERTION — no row is the contract: the row is the SessionStart hook's, written once the process really started (tests/test_resumeturn.py and tests/test_seat_recipe.py SessionStartRecordTest are its positive arms)
+        """The launch record is written by helm's SessionStart hook once
+        claude has really started, never by `helm launch` ahead of an exec
+        that may fail, and never for the session a `--fork-session` copies.
+        MUTATION: write a row from the argv before the exec — a launch that
+        never starts, or a fork, unbinds the capture of a session nobody
+        relaunched."""
+        self._hub_and_home("rec-home")
+        sid = "55555555-5555-4555-8555-555555555555"
+        for words in (["--resume", sid], ["--session-id", sid],
+                      ["--resume", sid, "--fork-session"], ["--continue"]):
+            with self.subTest(words=words):
+                self._launch_words(words)
+                self.assertEqual(self._launch_rows(), [])
+
     def test_launch_home_links_the_skills_hub_before_the_exec(self):
         """A --home launch onto a credhome with no skills entry creates
         `skills -> hub` and says so, then execs; the session it starts sees
@@ -332,10 +435,11 @@ class LaunchTest(unittest.TestCase):
         self.assertIn(hub + " is configured but MISSING", err)
         self.assertIn("NO helm skills", err)
 
-    def test_an_installing_launch_gives_the_home_it_wires_ultracode_and_opus_xhigh(self):  # noqa: VACUOUS_ASSERTION — the absent settings file on the --no-install control is paired with assertIs/assertEqual on the same file's keys after the installing launch, unconditionally, in this arm
+    def test_an_installing_launch_gives_the_home_it_wires_effort_high(self):  # noqa: VACUOUS_ASSERTION — the absent settings file on the --no-install control is paired with assertEqual on the same file's keys after the installing launch, unconditionally, in this arm
         """ARM (a), the launch door: `helm launch --seat S --home H` wires H
-        before the exec, and a Claude home it wires comes out with the two
-        keys, through homes.BENEFITS (the one writer). CONTROL: the same launch
+        before the exec, and a Claude home it wires comes out at effort high
+        for every model and with no ultracode written (the owner's ruling),
+        through homes.BENEFITS (the one writer). CONTROL: the same launch
         with --no-install, which writes nothing into a home, leaves a second
         bare home without a settings file, so the keys above are this door's
         work and not the fixture's."""
@@ -355,9 +459,12 @@ class LaunchTest(unittest.TestCase):
         ex.assert_called_once()
         with open(os.path.join(home, "settings.json")) as fh:
             got = json.load(fh)
-        self.assertIs(got.get("ultracode"), True, got)
-        self.assertEqual(got["modelSettings"]["claude-opus-5-5"]["effortLevel"],
-                         "xhigh")
+        self.assertEqual(got["effortLevel"], "high", got)
+        self.assertEqual(got["modelSettings"], {
+            "claude-opus-5-5": {"effortLevel": "high"},
+            "claude-sonnet-5": {"effortLevel": "high"},
+            "claude-fable-5-1": {"effortLevel": "high"}})
+        self.assertNotIn("ultracode", got)
         self.assertIn("settings defaults set", err.getvalue())
         other = os.path.join(os.path.dirname(home), "unwired-home")
         os.makedirs(other)
@@ -628,6 +735,413 @@ class LaunchTest(unittest.TestCase):
         self.assertNotIn("!", s)
         self.assertTrue(s.endswith("My-Proj-x"))
         self.assertLessEqual(len(s), 64)
+
+
+class LeadCompactWindowTest(unittest.TestCase):
+    """task/4049: a LEAD claude seat is launched with a narrower working window.
+
+    Per-request cost scales with the context re-sent, and a lead runs the
+    hottest loop in the fleet, so its window is narrowed at launch. The kimi
+    budget (task/2944) is the precedent: a catalog `context_budget` that the
+    launch line and the gauge BOTH read, so the number a seat is taught and
+    the number it is measured against cannot drift. The lead posture already
+    exists (`seat_role.HELM_SEAT_ROLE`, persisted in the spawn register); the
+    window is keyed on it, never on a seat name.
+
+    THE LEAD WINDOW IS THE NATIVE LEG'S. `launch_window(fam, model, role=...)`
+    reads it for the monitor's own leg, and autocompact's gauge reads it for
+    the same leg, so a native lead is taught the number and measured against
+    it. A PROXY family's line is minted with no role and teaches the pane its
+    full catalog window, so the gauge must NOT narrow that seat: the arm below
+    compares the gauge to the real proxy line and would fail if it did
+    by construction, and a worker of the same family is untouched."""
+
+    def test_the_window_is_the_catalogs_single_dial(self):
+        from helm import seat  # noqa: F401 — the facade first (seat_compat)
+        from helm.seat_catalog import LEAD_CONTEXT_WINDOW, launch_window
+        self.assertEqual(LEAD_CONTEXT_WINDOW, 400000)
+        # a worker keeps exactly the window it had before this change
+        self.assertEqual(launch_window({}, "claude-opus-5-5"), None)
+        self.assertEqual(launch_window({}, "claude-opus-5-5", role="worker"),
+                         None)
+        # the lead override is a NARROWING, exactly as a context_budget is:
+        # it never widens a family that already declares a smaller window.
+        self.assertEqual(launch_window({"max_context": 100000},
+                                       role="lead"), 100000)
+        self.assertEqual(launch_window({"max_context": 1000000},
+                                       role="lead"), LEAD_CONTEXT_WINDOW)
+
+    def test_a_lead_launch_line_is_taught_the_lead_window(self):
+        env = launch.build_env({}, "some-seat", role="lead")
+        self.assertEqual(env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "400000")
+        self.assertEqual(env["CLAUDE_CODE_MAX_CONTEXT_TOKENS"], "400000")
+        # the unconditional positive control on the SAME call: the env really
+        # was built (the window keys above are additions to it, not the whole
+        # of it), so a build that silently returned {} cannot pass this arm.
+        self.assertEqual(env["HELM_CHAT_NAME"], "some-seat")
+
+    def test_a_worker_launch_line_carries_no_window(self):
+        env = launch.build_env({}, "some-seat")
+        # the unconditional positive control on the SAME call: a lead is
+        # taught the window, so "absent" below is the worker branch and not a
+        # call that never reached the window code at all.
+        lead = launch.build_env({}, "some-seat", role="lead")
+        self.assertEqual(lead["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "400000")
+        self.assertNotIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW", env)
+        self.assertNotIn("CLAUDE_CODE_MAX_CONTEXT_TOKENS", env)
+        base = launch.build_env({}, "some-seat", role="worker")
+        self.assertNotIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW", base)
+
+    def test_the_gauge_reads_the_same_number_the_line_teaches(self):
+        """The window is one dial, not two: whatever the launch line stamps,
+        `autocompact._window` must divide the reading by the same value, or a
+        lead is compacted at 80% of a window it was never taught.
+
+        THE PROXY LEG IS THE ONE THAT BITES, and the arm is written against
+        the REAL launch line rather than against the number this module
+        happens to believe. A proxy family's line is minted by
+        `seat_launch_assets.launch_line` -> `launch_window(fam, model)` with
+        NO role: the pane is taught its full catalog window. So a codex or
+        kimi seat whose register says lead is still taught 320k/380k/1M, and
+        a gauge that narrowed it to the lead window would inject /compact at
+        192k into a pane taught four times that."""
+        from helm import autocompact, seat_catalog, seat
+        self.assertEqual(
+            autocompact._window("claude", role="lead"),
+            (seat_catalog.LEAD_CONTEXT_WINDOW, "FAMILIES.lead_window"))
+        # a worker of the same family is untouched: the native claude seat
+        # pins no window, so it falls through to the assumed default exactly
+        # as it did before this change.
+        self.assertEqual(autocompact._window("claude")[0],
+                         autocompact.CC_ASSUMED_WINDOW)
+        # THE PROXY ARMS: the gauge must equal what the proxy LINE teaches,
+        # for every family, lead or not.
+        for family, model in (("codex", "gpt-6.1-sol"), ("kimi", "kimi-k3"),
+                              ("gemini", None), ("ds4pro", "ds4-pro"),
+                              ("dots3", None)):
+            fam = seat.FAMILIES[family]
+            taught = seat_catalog.launch_window(fam, model)
+            for role in (None, "lead", "worker"):
+                self.assertEqual(
+                    autocompact._window(family, model, role=role)[0], taught,
+                    "%s/%s as %r: the gauge must read what the proxy line "
+                    "teaches" % (family, model, role))
+
+
+class LeadLeanLaunchTest(unittest.TestCase):
+    """task/4056: the lean profile reaches a NATIVE lead at launch.
+
+    The settings.json seeder never runs for a native claude seat (it has no
+    FAMILIES entry, so the native spawn writes no launch assets), which is
+    exactly the seat the profile exists for. The layer rides `--settings`,
+    checked against the installed binary, and only a lead gets it."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="helm-test-leanlaunch-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.path = os.path.join(self.tmp, "lean.json")
+
+    def test_a_lead_launch_is_handed_the_lean_settings_file(self):
+        args = launch._lead_lean_args("some-seat", "lead")
+        self.assertEqual(args[0], "--settings")
+        with open(args[1]) as f:
+            doc = json.load(f)
+        from helm import seat_catalog
+        self.assertEqual(doc["enabledPlugins"],
+                         {seat_catalog.LEAD_DISABLED_PLUGIN_ID: False})
+        self.assertIn("Artifact", doc["permissions"]["deny"])
+        self.assertEqual(doc["skillListingBudgetFraction"],
+                         seat_catalog.LEAD_SKILL_LISTING_BUDGET)
+
+    def test_the_seat_name_really_reaches_the_path_not_a_shadowed_module(self):
+        """task/4056: this helper imports the `seat` FACADE beside its
+        seat_catalog import (the impl-import guard requires it), and naming
+        that import `seat` REBOUND this function's own `seat` parameter. The
+        crash was invisible to every arm that passed the same argparse name
+        straight through: only a name that really has to be VALIDATED shows
+        it, so this arm asserts the name lands in the file's own path."""
+        args = launch._lead_lean_args("a-valid-seat-name", "lead")
+        self.assertIn("a-valid-seat-name", args[1])
+        # and the validation is really applied, not bypassed: a name that
+        # cannot be a seat refuses here rather than writing a path.
+        from helm import home
+        self.assertRaises(home.SeatNameError,
+                          launch._lead_lean_args, "not a seat name!", "lead")
+
+    def test_a_worker_launch_is_handed_nothing(self):
+        # THE POSITIVE CONTROL on the same call: a lead really gets the flag,
+        # so the empty list below is the role branch, not a helper that never
+        # returned anything.
+        self.assertEqual(launch._lead_lean_args("s", "lead")[0], "--settings")
+        self.assertEqual(launch._lead_lean_args("s", "worker"), [])
+        self.assertEqual(launch._lead_lean_args("s", None), [])
+
+    def test_the_settings_document_is_the_same_one_the_seeder_writes(self):
+        """One document, two delivery paths, so they cannot drift."""
+        from helm import seat_catalog
+        doc = seat_catalog.lead_lean_settings_doc()
+        for key, value in seat_catalog.lead_lean_settings():
+            self.assertEqual(doc[key], value)
+        self.assertEqual(doc["permissions"]["deny"],
+                         list(seat_catalog.LEAD_DENIED_TOOLS))
+
+
+class NativeLeadRoleTest(unittest.TestCase):
+    """task/4053: a native Claude seat helm never spawned has no spawn
+    register, so `recorded_role` read every such lead as a worker and the lead
+    window, the lead-lean profile and the lead marker never reached it. Its
+    role is now its DECLARATION (`seat_role.declare_role`), written by `helm
+    launch --seat S --role R` and by `helm seat resume S --role R` on an
+    adopted seat. A spawned seat keeps its spawn register as the authority."""
+
+    setUp = LaunchTest.setUp
+    tearDown = LaunchTest.tearDown
+
+    def _launch(self, *args):
+        """(rc, argv, env, stderr) of one `helm launch`, the exec stubbed."""
+        err = io.StringIO()
+        env = {k: v for k, v in os.environ.items() if k != "HELM_SEAT_ROLE"}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(launch.seats, "join"), \
+                mock.patch.object(launch.seat_launch_owner, "exec_attached",
+                                  return_value=0) as owner, \
+                contextlib.redirect_stderr(err):
+            rc = launch.cmd_launch(["--no-install"] + list(args))
+        argv, child = owner.call_args.args if owner.called else (None, None)
+        return rc, argv, child, err.getvalue()
+
+    def _declaration(self, name):
+        from helm import seat_role
+        return os.path.join(seat._instance_dir("claude", name),
+                            seat_role.DECLARATION)
+
+    def _register(self, family, name, rec):
+        d = seat._instance_dir(family, name)
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, "spawn.json")
+        with open(path, "w") as f:
+            if isinstance(rec, str):
+                f.write(rec)
+            else:
+                json.dump(rec, f)
+        return path
+
+    def test_a_native_lead_declared_at_launch_reads_lead(self):  # noqa: VACUOUS_ASSERTION — each absence (--role, the marker, the window, --settings) sits beside an unconditional positive on the same argv/env from an earlier launch of this arm: --settings, the window and HELM_SEAT_ROLE=lead are asserted present first
+        """THE RED ARM. On main `--role` was the first unknown token, so it
+        went to claude and the seat stayed a worker."""
+        from helm.seat_role import recorded_role
+        from helm.seat_catalog import LEAD_CONTEXT_WINDOW
+        rc, argv, child, err = self._launch("--seat", "lead-by-hand",
+                                            "--role", "lead")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(recorded_role("lead-by-hand"), "lead")
+        self.assertNotIn("--role", argv)
+        self.assertIn("--settings", argv)
+        self.assertEqual(child["CLAUDE_CODE_AUTO_COMPACT_WINDOW"],
+                         str(LEAD_CONTEXT_WINDOW))
+        self.assertEqual(child["HELM_SEAT_ROLE"], "lead")
+        # the declaration outlives the launch: a relaunch with no --role is
+        # still a lead
+        rc, argv, child, err = self._launch("--seat", "lead-by-hand")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(recorded_role("lead-by-hand"), "lead")
+        self.assertEqual(child["HELM_SEAT_ROLE"], "lead")
+        # and an explicit worker declaration takes the lead away
+        rc, argv, child, err = self._launch("--seat", "lead-by-hand",
+                                            "--role", "worker")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(recorded_role("lead-by-hand"), "worker")
+        self.assertNotIn("HELM_SEAT_ROLE", child)
+        self.assertNotIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW", child)
+        self.assertNotIn("--settings", argv)
+
+    def test_a_numbered_native_name_takes_a_declaration(self):
+        """`<project>-claude-N` has a digit tail, which the register walk never
+        reads; the declaration does not depend on that walk."""
+        from helm.seat_role import recorded_role
+        rc, _argv, _child, err = self._launch("--seat", "proj-claude-2",
+                                              "--role", "lead")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(recorded_role("proj-claude-2"), "lead")
+
+    def test_a_native_seat_with_no_declaration_reads_worker(self):  # noqa: VACUOUS_ASSERTION — the child env is asserted to carry HELM_CHAT_NAME first, so the absent marker and window are the worker branch of a real launch
+        from helm.seat_role import recorded_role
+        rc, argv, child, err = self._launch("--seat", "undeclared-seat")
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(child["HELM_CHAT_NAME"], "undeclared-seat")
+        self.assertEqual(recorded_role("undeclared-seat"), "worker")
+        self.assertNotIn("HELM_SEAT_ROLE", child)
+        self.assertNotIn("CLAUDE_CODE_AUTO_COMPACT_WINDOW", child)
+        self.assertFalse(os.path.exists(self._declaration("undeclared-seat")))
+
+    def test_a_corrupt_or_mismatched_declaration_reads_worker(self):  # noqa: VACUOUS_ASSERTION — the first row of the table is the positive control on the same file and reader: a good declaration reads lead
+        from helm.seat_role import recorded_role
+        # the positive control on the same file: a good declaration is a lead
+        path = self._declaration("seat-x")
+        os.makedirs(os.path.dirname(path))
+        for body, want in (
+                ({"v": 1, "seat": "seat-x", "role": "lead"}, "lead"),
+                ("{not json", "worker"),
+                (["seat-x", "lead"], "worker"),
+                ({"v": 1, "seat": "seat-y", "role": "lead"}, "worker"),
+                ({"v": 1, "seat": "seat-x", "role": "leader"}, "worker")):
+            with self.subTest(body=body):
+                with open(path, "w") as f:
+                    f.write(body if isinstance(body, str) else json.dumps(body))
+                self.assertEqual(recorded_role("seat-x"), want)
+
+    def test_a_broken_register_is_not_replaced_by_a_declaration(self):
+        """A spawn.json that does not resolve is a broken register: the seat
+        reads worker even beside a lead declaration, and launch refuses to
+        declare over it."""
+        from helm.seat_role import recorded_role
+        path = self._declaration("broken-seat")
+        os.makedirs(os.path.dirname(path))
+        with open(path, "w") as f:
+            json.dump({"v": 1, "seat": "broken-seat", "role": "lead"}, f)
+        self.assertEqual(recorded_role("broken-seat"), "lead")   # control
+        reg = self._register("claude", "broken-seat", "{not json")
+        self.assertEqual(recorded_role("broken-seat"), "worker")
+        rc, _argv, _child, err = self._launch("--seat", "broken-seat",
+                                              "--role", "lead")
+        self.assertEqual(rc, 2)
+        self.assertIn("does not resolve", err)
+        with open(reg) as f:
+            self.assertEqual(f.read(), "{not json")
+
+    def test_a_spawned_seats_register_stays_the_authority(self):  # noqa: VACUOUS_ASSERTION — recorded_role is asserted to read the register's role before the refusal, and the agreeing --role launch returns 0 after it, on the same seat
+        """CONTROL: a proxy seat's register, and a spawned native seat's, are
+        read exactly as before; a --role that disagrees with one is refused
+        and writes nothing, and one that agrees launches."""
+        from helm.seat_role import recorded_role
+        for family, name, role in (("codex", "proj-codex", "lead"),
+                                   ("claude", "proj-claude", "worker")):
+            with self.subTest(family=family):
+                rec = {"v": 1, "seat": name, "identity": name,
+                       "family": family, "project": "proj", "role": role}
+                reg = self._register(family, name, rec)
+                with open(reg) as f:
+                    before = f.read()
+                self.assertEqual(recorded_role(name), role)
+                other = "worker" if role == "lead" else "lead"
+                rc, _argv, _child, err = self._launch("--seat", name,
+                                                      "--role", other)
+                self.assertEqual(rc, 2)
+                self.assertIn("spawn register is the authority", err)
+                with open(reg) as f:
+                    self.assertEqual(f.read(), before)
+                self.assertEqual(recorded_role(name), role)
+                self.assertFalse(os.path.exists(self._declaration(name)))
+                rc, _argv, _child, err = self._launch("--seat", name,
+                                                      "--role", role)
+                self.assertEqual(rc, 0, err)
+
+    def test_role_needs_a_named_seat_and_a_seat_role(self):  # noqa: VACUOUS_ASSERTION — the unconditional positive control follows the loop: the same seat with a seat role launches and its declaration exists where the absence looked
+        for args in (("--role", "lead"), ("--seat", "s1", "--role", "boss")):
+            with self.subTest(args=args):
+                rc, argv, _child, err = self._launch(*args)
+                self.assertEqual(rc, 2)
+                self.assertIsNone(argv)
+                self.assertIn("no session was started", err)
+        self.assertFalse(os.path.exists(self._declaration("s1")))
+        # the positive control: the same seat with a seat role launches and
+        # writes its declaration where the absence above looked
+        rc, argv, _child, err = self._launch("--seat", "s1", "--role", "lead")
+        self.assertEqual(rc, 0, err)
+        self.assertIsNotNone(argv)
+        self.assertTrue(os.path.exists(self._declaration("s1")))
+
+    def test_a_role_flag_with_no_value_is_refused_not_passed_to_claude(self):  # noqa: VACUOUS_ASSERTION — the positive control follows on the same seat: a valued --role launches and writes the declaration the absence looked for
+        """A trailing `--role` with no value is refused: as the parser's first
+        unknown token it would reach claude and leave the seat undeclared."""
+        rc, argv, _child, err = self._launch("--seat", "s2", "--role")
+        self.assertEqual(rc, 2)
+        self.assertIsNone(argv)
+        self.assertIn("no session was started", err)
+        self.assertFalse(os.path.exists(self._declaration("s2")))
+        rc, argv, _child, err = self._launch("--seat", "s2", "--role", "lead")
+        self.assertEqual(rc, 0, err)
+        self.assertTrue(os.path.exists(self._declaration("s2")))
+
+    def test_a_declaration_never_writes_through_a_linked_seat_dir(self):
+        """A seat whose instance path is a symlink into another seat's is
+        refused, so its declaration cannot replace the other seat's."""
+        from helm import seat_role
+        victim = self._declaration("victim-seat")
+        os.makedirs(os.path.dirname(victim))
+        with open(victim, "w") as f:
+            json.dump({"v": 1, "seat": "victim-seat", "role": "lead"}, f)
+        self.assertEqual(seat_role.recorded_role("victim-seat"), "lead")
+        alias = seat._instance_dir("claude", "alias-seat")
+        os.symlink(os.path.dirname(victim), alias)
+        why = seat_role.declare_role("alias-seat", "worker")
+        self.assertIn("symlink", why or "")
+        self.assertEqual(seat_role.recorded_role("victim-seat"), "lead")
+        with open(victim) as f:
+            self.assertEqual(json.load(f)["seat"], "victim-seat")
+
+    def test_an_adopted_seat_resume_declares_its_role_then_resumes(self):
+        from helm import orcaadopt, seat_role
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(orcaadopt, "resolve",
+                               return_value={"seat": "adopted-lead"}), \
+                mock.patch.object(orcaadopt, "resume",
+                                  return_value=(0, ["resumed"])) as resume, \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = seat._resume("adopted-lead", ["--role", "lead"])
+        self.assertEqual(rc, 0, err.getvalue())
+        self.assertEqual(resume.call_count, 1)
+        self.assertEqual(seat_role.recorded_role("adopted-lead"), "lead")
+        # no spawn register was written: the seat still resolves through the
+        # adoption path, not as a registered native seat
+        self.assertIsNotNone(seat._seat_family("adopted-lead")[1])
+
+    def test_an_unknown_seat_resume_with_a_role_declares_nothing(self):  # noqa: VACUOUS_ASSERTION — the positive control follows: the same call for a seat orca resolves returns 0 and writes the declaration the absence looked for
+        from helm import orcaadopt
+        err = io.StringIO()
+        with mock.patch.object(orcaadopt, "resolve", return_value=None), \
+                mock.patch.object(orcaadopt, "resume") as resume, \
+                contextlib.redirect_stderr(err):
+            rc = seat._resume("typo-seat", ["--role", "lead"])
+        self.assertEqual(rc, 2)
+        resume.assert_not_called()
+        self.assertFalse(os.path.exists(self._declaration("typo-seat")))
+        # the positive control: the same call for a seat orca DOES know
+        # writes the declaration the absence above looked for
+        with mock.patch.object(orcaadopt, "resolve",
+                               return_value={"seat": "typo-seat"}), \
+                mock.patch.object(orcaadopt, "resume",
+                                  return_value=(0, [])), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(seat._resume("typo-seat", ["--role", "lead"]), 0)
+        self.assertTrue(os.path.exists(self._declaration("typo-seat")))
+
+    def test_a_worker_launch_drops_an_inherited_lead_marker(self):  # noqa: VACUOUS_ASSERTION — the positive control runs first on the same producer: a lead launch keeps the marker, so the worker absence below is the role branch of build_env, not a scrubber that strips every launch
+        """THE RED ARM. A worker launched from inside a lead's pane inherits
+        HELM_SEAT_ROLE=lead in its base env. build_env must strip it, or the
+        memory cap (seatlimits.role_of) reads the worker as a lead by
+        contagion. A lead launch keeps the marker; a worker and an
+        unregistered seat (both read worker) must not carry one forward."""
+        # THE POSITIVE CONTROL: a lead launch sets the marker on a clean base.
+        lead = launch.build_env({"PATH": "/bin"}, "seat-a",
+                                allocate_scratch=False, role="lead")
+        self.assertEqual(lead["HELM_SEAT_ROLE"], "lead")
+        # THE CLAIM: a worker launch, from a lead's pane, drops the inherited
+        # marker; the worker's own identity still rides.
+        base = {"PATH": "/bin", "HELM_SEAT_ROLE": "lead"}
+        env = launch.build_env(base, "seat-a", allocate_scratch=False,
+                               role="worker")
+        self.assertNotIn("HELM_SEAT_ROLE", env)
+        self.assertEqual(env["HELM_CHAT_NAME"], "seat-a")
+        # AND AN UNREGISTERED SEAT (recorded_role reads worker) is the same
+        # worker branch: the inherited marker does not survive.
+        env2 = launch.build_env(base, "seat-a", allocate_scratch=False)
+        self.assertNotIn("HELM_SEAT_ROLE", env2)
+        # AND A CLEAN SHELL STILL LAUNCHES A WORKER UNCHANGED: the strip adds
+        # nothing, so the worker of a marker-less base carries no marker.
+        clean = launch.build_env({"PATH": "/bin"}, "seat-a",
+                                 allocate_scratch=False, role="worker")
+        self.assertNotIn("HELM_SEAT_ROLE", clean)
 
 
 if __name__ == "__main__":

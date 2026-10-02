@@ -269,6 +269,9 @@ def _actions(entry):
       rescope    any entry -- the one lever that works on a JIT entry, which
                 is where the measured cost actually is
       retire     prior/heuristic/reference
+      reword     prior/heuristic/reference/lexicon (write.regloss's types):
+                 the line the entry fires as, its gloss
+      keywords   the same four types (write.retag's): what makes it fire
 
     `rescope` leads because of what the ledger says rather than what reads
     tidiest: across the live windows sampled while this was written, the pinned
@@ -287,6 +290,29 @@ def _actions(entry):
             out.append("undemote")
     if kind in ("prior", "heuristic", "reference"):
         out.append("retire")
+    if kind in _EDIT_TYPES:
+        out += ["reword", "keywords"]
+    return out
+
+
+#: The types the two text writers admit (write._KEYWORD_TYPES, which both
+#: regloss and retag check). Spelled here so the read side never imports the
+#: writer; tests/test_injectpack.py pins the two equal.
+_EDIT_TYPES = ("prior", "heuristic", "reference", "lexicon")
+
+
+def _keywords_of(entry):
+    """-> the entry's probes as a list, `trigger` first for a heuristic (the
+    key its writer reads first)."""
+    raw = entry.get("trigger") or entry.get("keywords") or ""
+    if isinstance(raw, (list, tuple)):
+        raw = ",".join(str(k) for k in raw)
+    out, seen = [], set()
+    for part in str(raw).split(","):
+        k = " ".join(part.split())
+        if k and k.lower() not in seen:
+            seen.add(k.lower())
+            out.append(k)
     return out
 
 
@@ -309,7 +335,8 @@ def entries(win, project=None):
                "bytes": total, "present": bool(entry) or ident == _who_id(),
                "type": (entry or {}).get("type"),
                "load_class": (entry or {}).get("load_class"),
-               "text": "", "project": "", "scope_how": "", "actions": []}
+               "text": "", "project": "", "scope_how": "", "actions": [],
+               "gloss": "", "draft": "", "keywords": []}
         if entry:
             # A GLOSS THAT READS AS WHOLE IS THE ANSWER TO THE WRONG QUESTION.
             # The row exists so the owner can decide whether an entry is worth
@@ -321,6 +348,14 @@ def entries(win, project=None):
                 entry.get("gloss") or entry.get("statement") or "", 400)
             row["project"], row["scope_how"] = _scope(entry)
             row["actions"] = _actions(entry)
+            # THE EDIT FORM IS SEEDED WITH WHAT IS THERE, never a blank: the
+            # owner tweaks the line he reads, he does not retype it.
+            # The gloss when there is one, else the statement it fires from.
+            row["gloss"] = str(entry.get("gloss") or "")
+            row["draft"] = row["gloss"] or " ".join(
+                str(entry.get("statement") or entry.get("move")
+                    or entry.get("definition") or "").split())
+            row["keywords"] = _keywords_of(entry)
         rows.append(row)
     rows.sort(key=lambda r: (-r["bytes"], -r["fires"], r["id"]))
     return rows, derived, missing
@@ -521,11 +556,17 @@ def _derived_note(derived, ledgered):
 # they get the same _commit path, the same validation and the same event
 # receipt as every other write, so a change made from the browser is
 # indistinguishable in the record from one made at the CLI.
-ACTIONS = ("demote", "undemote", "rescope", "retire")
+ACTIONS = ("demote", "undemote", "rescope", "retire", "reword", "keywords")
 
 
-def act(action, eid, reason="", owner=None, project=None):
-    """-> (result, error). One owner click, one store write."""
+def act(action, eid, reason="", owner=None, project=None, text=None,
+        keywords=None):
+    """-> (result, error). One owner click, one store write.
+
+    `reword` sets the entry's gloss (the line it fires as) through
+    write.regloss; `keywords` replaces its probes through write.retag, after
+    the same keyword lint a new entry must pass. Both answer what changed:
+    the fired line and its bytes, and the keywords, before and after."""
     action = str(action or "").strip()
     eid = str(eid or "").strip()
     if action not in ACTIONS:
@@ -533,6 +574,8 @@ def act(action, eid, reason="", owner=None, project=None):
                                                          ", ".join(ACTIONS))
     if not eid:
         return None, "need the entry id"
+    if action in ("reword", "keywords"):
+        return _edit(action, eid, text, keywords, project)
     reason = str(reason or "").strip()
     if action in ("demote", "undemote", "retire") and not reason:
         # THE WRITERS DEMAND A REASON FOR A TIER FLIP and refusing here rather
@@ -560,3 +603,65 @@ def act(action, eid, reason="", owner=None, project=None):
             "status": entry.get("status"),
             "load_class": entry.get("load_class"),
             "project": str(entry.get("project") or "")}, None
+
+
+def _shown(entry):
+    """-> {"line", "bytes", "keywords"}: what one entry fires as, today."""
+    from . import inject
+    line = inject._entry_line(entry)
+    return {"line": line, "bytes": len(line.encode("utf-8")),
+            "keywords": _keywords_of(entry)}
+
+
+def _edit(action, eid, text, keywords, project):
+    """The two text edits. THE WRITERS DECIDE: regloss refuses a line over
+    LINE_CAP with the exact overage, retag refuses an empty list. The one
+    guard added here is the keyword lint every new entry already passes
+    (write._keyword_lint, with the df of the live JIT corpus), because retag
+    alone would accept the near-unfindable shapes the lint exists to stop --
+    a comma-less salad, a lone generic word -- and the owner would see a
+    saved edit that made the entry stop firing."""
+    try:
+        from . import pk
+        from .store import load, resolve, write
+        from .store._common import (GENERIC_KEYWORDS, _HEURISTIC_GENERIC,
+                                    _JIT_TYPES)
+    except Exception as exc:
+        return None, "store unavailable: %s" % exc
+    cur = load._find(eid, project=project, types=write._KEYWORD_TYPES)
+    if not cur:
+        return None, "'%s' not found" % eid
+    before = _shown(cur)
+    ts = pk.now_ts()
+    if action == "reword":
+        if not " ".join(str(text or "").split()):
+            return None, ("the new line is empty: write the line this entry "
+                          "should fire as")
+        entry, err = write.regloss(eid, ts, text=text, project=project,
+                                   ctype=cur["type"])
+    else:
+        cells = write._kw_list(keywords)
+        if not (cur["type"] == "lexicon" and not cells):
+            generic = _HEURISTIC_GENERIC if cur["type"] == "heuristic" \
+                else GENERIC_KEYWORDS
+            me = (cur["type"], str(cur["id"]))
+            corpus = [e for e in load.load_all(project=project,
+                                               include_dormant=False,
+                                               types=_JIT_TYPES)
+                      if (e.get("type"), str(e.get("id"))) != me]
+            bad = write._keyword_lint(str(cur["id"]), cells,
+                                      resolve._df_map(
+                                          resolve._jit_candidates(corpus)),
+                                      generic)
+            if bad:
+                return None, bad
+        entry, err = write.retag(eid, ts, replace=",".join(cells),
+                                 project=project, ctype=cur["type"])
+    if err:
+        return None, err
+    return {"id": str(entry["id"]), "action": action,
+            "type": entry.get("type"), "status": entry.get("status"),
+            "load_class": entry.get("load_class"),
+            "project": str(entry.get("project") or ""),
+            "before": before, "after": _shown(entry),
+            "changed": _shown(entry) != before}, None

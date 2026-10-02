@@ -18,8 +18,10 @@ rotated-away token presented again trips reuse detection):
   * Orca -> home ONLY. Orca's files are opened read-only and never written.
   * Only when Orca's copy is STRICTLY fresher (access-token expiresAt) AND the
     home's own chain is provably spent: the home has no token or no refresh
-    token, carries Orca's family, or its refresh lifetime has passed. Nothing
-    local proves a REFRESH: lifetimes within the jitter are one grant Orca
+    token, carries Orca's family, its refresh lifetime has passed, or the
+    token endpoint has refused its refresh token (keepalive's HTTP 400,
+    logged against that token's family digest). Nothing local proves a
+    REFRESH: lifetimes within the jitter are one grant Orca
     rotated away OR a login minted minutes apart, and a record that Orca once
     held the home's token fits an independent re-login of Orca's dir as well
     as a refresh. A home on an INDEPENDENT live login chain (lifetimes further
@@ -85,6 +87,10 @@ UNKNOWN = "UNKNOWN"
 DISAGREE = "DISAGREE"
 OWN_CHAIN = "OWN-CHAIN"
 UNPROVEN = "CHAIN-UNPROVEN"
+# The STALE chain reason for a home whose refresh token the token endpoint
+# refused (keepalive's log, bound to the token's family): spent, whatever its
+# refresh lifetime says.
+REFUSED = "home-refresh-refused"
 # The identity keys that must agree when both sides carry them.
 ID_KEYS = ("organizationUuid", "accountUuid")
 # How far apart two copies' refreshTokenExpiresAt may be and still be one
@@ -309,6 +315,7 @@ def _measure(real):
         # Orca is ahead. Only a home whose own chain is provably spent is
         # Orca's to replace; a home on an independent live login is not stale,
         # it is another chain.
+        refused = None
         if out["same_family"]:
             chain = "same-family"
         elif hfacts["family"] is None:
@@ -316,9 +323,21 @@ def _measure(real):
         elif h_life is not None and h_life <= time.time() * 1000:
             chain = "home-refresh-expired"
         else:
-            chain = None
+            # THE TOKEN ENDPOINT'S OWN ANSWER IS PROOF. A refresh lifetime
+            # still ahead says nothing when the endpoint refuses the token
+            # (a grant that rotated it and was lost, a revocation): keepalive
+            # asks it every hour and logs the refusal against this token's
+            # family, and this measurement read "nothing proves the chain is
+            # spent" beside a day of HTTP 400s.
+            refused = _refused(real, hfacts["family"])
+            chain = REFUSED if refused else None
         if chain:
-            out.update(verdict=STALE, chain=chain, reason="%s (%s)" % (expiries, chain))
+            why = chain if not refused else (
+                "%s: the token endpoint refused this home's refresh token %d "
+                "time%s, last at %s (%s), so its own chain is spent"
+                % (chain, refused["count"], "s"[:refused["count"] != 1],
+                   refused["ts"], refused["by"]))
+            out.update(verdict=STALE, chain=chain, reason="%s (%s)" % (expiries, why))
         elif two_grants:
             out.update(verdict=OWN_CHAIN, reason="%s, but nothing proves the home's own "
                        "login chain (refresh lifetime to %s, Orca's to %s) is spent — "
@@ -341,6 +360,18 @@ def _measure(real):
     else:
         out.update(verdict=FRESH, reason=expiries)
     return out, orca, hblob
+
+
+def _refused(real, family):
+    """keepalive's recorded refusal of the refresh token the home at `real`
+    holds now, or None; never raises (a missing proof is only a missing
+    proof)."""
+    from .. import keepalive
+    try:
+        since = os.stat(os.path.join(real, AUTH_JSON)).st_mtime
+        return keepalive.refusal_of(os.path.basename(real), family, since)
+    except Exception:                      # noqa: BLE001 — evidence, never a raise
+        return None
 
 
 def _cure(real):

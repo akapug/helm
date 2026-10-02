@@ -1,0 +1,1 @@
+skills [dupes|sync [--apply]] — census (read-only) + sync: one canonical skills source symlinked into EVERY claude-code config dir (credhomes + seats; dry-run default)

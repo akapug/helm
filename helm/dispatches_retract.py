@@ -416,7 +416,10 @@ def retract(rid, reason, reads, basis, reissue=False, successor=None,
                 return None, ("the recorded reissue successor %s does not "
                               "supersede %s" % (new["id"][:12], row["id"][:12]))
             out["reissued"] = dispatches._finish_reissue(new, seat, notify)
-        return out, None
+        # AN IDENTICAL RETRY CLOSES what a first run's findings close missed.
+        return dispatches.review_findings.with_closed(
+            out, *dispatches.review_findings.close_retracted(
+                out, current)), None
     err = dispatches._retract_admission_error(row)
     if err:
         if row.get("verdict_retracted"):
@@ -459,7 +462,12 @@ def retract(rid, reason, reads, basis, reissue=False, successor=None,
         # idempotent because a process may die after this durable event and an
         # identical retry must repair, not duplicate, both post-write legs.
         out["reissued"] = dispatches._finish_reissue(new, seat, notify)
-    return out, None
+    # THE FINDINGS THIS FIX FILED OR CARRIED CLOSE "retracted" once no other
+    # unretracted FIX of the chain names them, and only when the retraction
+    # reads source-clean; any other reading keeps them open and says so
+    # (helm/review_findings.py, task/3862).
+    return dispatches.review_findings.with_closed(
+        out, *dispatches.review_findings.close_retracted(out, current)), None
 
 
 # ---------------------------------------------------------------------------

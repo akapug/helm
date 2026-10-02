@@ -145,12 +145,16 @@ function flagWhen(at) {
 function flagsHTML(sec, d) {
   if (!sec) return {head: '<span class="bmut">not read yet</span>', rows: ""};
   if (sec.loading) return {head: '<span class="bmut">still being read</span>', rows: ""};
+  /* with no reading to draw there is no sheet, so the owner's declarations
+     the watchdog has not folded yet are said in the head (task/4027) */
+  const pend = sec.declared_pending || {};
+  const said = Object.keys(pend).sort().map(f => ' · <b>' + esc(f + " " + famPending(pend[f])) + "</b>").join("");
   if (sec.unavailable)
-    return {head: '<span class="bmut">not measured — ' + esc(sec.unavailable) + "</span>", rows: ""};
+    return {head: '<span class="bmut">not measured — ' + esc(sec.unavailable) + said + "</span>", rows: ""};
   if (sec.stale)
     return {head: '<span class="bunk">STALE</span> <span class="bmut">— the burn flags were read '
       + esc(lrAgo(sec.age_s)) + ", past their " + esc(lrDur(sec.limit_s) || "?")
-      + " bound, so no colour is drawn until a fresh reading arrives</span>", rows: ""};
+      + " bound, so no colour is drawn until a fresh reading arrives" + said + "</span>", rows: ""};
   const ov = sec.overall || {}, fams = sec.families || {};
   const head = '<b style="color:' + (FLAGCOL[ov.colour] || FLAGCOL.GREY) + '">'
     + esc(ov.colour === "GREY" ? "NOT MEASURED" : ov.colour || "?") + "</b> · "
@@ -164,6 +168,7 @@ function flagsHTML(sec, d) {
       + '" data-fam-sel="' + esc(f) + '" style="--fc:' + (FLAGCOL[fl.colour] || FLAGCOL.GREY) + '" title="'
       + esc(f + " " + (fl.colour === "GREY" ? "not measured" : fl.colour || "?")
         + (fl.provenance === "owner-declared" ? " · DECLARED by the owner, not measured" : "")
+        + (fl.declared_pending ? " · DECLARED " + fl.declared_pending.colour + " by the owner, pending the watchdog's fold" : "")
         + (fl.provenance === "derived" ? " · derived, not a direct reading" : "")
         + (fl.money_provenance === "certified-local" ? " · money CERTIFIED by the seat that runs the local hardware, not a vendor measurement" : "")
         + " · " + (fl.axis || "no axis") + " · changes " + flagWhen(fl.expires_at)
@@ -292,7 +297,7 @@ function boardCapacity(d, active) {
     : !read
       ? '<span class="bunk">lanes UNKNOWN</span> <span class="bmut">(' + esc((seats && seats.unavailable) || "the roster was not read") + ")</span>"
       : "<b>" + lanes.running + " lane" + (lanes.running === 1 ? "" : "s") + " running</b>"
-        // SOME OF R MAY ALREADY BE ON MAIN: a land releases no lease, so a
+        // SOME OF R MAY ALREADY BE ON MAIN: a hand land releases no lease (auto-land releases the lanes it lands), so a
         // landed lane stays a live claim until its holder releases it. R keeps
         // counting it and says how many — the same running[] verdicts the
         // kanban draws in its landed column.
@@ -413,15 +418,18 @@ function boardProgress(j, d) {
   const commits = tst === "ok" && typeof pg.lands7 === "number" ? pg.lands7 : null;
   const commitTxt = tst === "stale" ? "STALE" : tst === "unknown" ? "commits ?" : tst !== "ok" ? "reading…"
     : commits === null ? "commits ?" : commits + " commit" + (commits === 1 ? "" : "s");
-  const flow = kst === "ok" && typeof pg.opened7 === "number" && typeof pg.closed7 === "number";
-  const net = flow ? pg.opened7 - pg.closed7 : null;
+  // THE WEEK'S TASK FIGURE IS THE ONE READER'S net_7d (task/3745): the same
+  // number the row's health line and `helm task health` print, so there is
+  // one count, not a second one this page keeps for itself.
+  const h = (j && j.health) || null;
+  const flow = kst === "ok" && h && typeof h.net_7d === "number";
+  const net = flow ? h.net_7d : null;
   const arrow = net === null ? ""
     : ' · <span class="' + (net > 0 ? "bwarn" : "bgood") + '">'
       + (net > 0 ? "↑" + net : net < 0 ? "↓" + -net : "→0") + "</span>";
   const commitLine = commits !== null ? commits + " commit" + (commits === 1 ? "" : "s") + " on " + ref
     : "commits on " + ref + " " + (tst !== "ok" ? boardSecWord(trunk) : "not read here");
-  const taskLine = flow ? pg.opened7 + " opened, " + pg.closed7 + " closed — backlog "
-      + (net > 0 ? "up " + net : net < 0 ? "down " + -net : "even")
+  const taskLine = flow ? "7-day net " + (net > 0 ? "+" + net : net)
     : "tasks " + boardSecWord(tasks);
   return {cell: '<span title="the last seven days: the commits on this project\'s ' + esc(ref) + ', and its tasks opened against closed">'
       + esc(commitTxt) + "</span>" + arrow,
@@ -569,13 +577,31 @@ function projTab(p, j, d, tab) {
    TABS STICK BELOW THE NAVIGATION (task/3475): the helm project's Team tab
    is 4,443 px tall at 1440 px and 6,426 at 420, and its name and tab strip
    scrolled away with it; `.bstick` holds both while the body scrolls. */
+/* THE PROJECT'S HEALTH LINE, under its name (task/3745): the one reader's
+   facts — open stories, today's flow, the 7-day net — the same line `helm
+   task health` prints, so the board and the CLI cannot disagree. Compact
+   here (it wraps under the name, and a phone has no hover for the long
+   form, which the tooltip holds): "2 open · today +1 −0 · week +3". A
+   project with no rows still reads it: zeros, not absence. */
+function boardHealth(j, d) {
+  const h = (j && j.health) || null;
+  if (!h || typeof h.open_stories !== "number" || typeof h.net_7d !== "number")
+    return "";
+  const sgn = n => (n > 0 ? "+" + n : n < 0 ? "−" + (-n) : "0");
+  const day = (typeof h.opened_today === "number" && typeof h.closed_today === "number")
+    ? " · today " + sgn(h.opened_today) + " −" + h.closed_today : "";
+  return '<span class="bhealth" title="the one reader: its open stories, and the week\'s flow — today\'s opened and closed, and the 7-day net (opened minus closed); the same line `helm task health` prints">'
+    + h.open_stories + " open" + day
+    + " · week " + sgn(h.net_7d) + "</span>";
+}
 function boardRowHTML(p, d, open, tab) {
   const lit = light(p), key = pkey(p);
   const j = d && d.projects ? d.projects[key] : undefined;
   const line = '<div class="bline">'
     + '<button type="button" class="blight" title="' + esc(lit.colour + " · " + lit.why + " — tap to set")
     + '"><span class="' + esc("dot " + lit.colour + (lit.authored ? " authored" : "")) + '"></span></button>'
-    + '<span class="bname">' + esc(p.name) + "</span>"
+    + '<span class="bname"><span class="bname-t">' + esc(p.name) + "</span>" + boardHealth(j, d)
+    + "</span>"
     + boardTeam(p, j, d) + boardCount(key) + boardWide(p, j, d)
     + "</div>";
   const det = open ? boardDetail(p, j, d, tab) : null;

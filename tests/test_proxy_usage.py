@@ -541,7 +541,24 @@ class MeterTest(unittest.TestCase):
         family, seat, d = self.sidecar(pool=("pool@example.test",))
         control, _faults = self.pool(d)
         self.assertEqual((list(control.values()), _faults), (["pool@example.test"], []))
+        # THE DEPTH IS THE ONE THIS DECODER REFUSES, FOUND, NOT ASSUMED. The
+        # limit is the C stack, and its reach moves between patch releases:
+        # under the same 8 MiB stack, CPython 3.14.6 refused 50,000 levels and
+        # 3.14.7 parsed them into a list and the file read as "not an object" -- a true
+        # verdict about a fixture that no longer exercised this arm. Double
+        # until the real decoder raises, then plant twice that, so the reader
+        # (a few frames deeper than this probe) refuses it too.
         depth = 50_000
+        while True:
+            try:
+                json.loads("[" * depth + "]" * depth)
+            except RecursionError:
+                break
+            depth *= 2
+            if depth > 6_400_000:
+                self.fail("MUST-HIT: the decoder refused no nesting depth up "
+                          "to 6,400,000, so no fixture here reaches the arm")
+        depth *= 2
         seat_paths._write_private(os.path.join(d, "auth", "deep.json"),
                                   "[" * depth + "]" * depth)
         accounts, faults = self.pool(d)
